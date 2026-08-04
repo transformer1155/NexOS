@@ -122,7 +122,6 @@ SFS 镜像由 `tools/sfs_gen.py` 从 `sfs_files/` 打包;中文与拼音字典�
 ### BIOS
 
 ```bash
-make run              # QEMU 窗口(图形环境),可敲键盘/滚鼠标
 make test             # 无头自动测试:shell + 翻页 + save/load + 文件系统 + 脚本
 make bios-run         # BIOS 镜像 (os.img)
 ```
