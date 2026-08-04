@@ -123,7 +123,7 @@ SFS 镜像由 `tools/sfs_gen.py` 从 `sfs_files/` 打包;中文与拼音字典�
 
 ```bash
 make test             # 无头自动测试:shell + 翻页 + save/load + 文件系统 + 脚本
-make bios-run         # BIOS 镜像 (os.img)
+make iso-run         # ISO 镜像 (os.iso)
 ```
 
 ### ISO + 数据盘(推荐,文件持久化)
