@@ -372,9 +372,9 @@ I/O/VGA/内存行为与 32 位保护模式一致,避免完整切换(关分页→
 
 ---
 
-# MiniOS 开源协议
+# NexOS 开源协议
 
-**MiniOS 开源协议（MiniOS Open Source License）**  
+**NexOS 开源协议（MiniOS Open Source License）**  
 版权所有 (c) 2026 MiniOS 项目开发者（以下简称“项目方”）
 
 允许并鼓励任何个人或组织出于学习、研究、教学、个人兴趣或非商业目的，使用、复制、修改、合并、发布、分发本软件及其衍生版本。
