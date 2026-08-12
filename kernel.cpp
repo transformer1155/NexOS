@@ -2505,7 +2505,7 @@ static uint32_t detect_memory_kb(){
 extern "C" char __bss_start[];
 extern "C" char __bss_end[];
 
-static void pmm_init(){
+static void pmm_init_builtin(){
     pmm_mem_kb = detect_memory_kb();
     uint32_t total_bytes = pmm_mem_kb * 1024;
     pmm_total_pages = (total_bytes - PMM_BASE_ADDR) / PAGE_SIZE;

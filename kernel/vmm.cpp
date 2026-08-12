@@ -91,3 +91,20 @@ uint32_t vmm_get_cr3(void){
 	__asm__ __volatile__("mov %%cr3, %0" : "=r"(val));
 	return val;
 }
+
+uint32_t vmm_get_pd_phys(void){
+	return g_pgdir_phys;
+}
+
+int vmm_activate_page_tables(int enable_paging){
+	if (!g_pgdir_phys) return -1;
+	/* Load CR3 to point to our page directory. Do not enable paging by default. */
+	vmm_set_cr3(g_pgdir_phys);
+	if (enable_paging) {
+		/* Enabling paging in this environment is dangerous; return error to
+		 * force the caller to handle mode transition explicitly.
+		 */
+		return -2;
+	}
+	return 0;
+}

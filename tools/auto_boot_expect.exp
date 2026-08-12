@@ -1,0 +1,21 @@
+#!/usr/bin/expect -f
+set timeout 120
+spawn qemu-system-x86_64 -m 128 -machine q35 -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd -drive if=pflash,format=raw,file=build/ovmf_vars.fd -drive file=build/os_uefi.img,format=raw,if=ide -serial stdio -display none
+expect {
+	-re "Press ESC in .* seconds to skip startup.nsh" {
+		# wait for prompt then send Enter to continue
+		sleep 1
+		send "\r"
+		exp_continue
+	}
+	-re "Shell>" {
+		# execute BOOTX64.EFI
+		send "FS0:\\\\EFI\\BOOT\\BOOTX64.EFI\r"
+	}
+	timeout {
+		puts "ERROR: timeout waiting for UEFI shell"
+		exit 2
+	}
+}
+# interact to let kernel run and print serial output
+interact
