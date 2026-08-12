@@ -1,0 +1,19 @@
+../vendor/mono/utils/mono-threads-posix.c: In function ‘mono_thread_info_get_system_max_stack_size’:
+../vendor/mono/utils/mono-threads-posix.c:156:23: error: storage size of ‘lim’ isn’t known
+  156 |         struct rlimit lim;
+      |                       ^~~
+../vendor/mono/utils/mono-threads-posix.c:159:13: error: implicit declaration of function ‘getrlimit’ [-Wimplicit-function-declaration]
+  159 |         if (getrlimit (RLIMIT_STACK, &lim))
+      |             ^~~~~~~~~
+../vendor/mono/utils/mono-threads-posix.c:159:24: error: ‘RLIMIT_STACK’ undeclared (first use in this function)
+  159 |         if (getrlimit (RLIMIT_STACK, &lim))
+      |                        ^~~~~~~~~~~~
+../vendor/mono/utils/mono-threads-posix.c:159:24: note: each undeclared identifier is reported only once for each function it appears in
+../vendor/mono/utils/mono-threads-posix.c:162:29: error: ‘rlim_t’ undeclared (first use in this function); did you mean ‘rlimit’?
+  162 |         if (lim.rlim_max > (rlim_t)INT_MAX)
+      |                             ^~~~~~
+      |                             rlimit
+../vendor/mono/utils/mono-threads-posix.c:162:36: error: expected ‘)’ before numeric constant
+  162 |         if (lim.rlim_max > (rlim_t)INT_MAX)
+      |            ~                       ^
+      |                                    )

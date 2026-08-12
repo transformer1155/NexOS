@@ -1,0 +1,4 @@
+../vendor/mono/metadata/w32process-win32.c:18:10: fatal error: winsock2.h: No such file or directory
+   18 | #include <winsock2.h>
+      |          ^~~~~~~~~~~~
+compilation terminated.

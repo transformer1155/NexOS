@@ -1,0 +1,4 @@
+../vendor/mono/metadata/threadpool-worker-wasm.c: In function ‘mono_threadpool_worker_request’:
+../vendor/mono/metadata/threadpool-worker-wasm.c:71:17: error: implicit declaration of function ‘mono_threads_schedule_background_job’ [-Wimplicit-function-declaration]
+   71 |                 mono_threads_schedule_background_job (fire_tp_callback);
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

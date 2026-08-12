@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/解决方案项/">
+    <File Path="ShellForm.Designer.cs" />
+  </Folder>
+  <Project Path="WinHost.csproj" />
+</Solution>

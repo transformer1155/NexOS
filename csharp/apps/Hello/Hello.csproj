@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- ================================================================
+       Hello.csproj - a NexOS managed app.
+
+       Built with /nostdlib so the resulting assembly contains its own
+       System.* core types (from ../../NexOS.Core) and therefore has no
+       AssemblyRef rows.  tools/mex_pack.py can then resolve every
+       metadata token inside a single file.
+       ================================================================ -->
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <AssemblyName>Hello</AssemblyName>
+
+    <NoStdLib>true</NoStdLib>
+    <DisableImplicitFrameworkReferences>true</DisableImplicitFrameworkReferences>
+    <RuntimeMetadataVersion>v4.0.30319</RuntimeMetadataVersion>
+
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+
+    <DebugType>none</DebugType>
+    <Optimize>true</Optimize>
+    <Deterministic>true</Deterministic>
+    <NoWarn>CS0626;CS0649;CS8021;CS1591;CS0169</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../../NexOS.Core/Corelib.cs" />
+    <Compile Include="../../NexOS.Core/Sys.cs" />
+    <Compile Include="Program.cs" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,4 @@
+Welcome to NexOS!
+This is a text file stored on the
+compatible simple file system (SFS).
+You can read it with: catfs welcome.txt

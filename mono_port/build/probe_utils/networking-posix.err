@@ -1,0 +1,17 @@
+In file included from ../vendor/mono/utils/networking-posix.c:42:
+../vendor/mono/utils/networking.h:57:32: error: field ‘v4’ has incomplete type
+   57 |                 struct in_addr v4;
+      |                                ^~
+../vendor/mono/utils/networking.h:72:28: error: field ‘v4’ has incomplete type
+   72 |         struct sockaddr_in v4;
+      |                            ^~
+../vendor/mono/utils/networking.h:76:25: error: field ‘addr’ has incomplete type
+   76 |         struct sockaddr addr;
+      |                         ^~~~
+../vendor/mono/utils/networking.h:82:32: error: field ‘v4’ has incomplete type
+   82 |                 struct in_addr v4;
+      |                                ^~
+../vendor/mono/utils/networking-posix.c: In function ‘mono_networking_get_tcp_protocol’:
+../vendor/mono/utils/networking-posix.c:183:16: error: implicit declaration of function ‘fetch_protocol’ [-Wimplicit-function-declaration]
+  183 |         return fetch_protocol ("tcp", &cache, &proto, 6); //6 is SOL_TCP on linux
+      |                ^~~~~~~~~~~~~~

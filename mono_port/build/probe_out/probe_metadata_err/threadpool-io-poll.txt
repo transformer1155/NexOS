@@ -1,0 +1,81 @@
+../vendor/mono/metadata/threadpool-io-poll.c:8:8: error: unknown type name ‘guint’
+    8 | static guint poll_fds_capacity;
+      |        ^~~~~
+../vendor/mono/metadata/threadpool-io-poll.c:9:8: error: unknown type name ‘guint’
+    9 | static guint poll_fds_size;
+      |        ^~~~~
+../vendor/mono/metadata/threadpool-io-poll.c:12:37: error: unknown type name ‘gint’; did you mean ‘int’?
+   12 | POLL_INIT_FD (mono_pollfd *poll_fd, gint fd, gint events)
+      |                                     ^~~~
+      |                                     int
+../vendor/mono/metadata/threadpool-io-poll.c:12:46: error: unknown type name ‘gint’; did you mean ‘int’?
+   12 | POLL_INIT_FD (mono_pollfd *poll_fd, gint fd, gint events)
+      |                                              ^~~~
+      |                                              int
+../vendor/mono/metadata/threadpool-io-poll.c:19:8: error: unknown type name ‘gboolean’
+   19 | static gboolean
+      |        ^~~~~~~~
+../vendor/mono/metadata/threadpool-io-poll.c:20:12: error: unknown type name ‘gint’; did you mean ‘int’?
+   20 | poll_init (gint wakeup_pipe_fd)
+      |            ^~~~
+      |            int
+../vendor/mono/metadata/threadpool-io-poll.c:34:8: error: unknown type name ‘gboolean’
+   34 | static gboolean
+      |        ^~~~~~~~
+../vendor/mono/metadata/threadpool-io-poll.c:41:19: error: unknown type name ‘gint’; did you mean ‘int’?
+   41 | poll_register_fd (gint fd, gint events, gboolean is_new)
+      |                   ^~~~
+      |                   int
+../vendor/mono/metadata/threadpool-io-poll.c:41:28: error: unknown type name ‘gint’; did you mean ‘int’?
+   41 | poll_register_fd (gint fd, gint events, gboolean is_new)
+      |                            ^~~~
+      |                            int
+../vendor/mono/metadata/threadpool-io-poll.c:41:41: error: unknown type name ‘gboolean’
+   41 | poll_register_fd (gint fd, gint events, gboolean is_new)
+      |                                         ^~~~~~~~
+../vendor/mono/metadata/threadpool-io-poll.c:88:17: error: unknown type name ‘gint’; did you mean ‘int’?
+   88 | poll_remove_fd (gint fd)
+      |                 ^~~~
+      |                 int
+../vendor/mono/metadata/threadpool-io-poll.c:116:8: error: unknown type name ‘gint’; did you mean ‘int’?
+  116 | static gint
+      |        ^~~~
+      |        int
+../vendor/mono/metadata/threadpool-io-poll.c:117:38: error: unknown type name ‘gint’; did you mean ‘int’?
+  117 | poll_mark_bad_fds (mono_pollfd *fds, gint size)
+      |                                      ^~~~
+      |                                      int
+../vendor/mono/metadata/threadpool-io-poll.c:142:8: error: unknown type name ‘gint’; did you mean ‘int’?
+  142 | static gint
+      |        ^~~~
+      |        int
+../vendor/mono/metadata/threadpool-io-poll.c:143:36: error: unknown type name ‘gint’; did you mean ‘int’?
+  143 | poll_event_wait (void (*callback) (gint fd, gint events, gpointer user_data), gpointer user_data)
+      |                                    ^~~~
+      |                                    int
+../vendor/mono/metadata/threadpool-io-poll.c:143:45: error: unknown type name ‘gint’; did you mean ‘int’?
+  143 | poll_event_wait (void (*callback) (gint fd, gint events, gpointer user_data), gpointer user_data)
+      |                                             ^~~~
+      |                                             int
+../vendor/mono/metadata/threadpool-io-poll.c:143:58: error: unknown type name ‘gpointer’
+  143 | poll_event_wait (void (*callback) (gint fd, gint events, gpointer user_data), gpointer user_data)
+      |                                                          ^~~~~~~~
+../vendor/mono/metadata/threadpool-io-poll.c:143:79: error: expected ‘;’, ‘,’ or ‘)’ before ‘gpointer’
+  143 | poll_event_wait (void (*callback) (gint fd, gint events, gpointer user_data), gpointer user_data)
+      |                                                                               ^~~~~~~~
+../vendor/mono/metadata/threadpool-io-poll.c:222:8: error: unknown type name ‘ThreadPoolIOBackend’
+  222 | static ThreadPoolIOBackend backend_poll = {
+      |        ^~~~~~~~~~~~~~~~~~~
+../vendor/mono/metadata/threadpool-io-poll.c:223:9: error: ‘poll_init’ undeclared here (not in a function)
+  223 |         poll_init,
+      |         ^~~~~~~~~
+../vendor/mono/metadata/threadpool-io-poll.c:225:9: error: ‘poll_register_fd’ undeclared here (not in a function); did you mean ‘poll_can_register_fd’?
+  225 |         poll_register_fd,
+      |         ^~~~~~~~~~~~~~~~
+      |         poll_can_register_fd
+../vendor/mono/metadata/threadpool-io-poll.c:226:9: error: ‘poll_remove_fd’ undeclared here (not in a function)
+  226 |         poll_remove_fd,
+      |         ^~~~~~~~~~~~~~
+../vendor/mono/metadata/threadpool-io-poll.c:227:9: error: ‘poll_event_wait’ undeclared here (not in a function)
+  227 |         poll_event_wait,
+      |         ^~~~~~~~~~~~~~~

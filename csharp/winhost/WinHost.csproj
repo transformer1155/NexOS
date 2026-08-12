@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- ================================================================
+       WinHost.csproj - run the NexOS C# shell on Windows.
+
+       Based on the Visual Studio WinForms template (WinFormsApp1):
+       a standard SDK-style csproj with net8.0-windows + UseWindowsForms,
+       the partial-Form + Designer + resx split, and
+       ApplicationConfiguration.Initialize() as the entry point.
+
+       The shared shell sources (Shell.cs / Apps.cs / Desktop.cs /
+       Forms.cs / Sys.cs) are compiled in place - no copies, no forks.
+       Forms.cs and Sys.cs hide their [InternalCall] stubs behind
+       "#if !WINHOST", so under WINHOST Backend.cs supplies the real
+       GDI+ implementations with identical signatures.  Corelib.cs is
+       deliberately NOT included: the real BCL provides Object/String.
+
+       Run:  dotnet run csharp/winhost/WinHost.csproj
+       ================================================================ -->
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <DefineConstants>$(DefineConstants);WINHOST</DefineConstants>
+    <!-- Needed for the custom pixel-exact GDI+ frame to stay 1:1 with
+         the VM's 1280x720 guest on high-DPI displays. -->
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <!-- The borrowed NexOS sources are not nullable-annotated; keep the
+         harness output clean without changing their semantics. -->
+    <NoWarn>CS8618;CS0649;CS0169;CS0414</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Shared NexOS C# UI sources, compiled straight from the tree. -->
+    <Compile Include="../NexOS.Core/Sys.cs" />
+    <Compile Include="../NexOS.Forms/Forms.cs" />
+    <Compile Include="../apps/Shell/Shell.cs" />
+    <Compile Include="../apps/Shell/Apps.cs" />
+    <Compile Include="../apps/Shell/Desktop.cs" />
+    <Compile Include="../apps/Shell/Browser.cs" />
+    <Compile Include="../apps/Shell/Popup.cs" />
+  </ItemGroup>
+
+  <!-- Local files (Backend.cs, Program.cs, ShellForm.cs, ShellForm.Designer.cs,
+       ShellForm.resx) are picked up automatically by the SDK's default glob. -->
+
+</Project>

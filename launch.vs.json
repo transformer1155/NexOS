@@ -1,0 +1,17 @@
+{
+  "version": "0.2.1",
+  "defaults": {},
+  "configurations": [
+    {
+      "type": "default",
+      "project": "",
+      "name": "Make Play (WSL)",
+      "projectTarget": "",
+      "env": {},
+      "args": "",
+      "cwd": "${workspaceRoot}",
+      "program": "wsl",
+      "commandLine": "-d Debian -- make play"
+    }
+  ]
+}

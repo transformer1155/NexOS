@@ -1,0 +1,4 @@
+../vendor/mono/metadata/attach.c:25:10: fatal error: sys/socket.h: No such file or directory
+   25 | #include <sys/socket.h>
+      |          ^~~~~~~~~~~~~~
+compilation terminated.

@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- ================================================================
+       Shell.csproj - the resident NexOS GUI, written in C#.
+
+       Contains the NexOS.Forms toolkit, every built-in application and
+       (later) the desktop, compiled into one /nostdlib assembly so
+       tools/mex_pack.py can resolve every metadata token locally and
+       flatten it into shell.mex for MiniCLR.
+       ================================================================ -->
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <AssemblyName>Shell</AssemblyName>
+
+    <NoStdLib>true</NoStdLib>
+    <DisableImplicitFrameworkReferences>true</DisableImplicitFrameworkReferences>
+    <RuntimeMetadataVersion>v4.0.30319</RuntimeMetadataVersion>
+
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+
+    <DebugType>none</DebugType>
+    <Optimize>true</Optimize>
+    <Deterministic>true</Deterministic>
+    <NoWarn>CS0626;CS0649;CS8021;CS1591;CS0169</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../../NexOS.Core/Corelib.cs" />
+    <Compile Include="../../NexOS.Core/Sys.cs" />
+    <Compile Include="../../NexOS.Forms/Forms.cs" />
+    <Compile Include="Shell.cs" />
+    <Compile Include="Login.cs" />
+    <Compile Include="Apps.cs" />
+    <Compile Include="Desktop.cs" />
+    <Compile Include="Browser.cs" />
+    <Compile Include="AiSetup.cs" />
+    <Compile Include="AiAgent.cs" />
+    <Compile Include="Popup.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Update="Shell.resx">
+      <Generator></Generator>
+    </EmbeddedResource>
+  </ItemGroup>
+
+</Project>
