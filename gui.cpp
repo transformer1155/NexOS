@@ -17,6 +17,7 @@
 #include "zfont_data.h"   // embedded GB2312 16x16 CJK font (387 glyphs)
 #include "ime_dict.h"     // pinyin -> Hanzi dictionary for IME
 #include "win32.h"        // Win32 subsystem: registry, PE32 loader, GDI display list
+#include "addrman.h"       // Address Management Registry (single source of truth)
 
 // ---------------------------------------------------------------------
 //  NexOS.Forms managed (C#) GUI shell bridge.
@@ -41,6 +42,7 @@ static inline int         mforms_key(int, int) { return 0; }
 static inline void        mforms_set_mouse(int, int) {}
 static inline int         mforms_has_desktop(void) { return 0; }
 static inline void        mforms_paint_desktop(int, int) {}
+static inline int         g_mforms_anim = 0;   // 64-bit build: no managed shell
 static inline void        mforms_paint_overlay(int, int) {}
 static inline int         mforms_desktop_click(int, int) { return -2; }
 static inline int         mforms_desktop_rclick(int, int) { return -2; }
@@ -84,6 +86,70 @@ struct VbeInfo {
 #define PXF_RGB24    2  // 24-bit packed RGB
 #define PXF_RGB565   3  // 16-bit RGB565
 #define PXF_BLT_ONLY 4  // No linear framebuffer
+
+// ---- Boot beacon: fill the whole framebuffer with a solid color. ----
+// Screen-visible progress indicator for when there is no serial console.
+// The color is computed from (r,g,b) using the GOP pixel format stored at
+// 0x500F, so it renders correctly on both RGBX and BGRX panels.  The
+// framebuffer virtual address is chosen per execution mode:
+//   64-bit kernel : identity-mapped physical LFB (switch32to64.asm)
+//   32-bit kernel : 0xF0000000 window after vmm_map_high_fb() (sb==1),
+//                   otherwise the physical LFB (UEFI firmware identity-maps
+//                   all RAM at kmain entry, before vmm_map_high_fb swaps CR3)
+// diag_step (defined in kernel64.cpp for 64-bit, no-op stub in kernel.cpp for
+// 32-bit) replaces color beacons for progress tracing: it only logs the step
+// name to serial (and records last-step for fault capture), never paints the
+// whole screen, so the real desktop stays visible.
+extern "C" void diag_step(uint32_t id, const char* name);
+
+extern "C" void boot_beacon(uint8_t r, uint8_t g, uint8_t b) {
+    volatile uint8_t* vb = (volatile uint8_t*)0x5000;
+    uint16_t w     = *(volatile uint16_t*)(vb + 0x04);
+    uint16_t h     = *(volatile uint16_t*)(vb + 0x06);
+    uint16_t pitch = *(volatile uint16_t*)(vb + 0x09);
+    uint8_t  fmt   = *(volatile uint8_t*)(vb + 0x0F);
+    if (w == 0 || h == 0) return;
+    uint64_t fb64 = *(volatile uint64_t*)(vb + 0x10);
+    uint32_t sb   = *(volatile uint32_t*)(vb + 0x18);
+    uintptr_t fbva;
+#ifdef __x86_64__
+    // BIOS path populates ONLY the 32-bit framebuffer_phys at 0x5000 and
+    // leaves framebuffer_phys64 (0x5010) zero/garbage.  Use the 32-bit LFB
+    // phys, which the long-mode 1GiB identity pages cover (0..8 GiB).  Only
+    // keep fb64 when it is a genuine >4 GiB UEFI GOP address.
+    if (fb64 == 0 || fb64 > 0xFFFFFFFFULL) {
+        uint32_t fb32 = *(volatile uint32_t*)(vb + 0x00);
+        fbva = (uintptr_t)fb32;
+    } else {
+        fbva = (uintptr_t)fb64;
+    }
+#else
+    if (fb64 > 0xFFFFFFFFULL) {
+        fbva = (sb == 1) ? 0xF0000000u : (uintptr_t)fb64;
+    } else {
+        fbva = (uintptr_t)(*(volatile uint32_t*)(vb + 0x00));
+    }
+#endif
+    // Pixel packing.  The framebuffer stores pixels little-endian:
+    //   RGBX32 (fmt==1): byte order R,G,B,X  -> value = (B<<16)|(G<<8)|R
+    //   BGRX32 (fmt==0): byte order B,G,R,X  -> value = (R<<16)|(G<<8)|B
+    // The two branches below were previously SWAPPED, which made every beacon
+    // render with red/blue inverted on BGRX panels (real Intel GOP == BGRX),
+    // so a "RED" stage showed blue and "YELLOW" showed magenta -- fatal for a
+    // colour-based boot diagnostic.  Corrected so the logical (r,g,b) appears
+    // correctly on both pixel formats.
+    uint32_t px;
+    if (fmt == 1)      px = ((uint32_t)b << 16) | ((uint32_t)g << 8) | r;   // RGBX32
+    else if (fmt == 0) px = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;   // BGRX32
+    else if (fmt == 3) px = (uint32_t)((((uint16_t)r>>3)<<11)|(((uint16_t)g>>2)<<5)|((uint16_t)b>>3)); // RGB565
+    else               px = ((uint32_t)b << 16) | ((uint32_t)g << 8) | r;   // RGB24/unknown
+    uint32_t pstride = (pitch != 0) ? (pitch / 4u) : (uint32_t)w;
+    volatile uint32_t* fb = (volatile uint32_t*)fbva;
+    for (uint32_t y = 0; y < h; y++) {
+        volatile uint32_t* row = fb + (uint32_t)y * pstride;
+        for (uint32_t x = 0; x < pstride; x++) row[x] = px;
+    }
+}
 
 // ---- Port I/O helpers ----
 static inline void outb(uint16_t p, uint8_t v) {
@@ -256,6 +322,15 @@ static int utf8_display_width(const char* s) {
     return w;
 }
 static bool g_vbe_mode_set_by_bios = false;  // true if mode set by BIOS/UEFI
+// True when the framebuffer we were handed comes straight from UEFI GOP.
+// Detection rule: the BIOS path (stage2.asm INT 10h) ALWAYS stores a non-zero
+// VBE mode number at VbeInfo.mode_number (0x500B); bootuefi.c / GOP never does.
+// This matters because on a GOP framebuffer the firmware has already picked the
+// ACTIVE scanout surface (e.g. QEMU's ramfb, or the real panel on Iris Xe).
+// Calling bochs_vbe_set_mode() afterwards reprograms the *standard VGA* device
+// and moves scanout to a DIFFERENT surface, so every pixel the GUI draws into
+// the GOP framebuffer becomes invisible -> black screen.
+static bool g_gop_native = false;
 
 // VGA text buffer pointer, defined in kernel.cpp.  In VBE/fb_console mode it
 // points to a shadow buffer; in real VGA text mode it aliases 0xB8000.
@@ -585,6 +660,7 @@ struct GuiCallbacks {
     void     (*optimize_memory)(void);        // force heap coalescing + page reclaim
     int      (*list_files)(int fs_type, char* buf, int bufsize);  // 0=mkfs,1=sfs,2=fat32
     int      (*read_file)(int fs_type, const char* name, uint8_t* buf, int bufsize); // returns bytes read or -1
+    int      (*write_file)(int fs_type, const char* name, const uint8_t* buf, int size);
     void     (*get_time)(int* h, int* m, int* s);
     // File-mutation (context-menu actions: new folder / delete / rename).
     int      (*mkdir)(int fs, const char* name);
@@ -632,6 +708,11 @@ struct GuiCallbacks {
 
 static GuiCallbacks g_cb;
 static int g_startup_app_id = -1;   // set by kernel before gui_enter()
+
+// (enter_gui() is now always entered.  The old g_skip_enter_gui voice-test
+//  workaround for a phantom enter_gui() return-hang was skipping the desktop
+//  paint entirely and leaving real hardware stuck at the firmware-default
+//  light-gray screen -- see 2026-08-18 root-cause notes.)
 
 // Defined at the bottom of this file inside the extern "C" thunk block.
 // Forward-declared here so Win11Desktop::launch_app() can drop straight back
@@ -733,7 +814,32 @@ struct Graphics {
             return;
         }
 
+#if defined(__x86_64__)
+        // 64-bit kernel: pointers are 64-bit wide, and switch32to64.asm has
+        // identity-mapped the high framebuffer with a 1 GiB page, so use the
+        // FULL physical address.  Truncating to framebuffer_phys would give 0
+        // for a real-hardware LFB at 0x4000000000 (Intel Iris Xe) and every
+        // pixel write would land on the IVT instead of the screen -- the
+        // machine stays alive but the display never lights up.
+        if (info->framebuffer_phys64 > 0xFFFFFFFFULL) {
+            lfb = (volatile uint32_t*)(uintptr_t)info->framebuffer_phys64;
+            // Register the real high framebuffer as FB_PHYS and, crucially, as the
+            // draw address FB_VIRT.  In 64-bit, switch32to64.asm identity-mapped
+            // the REAL address, so the GUI must draw there (NOT the 0xF0000000
+            // window that only exists in the 32-bit compat page tables).
+            addr_set(ADDR_FB_PHYS, info->framebuffer_phys64, info->framebuffer_phys64,
+                     (uint64_t)info->pitch * info->height, ADDR_FLAG_FB | ADDR_FLAG_MMIO);
+            addr_set(ADDR_FB_VIRT, info->framebuffer_phys64, info->framebuffer_phys64, 0, ADDR_FLAG_FB);
+            serial_puts("[GUI] 64-bit high framebuffer in use (1GiB identity page)\n");
+        } else {
+            lfb = (volatile uint32_t*)(uintptr_t)info->framebuffer_phys;
+            addr_set(ADDR_FB_PHYS, info->framebuffer_phys, info->framebuffer_phys,
+                     (uint64_t)info->pitch * info->height, ADDR_FLAG_FB | ADDR_FLAG_MMIO);
+            addr_set(ADDR_FB_VIRT, info->framebuffer_phys, info->framebuffer_phys, 0, ADDR_FLAG_FB);
+        }
+#else
         lfb = (volatile uint32_t*)info->framebuffer_phys;
+#endif
         width = info->width;
         height = info->height;
         pitch = info->pitch;
@@ -772,12 +878,17 @@ struct Graphics {
         // when the full 64-bit address is above 4 GB AND shadow_buffer == 0
         // (meaning the kernel could not set up the mapping).
 
-        // Validate framebuffer address is accessible (below 4GB for 32-bit kernel)
+        // Validate framebuffer address is accessible (below 4GB for 32-bit kernel).
+        // The 64-bit kernel has no such limit: it addresses the high LFB directly
+        // through the 1 GiB identity page built in switch32to64.asm, so this abort
+        // is deliberately restricted to the 32-bit build.
+#if !defined(__x86_64__)
         if (info->framebuffer_phys64 > 0xFFFFFFFFULL && info->shadow_buffer == 0) {
             serial_puts("[GUI] WARNING: Framebuffer above 4GB without shadow buffer\n");
             initialized = false;
             return;
         }
+#endif
 
         serial_puts("[GUI] Pixel format: ");
         serial_puts(pixel_format == PXF_BGRX32 ? "BGRX32" :
@@ -790,12 +901,18 @@ struct Graphics {
         g_bga_available = bga_detect();
         // Check if mode was already set by BIOS (INT 10h) or UEFI (GOP)
         g_vbe_mode_set_by_bios = (info->vbe_mode_set == 1);
+        // A GOP framebuffer is recognised by the ABSENCE of a VBE mode number:
+        // stage2.asm always fills it in on the BIOS path (0x117 / 0x144), and the
+        // BGA fallback above synthesises 0x117 as well, so mode_number == 0 with
+        // vbe_mode_set == 1 can only mean "UEFI GOP handed us an active surface".
+        g_gop_native = (info->mode_number == 0) && (info->vbe_mode_set == 1);
 
         serial_puts("[GUI] BGA: ");
         serial_puts(g_bga_available ? "yes" : "no");
         serial_puts(", BIOS mode set: ");
         serial_puts(g_vbe_mode_set_by_bios ? "yes" : "no");
-        serial_puts("\n");
+        serial_puts(", source: ");
+        serial_puts(g_gop_native ? "UEFI-GOP\n" : "BIOS-VBE/BGA\n");
 
         // Allocate backbuffer (off-screen buffer for double buffering)
         backbuffer = (uint32_t*)kmalloc(width * height * 4);
@@ -931,6 +1048,20 @@ struct Graphics {
     }
 
     void enable_vbe_mode() {
+        // UEFI GOP already owns the ACTIVE scanout surface -- do not touch BGA.
+        //
+        // QEMU q35 + OVMF exposes BOTH a standard VGA device (with Bochs VBE
+        // ports) AND the surface GOP actually selected (ramfb here).  Firing
+        // bochs_vbe_set_mode() would reprogram std VGA and hand scanout to its
+        // own LFB (0xFD000000 / 0xE0000000), while the GUI keeps drawing into the
+        // GOP framebuffer we were told about (0x7E4CF000) -> the monitor shows the
+        // untouched, black std-VGA surface.  Real hardware is worse: the LFB sits
+        // at 0x4000000000 and BGA ports don't exist at all, but if a chipset did
+        // answer we would blank the panel the firmware just lit up.
+        if (g_gop_native) {
+            serial_puts("[GUI] UEFI GOP surface is already active - skipping BGA mode set\n");
+            return;
+        }
         // If BGA ports available (QEMU/VirtualBox), set mode dynamically
         if (g_bga_available) {
             bochs_vbe_set_mode(width, height, bpp);
@@ -944,6 +1075,12 @@ struct Graphics {
         }
     }
     void disable_vbe_mode() {
+        // Symmetric with enable_vbe_mode(): we never programmed BGA on a GOP
+        // framebuffer, so disabling it would only blank a surface we don't own.
+        if (g_gop_native) {
+            serial_puts("[GUI] UEFI GOP surface stays active (BGA never programmed)\n");
+            return;
+        }
         // Only disable if we set it via BGA (can't switch back to text mode without INT 10h)
         if (g_bga_available) {
             bochs_vbe_disable();
@@ -996,6 +1133,48 @@ struct Graphics {
                 int g = (dg * (255 - alpha) + cg * alpha) / 255;
                 int b = (db * (255 - alpha) + cb * alpha) / 255;
                 p[col] = (uint32_t)((r << 16) | (g << 8) | b);
+            }
+        }
+    }
+
+    // Alpha-blend a single pixel over whatever is already in the backbuffer.
+    // (put_pixel is hard-replace and ignores alpha, so translucent effects
+    //  must composite manually — this is what gives windows a real glass
+    //  edge that lets the desktop / window behind show through.)
+    inline void blend_pixel(int x, int y, Color c, int alpha) {
+        if (alpha <= 0) return;
+        if ((uint32_t)x >= width || (uint32_t)y >= height) return;
+        uint32_t d = backbuffer[y * width + x];
+        int dr = (int)((d >> 16) & 0xFF), dg = (int)((d >> 8) & 0xFF), db = (int)(d & 0xFF);
+        int cr = (int)((c >> 16) & 0xFF), cg = (int)((c >> 8) & 0xFF), cb = (int)(c & 0xFF);
+        int r = (dr * (255 - alpha) + cr * alpha) / 255;
+        int g = (dg * (255 - alpha) + cg * alpha) / 255;
+        int b = (db * (255 - alpha) + cb * alpha) / 255;
+        backbuffer[y * width + x] = (uint32_t)((r << 16) | (g << 8) | b);
+    }
+
+    // Alpha-blend a solid colour inside a rounded rect over existing pixels.
+    // Used for the Win11-style soft shadow + frosted (translucent) rim.
+    void blend_rounded_rect(int x, int y, int w, int h, int r, Color c, int alpha) {
+        if (alpha <= 0) return;
+        if (alpha > 255) alpha = 255;
+        if (r > h / 2) r = h / 2;
+        if (r > w / 2) r = w / 2;
+        if (r < 0) r = 0;
+        // Center rectangle
+        blend_rect(x + r, y, w - 2 * r, h, c, alpha);
+        // Top and bottom strips
+        blend_rect(x, y + r, r, h - 2 * r, c, alpha);
+        blend_rect(x + w - r, y + r, r, h - 2 * r, c, alpha);
+        // Corners
+        for (int dy = 0; dy < r; dy++) {
+            int dx = (int)(r * 0.7 - dy * 0.3);
+            if (dx < 0) dx = 0;
+            for (int i = 0; i <= dx; i++) {
+                blend_pixel(x + r - 1 - i, y + r - 1 - dy, c, alpha);
+                blend_pixel(x + w - r + i, y + r - 1 - dy, c, alpha);
+                blend_pixel(x + r - 1 - i, y + h - r + dy, c, alpha);
+                blend_pixel(x + w - r + i, y + h - r + dy, c, alpha);
             }
         }
     }
@@ -1576,6 +1755,7 @@ enum AppType {
     APP_NOTEPAD,        // managed-only; no legacy native drawer
     APP_AISETUP,        // one-tap AI enablement wizard (managed)
     APP_AIAGENT,        // AI Agent runner (managed): Planner/Actor/Critic
+    APP_DEMO,           // button-shrink + reply "啊" demo window (managed)
 };
 
 constexpr int MAX_WINDOWS = 8;
@@ -2424,6 +2604,11 @@ struct StartMenuItem {
 
     } // namespace browser
 
+// TEMP VERIFY: isolated window-edge frame (light-gray backdrop + demo window
+// only) so the new Win11 soft shadow + frosted rim are unambiguous.  Remove
+// together with the temp window in gui_init() after verification.
+static bool g_edge_test = true;
+
 struct Win11Desktop {
     Graphics gfx;
     MouseCursor cursor;
@@ -2456,6 +2641,7 @@ struct Win11Desktop {
     bool anim_active_prev;     // was any window animating last frame
     int anim_stall;            // consecutive throttled passes (deadlock guard)
     uint32_t anim_ms_scale;    // 0xFFFFFFFF / anim_tsc_per_ms (tick_ms_now)
+    uint32_t last_ai_repaint_ms; // last AI-desktop animation repaint (ms)
 
     // Frame counter (fallback ms source for managed double-click when the
     // TSC calibration was rejected) and desktop double-click state.
@@ -2506,6 +2692,7 @@ struct Win11Desktop {
         last_anim_tsc = 0;
         anim_stall = 0;
         frame_counter = 0;
+        last_ai_repaint_ms = 0;
         dbl_t = 0; dbl_kind = 0xFFFFFFFFu; dbl_x = -9999; dbl_y = -9999;
         selected_icon = -1;
         clock_h = 0; clock_m = 0; clock_s = 0;
@@ -2932,11 +3119,27 @@ struct Win11Desktop {
         if (!win.visible || win.minimized) return;
         if (rx < 0) { rx = win.x; ry = win.y; rw = win.w; rh = win.h; }
 
-        // Window shadow (skip in fullscreen)
+        // ---- Win11-style soft drop shadow (acrylic float) ----
+        // The gfx backend's fill_/put_pixel are hard-replace and ignore alpha,
+        // so a real translucent shadow must be *blended* over the surface that
+        // is already in the backbuffer (the desktop / window behind).  Several
+        // concentric low-alpha layers accumulate into a soft blurred shadow.
+        // Drawn before the opaque body, so only the outer band survives.
         if (!win.fullscreen) {
-            for (int i = 0; i < 4; i++) {
-                gfx.fill_rect(rx + 3 + i, ry + 3 + i, rw, rh, 0x20000000);
-            }
+            gfx.blend_rounded_rect(rx - 14, ry - 10, rw + 28, rh + 26, 20, 0x000000, 14);
+            gfx.blend_rounded_rect(rx - 10, ry -  7, rw + 20, rh + 19, 18, 0x000000, 18);
+            gfx.blend_rounded_rect(rx -  6, ry -  4, rw + 12, rh + 12, 16, 0x000000, 24);
+        }
+
+        // ---- Frosted translucent rim (glass edge) ----
+        // A thin band just outside the frame, alpha-blended so the surface
+        // behind shows through — the Windows 11 acrylic edge.  Neutral for
+        // inactive windows; a very faint accent tint for the active one (no
+        // loud blue glow — that was the old look the user rejected).
+        if (!win.fullscreen) {
+            uint32_t rim = win.active ? 0xBFD4F0 : 0xD2D2D2;
+            int     ra  = win.active ? 60 : 52;
+            gfx.blend_rounded_rect(rx - 3, ry - 3, rw + 6, rh + 6, 9, rim, ra);
         }
 
         // Window background
@@ -4420,17 +4623,31 @@ struct Win11Desktop {
     void render_all() {
         if (!gfx.initialized) return;
         if (!gui_mode) return;   // never paint after gui_exit() (e.g. "Terminal" shortcut)
+        if (g_edge_test) {
+            // Isolated edge-test frame: light-gray backdrop + the demo
+            // window only, so the new Win11 soft shadow + frosted rim are
+            // unambiguous.  Remove together with the temp window.
+            gfx.clear_screen(0xD8DCE2);
+            for (int i = 0; i < window_count; i++)
+                if (windows[i].visible && !windows[i].minimized)
+                    draw_window_animated(i);
+            serial_puts("[GUI] render_all edge-test\n");
+            return;
+        }
         frame_counter++;
         serial_puts("[GUI] render_all begin\n");
+        diag_step(100, "render_all enter");
 
         // The managed (C#) Win11 shell paints in two layers so windows
         // land between the wallpaper and the taskbar, exactly as they do
         // on Windows.  Layer 2 goes in after the window loop below.
-        const bool managed_desk = mforms_has_desktop() != 0;
+        const bool managed_desk = false;  // DIAG-TEMP: bypass mforms to isolate >4GB crash in managed C# shell
         if (managed_desk) {
             mforms_set_mouse(mouse_x, mouse_y);
             mforms_set_running(running_mask());
+            diag_step(101, "render_all before mforms_paint_desktop");
             mforms_paint_desktop(gfx.width, gfx.height);
+            diag_step(102, "render_all after mforms_paint_desktop");
         } else {
             draw_wallpaper();
             draw_topbar();
@@ -4489,10 +4706,23 @@ struct Win11Desktop {
         serial_puts("[GUI] render_all end\n");
     }
 
-    void enter_gui() {
+        void enter_gui() {
+        diag_step(110, "enter_gui enter");
         if (!gfx.initialized) { serial_puts("[GUI] No VBE\n"); return; }
+        diag_step(111, "enter_gui gfx initialized");
+#if defined(__x86_64__)
+        boot_beacon(255, 128, 0);          // E1 ORANGE : passed gfx init check
+#endif
         gfx.enable_vbe_mode();  // Sets BGA mode (emulator) or uses BIOS-set mode (real HW)
+        diag_step(112, "enter_gui vbe mode set");
+#if defined(__x86_64__)
+        boot_beacon(128, 128, 255);        // E2 LIGHT BLUE : after enable_vbe_mode
+#endif
         gfx.force_clear_lfb();  // wipe bootuefi/OVMF residue
+        diag_step(113, "enter_gui lfb cleared");
+#if defined(__x86_64__)
+        boot_beacon(64, 64, 64);           // E3 DARK GRAY : after clear, before render_all
+#endif
         serial_puts("[GUI] LFB cleared\n");
         gui_mode = true;
         calibrate_tsc();
@@ -4501,6 +4731,9 @@ struct Win11Desktop {
         cursor.saved_valid = false;  // Force background re-capture
         ime_reset();
         serial_puts("[GUI] IME reset done\n");
+#if defined(__x86_64__)
+        boot_beacon(140, 140, 140);      // E4 LIGHT GRAY : passed ime_reset, about to render_all
+#endif
         render_all();   // draws everything + cursor + presents to screen
         // Auto-open a Terminal for immediate IME testing
         // (disabled while debugging Win32 window rendering)
@@ -4945,6 +5178,13 @@ struct Win11Desktop {
             uint32_t lp = ((uint32_t)(ly & 0xFFFF) << 16) | (uint32_t)(lx & 0xFFFF);
             win32_window_dispatch(win.w32_index, 0x0201, 1, lp);   // WM_LBUTTONDOWN
             win32_window_dispatch(win.w32_index, 0x0202, 0, lp);   // WM_LBUTTONUP
+            // If a BUTTON child control was hit, synthesise a WM_COMMAND so
+            // the app's WndProc can react to the click (BN_CLICKED).
+            int hit_id = win32_window_button_hit(win.w32_index, lx, ly);
+            if (hit_id) {
+                serial_puts("[gui] win32 button hit id="); serial_putdec(hit_id); serial_puts("\n");
+                win32_window_dispatch(win.w32_index, 0x0111, (uint32_t)hit_id, 0); // WM_COMMAND
+            }
             win32_window_repaint(win.w32_index);
             return;
         }
@@ -5354,6 +5594,7 @@ struct Win11Desktop {
             case APP_BROWSER:       return 8;   // Kind.Browser
             case APP_AISETUP:       return 9;   // Kind.AiSetup
             case APP_AIAGENT:       return 10;  // Kind.AiAgent
+            case APP_DEMO:          return 11;  // Kind.Demo
             default:                return -1;   // Win32 stay native
         }
     }
@@ -5373,6 +5614,7 @@ struct Win11Desktop {
             case 8: return APP_BROWSER;
             case 9: return APP_AISETUP;
             case 10: return APP_AIAGENT;
+            case 11: return APP_DEMO;
             default: return APP_NONE;
         }
     }
@@ -5454,6 +5696,8 @@ struct Win11Desktop {
                 ww = 380; wh = 320; title = "AI Setup"; break;
             case APP_AIAGENT:
                 ww = 420; wh = 440; title = "AI Agent"; break;
+            case APP_DEMO:
+                ww = 360; wh = 320; title = "Demo"; break;
             default: return;
         }
 
@@ -5494,6 +5738,13 @@ struct Win11Desktop {
                         memcpy_(windows[wid].title, mt, tl);
                         windows[wid].title[tl] = 0;
                     }
+                    // Give the freshly opened managed window keyboard focus so
+                    // it receives keystrokes immediately (e.g. the AI goal box
+                    // must accept typing without the user clicking it first).
+                    serial_puts("[gui] managed focus wid="); serial_putdec(wid); serial_puts("\n");
+                    for (int j = 0; j < window_count; j++) windows[j].active = false;
+                    windows[wid].active = true;
+                    active_window = wid;
                 }
                 return;
             }
@@ -5604,6 +5855,24 @@ struct Win11Desktop {
             int id = create_window(wx, wy, ww, wh, wi.title, APP_WIN32);
             if (id < 0) break;
             windows[id].w32_index = i;
+            // Focus the freshly launched window so it receives keyboard
+            // input immediately.  Without this, active_window stays on the
+            // desktop / previously-focused window and every keystroke is
+            // routed away from the app, so typing into it appears dead.
+            for (int j = 0; j < window_count; j++) windows[j].active = false;
+            windows[id].active = true;
+            active_window = id;
+            serial_puts("[WIN32] placed hwnd=0x");
+            serial_puthex32(wi.hwnd);
+            serial_puts(" at sx="); serial_putdec(wx);
+            serial_puts(" sy="); serial_putdec(wy);
+            serial_puts(" sw="); serial_putdec(ww);
+            serial_puts(" sh="); serial_putdec(wh);
+            serial_puts(" (client origin sx=");
+            serial_putdec(wx + 2);
+            serial_puts(" sy=");
+            serial_putdec(wy + TITLE_BAR_H + 2);
+            serial_puts(")\n");
             int fl = 0;
             if (filename) { while (filename[fl] && fl < 47) { windows[id].w32_file[fl] = filename[fl]; fl++; } }
             windows[id].w32_file[fl] = 0;
@@ -5741,7 +6010,6 @@ struct Win11Desktop {
                 if (ch >= 'a' && ch <= 'z') vk = (uint32_t)(ch - 'a' + 'A');
                 if (ch == '\n' || ch == 0x0D) vk = 0x0D;
                 if (ch == 8) vk = 0x08;
-                serial_puts("[gui] win32 WM_CHAR ch="); serial_putdec((int)(unsigned char)ch); serial_puts("\n");
                 win32_window_dispatch(wa.w32_index, 0x0100, vk, 1);              // WM_KEYDOWN
                 // TranslateMessage() also synthesises a WM_CHAR for the control
                 // keys (VK_BACK -> 8, VK_TAB -> 9, VK_RETURN -> 13), so we do
@@ -5892,6 +6160,18 @@ struct Win11Desktop {
     void handle_ctrl(int code) {
         if (!gui_mode) return;
 
+        // Virtual-desktop switch (Ctrl+Left=default / Right=AI / Up=toggle).
+        // The GUI kernel shortcut was changed from Ctrl+Win+arrows to plain
+        // Ctrl+arrows (see kernel.cpp Keyboard::process).  Routed as negative
+        // virtual keys straight to the managed desktop so it works even when
+        // no window is focused.
+        if (code == 5 || code == 6 || code == 7) {
+            int k = (code == 5) ? -7 : (code == 6) ? -8 : -9;
+            mforms_desktop_key(k);
+            render_all();
+            return;
+        }
+
         // ---- Desktop inline-rename editor (no window focused) ----
         // The desktop key path already forwards every keystroke to
         // Desktop.Key(), which is a no-op unless a rename is in progress.
@@ -5903,6 +6183,7 @@ struct Win11Desktop {
             else if (code == 2) k = -4;   // Ctrl+V -> paste
             else if (code == 3) k = -5;   // Ctrl+Z -> undo
             else if (code == 4) k = -6;   // Ctrl+A -> select all
+            else if (code == 8) k = -10;  // Ctrl+S -> save
             if (k != 0) { mforms_desktop_key(k); render_all(); }
             return;
         }
@@ -5916,6 +6197,7 @@ struct Win11Desktop {
             else if (code == 2) k = -4;   // Ctrl+V -> paste
             else if (code == 3) k = -5;   // Ctrl+Z -> undo
             else if (code == 4) k = -6;   // Ctrl+A -> select all
+            else if (code == 8) k = -10;  // Ctrl+S -> save
             if (k != 0) { mforms_key(w.managed_app, k); render_all(); }
             return;
         }
@@ -5985,7 +6267,6 @@ struct Win11Desktop {
         //      The PE's window procedure maps code 1..4 to copy/paste/undo/
         //      select-all on its focused field. ----
         if (w.app == APP_WIN32 && w.w32_index >= 0) {
-            serial_puts("[gui] win32 handle_ctrl code="); serial_putdec(code); serial_puts("\n");
             win32_window_dispatch(w.w32_index, 0x8001 /*WM_NexOS_CTRL*/, code, 0);
             render_all();
             return;
@@ -6023,18 +6304,27 @@ static Win11Desktop g_wm;
 #if NexOS_HAVE_MFORMS
 namespace {
 
-void mh_fill_rect  (int x,int y,int w,int h,uint32_t c){ g_wm.gfx.fill_rect(x,y,w,h,c); }
-void mh_fill_round (int x,int y,int w,int h,int r,uint32_t c){ g_wm.gfx.fill_rounded_rect(x,y,w,h,r,c); }
-void mh_draw_round (int x,int y,int w,int h,int r,uint32_t c){ g_wm.gfx.draw_rounded_rect(x,y,w,h,r,c); }
-void mh_draw_rect  (int x,int y,int w,int h,uint32_t c){ g_wm.gfx.draw_rect(x,y,w,h,c); }
-void mh_draw_line  (int x0,int y0,int x1,int y1,uint32_t c){ g_wm.gfx.draw_line(x0,y0,x1,y1,c); }
-void mh_fill_grad  (int x,int y,int w,int h,uint32_t t,uint32_t b){ g_wm.gfx.fill_gradient(x,y,w,h,t,b); }
-void mh_text       (int x,int y,const char* s,uint32_t fg){ g_wm.gfx.draw_text_utf8_transparent(x,y,s,fg); }
-void mh_text_bg    (int x,int y,const char* s,uint32_t fg,uint32_t bg){ g_wm.gfx.draw_text_utf8(x,y,s,fg,bg); }
-void mh_fill_circle(int cx,int cy,int r,uint32_t c){ g_wm.gfx.fill_circle(cx,cy,r,c); }
-void mh_draw_circle(int cx,int cy,int r,uint32_t c){ g_wm.gfx.draw_circle(cx,cy,r,c); }
-void mh_icon       (int x,int y,int sz,uint32_t bg,char letter,uint32_t lc){ g_wm.gfx.draw_icon(x,y,sz,bg,letter,lc); }
-void mh_progress   (int x,int y,int w,int h,int pct,uint32_t c){ g_wm.gfx.draw_progress(x,y,w,h,pct,c); }
+// [DIAG] Per-host-callback colour beacons.  The 64-bit kernel installs a NULL
+// IDT, so a page fault during desktop paint triple-faults silently and the
+// last framebuffer write stays on screen.  Each drawing callback paints the
+// whole screen its own colour at entry, so the frozen colour = the LAST
+// callback that started before the fault.  Legend (ask assistant / see
+// build/beacon_legend.md):
+//   RED=fill_rect GREEN=fill_round BLUE=draw_round YELLOW=draw_rect
+//   MAGENTA=draw_line CYAN=fill_grad ORANGE=text PINK=text_bg
+//   PURPLE=fill_circle LIME=draw_circle NAVY=icon MAROON=progress GRAY=image
+void mh_fill_rect  (int x,int y,int w,int h,uint32_t c){ diag_step(300, "mh_fill_rect");   g_wm.gfx.fill_rect(x,y,w,h,c); }
+void mh_fill_round (int x,int y,int w,int h,int r,uint32_t c){ diag_step(301, "mh_fill_round"); g_wm.gfx.fill_rounded_rect(x,y,w,h,r,c); }
+void mh_draw_round (int x,int y,int w,int h,int r,uint32_t c){ diag_step(302, "mh_draw_round"); g_wm.gfx.draw_rounded_rect(x,y,w,h,r,c); }
+void mh_draw_rect  (int x,int y,int w,int h,uint32_t c){ diag_step(303, "mh_draw_rect");   g_wm.gfx.draw_rect(x,y,w,h,c); }
+void mh_draw_line  (int x0,int y0,int x1,int y1,uint32_t c){ diag_step(304, "mh_draw_line"); g_wm.gfx.draw_line(x0,y0,x1,y1,c); }
+void mh_fill_grad  (int x,int y,int w,int h,uint32_t t,uint32_t b){ diag_step(305, "mh_fill_grad"); g_wm.gfx.fill_gradient(x,y,w,h,t,b); }
+void mh_text       (int x,int y,const char* s,uint32_t fg){ diag_step(306, "mh_text"); g_wm.gfx.draw_text_utf8_transparent(x,y,s,fg); }
+void mh_text_bg    (int x,int y,const char* s,uint32_t fg,uint32_t bg){ diag_step(307, "mh_text_bg"); g_wm.gfx.draw_text_utf8(x,y,s,fg,bg); }
+void mh_fill_circle(int cx,int cy,int r,uint32_t c){ diag_step(308, "mh_fill_circle"); g_wm.gfx.fill_circle(cx,cy,r,c); }
+void mh_draw_circle(int cx,int cy,int r,uint32_t c){ diag_step(309, "mh_draw_circle"); g_wm.gfx.draw_circle(cx,cy,r,c); }
+void mh_icon       (int x,int y,int sz,uint32_t bg,char letter,uint32_t lc){ diag_step(310, "mh_icon"); g_wm.gfx.draw_icon(x,y,sz,bg,letter,lc); }
+void mh_progress   (int x,int y,int w,int h,int pct,uint32_t c){ diag_step(311, "mh_progress"); g_wm.gfx.draw_progress(x,y,w,h,pct,c); }
 
 // Pixel width of a UTF-8 string: ASCII glyphs advance 8px, 3-byte CJK
 // 16px, 2-byte sequences carry no glyph (matches draw_text_utf8).
@@ -6132,6 +6422,7 @@ static void tex_load_all(void) {
 }
 
 void mh_image(int id, int x, int y, int w, int h) {
+    diag_step(320, "mh_image enter");
     if (id < 0 || id >= TEX_MAX || !g_tex[id].loaded) return;
     g_wm.gfx.draw_image(g_tex[id], x, y, w, h);
 }
@@ -6164,6 +6455,7 @@ static void mforms_boot(void) {
     g_mforms_booted = true;
 
     tex_load_all();     // SFS textures (fallback: flat colours if absent)
+    diag_step(321, "mforms_boot textures loaded");
 
     MFormsHost h;
     // ---- drawing ----
@@ -6198,6 +6490,7 @@ static void mforms_boot(void) {
     h.tick_ms          = mh_tick_ms;
     h.list_files       = g_cb.list_files;
     h.read_file        = g_cb.read_file;
+    h.write_file       = g_cb.write_file;
     h.get_time         = g_cb.get_time;
     h.mkdir            = g_cb.mkdir;
     h.remove           = g_cb.remove;
@@ -6223,7 +6516,10 @@ static void mforms_boot(void) {
     h.user_name        = g_cb.user_name;
 
     mforms_init(&h);
-    mforms_start();
+    diag_step(330, "mforms_init done");
+    int msr = mforms_start();
+    if (msr != 0) diag_step(331, "mforms_start FAILED");
+    else          diag_step(332, "mforms_start OK");
     serial_puts("[MFORMS] ");
     serial_puts(mforms_report());
     serial_puts("\n");
@@ -6279,6 +6575,9 @@ void gui_set_callbacks(const GuiCallbacks* cb) {
 
 int gui_init(void) {
     g_wm.init();
+    // TEMP VERIFY: auto-open a demo window so the capture shows the new
+    // Win11 translucent edge.  Remove after verification.
+    g_wm.create_window(320, 180, 440, 320, "Demo", APP_NONE);
     return g_wm.gfx.initialized ? 0 : -1;
 }
 
@@ -6376,6 +6675,37 @@ static void fb_diag_setp(int x, int y, uint32_t rgb, uint32_t eff_pitch) {
     }
 }
 
+static void fb_hex8(uint8_t v) {
+    static const char* hx = "0123456789ABCDEF";
+    serial_puts((char*)&hx[(v >> 4) & 0xF]);
+    serial_puts((char*)&hx[v & 0xF]);
+}
+
+// Format-agnostic LFB write-after-read coherence probe. Writes four known
+// bytes at three probe pixels and reads them back.  If the bytes do NOT read
+// back identical, the framebuffer mapping is NOT coherent/writable at that
+// location -> category ① (fb_base invalid / >4GB page-table mapping broken).
+// This is decisive from the serial log alone; no photograph required.
+static void fb_diag_probe(void) {
+    Graphics& g = g_wm.gfx;
+    struct P { int x, y; } pts[3] = { {0,0}, {0,(int)g.height-1}, {(int)g.width/2,(int)g.height/2} };
+    serial_puts("[DIAG] === LFB write-after-read probe ===\n");
+    for (int k = 0; k < 3; k++) {
+        int x = pts[k].x, y = pts[k].y;
+        if (x < 0 || y < 0) continue;
+        uint8_t* p = (uint8_t*)g.lfb + (uint32_t)y * g.pitch + (uint32_t)x * 4u;
+        uint8_t w0=0x12,w1=0x34,w2=0x56,w3=0x78;
+        p[0]=w0; p[1]=w1; p[2]=w2; p[3]=w3;
+        uint8_t r0=p[0],r1=p[1],r2=p[2],r3=p[3];
+        int ok = (r0==w0 && r1==w1 && r2==w2 && r3==w3);
+        serial_puts("[DIAG] probe(");
+        serial_putdec(x); serial_puts(","); serial_putdec(y);
+        serial_puts(") wr=12 34 56 78 rd=");
+        fb_hex8(r0); fb_hex8(r1); fb_hex8(r2); fb_hex8(r3);
+        serial_puts(ok ? " MATCH\n" : " MISMATCH(fb not writable/coherent)\n");
+    }
+}
+
 static void gui_fb_diag(void) {
     Graphics& g = g_wm.gfx;
     if (!g.initialized || !g.lfb) {
@@ -6407,6 +6737,8 @@ static void gui_fb_diag(void) {
     } else {
         serial_puts("[DIAG] variant=0 (default) vertical rainbow bars\n");
     }
+
+    fb_diag_probe();          // write-after-read coherence check (category ①)
 
     /* Clear to black first. */
     for (uint32_t y = 0; y < g.height; y++)
@@ -6451,7 +6783,44 @@ void gui_enter(void) {
 #ifdef FB_DIAG
     gui_fb_diag();          // draw raw test pattern and halt for inspection
 #endif
+    *(volatile uint8_t*)0x5101 = 8;   // milestone: gui_enter reached
+    diag_step(333, "gui_enter starting");
+#if defined(__x86_64__)
+    // The GUI must draw to the address the Address Management Registry says is
+    // the framebuffer virtual address (FB_VIRT).  In 64-bit that is the REAL
+    // (identity-mapped) high framebuffer -- NOT the 0xF0000000 shadow window,
+    // which only exists in the 32-bit compat page tables and would #PF here.
+    // Fall back to the raw VbeInfo read only if the registry was never filled.
+    {
+        // Always prefer the GOP framebuffer base the UEFI loader stashed at
+        // 0x5000 -- it is the address boot_beacon() already proved reachable on
+        // real hardware (incl. >4GB LFBs).  addr_virt(ADDR_FB_VIRT) can be 0
+        // (gfx init got a truncated 32-bit phys when framebuffer_phys64 was
+        // unset) or point at the 0xF0000000 shadow window that only exists in
+        // the 32-bit compat page tables; both #PF the instant gfx.* writes.
+        volatile uint8_t* vb = (volatile uint8_t*)0x5000;
+        uint64_t fb64 = *(volatile uint64_t*)(vb + 0x10);
+        uint64_t fbv  = (fb64 != 0) ? fb64 : addr_virt(ADDR_FB_VIRT);
+        if (fbv == 0) fbv = (uint64_t)(uintptr_t)g_wm.gfx.lfb;   // last resort
+        g_wm.gfx.lfb = (volatile uint32_t*)(uintptr_t)fbv;
+        addr_set(ADDR_FB_VIRT, fbv, fbv, 0, ADDR_FLAG_FB);
+    }
+#endif
+#if defined(__x86_64__)
+    boot_beacon(128, 0, 128);          // GU-A PURPLE : gui_enter lfb set, before mforms_boot
+#endif
     mforms_boot();          // bring the managed (C#) shell online before drawing
+#if defined(__x86_64__)
+    boot_beacon(0, 128, 128);          // GU-B TEAL   : after mforms_boot, before enter_gui
+#endif
+    // Enter the GUI and paint the desktop unconditionally.  The old
+    // g_skip_enter_gui guard (a temporary voice-test workaround for a
+    // supposed enter_gui() return-hang) was skipping the ENTIRE native
+    // desktop paint on real hardware, leaving the framebuffer at its
+    // firmware-default light-gray (140,140,140) -- exactly the symptom
+    // reported on the Iris Xe laptop.  The hang never reproduced
+    // (enter_gui() returns cleanly to "Entered GUI mode"), so we no
+    // longer skip it.  See 2026-08-18 root-cause notes.
     g_wm.enter_gui();
 }
 
@@ -6512,6 +6881,25 @@ void gui_fill_rect(int x, int y, int w, int h, uint32_t color) {
 void gui_tick(void) {
     if (!g_wm.gui_mode) return;
     g_wm.update_clock();
+    // The AI desktop's animations (thinking dots, typewriter reveal) need
+    // continuous repaints, but the main loop only repaints on input events.
+    // While the managed shell has requested animation (g_mforms_anim), drive
+    // render_all() at ~30 fps so the reveal actually progresses on screen.
+#if defined(__x86_64__)
+    // The 64-bit kernel runs the native GUI with no managed shell, so nothing
+    // else drives repaints.  Repaint here (the caller throttles gui_tick to
+    // every ~50 main-loop iterations) to keep the desktop alive and to erase
+    // any leftover diagnostic corner mark.
+    g_wm.render_all();
+#else
+    if (g_mforms_anim) {
+        uint32_t now = g_wm.tick_ms_now();
+        if ((uint32_t)(now - g_wm.last_ai_repaint_ms) >= 33) {
+            g_wm.last_ai_repaint_ms = now;
+            g_wm.render_all();
+        }
+    }
+#endif
 }
 
 void gui_animate_frame(void) {
@@ -6746,12 +7134,35 @@ extern "C" void fb_console_init(void) {
         serial_puts("[FBCON] BltOnly - no linear framebuffer\n");
         return;
     }
+#if defined(__x86_64__)
+    // Same >4 GiB framebuffer rule as Gfx::init: on real hardware the LFB can
+    // be at 0x4000000000, where framebuffer_phys (32-bit) truncates to 0 and
+    // the text console would scribble over the interrupt vector table.
+    if (info->framebuffer_phys64 > 0xFFFFFFFFULL)
+        fb_lfb = (volatile uint32_t*)(uintptr_t)info->framebuffer_phys64;
+    else
+        fb_lfb = (volatile uint32_t*)(uintptr_t)info->framebuffer_phys;
+#else
     fb_lfb = (volatile uint32_t*)info->framebuffer_phys;
+#endif
     fb_width = info->width;
     fb_height = info->height;
     fb_pitch = info->pitch;
     fb_bpp = info->bpp;
     fb_pixel_format = info->pixel_format;
+    // ---- Address Management Registry: register known regions ----
+    addr_set(ADDR_VBE_INFO, 0x5000, 0x5000, 0, ADDR_FLAG_RAM);
+    addr_set(ADDR_STAGE_MARK, 0x5101, 0x5101, 1, ADDR_FLAG_RAM);
+    addr_set(ADDR_FAULT_MARK, 0x5100, 0x5100, 1, ADDR_FLAG_RAM);
+    addr_set(ADDR_VGA_TEXT, 0xB8000, 0xB8000, 80u * 25u * 2u, ADDR_FLAG_RAM);
+    addr_set(ADDR_FB_WIN, 0xF0000000u, 0xF0000000u, 0, ADDR_FLAG_FB);
+    addr_set(ADDR_FB_PHYS, info->framebuffer_phys64, info->framebuffer_phys64,
+             (uint64_t)info->pitch * info->height, ADDR_FLAG_FB | ADDR_FLAG_MMIO);
+    // FB_VIRT = the virtual address this console will actually draw to; for the
+    // 32-bit high-FB case vmm_map_high_fb() later overrides it to the window.
+    addr_set(ADDR_FB_VIRT, (uint64_t)(uintptr_t)fb_lfb, (uint64_t)(uintptr_t)fb_lfb, 0, ADDR_FLAG_FB);
+    addr_set(ADDR_HEAP, 0x300000, 0x300000, 0x1000000, ADDR_FLAG_RAM);
+    addr_set(ADDR_KERNEL64_LOAD, 0x100000, 0x100000, 0, ADDR_FLAG_RAM);
     fb_console_active = true;
     serial_puts("[FBCON] Framebuffer console initialized\n");
 }

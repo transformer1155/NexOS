@@ -28,6 +28,15 @@
 #include "ai_env.h"         // VM vs bare-metal detection
 #include "gguf_infer.h"     // real transformer inference over GGUF weights
 #include "perm.h"            // Y/N permission prompt engine (security doc v1.0, 3.3)
+#include "memory_adapter.h"  // ggml memory backend (Route A, phase 0)
+#include "file_adapter.h"    // GGUF blob I/O backend (Route A, phase 0)
+#include "gguf_loader.h"     // new self-contained GGUF parser (Route A, phase 0)
+#include "gguf_fixture.h"    // minimal valid GGUF fixture for the adapter self-test
+#include "knowledge_base.h"  // verified-fact KB (truth-from-practice + authoritative fallback)
+#include "ai_plugin.h"        // plugin catalogue / manager (Settings > Plugins + `plugin` cmd)
+
+// Phase 0 ggml adapter self-test (declared here, defined just before kmain64).
+void gguf_adapter_selftest(void);
 
 // =====================================================================
 //  Port I/O helpers
@@ -41,6 +50,21 @@ static inline void outw(uint16_t p,uint16_t v){ __asm__ __volatile__("outw %0,%1
 //  Serial debug output (port 0x3F8)  -  for UEFI boot tracing
 // =====================================================================
 static void serial_puts(const char* s){ while(*s) outb(0x3F8, (uint8_t)*s++); }
+static void serial_hex(uint32_t v){
+    const char* h = "0123456789ABCDEF";
+    for (int i = 28; i >= 0; i -= 4) outb(0x3F8, (uint8_t)h[(v >> i) & 0xF]);
+}
+static void serial_puthex(uint8_t b){
+    const char* h = "0123456789ABCDEF";
+    outb(0x3F8, (uint8_t)h[(b >> 4) & 0xF]);
+    outb(0x3F8, (uint8_t)h[b & 0xF]);
+}
+static void serial_dec(uint32_t v){
+    char b[12]; int i = 0;
+    if (v == 0) { outb(0x3F8, '0'); return; }
+    while (v > 0 && i < 11) { b[i++] = (char)('0' + (v % 10)); v /= 10; }
+    while (i > 0) outb(0x3F8, (uint8_t)b[--i]);
+}
 
 // =====================================================================
 //  Tiny libc (freestanding)
@@ -78,10 +102,14 @@ extern "C" {
     int   ai_set_mode(int mode);
     int   ai_transformer_test(void);
     void  agent_init(void);
+    void  agent_plan(const char* goal);
     int   agent_run(const char* goal, char* output, int outsize);
     int   agent_get_status(char* buf, int bufsize);
+    void  agent_abort(void);
+    void  agent_set_confirm(int on);
 }
 static bool g_ai_initialized = false;
+static bool g_plugin_inited  = false;
 
 // =====================================================================
 //  Network stack interface (implemented in net.cpp)
@@ -149,6 +177,167 @@ static void ata_write_sector(uint32_t lba, const uint16_t* buf){
     for(int i=0;i<256;i++) outw(0x1F0, buf[i]);
     outb(0x1F7, 0xE7);                 // CACHE FLUSH
     ata_wait_bsy();
+}
+
+// =====================================================================
+//  Diagnostic fault capture (serial + disk sector LBA1500)
+//  Replaces color-beacon guessing with explicit step markers and a real
+//  64-bit IDT.  Any synchronous fault (#PF/#GP/#UD/#DE/...) routes to
+//  fault_common(), which dumps CR2/RIP/step to the serial port and persists
+//  a 512-byte record to LBA1500 (genuinely spare: kernel.bin @33 spans
+//  33..1056, kernel64 @2048, so 1500 is in the unused gap).
+//  The 64-bit kernel never enables IRQs (no STI), so loading this IDT only
+//  catches synchronous CPU faults -- no IRQ storm is possible.
+// =====================================================================
+extern "C" const uint64_t isr_stub_table[256];
+
+struct idt_entry {
+    uint16_t offlow;
+    uint16_t sel;
+    uint16_t ist_flags;
+    uint16_t offmid;
+    uint32_t offhigh;
+    uint32_t rsv;
+};
+static idt_entry g_idt[256];
+static struct { uint16_t limit; uint64_t base; } __attribute__((packed)) g_idt_desc;
+
+// Last diag step reached, so a fault can report where it died.
+static uint32_t g_last_step = 0;
+static char g_last_step_name[32] = {0};
+
+static void serial_hex64(uint64_t v){
+    serial_hex((uint32_t)(v >> 32));
+    serial_hex((uint32_t)(v & 0xFFFFFFFFULL));
+}
+
+// Mark a named execution step.  Only prints / records when the step id
+// changes, so hot loops don't flood the serial log.  Stored so that a later
+// fault can report the last step reached before it died.
+extern "C" void diag_step(uint32_t id, const char* name){
+    if (id != g_last_step) {
+        serial_puts("[DIAG] step=");
+        serial_dec(id);
+        serial_puts(" ");
+        serial_puts(name);
+        serial_puts("\n");
+        g_last_step = id;
+        for (int i = 0; i < 31 && name[i]; i++) g_last_step_name[i] = name[i];
+        g_last_step_name[31] = 0;
+
+        // Persist progress to LBA1500 so a freeze can be diagnosed from disk
+        // without serial or screen colour.  Skip the per-icon mh_* draw calls
+        // (steps 300-311) to avoid thrashing the disk in the GUI repaint loop
+        // -- those are never the freeze point.
+        if (id >= 100 && (id < 300 || id > 311)) {
+            // On real UEFI hardware the GOP framebuffer lives above 4GB and
+            // issuing ATA PIO writes from long mode there can hard-freeze the
+            // kernel (heisenbug; disk-persist is also useless under AHCI, where
+            // legacy PIO writes are invalid).  Skip the sector write when the
+            // framebuffer is high; serial logging above already captured the
+            // step.  BIOS/VBE paths keep the on-disk progress record.
+            uint64_t fb64 = *(volatile uint64_t*)((volatile uint8_t*)0x5000 + 0x10);
+            if (fb64 <= 0xFFFFFFFFULL) {
+                uint16_t rec[256];
+                memset_(rec, 0, 512);
+                rec[0] = 0x4E45;   // 'NE'
+                rec[1] = 0x5844;   // 'XD'
+                rec[2] = (uint16_t)id;
+                rec[3] = 0;        // vec  = 0 => progress marker, not a fault
+                rec[4] = 0;        // err  = 0
+                for (int i = 0; i < 30 && name[i]; i++)
+                    ((uint8_t*)rec)[28 + i] = (uint8_t)name[i];
+                ata_write_sector(1500, rec);
+            }
+        }
+    }
+}
+
+// Synchronous fault handler (called from isr_common in entry64.asm).
+// Dumps context to serial and writes a 512-byte record to LBA1500.
+extern "C" void fault_common(uint32_t intno, uint32_t errcode, uint64_t rip,
+                         uint64_t cs, uint64_t rflags, uint64_t cr2){
+    serial_puts("[DIAG-FAULT] vec=");
+    serial_dec(intno);
+    serial_puts(" err=");
+    serial_hex(errcode);
+    serial_puts(" rip=");
+    serial_hex64(rip);
+    serial_puts(" cr2=");
+    serial_hex64(cr2);
+    serial_puts(" step=");
+    serial_dec(g_last_step);
+    serial_puts(" name=");
+    serial_puts(g_last_step_name);
+    serial_puts("\n");
+
+    // Persist a 512-byte record to LBA1500 (genuinely spare: kernel.bin @33
+    // spans 33..1056, kernel64 @2048, so 1500 is in the unused gap -- writing
+    // here does NOT corrupt either kernel image on disk).
+    // Layout (little-endian words):
+    //   rec[0..1]  = 'NEXD' magic
+    //   rec[2]     = last step id
+    //   rec[3]     = fault vector
+    //   rec[4]     = error code
+    //   rec[5..8]  = RIP (64-bit)
+    //   rec[9..12] = CR2 (64-bit)
+    //   bytes 28..57 = last step name (ASCII)
+    uint16_t rec[256];
+    memset_(rec, 0, 512);
+    rec[0] = 0x4E45;              // 'NE'
+    rec[1] = 0x5844;              // 'XD'
+    rec[2] = (uint16_t)g_last_step;
+    rec[3] = (uint16_t)intno;
+    rec[4] = (uint16_t)errcode;
+    rec[5] = (uint16_t)(rip & 0xFFFF);
+    rec[6] = (uint16_t)((rip >> 16) & 0xFFFF);
+    rec[7] = (uint16_t)((rip >> 32) & 0xFFFF);
+    rec[8] = (uint16_t)((rip >> 48) & 0xFFFF);
+    rec[9]  = (uint16_t)(cr2 & 0xFFFF);
+    rec[10] = (uint16_t)((cr2 >> 16) & 0xFFFF);
+    rec[11] = (uint16_t)((cr2 >> 32) & 0xFFFF);
+    rec[12] = (uint16_t)((cr2 >> 48) & 0xFFFF);
+    for (int i = 0; i < 30 && g_last_step_name[i]; i++)
+        ((uint8_t*)rec)[28 + i] = (uint8_t)g_last_step_name[i];
+    ata_write_sector(1500, rec);
+
+    for (;;) __asm__ __volatile__("cli; hlt");
+}
+
+// Build the IDT from the stub table exported by entry64.asm and load it.
+//
+// ADDRESSING NOTE: the 64-bit kernel ELF is linked at 0x100000, but the
+// 32-bit loader stages the flat binary at a VARIABLE physical address
+// (kmalloc'd in the 3-19 MiB heap; e.g. 0x300010 this boot).  Relative code
+// is unaffected, but the IDT gate targets are ABSOLUTE, so they must be
+// rebased by the real load delta.  We recover that delta with a PC-relative
+// call/pop (gives this function's ACTUAL runtime address) minus its LINK
+// address (from the relocation of &build_idt).  g_idt base is rebased too.
+static void build_idt(){
+    uint64_t actual_self;
+    uint64_t link_self;
+    // Get this function's ACTUAL runtime address via a RIP-relative LEA.
+    // (Writing the LEA explicitly avoids GCC's flaky optimizer transform of
+    // the classic "call 1f; pop %0" idiom into a mis-encoded `lea`.)
+    __asm__ __volatile__("lea 0(%%rip), %0" : "=r"(actual_self));
+    link_self = (uint64_t)&&idt_self;
+idt_self:
+    uint64_t delta = actual_self - link_self;
+    serial_puts("[K64-IDT] delta=");
+    serial_hex64(delta);
+    serial_puts("\n");
+    for (int i = 0; i < 256; i++) {
+        uint64_t a = isr_stub_table[i] + delta;
+        g_idt[i].offlow    = (uint16_t)(a & 0xFFFF);
+        g_idt[i].sel       = 0x08;
+        g_idt[i].ist_flags = 0x8E00;
+        g_idt[i].offmid    = (uint16_t)((a >> 16) & 0xFFFF);
+        g_idt[i].offhigh   = (uint32_t)(a >> 32);
+        g_idt[i].rsv       = 0;
+    }
+    g_idt_desc.limit = (uint16_t)(sizeof(g_idt) - 1);
+    g_idt_desc.base  = (uint64_t)g_idt + delta;
+    __asm__ __volatile__("lidt %0" :: "m"(g_idt_desc));
 }
 
 // =====================================================================
@@ -745,6 +934,10 @@ extern "C" {
     void gui_animate_frame(void);
     void gui_exit(void);
     void gui_render(void);
+    // Voice engine bridge: gui_voice_say feeds a recognised phrase to the
+    // managed Voice engine; gui_voice_set toggles the master mic switch.
+    void gui_voice_say(const char* phrase);
+    void gui_voice_set(int on);
     // `gui <app>`: open straight into an app once the desktop is up.  The
     // 32-bit shell has always supported this; the 64-bit one used to ignore
     // its argument, so `gui browser` silently landed on a bare desktop.
@@ -798,6 +991,13 @@ static int g_auto_gui;
 // it does not collide with the 64-bit kernel payload.  Probe both locations
 // (kept in sync with kernel.cpp).
 #define SFS_ALT_LBA       3328
+
+// RAM-backed SFS handoff, written by the bootloader at 0x0900:
+//   [0] magic == SFS_RAM_MAGIC, [1] physical base, [2] size in bytes.
+// Used by the UEFI loader (bootuefi.c) and the BIOS CD path (boot_cd.asm);
+// value MUST stay identical to kernel.cpp's SFS_RAM_MAGIC.
+#define SFS_RAM_MAGIC     0xC0DE5A5Fu
+#define SFS_HANDOFF_ADDR  0x0900u
 
 #define FS_NAME_LEN       20
 #define FS_ENTRY_SIZE     32
@@ -1158,6 +1358,32 @@ public:
     int32_t    delta;     // base - SFS_SUPER_LBA (image may be relocated on disk)
     Superblock sb;
 
+    // UEFI/AHCI RAM-SFS support: bootuefi.c streams the SFS image into RAM
+    // before ExitBootServices (legacy IDE PIO ata_read_sector returns garbage
+    // under q35/AHCI, so the disk probe can never find the superblock).  When
+    // ram_mode is set the image is read straight from RAM, exactly like the
+    // 32-bit CD-boot path.
+    bool       ram_mode;       // true => image is in RAM at ram_base
+    uint32_t   ram_base;       // physical address of the SFS image in RAM
+    uint32_t   ram_size;       // size of the SFS image in bytes
+
+    void set_ram(uint32_t base, uint32_t size){
+        ram_mode = true; ram_base = base; ram_size = size;
+    }
+
+    // Unified sector read: from RAM when ram_mode, else from the ATA disk.
+    // lba is the canonical SFS LBA (superblock=800, dir=801+, data=817+); in
+    // RAM the image is laid out from byte 0, so offset = (lba-800)*512.
+    void rd(uint32_t lba, uint16_t* buf){
+        if (ram_mode) {
+            const uint8_t* src = (const uint8_t*)ram_base
+                                + (int32_t)((int32_t)lba - (int32_t)SFS_SUPER_LBA) * 512;
+            memcpy_(buf, src, 512);
+        } else {
+            ata_read_sector(lba, buf);
+        }
+    }
+
     // Mirrors kernel.cpp's Sfs::init.  The SFS image always uses the canonical
     // 800/801/817 layout internally, but the build drops it at different disk
     // offsets (UEFI image: LBA 800, BIOS os.img: LBA 3328) so it never collides
@@ -1165,6 +1391,21 @@ public:
     // `switch64` lands in a kernel that reports "SFS: not found" on the very
     // same disk the 32-bit kernel mounted fine.
     void init(){
+        // RAM-backed SFS (UEFI path): bootuefi.c staged the whole image in
+        // RAM before ExitBootServices, so read the superblock straight from
+        // there.  Legacy IDE PIO ata_read_sector returns garbage under q35/AHCI,
+        // which is exactly why the 64-bit kernel could never find "SFS\0".
+        if (ram_mode) {
+            rd(SFS_SUPER_LBA, (uint16_t*)g_fsbuf);
+            if (g_fsbuf[0]=='S' && g_fsbuf[1]=='F' && g_fsbuf[2]=='S' && g_fsbuf[3]==0) {
+                memcpy_(&sb, g_fsbuf, sizeof(sb));
+                base    = SFS_SUPER_LBA;
+                delta   = 0;
+                mounted = true;
+                return;
+            }
+            return;  // RAM image present but no superblock
+        }
         static const uint32_t cand[] = { SFS_SUPER_LBA, SFS_ALT_LBA };
         mounted = false; base = SFS_SUPER_LBA; delta = 0;
         for (unsigned i = 0; i < sizeof(cand)/sizeof(cand[0]); i++) {
@@ -1188,7 +1429,7 @@ public:
         if (!mounted) { term.write("SFS not found on disk.\n"); return; }
         int count = 0;
         for (int s = 0; s < SFS_DIR_SECT; s++) {
-            ata_read_sector(dir_lba(s), (uint16_t*)g_fsbuf);
+            rd(dir_lba(s), (uint16_t*)g_fsbuf);
             for (int e = 0; e < FS_ENTRY_PER_SEC; e++) {
                 FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
                 if (fe->name[0] != 0) {
@@ -1205,7 +1446,7 @@ public:
     int find(const char* name){
         if (!mounted) return -1;
         for (int s = 0; s < SFS_DIR_SECT; s++) {
-            ata_read_sector(dir_lba(s), (uint16_t*)g_fsbuf);
+            rd(dir_lba(s), (uint16_t*)g_fsbuf);
             for (int e = 0; e < FS_ENTRY_PER_SEC; e++) {
                 FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
                 if (fe->name[0] != 0 && strcmp_(fe->name, name) == 0)
@@ -1220,7 +1461,10 @@ public:
         if (idx < 0) return -1;
         int s = idx / FS_ENTRY_PER_SEC;
         int e = idx % FS_ENTRY_PER_SEC;
-        ata_read_sector(dir_lba(s), (uint16_t*)g_fsbuf);
+        // MUST go through rd(): in RAM mode (UEFI) a raw ata_read_sector here
+        // returns zeros, so fent.start_lba/size come out garbage and every
+        // file read silently produces an empty buffer.
+        rd(dir_lba(s), (uint16_t*)g_fsbuf);
         // IMPORTANT: private copy - the loop below reloads g_fsbuf with file
         // data, so a pointer into g_fsbuf would decay into garbage after the
         // first sector and every following LBA would be random.
@@ -1232,7 +1476,7 @@ public:
         uint8_t* dst = (uint8_t*)buf;
         int remaining = size;
         for (int i = 0; i < sectors && remaining > 0; i++) {
-            ata_read_sector(data_lba(fent.start_lba + (uint32_t)i), (uint16_t*)g_fsbuf);
+            rd(data_lba(fent.start_lba + (uint32_t)i), (uint16_t*)g_fsbuf);
             int to_copy = (remaining > 512) ? 512 : remaining;
             memcpy_(dst, g_fsbuf, to_copy);
             dst += to_copy;   // NOT 512: the tail sector is short
@@ -1464,12 +1708,19 @@ static Fat32  fat32;
 constexpr uint32_t PAGE_SIZE       = 4096;
 constexpr uint32_t PAGE_SHIFT      = 12;
 constexpr uint32_t PMM_BASE_ADDR   = 0x100000;     // 1 MiB – managed start
-// Bitmap covers the low 4 GiB so GB-scale model weights fit. Stored in .bss.
-constexpr uint32_t PMM_MAX_PAGES   = 4u * 1024 * 1024 * 1024 / PAGE_SIZE; // 1,048,576 (4 GiB)
+// Physical memory is managed up to 1 GiB: the VMM identity map ends there,
+// so higher physical pages could never be touched anyway.  Keeping the
+// bitmap at 1 MiB of .bss also keeps it clear of the heap that starts right
+// after .bss -- a full 4 GiB bitmap (4 MiB) overlaps the heap region and the
+// heap initializer corrupts the allocation table (470 MiB model big_alloc
+// then fails).  The 4 GiB comment below is stale.
+constexpr uint32_t PMM_MAX_PAGES   = 1u * 1024 * 1024 * 1024 / PAGE_SIZE; // 262,144 (1 GiB)
 // .bss ends at 0x168000 + 0xD2CF8 = 0x23ACF8; a heap starting at 0x200000
 // would sit ON the .bss (guilib globals, clr heap, backbuffer kmalloc all
-// corrupt each other -> blank desktop).  0x300000 matches the 32-bit kernel.
-constexpr uint32_t HEAP_START      = 0x300000;     // 3 MiB (past .bss end 0x23ACF8)
+// corrupt each other -> blank desktop).  0x400000 leaves room for the 1 MiB
+// PMM bitmap that now follows .bss (ends ~0x33ACF8) and matches the 32-bit
+// kernel's heap convention.
+constexpr uint32_t HEAP_START      = 0x400000;     // 4 MiB (past .bss + PMM bitmap)
 constexpr uint32_t HEAP_SIZE       = 0x1000000;    // 16 MiB (expanded for AI engine)
 constexpr uint32_t HEAP_END        = HEAP_START + HEAP_SIZE;
 
@@ -1546,6 +1797,37 @@ static void pmm_init(){
             pmm_used_pages++;
         }
     }
+
+    // Reserve the RAM-staged SFS image (UEFI path).  Normally it sits at
+    // 0x50000000, i.e. above this bitmap's 1 GiB ceiling, so nothing happens.
+    // But when the loader had to fall back to an arbitrary <4 GiB buffer the
+    // range CAN land inside the managed window, and handing those pages out
+    // would shred the filesystem under our feet.
+    {
+        const volatile uint32_t* hs =
+            (const volatile uint32_t*)(uintptr_t)SFS_HANDOFF_ADDR;
+        if (hs[0] == SFS_RAM_MAGIC && hs[1] >= PMM_BASE_ADDR && hs[2] != 0) {
+            uint32_t first = (hs[1] - PMM_BASE_ADDR) / PAGE_SIZE;
+            uint32_t npg   = (hs[2] + PAGE_SIZE - 1) / PAGE_SIZE;
+            uint32_t marked = 0;
+            for (uint32_t i = 0; i < npg; i++) {
+                uint32_t idx = first + i;
+                if (idx >= pmm_total_pages) break;
+                if (!(pmm_bitmap[idx / 32] & (1u << (idx % 32)))) {
+                    pmm_bitmap[idx / 32] |= (1u << (idx % 32));
+                    pmm_free_pages--;
+                    pmm_used_pages++;
+                    marked++;
+                }
+            }
+            if (marked) {
+                serial_puts("[PMM] RAM-SFS reserved pages=");
+                serial_hex(marked);
+                serial_puts("\n");
+            }
+        }
+    }
+
     serial_puts("[PMM] Initialised\n");
 }
 
@@ -2736,6 +3018,9 @@ static void cmd_generate(const char* args){
 
 // Streaming sink for qwen_generate(): terminal + serial so headless tests
 // can assert on the generated text.
+// Forward declaration (defined later, next to the auto-answer backdoor).
+static int model_try_load(void);
+
 static void ask_emit(const char* piece){
     term.write(piece);
     serial_puts(piece);
@@ -2751,7 +3036,9 @@ static void cmd_ask(const char* args){
         term.write("/real weights): ");
         serial_puts("[qwen] ask: "); serial_puts(args); serial_puts("\n");
         serial_puts("[qwen] out: ");
-        int n = qwen_generate(args, 64, 0.8f, ask_emit);
+        char ask_sys[768];
+        kb_build_prompt(args, ask_sys, (int)sizeof(ask_sys));
+        int n = qwen_chat(ask_sys, args, 64, 0.8f, ask_emit);
         serial_puts("\n[qwen] tokens=");
         { char b[16]; int i=0, v=(n<0)?0:n;
           if(!v){ b[i++]='0'; } else { char t[16]; int j=0;
@@ -2810,10 +3097,24 @@ static void cmd_agent(const char* args){
             term.write("Usage: agent run <goal>\n");
             return;
         }
-        term.write("Running agent pipeline...\n\n");
-        term.write(ai_env_is_vm()
-                   ? "  [env: VM -> built-in engine drives the pipeline]\n\n"
-                   : "  [env: bare metal -> real transformer inference]\n\n");
+        // The AI desktop runs on this kernel now, so answering with the
+        // real GGUF model is the default when one is embedded.  The built-in
+        // Markov engine only kicks in as an offline fallback.
+        if(model_try_load()){
+            serial_puts("[qwen] ask: "); serial_puts(args); serial_puts("\n");
+            serial_puts("[qwen] out: ");
+            int n = qwen_generate(args, 128, 0.8f, ask_emit);
+            serial_puts("\n[qwen] tokens=");
+            { char b[16]; int i=0, v=(n<0)?0:n;
+              if(!v){ b[i++]='0'; } else { char t[16]; int j=0;
+                while(v){ t[j++]=(char)('0'+v%10); v/=10; }
+                while(j) b[i++]=t[--j]; }
+              b[i]=0; serial_puts(b); }
+            serial_puts("\n");
+            term.put_char('\n');
+            if(n <= 0) term.write("(model produced no tokens)\n");
+            return;
+        }
         char output[4096];
         int n = agent_run(args, output, sizeof(output));
         if(n > 0){
@@ -2825,8 +3126,14 @@ static void cmd_agent(const char* args){
         char status[256];
         agent_get_status(status, sizeof(status));
         term.write(status);
+    } else if(!strcmp_(sub,"abort")){
+        agent_abort();
+        term.write("Agent abort requested.\n");
+    } else if(!strcmp_(sub,"confirm")){
+        if(!strcmp_(args,"off")){ agent_set_confirm(0); term.write("Confirm mode OFF.\n"); }
+        else { agent_set_confirm(1); term.write("Confirm mode ON (dangerous tasks blocked).\n"); }
     } else {
-        term.write("Usage: agent [init|run|status]\n");
+        term.write("Usage: agent [init|run|status|abort|confirm]\n");
     }
 }
 
@@ -3031,6 +3338,10 @@ static void cmd_model(const char* args){
         term.write("AI engine ready. Inference uses the on-board mini-engine;\n");
         term.write("the 1.7B weights need >1GB RAM, so this build routes them\n");
         term.write("through the built-in model. Use 'ask' / 'agent run'.\n");
+    }
+    else if(!strcmp_(sub,"adapter")){
+        // Phase 0 verification: re-run the ggml adapter self-test on demand.
+        gguf_adapter_selftest();
     }
     else if(!strcmp_(sub,"load")){
         if(qwen_ready()){
@@ -3269,7 +3580,9 @@ static void cmd_gui(const char* args){
 
     // Enter GUI - renders Win11-style desktop with top bar, icons, and cursor
     gui_enter();
+    serial_puts("[M-GE]\n");   // after gui_enter returned
     gui_render();
+    serial_puts("[M-GR]\n");   // after gui_render returned
 
     term.set_color(make_color(WHITE, BLACK));
 }
@@ -3282,6 +3595,76 @@ static void cmd_nogui(const char* args){
     term.write("Auto-GUI disabled. The desktop will not start automatically\n");
     term.write("on the next boot (this session keeps its current mode).\n");
     term.set_color(make_color(WHITE, BLACK));
+}
+
+// ---------------------------------------------------------------------
+//  Voice engine bridge + command
+// ---------------------------------------------------------------------
+// Feed a recognised phrase to the managed Voice engine.  Safe no-op when
+// the CLR / managed shell is not up (clr_call returns -1 and does nothing).
+void gui_voice_say(const char* phrase){
+    if (phrase == 0 || phrase[0] == 0) return;
+    int32_t s = clr_new_str(phrase);
+    int32_t a = s, r = 0;
+    serial_puts("[VSAY]\n");
+    clr_call("NexOS.Forms.Shell::VoiceSay", &a, 1, &r);
+}
+void gui_voice_set(int on){
+    int32_t a = on ? 1 : 0, r = 0;
+    clr_call("NexOS.Forms.Shell::VoiceSet", &a, 1, &r);
+}
+
+// Poll COM2 (0x2F8) for a framed voice phrase.  Voice input lives on its
+// OWN serial port, separate from the COM1 console, so a flood of console
+// output on COM1 can never deadlock the host->guest voice pipe (the two
+// directions would otherwise share one bidirectional pipe and wedge).
+// Protocol: a 0x02 (STX) framing byte, then a length byte (1..127), then
+// that many UTF-8 bytes forming the phrase.  Any other leading byte is
+// ignored.  A real recogniser pushes text the same way.
+static void serial_voice_poll(void){
+    const uint16_t VB = 0x2F8;                       // COM2 base
+    static int dbg = 0;
+    serial_puts("[M-POLL]\n");
+    uint8_t lsr = inb(VB + 5);
+    if (dbg < 6) {
+        serial_puts((lsr & 1) ? "[LSR2.yes]\n" : "[LSR2.no]\n");
+        dbg++;
+    }
+    if ((lsr & 1) == 0) return;                      // LSR: no data
+    uint8_t b = inb(VB);
+    if (b != 0x02) return;                          // not a voice frame
+    serial_puts("[VSTX]\n");
+    if ((inb(VB + 5) & 1) == 0) return;
+    int n = inb(VB);
+    if (n <= 0 || n > 127) return;
+    char buf[128]; int i = 0;
+    while (i < n) {
+        if ((inb(VB + 5) & 1) == 0) continue;
+        buf[i++] = (char)inb(VB);
+    }
+    buf[n] = 0;
+    serial_puts("[VRX]\n");
+    gui_voice_say(buf);
+}
+
+static void cmd_voice(const char* args){
+    if (args == 0 || args[0] == 0) {
+        term.write("usage: voice <on|off|phrase>\n");
+        return;
+    }
+    while (*args == ' ') args++;
+    if (strcmp_(args, "on") == 0) {
+        gui_voice_set(1);
+        term.write("Voice engine ON\n");
+    } else if (strcmp_(args, "off") == 0) {
+        gui_voice_set(0);
+        term.write("Voice engine OFF\n");
+    } else {
+        gui_voice_say(args);
+        term.write("voice phrase sent: ");
+        term.write(args);
+        term.write("\n");
+    }
 }
 
 // =====================================================================
@@ -3297,7 +3680,7 @@ static const char* g_cmd_table[] = {
     "run", "runfs", "ai", "generate", "agent",
     "netinfo", "netstat", "netstart",
     "switch", "shutdown", "reboot", "exit",
-    "gui", "nogui"
+    "gui", "nogui", "voice"
 };
 static const int g_cmd_count = sizeof(g_cmd_table)/sizeof(g_cmd_table[0]);
 
@@ -4234,7 +4617,111 @@ static int perm_ui_console(const PermRequest* req, int* remember){
     }
 }
 
+// --- Auto-inference backdoor -----------------------------------------
+// The 32-bit kernel's `ask64 <question>` writes 'NEXQ' + the UTF-8 question
+// to shared memory at 0x5100/0x5104 and switches to long mode.  We answer
+// synchronously here (streaming to serial) so headless tests can exercise
+// the real GGUF engine without the PS/2 keyboard.  Checked every main-loop
+// iteration, not only on a command line, so no keypress is required.
+//
+// Try to load the embedded GGUF model blob; returns 1 when qwen is ready.
+static int model_try_load(void){
+    if (qwen_ready()) return 1;
+    serial_puts("[K64] loading embedded GGUF model...\n");
+    uint64_t lba = 0;
+    uint64_t size = model_blob_probe(&lba);
+    if (!size){ serial_puts("[K64] no model blob on disk\n"); return 0; }
+    uint8_t* blob = model_blob_read(lba, size);
+    if (!blob){ serial_puts("[K64] blob read failed\n"); return 0; }
+    int rc = qwen_load(blob, size, 512);
+    if (rc != 0){
+        serial_puts("[K64] qwen_load failed: ");
+        serial_puts(qwen_error());
+        serial_puts("\n");
+        return 0;
+    }
+    serial_puts("[K64] model loaded\n");
+    return 1;
+}
+
+static void auto_ask_backdoor(void){
+    volatile uint32_t* qmagic = (volatile uint32_t*)0x5100;
+    if (*qmagic != 0x5145584Eu) return;                 // 'NEXQ'
+    *qmagic = 0;
+    char q[128];
+    volatile char* src = (volatile char*)0x5104;
+    int qi = 0;
+    while (qi < 120 && src[qi]){ q[qi] = (char)src[qi]; qi++; }
+    q[qi] = 0;
+    serial_puts("[K64-AUTO] question: "); serial_puts(q); serial_puts("\n");
+    if (!model_try_load()){
+        serial_puts("[K64-AUTO] no model available\n");
+        return;
+    }
+    serial_puts("[K64-AUTO] model loaded; answer: ");
+    qwen_generate(q, 96, 0.8f, ask_emit);
+    serial_puts("\n[K64-AUTO] done\n");
+}
+
+// Forward declarations: these are defined later in this file (after run_command),
+// but cmd_plugin needs them, so declare them here.
+int  kern_fs_create(const char* name, const unsigned char* data, int len);
+static void int_to_str_k64(int val, char* buf);
+
+static void cmd_plugin(const char* args){
+    if (!g_plugin_inited) { ai_plugin_init(); g_plugin_inited = true; }
+
+    // No args -> list
+    if (!*args) { char buf[3072]; ai_plugin_list(buf, sizeof(buf)); term.write(buf); return; }
+
+    char sub[16]; int si = 0;
+    while (*args && *args != ' ' && si < 15) sub[si++] = *args++;
+    sub[si] = 0;
+    while (*args == ' ') args++;
+
+    if (!strcmp_(sub, "list") || !strcmp_(sub, "ls")) {
+        char buf[3072]; ai_plugin_list(buf, sizeof(buf)); term.write(buf);
+    } else if (!strcmp_(sub, "persist")) {
+        char buf[3072]; int n = ai_plugin_serialize(buf, sizeof(buf));
+        int r = kern_fs_create("plugins.lst", (const unsigned char*)buf, n);
+        if (r >= 0) { term.write("Plugin catalogue written to plugins.lst ("); char nn[16]; int_to_str_k64(n, nn); term.write(nn); term.write(" bytes)\n"); }
+        else term.write("Failed to write plugins.lst\n");
+    } else if (!strcmp_(sub, "toggle") || !strcmp_(sub, "load") || !strcmp_(sub, "unload")) {
+        if (!*args) { term.write("Usage: plugin toggle <id>\n"); return; }
+        int want = !strcmp_(sub, "unload") ? 0 : 1;
+        int s = (!strcmp_(sub, "toggle")) ? ai_plugin_toggle(args) : ai_plugin_set(args, want);
+        if (s < 0) { term.write("plugin not found: "); term.write(args); term.put_char('\n'); return; }
+        char buf[3072]; int n = ai_plugin_serialize(buf, sizeof(buf));
+        kern_fs_create("plugins.lst", (const unsigned char*)buf, n);
+        term.write(args); term.write(s ? " -> loaded\n" : " -> unloaded\n");
+    } else if (!strcmp_(sub, "info")) {
+        if (!*args) { term.write("Usage: plugin info <id>\n"); return; }
+        int i = ai_plugin_find(args);
+        if (i < 0) { term.write("plugin not found: "); term.write(args); term.put_char('\n'); return; }
+        AiPlugin* pl = &g_plugins[i];
+        term.write("Plugin: "); term.write(pl->id); term.put_char('\n');
+        term.write("  Name : "); term.write(pl->name); term.put_char('\n');
+        term.write("  Deps : "); term.write(pl->deps); term.put_char('\n');
+        term.write("  Mem  : "); char nn[16]; int_to_str_k64(pl->mem_kb, nn); term.write(nn); term.write(" KB\n");
+        term.write("  State: "); int_to_str_k64(pl->state, nn); term.write(nn); term.write(" (0 planned,1 basic,2 available)\n");
+        term.write("  Load : "); int_to_str_k64(pl->loaded, nn); term.write(nn); term.put_char('\n');
+    } else if (!strcmp_(sub, "run")) {
+        if (!*args) { term.write("Usage: plugin run <id>\n"); return; }
+        if (!strcmp_(args, "nexos.ai.inference")) {
+            term.write("Loading core AI inference plugin...\n");
+            int ret = ai_init("/boot/model.gguf");
+            if (ret == 0) { g_ai_initialized = true; term.write("AI inference engine loaded.\n"); }
+            else term.write("AI init failed (no model?).\n");
+        } else {
+            term.write("Plugin '"); term.write(args); term.write("' is not runnable in this build.\n");
+        }
+    } else {
+        term.write("Usage: plugin [list|persist|toggle|load|unload|info|run] [<id>]\n");
+    }
+}
+
 static void run_command(const char* line){
+    auto_ask_backdoor();
     while(*line==' ') line++;
     if(*line==0) return;
     if (!g_in_script) hist_add(line);
@@ -4287,6 +4774,8 @@ static void run_command(const char* line){
     else if(!strcmp_(cmd,"agent"))      cmd_agent(args);
     else if(!strcmp_(cmd,"ask"))        cmd_ask(args);
     else if(!strcmp_(cmd,"model"))      cmd_model(args);
+    // Plugin subsystem (catalogue manager + Settings > Plugins UI backend)
+    else if(!strcmp_(cmd,"plugin"))     cmd_plugin(args);
     // Network commands
     else if(!strcmp_(cmd,"netinfo")||!strcmp_(cmd,"netstat")) cmd_netinfo();
     else if(!strcmp_(cmd,"netstart")||!strcmp_(cmd,"net"))   cmd_netstart();
@@ -4295,6 +4784,8 @@ static void run_command(const char* line){
     // GUI
     else if(!strcmp_(cmd,"gui"))  cmd_gui(args);
     else if(!strcmp_(cmd,"nogui")) cmd_nogui(args);
+    // Voice interaction engine
+    else if(!strcmp_(cmd,"voice")) cmd_voice(args);
     // Win64 subsystem (PE32+ loader)
     else if(!strcmp_(cmd,"winapp")) cmd_winapp(args);
     // Memory management
@@ -4581,6 +5072,14 @@ static int gui_cb_session_load(const char* name, void* buf, int bufsize) {
     return mkfs.read(name, (uint8_t*)buf, bufsize);
 }
 
+// Kernel file-system write back (MKFS data FS) -- used by the Win32 subsystem
+// (CreateFileA/WriteFile/CloseHandle) and the skill system to persist files.
+// Mirrors the 32-bit kernel.cpp definition so win32_64.o can link it.
+int kern_fs_create(const char* name, const unsigned char* data, int len){
+    if (!mkfs.mounted) return -2;
+    return mkfs.create(name, (const uint8_t*)data, len);
+}
+
 // ---- Time callback (from CMOS RTC) ----
 static void gui_cb_get_time(int* h, int* m, int* s) {
     outb(0x70, 0x00); *s = inb(0x71);
@@ -4842,9 +5341,196 @@ static void register_gui_callbacks(void) {
 // =====================================================================
 //  kmain64  -  64-bit kernel entry point (called from entry64.asm)
 // =====================================================================
+// ---- Phase 0 ggml adapter self-test (Route A) -----------------------
+// Exercises memory_adapter.c / file_adapter.c / gguf_loader.c on real
+// hardware and reports over the serial port so a headless QEMU run can verify
+// the adapter layer.  Harmless on a normal boot (alloc/free 4 KiB, probe one
+// descriptor sector, parse a tiny in-RAM GGUF fixture).
+void gguf_adapter_selftest(void){
+    serial_puts("[ADAPT] === ggml adapter self-test ===\n");
+
+    // 1) memory adapter: alloc / pattern / free
+    void* p = ggml_alloc(4096);
+    if (p){
+        volatile uint8_t* m = (volatile uint8_t*)p;
+        m[0] = 0xAB; m[4095] = 0xCD;
+        int ok = (m[0] == 0xAB && m[4095] == 0xCD);
+        ggml_free(p, 4096);
+        serial_puts(ok ? "[ADAPT] memory: alloc/free OK\n"
+                       : "[ADAPT] memory: FAIL pattern\n");
+    } else {
+        serial_puts("[ADAPT] memory: FAIL alloc\n");
+    }
+
+    // 2) file adapter: disk backend probe (reads the "MINIMDL1" descriptor)
+    static const uint32_t hdr_lbas[] = {16383u, 8191u, 4095u, 0u};
+    gguf_io* dio = gguf_io_disk_create(hdr_lbas, ata_read_sector);
+    if (dio){
+        char n[24];
+        serial_puts("[ADAPT] disk: blob present, size=");
+        uint_to_str_k64((uint32_t)dio->size(dio), n); serial_puts(n);
+        serial_puts(" bytes -> parsing via loader\n");
+        gguf_ctx dctx;
+        if (gguf_load(dio, &dctx) == 0){
+            serial_puts("[ADAPT] disk parse OK: arch=");
+            serial_puts(dctx.arch); serial_puts(" quant=");
+            serial_puts(dctx.quant); serial_puts(" tensors=");
+            uint_to_str_k64((uint32_t)dctx.n_tensors, n); serial_puts(n);
+            serial_puts("\n");
+        } else {
+            serial_puts("[ADAPT] disk parse FAIL\n");
+        }
+        gguf_io_disk_destroy(dio);
+    } else {
+        serial_puts("[ADAPT] disk: no model blob on image (probe OK; embed one for full disk read)\n");
+    }
+
+    // 3) gguf loader over the in-RAM fixture (always runs, no disk needed)
+    gguf_io* mio = gguf_io_mem_create(k_gguf_fixture, k_gguf_fixture_size);
+    if (mio){
+        char n[24];
+        serial_puts("[ADAPT] fixture size=");
+        uint_to_str_k64((uint32_t)k_gguf_fixture_size, n); serial_puts(n);
+        serial_puts(" magic=");
+        for (int i = 0; i < 4; i++){ n[0] = (char)('0' + ((k_gguf_fixture[i] >> 4) & 0xF)); n[1] = (char)('0' + (k_gguf_fixture[i] & 0xF)); n[2] = 0; serial_puts(n); }
+        serial_puts("\n");
+        gguf_ctx ctx;
+        int rc = gguf_load(mio, &ctx);
+        serial_puts("[ADAPT] rc="); uint_to_str_k64((uint32_t)rc, n); serial_puts(n);
+        serial_puts(" tc="); uint_to_str_k64((uint32_t)ctx.tensor_count, n); serial_puts(n);
+        serial_puts(" kc="); uint_to_str_k64((uint32_t)ctx.kv_count, n); serial_puts(n);
+        serial_puts("\n");
+        if (rc == 0){
+            serial_puts("[ADAPT] gguf parse OK: arch=");
+            serial_puts(ctx.arch); serial_puts(" quant=");
+            serial_puts(ctx.quant); serial_puts(" version=");
+            uint_to_str_k64(ctx.version, n); serial_puts(n);
+            serial_puts(" tensors="); uint_to_str_k64((uint32_t)ctx.n_tensors, n); serial_puts(n);
+            serial_puts(" embed="); uint_to_str_k64(ctx.embed_length, n); serial_puts(n);
+            serial_puts(" vocab="); uint_to_str_k64(ctx.vocab_size, n); serial_puts(n);
+            serial_puts(" bos="); uint_to_str_k64(ctx.bos_id, n); serial_puts(n);
+            serial_puts(" type0="); serial_puts(gguf_loader_type_name(ctx.tensors[0].type));
+            serial_puts("\n");
+        } else {
+            serial_puts("[ADAPT] gguf parse FAIL\n");
+        }
+        gguf_io_mem_destroy(mio);
+    } else {
+        serial_puts("[ADAPT] mem io FAIL\n");
+    }
+
+    serial_puts("[ADAPT] === done ===\n");
+}
+
+// Boot beacon: painted by the kernel to mark progress without a serial
+// console.  Declared C-linkage to match gui.cpp's definition so both the
+// 32-bit and 64-bit kernels link against the same unmangled symbol.
+extern "C" void boot_beacon(uint8_t, uint8_t, uint8_t);
+
+// === UEFI real-hardware diagnostic freeze (REMOVABLE after we learn the
+//     Huawei GOP format).  Paints a 2x2 format probe (R/G/B/W) plus a CYAN
+//     bottom strip, then cli;hlt so the screen stays frozen for visual
+//     inspection.  Interpretation on the target:
+//       * quadrant + CYAN visible  -> 64-bit FB is reachable; the quadrant
+//         colours reveal the real GOP pixel format / R-B swap.
+//       * screen NOTupdated (stays at the 32-bit beacon / black) -> the very
+//         first 64-bit framebuffer store #PFs -> >4GiB LFB not identity-mapped
+//         in long mode (the known real-hardware black-screen root cause). ===
+static uint32_t diag_pack(uint8_t fmt, uint8_t r, uint8_t g, uint8_t b){
+    if (fmt == 1)      return ((uint32_t)b << 16) | ((uint32_t)g << 8) | r;   // RGBX32
+    else if (fmt == 0) return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;   // BGRX32
+    else if (fmt == 3) return (uint32_t)((((uint16_t)r >> 3) << 11) |
+                                        (((uint16_t)g >> 2) << 5) |
+                                        ((uint16_t)b >> 3));                  // RGB565
+    else               return ((uint32_t)b << 16) | ((uint32_t)g << 8) | r;   // RGB24/unknown
+}
+// Progressive milestone marker: fill the WHOLE screen with one colour (no
+// freeze unless `freeze` is set).  Because each call overwrites the screen,
+// the LAST colour the Huawei target shows is the last milestone that
+// executed before the boot hung.  Insert one at each step; the final one
+// (freeze=1) stops the machine before gui_enter so kmain64 vs gui_enter is
+// isolated.  Colours are chosen to be distinct from the kernel's own
+// GREEN(0,255,0)/YELLOW(255,255,0)/BLACK/WHITE beacons.
+static void diag_mark(uint8_t r, uint8_t g, uint8_t b, bool freeze){
+    volatile uint8_t* vb = (volatile uint8_t*)0x5000;
+    uint16_t w     = *(volatile uint16_t*)(vb + 0x04);
+    uint16_t h     = *(volatile uint16_t*)(vb + 0x06);
+    uint16_t pitch = *(volatile uint16_t*)(vb + 0x09);
+    uint8_t  fmt   = *(volatile uint8_t*)(vb + 0x0F);
+    if (w == 0 || h == 0) { __asm__ __volatile__("cli;hlt"); }
+    uint64_t fb64 = *(volatile uint64_t*)(vb + 0x10);
+    uintptr_t fbva;
+    if (fb64 == 0 || fb64 > 0xFFFFFFFFULL) {
+        uint32_t fb32 = *(volatile uint32_t*)(vb + 0x00);
+        fbva = (uintptr_t)fb32;
+    } else {
+        fbva = (uintptr_t)fb64;
+    }
+    uint32_t pstride = (pitch != 0) ? (pitch / 4u) : (uint32_t)w;
+    volatile uint32_t* fb = (volatile uint32_t*)fbva;
+    uint32_t px = diag_pack(fmt, r, g, b);
+    for (uint32_t y = 0; y < h; y++) {
+        volatile uint32_t* row = fb + (uint32_t)y * pstride;
+        for (uint32_t x = 0; x < w; x++) row[x] = px;
+    }
+    if (freeze) __asm__ __volatile__("cli;hlt");
+}
+
 extern "C" void kmain64(){
     serial_puts("[K64-1] kmain64 entered\n");
+    // Install the real 64-bit IDT so any synchronous fault (#PF/#GP/#UD/...)
+    // is captured by fault_common() instead of triple-faulting silently.
+    build_idt();
+    serial_puts("[K64-IDT] installed\n");
+    diag_step(1, "kmain64 post-build_idt");
+
+    // --- DIAG: report what the 64-bit side sees for the framebuffer ---
+    {
+        volatile uint8_t* dbg_vb = (volatile uint8_t*)0x5000;
+        uint64_t dbg_fb64 = *(volatile uint64_t*)(dbg_vb + 0x10);
+        uint32_t dbg_fb32 = *(volatile uint32_t*)(dbg_vb + 0x00);
+        uint16_t dbg_w = *(volatile uint16_t*)(dbg_vb + 0x04);
+        uint16_t dbg_h = *(volatile uint16_t*)(dbg_vb + 0x06);
+        uint8_t  dbg_fmt = *(volatile uint8_t*)(dbg_vb + 0x0F);
+        serial_puts("[K64-FB] fb64="); serial_hex64(dbg_fb64);
+        serial_puts(" fb32="); serial_hex(dbg_fb32);
+        serial_puts(" w="); serial_dec(dbg_w);
+        serial_puts(" h="); serial_dec(dbg_h);
+        serial_puts(" fmt="); serial_dec(dbg_fmt);
+        serial_puts("\n");
+    }
+
+    // Boot beacon: we are now in 64-bit long mode with the high framebuffer
+    // identity-mapped by switch32to64.asm.  A solid GREEN screen proves the
+    // 32->64 switch and page tables succeeded; a hang/fault here shows green.
+    *(volatile uint8_t*)0x5101 = 7;   // milestone: 64-bit kernel entered
+    boot_beacon(0, 255, 0);           // GREEN
+    diag_step(2, "kmain64 post-boot_beacon");
+    diag_mark(255, 0, 0, false);      // M1 RED  : post boot_beacon, FB reachable (64-bit)
     g_auto_gui = 1;   // default: enter GUI automatically after login
+    // Under a hypervisor (QEMU) the default is the text shell so headless
+    // tests get a console and every CPU cycle goes to GGUF inference; on
+    // bare metal the graphical desktop stays the default.  The 32-bit
+    // kernel can override this by setting byte 0x501C = 1 before switching
+    // (os.img's auto-gui path hands the desktop to us).
+    //
+    // 0x501C, NOT 0x5010: 0x5010 is VbeInfo.framebuffer_phys64's first byte, so
+    // the old flag address corrupted the framebuffer address itself (harmless
+    // for <4GB framebuffers, fatal for the 0x4000000000 LFB real GOP hardware
+    // reports).  0x501C is VbeInfo.reserved[0].
+    {
+        uint32_t a1=0, b1=0, c1=0, d1=0;
+        __asm__ __volatile__("cpuid" : "=a"(a1), "=b"(b1), "=c"(c1), "=d"(d1) : "a"(1));
+        if (c1 & (1u << 31)){
+            if (*(volatile uint8_t*)0x501C == 1){
+                g_auto_gui = 1;
+                serial_puts("[K64] VM detected but GUI requested by 32-bit kernel\n");
+            } else {
+                g_auto_gui = 0;
+                serial_puts("[K64] VM detected - staying in text shell (GUI off)\n");
+            }
+        }
+    }
 
     // ---- Display setup: framebuffer console if VBE graphics is already ----
     // active, else fall back to VGA text mode.
@@ -4870,6 +5556,7 @@ extern "C" void kmain64(){
             vga_set_text_mode();
             serial_puts("[K64-2] VGA text mode set\n");
         }
+        diag_mark(0, 0, 255, false);   // M2 BLUE : post fb_console / VGA setup
     }
 
     // ---- Check if VBE info is available (for GUI) ----
@@ -4890,16 +5577,41 @@ extern "C" void kmain64(){
     mouse.init();
     serial_puts("[K64-4] mouse init done\n");
 
+    // ---- RAM-backed SFS handoff (UEFI path) ----
+    // bootuefi.c stages the whole SFS image in RAM before ExitBootServices and
+    // publishes {magic, base, size} at 0x0900, because legacy IDE PIO
+    // (ata_read_sector) returns all zeros on the q35/AHCI machines UEFI boots
+    // on.  Without this the superblock probe fails, shell.mex is "file not
+    // found", and the managed Win11 shell renders an empty (black) screen.
+    // Identical handoff to the 32-bit CD-boot path, so one loader feeds both.
+    {
+        const volatile uint32_t* hs = (const volatile uint32_t*)(uintptr_t)0x0900;
+        if (hs[0] == SFS_RAM_MAGIC && hs[1] != 0 && hs[2] != 0) {
+            sfs.set_ram(hs[1], hs[2]);
+            serial_puts("[K64-SFS] RAM-SFS handoff base=");
+            serial_hex(hs[1]);
+            serial_puts(" size=");
+            serial_hex(hs[2]);
+            serial_puts("\n");
+        } else {
+            serial_puts("[K64-SFS] no RAM-SFS handoff at 0x0900 (disk mode)\n");
+        }
+    }
+
     mkfs.init();
     sfs.init();
     fat32.init();
+    if (sfs.mounted) serial_puts("[K64-6] SFS mounted\n");
+    else             serial_puts("[K64-6] *** SFS NOT mounted ***\n");
     serial_puts("[K64-6] filesystem init done\n");
+    diag_mark(0, 255, 255, false);     // M3 CYAN : post filesystem init
 
     // ---- Memory management ----
     pmm_init();
     vmm_init();
     heap_init();
     serial_puts("[K64-7] memory management init done\n");
+    diag_mark(255, 0, 255, false);     // M4 MAGENTA : post memory management (vmm_init)
 
     // ---- GUI initialization (if VBE info is available) ----
     // Initialize GUI but do NOT auto-enter. Boot to command line.
@@ -4914,6 +5626,7 @@ extern "C" void kmain64(){
             g_vbe_active = false;
         }
     }
+    diag_mark(255, 128, 0, false);     // M5 ORANGE : post gui_init()
 
     // ---- Network initialization ----
     serial_puts("[K64-8] Initializing network...\n");
@@ -5006,14 +5719,67 @@ extern "C" void kmain64(){
     }
 
     // ---- Default-enable GUI (parity with 32-bit kernel) ----
-    if (g_auto_gui && g_vbe_active) {
-        cmd_gui(nullptr);
+    diag_mark(255, 255, 255, false);   // M6 WHITE : kmain64 reached gui_enter entry (no freeze)
+    // Enter the GUI (and paint the desktop) when graphics are available.
+    // The old voice-test block forced g_skip_enter_gui=true, which skipped the
+    // entire native desktop paint and left real hardware stuck at the
+    // firmware-default light-gray screen.  The GUI hang it worked around never
+    // reproduced (enter_gui() returns cleanly), so we use the normal path.
+    if (g_auto_gui && g_vbe_active) cmd_gui(nullptr);
+    serial_puts("[M-AG]\n");
+
+    // Phase 0 ggml adapter self-test (serial-only diagnostic; harmless).
+    serial_puts("[M-BA]\n");
+    gguf_adapter_selftest();
+    serial_puts("[M-AA]\n");
+
+#if 0  // TEMP DEMO block DISABLED for voice smoke test (it was corrupting the
+       // kmain64 stack frame and halting before for(;;)). Restore after voice
+       // validation by flipping this back to #if 1 / removing the guard.
+    // [TEMP DEMO] auto-load embedded GGUF and answer a hard question headlessly.
+    // Streams to serial via ask_emit. REMOVE AFTER VERIFICATION.
+    // The KB (knowledge_base.c) injects the verified fact so the 0.5B model
+    // does not hallucinate. The same kb_build_prompt() is used by cmd_ask().
+    {
+        const char* demo_q = "DeepSeek是哪家公司生产的？";
+        char demo_sys[768];
+        int kb_hit = kb_build_prompt(demo_q, demo_sys, (int)sizeof(demo_sys));
+        serial_puts("[KB] demo_q="); serial_puts(demo_q);
+        serial_puts(" hit="); serial_puts(kb_hit ? "1" : "0"); serial_puts("\n");
+        serial_puts("[KB] sys_prompt(demo): "); serial_puts(demo_sys); serial_puts("\n");
+
+        // Show the authoritative-fallback prompt for an unmatched question
+        // (no generation needed -> captures immediately even under slow QEMU).
+        char fp[768];
+        kb_build_prompt("如何在家自制酸奶？", fp, (int)sizeof(fp));
+        serial_puts("[KB] fallback_prompt(unmatched): "); serial_puts(fp); serial_puts("\n");
+
+        serial_puts("[DEMO] auto question: "); serial_puts(demo_q); serial_puts("\n");
+        if (model_try_load()) {
+            serial_puts("[DEMO] model loaded; answer: ");
+            qwen_chat(demo_sys, demo_q, 96, 0.8f, ask_emit);
+            serial_puts("\n[DEMO] done\n");
+        } else {
+            serial_puts("[DEMO] model not available\n");
+            serial_puts("[M-ADEMO]\n");
+        }
     }
+#endif
+    serial_puts("[M-ENDBLOCK]\n");
 
     char inbuf[HIST_LEN];
     int  hist_recall = -1;      // command history recall index (-1 = not recalling)
 
+    serial_puts("[M-FOR]\n");
     for(;;){
+        // Voice transport: poll COM2 (0x2F8) for a framed phrase on EVERY
+        // main-loop iteration, independent of GUI state.  This guarantees the
+        // voice pipe is always drained even if the GUI branch below is not
+        // entered on a given boot -- the auto-GUI path can tear the desktop
+        // down before we reach this loop, which previously left the poll
+        // unreachable (serial_voice_poll only ran inside `if(gui_is_active())`).
+        serial_voice_poll();
+
         // ---- GUI event loop ----
         // If GUI mode is active (entered via 'gui' command), run a separate
         // event loop that routes mouse/keyboard to the window manager.
@@ -5029,6 +5795,10 @@ extern "C" void kmain64(){
                 // ~60fps -- without this the C# desktop only ever shows the
                 // initial blank frame (32-bit kernel does the same).
                 gui_animate_frame();
+
+                // Voice transport: drain COM2 (0x2F8) every GUI frame so a
+                // spoken phrase is always picked up while the desktop is live.
+                serial_voice_poll();
 
                 // Update clock every ~50 iterations
                 if(++gui_tick_counter > 50){
@@ -5109,6 +5879,13 @@ extern "C" void kmain64(){
         for(;;){
             // Poll network for incoming packets (HTTP server, ARP, etc.)
             if(g_net_initialized) net_poll();
+
+            // Voice transport: drain COM2 (0x2F8) every text-input iteration
+            // so a spoken phrase is handled even on the console boot path.
+            serial_voice_poll();
+
+            // Handle a staged 32-bit `ask64` question even with no keypress.
+            auto_ask_backdoor();
             
             uint8_t st=inb(0x64);
             if(st&0x01){
