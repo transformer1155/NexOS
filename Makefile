@@ -25,7 +25,11 @@ CXXFLAGS := -m32 -ffreestanding -fno-exceptions -fno-rtti \
 LDFLAGS  := -m elf_i386 -nostdlib -T linker.ld -z noexecstack
 
 # ----- 64-bit (long-mode) kernel build variables -----
-CXX64FLAGS := -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1
+# CC64 lets a Windows/native build use a dedicated x86_64-elf cross compiler
+# for the long-mode kernel while CC (i686-elf) builds the 32-bit kernel.
+# Default to $(CC) so Linux toolchains that are multilib-capable keep working.
+CC64       ?= $(CC)
+CXX64FLAGS := -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1
 AS64FLAGS  := -f elf64
 LD64       := ld
 LDFLAGS64  := -m elf_x86_64 -nostdlib -T .attic64/linker64.ld -z noexecstack
@@ -44,22 +48,23 @@ EFI_CFLAGS  := -I$(EFI_INC) -I$(EFI_INC)/x86_64 -DEFI_FUNCTION_WRAPPER \
 EFI_LDFLAGS := -nostdlib -znocombreloc -T $(EFI_LDS) -shared -Bsymbolic \
                -L$(EFI_LIB) $(EFI_CRT0)
 
-# SFS is written to disk at LBA 3328.  kernel.bin occupies LBA 33..~1200;
-# LBA 1200-3327 is the growth gap.  The BIOS image is 4 MiB, so the SFS
-# region 3328-8191 (~2.4 MB) can hold textures.
+# SFS is written to disk at LBA 3488.  kernel64.bin (long-mode payload) occupies
+# LBA 2048..3488 (KERNEL64_SECTORS=1440); kernel.bin occupies LBA 33..~1200;
+# LBA 1200-3487 is the growth gap.  The BIOS image is 4 MiB, so the SFS
+# region 3488-8191 (~2.4 MB) can hold textures.
 #
 # ARCHITECTURE: this tree is 32-bit only.  The long-mode kernel (kernel64.cpp,
 # entry64.asm, linker64.ld, switch32to64.asm, switch64to32.asm) and the
 # PE32+/amd64 browser were retired to .attic64/ -- nothing in the build,
 # the disk layout or the shell references them any more.
-SFS_LBA      := 3328
+SFS_LBA      := 3488
 SFS_BYTE_OFF := $(shell echo $$(( $(SFS_LBA) * 512 )))
 
 # Real GGUF weights bypass SFS entirely (768-sector cap) and are appended to
 # the image as a raw blob: a one-sector descriptor at LBA 4095, payload from
 # LBA 4096.  Override MODEL_GGUF to embed a different model, e.g.
 #   make MODEL_GGUF=~/models/Qwen3-1.7B-Q4_K_M.gguf
-# NOTE: the SFS image itself is ~3.2k sectors (3328..~6580), so the blob has
+# NOTE: the SFS image itself is ~3.2k sectors (3488..~6600), so the blob has
 # to start well past it.  LBA 16384 = the 8 MiB mark, leaving the filesystem
 # room to more than double before anything collides.
 MODEL_HDR_LBA  := 16383
@@ -76,9 +81,14 @@ HYBRID_IMG := $(BUILD)/os_hybrid.img
         hybrid hybrid-run hybrid-run-uefi hybrid-test hybrid-test-uefi \
         test-all \
         play test-sec test-f0 test-fail test-w32 test-rclick inject \
+        textboot \
         csharp test-clr winhost winhost-shot
 
-all: $(ISO)
+# NOTE: default build reverted to the BIOS raw image (os.img) on 2026-08-12.
+# The CD/ISO path (boot_cd.asm) had an unresolved early-crash bug; the IMG
+# path (boot.asm -> stage2.asm) is the verified-good baseline, so it is the
+# default again until the CD path is fixed.  `make iso` still builds the ISO.
+all: $(IMG)
 
 # =====================================================================
 #  BIOS boot path
@@ -108,36 +118,52 @@ $(BUILD)/divdi3.o: divdi3.c | $(BUILD)
 $(BUILD)/ai_engine.o: ai_engine.cpp | $(BUILD)
 	$(CC) $(CXXFLAGS) -c ai_engine.cpp -o $@
 
+$(BUILD)/kb.o: kb.cpp kb.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c kb.cpp -o $@
+
+$(BUILD)/ai_plugin.o: ai_plugin.cpp ai_plugin.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c ai_plugin.cpp -o $@
+
+$(BUILD)/skill.o: skill.cpp skill.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c skill.cpp -o $@
+
 $(BUILD)/gguf.o: gguf.cpp gguf.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c gguf.cpp -o $@
 
 $(BUILD)/net.o: net.cpp | $(BUILD)
 	$(CC) $(CXXFLAGS) -c net.cpp -o $@
 
-$(BUILD)/gui.o: gui.cpp | $(BUILD)
+$(BUILD)/distnet.o: distnet.cpp distnet.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c distnet.cpp -o $@
+
+$(BUILD)/gui.o: gui.cpp logo.h font_vec.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c gui.cpp -o $@
+
+# Runtime vector font rasterizer (stb_truetype.h) - 32-bit and 64-bit.
+# Compiled as plain C (-x c) so its kmalloc/kfree calls use C linkage, matching
+# the extern "C" definitions in kernel.cpp.  tools/vecmath supplies <math.h>.
+$(BUILD)/font_vec.o: font_vec.c font_vec.h tools/stb/stb_truetype.h | $(BUILD)
+	$(CC) -x c $(CXXFLAGS) -I tools/stb -I tools/vecmath -c font_vec.c -o $@
+
+$(BUILD)/font_vec64.o: font_vec.c font_vec.h tools/stb/stb_truetype.h | $(BUILD)
+	$(CC64) -x c $(CXX64FLAGS) -I tools/stb -I tools/vecmath -c font_vec.c -o $@
+
+# 32-bit kernel uses the no-op stub (real rasterizer is 64-bit only, to stay
+# within the 0x10000..0x9FC00 load window).  gui.cpp falls back to font_la.
+$(BUILD)/font_vec_stub.o: font_vec_stub.c font_vec.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c font_vec_stub.c -o $@
+
+$(BUILD)/addrman.o: addrman.cpp addrman.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c addrman.cpp -o $@
+
+$(BUILD)/addrman64.o: addrman.cpp addrman.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c addrman.cpp -o $@
 
 $(BUILD)/winloader.o: winloader.cpp | $(BUILD)
 	$(CC) $(CXXFLAGS) -c winloader.cpp -o $@
 
 $(BUILD)/win32.o: win32.cpp win32.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c win32.cpp -o $@
-
-# ----- ATA, PS2, PCI, PMM/VMM objects -----
-$(BUILD)/ata.o: drivers/ata.cpp drivers/ata.h | $(BUILD)
-	$(CC) $(CXXFLAGS) -c drivers/ata.cpp -o $@
-
-$(BUILD)/ps2.o: drivers/ps2.cpp drivers/ps2.h | $(BUILD)
-	$(CC) $(CXXFLAGS) -c drivers/ps2.cpp -o $@
-
-$(BUILD)/pci.o: drivers/pci.cpp drivers/pci.h | $(BUILD)
-	$(CC) $(CXXFLAGS) -c drivers/pci.cpp -o $@
-
-$(BUILD)/pmm.o: kernel/pmm.cpp kernel/pmm.h | $(BUILD)
-	$(CC) $(CXXFLAGS) -c kernel/pmm.cpp -o $@
-
-$(BUILD)/vmm.o: kernel/vmm.cpp kernel/vmm.h | $(BUILD)
-	$(CC) $(CXXFLAGS) -c kernel/vmm.cpp -o $@
 
 # ----- Linux binary-compat shim (Wine-on-NexOS Milestone 0) -----
 $(BUILD)/linux_compat.o: linux_compat.cpp linux_compat.h setjmp.h syscall.h | $(BUILD)
@@ -175,12 +201,22 @@ $(BUILD)/mforms.o: mforms.cpp mforms.h clr.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -fno-optimize-sibling-calls -c mforms.cpp -o $@
 
 # ----- Link kernel ELF (entry.o first => _start at image offset 0) -----
-$(BUILD)/kernel.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/gui.o $(BUILD)/ata.o $(BUILD)/ps2.o $(BUILD)/pci.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o linker.ld | $(BUILD)
-	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/gui.o $(BUILD)/ata.o $(BUILD)/ps2.o $(BUILD)/pci.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o
+$(BUILD)/kernel.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/gui.o $(BUILD)/font_vec_stub.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o linker.ld | $(BUILD)
+	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/gui.o $(BUILD)/font_vec_stub.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o
 
 # ----- Extract flat kernel binary -----
 $(BUILD)/kernel.bin: $(BUILD)/kernel.elf | $(BUILD)
 	$(OBJCOPY) -O binary $< $@
+	@sz=$$(stat -c%s $@); \
+	 if [ $$sz -gt 589824 ]; then \
+	   echo "*** ERROR: kernel.bin is $$sz bytes (> 576 KiB)."; \
+	   echo "***        stage2.asm loads KERNEL_SECTORS=1152 sectors (576 KiB) and the"; \
+	   echo "***        kernel loads at 0x10000, so it must end <= 0xA0000 (VGA MMIO hole)."; \
+	   echo "***        The kernel would be silently truncated -- refusing to build."; \
+	   rm -f $@; exit 1; \
+	 elif [ $$sz -gt 530841 ]; then \
+	   echo "    [warn] kernel.bin $$sz bytes: >90% of the 576 KiB load window"; \
+	 fi
 
 # =====================================================================
 #  SFS (Simple File System) image generation
@@ -190,12 +226,31 @@ $(BUILD)/kernel.bin: $(BUILD)/kernel.elf | $(BUILD)
 #  detailed textures.  The UEFI disk keeps a texture-free SFS because
 #  its SFS slot (LBA 800) is only ~224 sectors before the ESP (LBA 1024).
 # =====================================================================
-$(SFS_IMG): $(wildcard $(SFS_DIR)/*) tools/sfs_gen.py tools/tex_pack.py $(SFS_DIR)/userdemo $(SFS_DIR)/hello.mex $(SFS_DIR)/shell.mex | $(BUILD)
+$(SFS_IMG): $(wildcard $(SFS_DIR)/*) tools/sfs_gen.py tools/tex_pack.py $(SFS_DIR)/userdemo $(SFS_DIR)/hello.mex $(SFS_DIR)/shell.mex $(SFS_DIR)/hello.nex | $(BUILD)
 	$(PYTHON) tools/tex_pack.py
 	$(PYTHON) tools/sfs_gen.py $(SFS_DIR) $@
 
 $(BUILD)/sfs_uefi.img: $(wildcard $(SFS_DIR)/*) tools/sfs_gen.py $(SFS_IMG) | $(BUILD)
 	$(PYTHON) tools/sfs_gen.py $(SFS_DIR) $@
+
+# =====================================================================
+#  Independent Linux user-space partition
+#  Packs linux_root/ into its own SFS volume, written to the BIOS disk
+#  at LINUX_SFS_LBA (after the main SFS volume, before the GGUF blob).
+#  The kernel mounts it as a second SFS and `linux <file>` reads ELF
+#  binaries from here first.
+# =====================================================================
+LINUX_ROOT     := linux_root
+LINUX_SFS_IMG  := $(BUILD)/linux_sfs.img
+# 12288 (6 MiB mark): main SFS grows past 8704 on the BIOS image, so 8704
+# would overlap it and clobber zfont.bin's tail.  12288 leaves ~2.8k sectors
+# of free space in the main SFS (usable by Sfs::create) before the Linux vol.
+LINUX_SFS_LBA  := 12288
+
+# Stage 6 dynamic-link test guest + libc.so are both packed into the Linux
+# SFS volume so `linux linux_dynlink` can load libc.so from there.
+$(LINUX_SFS_IMG): $(LINUX_ROOT)/python $(LINUX_ROOT)/linux_argv $(LINUX_ROOT)/linux_net $(LINUX_ROOT)/linux_dynlink $(LINUX_ROOT)/libc.so $(wildcard $(LINUX_ROOT)/*) tools/sfs_gen.py | $(BUILD)
+	$(PYTHON) tools/sfs_gen.py $(LINUX_ROOT) $@
 
 sfs: $(SFS_IMG)
 
@@ -231,14 +286,23 @@ PEFLAGS  = -O2 -nostdlib -ffreestanding -fno-asynchronous-unwind-tables \
 #  has moved to .attic64/ and is no longer built.  iexplore.exe is the
 #  browser, and MINGW64 is kept only so the attic can be rebuilt by hand.
 .PHONY: winpe
-winpe: winpe/iexplore.exe winpe/ntbrowser.exe
+winpe: winpe/iexplore.exe winpe/ntbrowser.exe winpe/notepad.exe
 	cp winpe/iexplore.exe $(SFS_DIR)/iexplore.exe
 	$(PYTHON) tools/pe_gap.py winpe/iexplore.exe
 	cp winpe/ntbrowser.exe $(SFS_DIR)/ntbrowser.exe
 	$(PYTHON) tools/pe_gap.py winpe/ntbrowser.exe
+	cp winpe/notepad.exe $(SFS_DIR)/notepad.exe
+	$(PYTHON) tools/pe_gap.py winpe/notepad.exe
 
 winpe/iexplore.exe: winpe/iexplore.c winpe/minipe.h
 	$(MINGW32) $(PEFLAGS) -Wl,--entry=_PeMain -Wl,--dynamicbase \
+	    -o $@ $< -lkernel32 -luser32 -lgdi32
+
+# notepad.exe: stage-2 Win32 demo -- a real 32-bit GUI program with a
+# white "edit" area and two BUTTON controls (Echo/Clear).  Proves the
+# user32/gdi32 L1->L2 jump: genuine windows, controls and message loop.
+winpe/notepad.exe: winpe/notepad.c
+	$(MINGW32) $(PEFLAGS) -Wl,--entry=_WinMainCRTStartup -Wl,--dynamicbase \
 	    -o $@ $< -lkernel32 -luser32 -lgdi32
 
 # ntbrowser.exe: the real networked NT browser (fetches via minios.dll
@@ -273,7 +337,9 @@ SHELL_SRC := csharp/apps/Shell/Shell.cs csharp/apps/Shell/Apps.cs \
              csharp/apps/Shell/AiSetup.cs csharp/apps/Shell/AiAgent.cs \
              csharp/apps/Shell/Login.cs \
              csharp/apps/Shell/Popup.cs \
-             csharp/NexOS.Forms/Forms.cs csharp/apps/Shell/Shell.csproj
+             csharp/apps/Shell/Demo.cs \
+             csharp/NexOS.Forms/Forms.cs csharp/NexOS.Forms/Voice.cs \
+             csharp/apps/Shell/Shell.csproj
 $(SFS_DIR)/shell.mex: $(SHELL_SRC) $(CS_CORE) tools/mex_pack.py
 	@if command -v dotnet >/dev/null 2>&1; then DN=dotnet; \
 	 elif command -v dotnet.exe >/dev/null 2>&1; then DN=dotnet.exe; \
@@ -328,21 +394,123 @@ $(SFS_DIR)/userdemo: tools/userdemo.S | $(SFS_DIR)
 	$(OBJCOPY) -O binary $(BUILD)/userdemo.elf $@
 
 # =====================================================================
-#  Disk image assembly
-#  boot + stage2 + kernel (32-bit) + SFS at LBA 3328, padded to 4 MiB
+#  NexOS native user programs (.nex) -- P1 basic runtime demo
+#  Freestanding ELF32 linked at NEX_TEXT (0x08048000) -- the guest load
+#  region INSIDE the 64-256 MiB PG_USER identity map that linux_run()
+#  (linux_compat.cpp) lays out for the ELF image / brk / strings / stack /
+#  mmap.  This keeps the guest clear of the 32-bit kernel boot stack, which
+#  linker.ld reserves at 0x1800000 (24 MiB) -- loading a guest at the old
+#  0x01800000 base overwrote the live kernel stack and corrupted the loader.
+#  A minimal libc (usr/libc.c) supplies printf / malloc / free / string.
+NEX_CC      ?= $(CC)
+NEX_LD      ?= $(LD)
+NEX_TEXT    := 0x08048000
+NEX_CFLAGS  := -x c -m32 -ffreestanding -nostdlib -fno-stack-protector -fno-pic \
+               -fno-pie -fno-asynchronous-unwind-tables -O2 -Wall -Wextra -Iusr
+NEX_LDFLAGS := -m elf_i386 -nostdlib -Ttext=$(NEX_TEXT) -e _start
+
+.PHONY: nex
+nex: $(SFS_DIR)/hello.nex
+
+$(SFS_DIR)/hello.nex: usr/libc.c usr/libc.h usr/hello.c | $(SFS_DIR)
+	$(NEX_CC) $(NEX_CFLAGS) -c usr/libc.c -o $(BUILD)/nex_libc.o
+	$(NEX_CC) $(NEX_CFLAGS) -c usr/hello.c -o $(BUILD)/nex_hello.o
+	$(NEX_LD) $(NEX_LDFLAGS) $(BUILD)/nex_libc.o $(BUILD)/nex_hello.o -o $@
+	@echo "==> NexOS app packed: $@ ($$(stat -c%s $@) bytes)"
+
+# Linux-compat Python-subset interpreter (Milestone: "AI writes Hello world").
+# Built as a freestanding ELF32 (same int 0x80 runtime as hello.nex) and
+# dropped into the independent Linux partition (linux_root/) so `linux python
+# hello_demo.py` loads it from there and opens its script from the main SFS.
+$(LINUX_ROOT)/python: usr/libc.c usr/libc.h usr/python.c | $(LINUX_ROOT)
+	$(NEX_CC) $(NEX_CFLAGS) -c usr/libc.c -o $(BUILD)/py_libc.o
+	$(NEX_CC) $(NEX_CFLAGS) -c usr/python.c -o $(BUILD)/py_python.o
+	$(NEX_LD) $(NEX_LDFLAGS) $(BUILD)/py_libc.o $(BUILD)/py_python.o -o $@
+	@echo "==> Linux Python interpreter packed: $@ ($$(stat -c%s $@) bytes)"
+
+# Stage 4 argv/envp transparency test (freestanding ELF32). Drops into the
+# independent Linux partition so `linux linux_argv ...` loads it from there.
+$(LINUX_ROOT)/linux_argv: usr/libc.c usr/libc.h usr/linux_argv.c | $(LINUX_ROOT)
+	$(NEX_CC) $(NEX_CFLAGS) -c usr/libc.c -o $(BUILD)/argv_libc.o
+	$(NEX_CC) $(NEX_CFLAGS) -c usr/linux_argv.c -o $(BUILD)/argv_linux_argv.o
+	$(NEX_LD) $(NEX_LDFLAGS) $(BUILD)/argv_libc.o $(BUILD)/argv_linux_argv.o -o $@
+	@echo "==> Linux argv/envp test packed: $@ ($$(stat -c%s $@) bytes)"
+
+# Stage 5 Linux socket bridge test (freestanding ELF32). Connects to a host
+# TCP echo server (10.0.2.2:18099 under QEMU user-net) via the 400-404
+# socket syscalls and verifies the round-trip echo.
+$(LINUX_ROOT)/linux_net: usr/libc.c usr/libc.h usr/linux_net.c | $(LINUX_ROOT)
+	$(NEX_CC) $(NEX_CFLAGS) -c usr/libc.c -o $(BUILD)/lnxnet_libc.o
+	$(NEX_CC) $(NEX_CFLAGS) -c usr/linux_net.c -o $(BUILD)/lnxnet_app.o
+	$(NEX_LD) $(NEX_LDFLAGS) $(BUILD)/lnxnet_libc.o $(BUILD)/lnxnet_app.o -o $@
+	@echo "==> Linux socket test packed: $@ ($$(stat -c%s $@) bytes)"
+
+# Stage 6 shared C runtime (libc.so) + dynamically-linked test guest.
+# libc.so is built -fPIC -shared (soname libc.so, sysv hash, BIND_NOW) so the
+# in-kernel ELF dynamic linker (linux_compat.cpp) can map it and resolve the
+# main's GLOB_DAT/PLT references against it.  _start is hidden in libc.c so
+# the guest can supply its own _start (dynlink_crt.c) without a clash.
+$(LINUX_ROOT)/libc.so: usr/libc_impl.c usr/libc.h | $(LINUX_ROOT)
+	$(NEX_CC) $(NEX_CFLAGS) -fPIC -fno-plt -c usr/libc_impl.c -o $(BUILD)/libc_pic.o
+	$(NEX_LD) -m elf_i386 -shared -nostdlib --soname=libc.so \
+	          --hash-style=sysv -z now -o $@ $(BUILD)/libc_pic.o
+	@echo "==> libc.so packed: $@ ($$(stat -c%s $@) bytes)"
+
+# Dynamically-linked guest: PIE main that DT_NEEDED=libc.so.  Calls
+# printf / nex_add through the GOT; the kernel linker loads it at 0x08048000
+# and resolves the R_386_GLOB_DAT references against libc.so.
+$(LINUX_ROOT)/linux_dynlink: usr/dynlink_crt.c usr/linux_dynlink.c usr/libc.h \
+                             $(LINUX_ROOT)/libc.so | $(LINUX_ROOT)
+	$(NEX_CC) -x c -m32 -ffreestanding -nostdlib -fno-stack-protector \
+	          -fno-asynchronous-unwind-tables -O2 -Wall -Wextra -Iusr \
+	          -fPIE -fno-plt -c usr/dynlink_crt.c -o $(BUILD)/dlcrt.o
+	$(NEX_CC) -x c -m32 -ffreestanding -nostdlib -fno-stack-protector \
+	          -fno-asynchronous-unwind-tables -O2 -Wall -Wextra -Iusr \
+	          -fPIE -fno-plt -c usr/linux_dynlink.c -o $(BUILD)/dlink_app.o
+	$(NEX_LD) -m elf_i386 -nostdlib -e _start --no-dynamic-linker -pie \
+	          -L$(LINUX_ROOT) -o $@ $(BUILD)/dlcrt.o $(BUILD)/dlink_app.o -lc
+	@echo "==> Linux dynamic-link test packed: $@ ($$(stat -c%s $@) bytes)"
+
 # =====================================================================
-$(IMG): $(BUILD)/boot.bin $(BUILD)/stage2.bin $(BUILD)/kernel.bin $(BUILD)/kernel64.bin $(SFS_IMG) | $(BUILD)
+#  Disk image assembly
+#  boot + stage2 + kernel (32-bit) + SFS at LBA 3488, padded to 4 MiB
+# =====================================================================
+$(IMG): $(BUILD)/boot.bin $(BUILD)/stage2.bin $(BUILD)/kernel.bin $(BUILD)/kernel64.bin $(SFS_IMG) $(LINUX_SFS_IMG) | $(BUILD)
 	cat $(BUILD)/boot.bin $(BUILD)/stage2.bin $(BUILD)/kernel.bin > $@
 	truncate -s 4M $@
+	# GUARD: kernel64.bin lives in the gap between LBA 2048 and the SFS at
+	# LBA $(SFS_LBA), and the 32-bit loader stages exactly KERNEL64_SECTORS
+	# sectors of it (kernel.cpp).  Outgrow either bound and the failure is
+	# SILENT: dd overwrites the filesystem, and/or the loader hands a
+	# truncated image to switch_to_64bit() which triple-faults.  That is the
+	# same "image grew into a hard-coded offset" class of bug as the 0x90000
+	# boot-stack collision, so make it a build error instead of a mystery.
+	@k64sz=$$(stat -c%s $(BUILD)/kernel64.bin); \
+	 secs=$$(sed -n 's/^#define[[:space:]]*KERNEL64_SECTORS[[:space:]]*\([0-9]*\).*/\1/p' kernel.cpp | head -1); \
+	 gap=$$(( ($(SFS_LBA) - 2048) * 512 )); \
+	 lim=$$(( $$secs * 512 )); \
+	 if [ $$lim -gt $$gap ]; then lim=$$gap; fi; \
+	 if [ $$k64sz -gt $$lim ]; then \
+	   echo "*** ERROR: kernel64.bin is $$k64sz bytes but only $$lim bytes are reachable."; \
+	   echo "***        KERNEL64_SECTORS=$$secs (kernel.cpp) => $$(( $$secs * 512 )) bytes;"; \
+	   echo "***        LBA 2048..$(SFS_LBA) gap => $$gap bytes."; \
+	   echo "***        Raise KERNEL64_SECTORS, and if it now exceeds the gap"; \
+	   echo "***        also push SFS_LBA (Makefile) and stage2/boot_cd out of the way."; \
+	   exit 1; \
+	 fi; \
+	 echo "    K64 fit:  $$k64sz / $$lim bytes ($$(( ($$lim - $$k64sz) / 512 )) spare sectors)"
 	# Write the 64-bit (long-mode) kernel at LBA 2048 so the 32-bit
 	# `switch` command can load it and transition to long mode.
 	dd if=$(BUILD)/kernel64.bin of=$@ bs=512 seek=2048 conv=notrunc 2>/dev/null
-	# Write SFS image at LBA 3328
+	# Write SFS image at LBA 3488
 	dd if=$(SFS_IMG) of=$@ bs=512 seek=$(SFS_LBA) conv=notrunc 2>/dev/null
+	# Write the independent Linux user-space partition after the main SFS
+	dd if=$(LINUX_SFS_IMG) of=$@ bs=512 seek=$(LINUX_SFS_LBA) conv=notrunc 2>/dev/null
 	@echo "==> BIOS Image built: $(IMG) ($$(stat -c%s $@) bytes)"
 	@echo "    Kernel32: $$(stat -c%s $(BUILD)/kernel.bin) bytes"
 	@echo "    Kernel64: $$(stat -c%s $(BUILD)/kernel64.bin) bytes at LBA 2048"
 	@echo "    SFS:      $$(stat -c%s $(SFS_IMG)) bytes at LBA $(SFS_LBA)"
+	@echo "    Linux FS: $$(stat -c%s $(LINUX_SFS_IMG)) bytes at LBA $(LINUX_SFS_LBA)"
 	@# Real GGUF weights are far larger than SFS can hold, so they go on the
 	@# disk as a bare blob after the filesystem (see tools/embed_model.py).
 	@if [ -f "$(MODEL_GGUF)" ]; then python3 tools/embed_model.py $@ $(MODEL_GGUF) $(MODEL_HDR_LBA) $(MODEL_DATA_LBA); \
@@ -416,46 +584,45 @@ uefi: $(UEFI_IMG)
 
 # =====================================================================
 #  UEFI diagnostic build (white-line hunter)
-#  Produces build/os_uefi_diag.img: a SEPARATE image that runs a raw
-#  framebuffer test pattern at GUI entry and halts, so the screen can be
-#  inspected / captured on real hardware (e.g. Iris Xe >4GB FB).
-#  Uses independent object/kernel/EFI images so the normal `uefi` build
-#  and its gui.o/bootuefi.o are never touched.
-#  Usage:
-#     make uefi-diag            -> vertical rainbow bars (real pitch)
-#     make uefi-diag FB_TEST=1  -> red square top-left (test 1: fb_base writable?)
-#     make uefi-diag FB_TEST=2  -> full-screen solid blue (test 3: range/pitch sanity)
-#     make uefi-diag FB_TEST=3  -> bars via width*4 pitch (test 2: does white line vanish?)
+#  Isolated from the normal `uefi` target.  Compiles gui.cpp with -DFB_DIAG
+#  (adds gui_fb_diag() + fb_diag_probe() that run at gui_enter and halt) and
+#  bootuefi.c with -DFB_DIAG (adds the [GOPF] serial log).  The diag kernel is
+#  linked with gui_diag.o in place of gui.o, temporarily substituted into the
+#  embedded kernel blob, then the normal kernel.blob/kernel_blob.o are restored
+#  so the `uefi` target is never touched.
+#  Output: build/os_uefi_diag.img (auto-boots as BOOTX64.EFI on real hw).
+#  Use:   make uefi-diag [FB_TEST=1|2|3]
 # =====================================================================
 UEFI_DIAG_IMG := $(BUILD)/os_uefi_diag.img
 
-# gui.cpp compiled with FB_DIAG (+ optional FB_TEST) -> separate object.
+DIAG_CXX := $(CC) $(CXXFLAGS) -DFB_DIAG
+ifdef FB_TEST
+DIAG_CXX += -DFB_TEST=$(FB_TEST)
+endif
+
 $(BUILD)/gui_diag.o: gui.cpp | $(BUILD)
-	$(CC) $(CXXFLAGS) -DFB_DIAG $(if $(FB_TEST),-DFB_TEST=$(FB_TEST),) -c gui.cpp -o $@
+	$(DIAG_CXX) -c gui.cpp -o $@
 
-# bootuefi.c compiled with FB_DIAG -> separate object (enables [GOPF] log).
 $(BUILD)/bootuefi_diag.o: uefi/bootuefi.c | $(BUILD)
-	gcc $(EFI_CFLAGS) -I. -DFB_DIAG $(if $(FB_TEST),-DFB_TEST=$(FB_TEST),) -c $< -o $@
+	$(CC) $(EFI_CFLAGS) -DFB_DIAG -c uefi/bootuefi.c -o $@
 
-# Diag kernel: same objects as the normal kernel but gui_diag.o instead of gui.o.
-$(BUILD)/kernel_diag.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/gui_diag.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o linker.ld | $(BUILD)
-	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/gui_diag.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o
+$(BUILD)/kernel_diag.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/gui_diag.o $(BUILD)/font_vec_stub.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o | $(BUILD)
+	$(LD) $(LDFLAGS) -o $@ $^
 
 $(BUILD)/kernel_diag.bin: $(BUILD)/kernel_diag.elf | $(BUILD)
 	$(OBJCOPY) -O binary $< $@
 
-$(BUILD)/kernel_diag_blob.o: $(BUILD)/kernel_diag.bin | $(BUILD)
-	cp $< $(BUILD)/kernel.blob
-	$(LD) -r -b binary -o $@ $(BUILD)/kernel.blob
-	cp $(BUILD)/kernel.bin $(BUILD)/kernel.blob
-
-$(BUILD)/bootx64_diag.so: $(BUILD)/bootuefi_diag.o $(BUILD)/enter_kernel_uefi.o $(BUILD)/get_embedded_uefi.o $(BUILD)/kernel_diag_blob.o | $(BUILD)
-	$(LD) $(EFI_LDFLAGS) $^ -o $@ -lefi -lgnuefi
+# Rebuild the embedded blob with the DIAG kernel, link, then restore the
+# normal kernel blob + object so `make uefi` stays intact.
+$(BUILD)/bootx64_diag.so: $(BUILD)/bootuefi_diag.o $(BUILD)/enter_kernel_uefi.o $(BUILD)/get_embedded_uefi.o $(BUILD)/kernel_diag.bin | $(BUILD)
+	cp -f $(BUILD)/kernel_diag.bin $(BUILD)/kernel.blob
+	$(LD) -r -b binary -o $(BUILD)/kernel_blob.o $(BUILD)/kernel.blob
+	$(LD) $(EFI_LDFLAGS) $(BUILD)/bootuefi_diag.o $(BUILD)/enter_kernel_uefi.o $(BUILD)/get_embedded_uefi.o $(BUILD)/kernel_blob.o -o $@ -lefi -lgnuefi
+	cp -f $(BUILD)/kernel.bin $(BUILD)/kernel.blob
+	$(LD) -r -b binary -o $(BUILD)/kernel_blob.o $(BUILD)/kernel.blob
 
 $(BUILD)/BOOTX64_DIAG.EFI: $(BUILD)/bootx64_diag.so tools/gen_reloc.py | $(BUILD)
-	$(OBJCOPY) -j .text -j .sdata -j .data -j .dynamic \
-	           -j .dynsym -j .dynstr \
-	           --target=efi-app-x86_64 $< $@
+	$(OBJCOPY) -j .text -j .sdata -j .data -j .dynamic -j .dynsym -j .dynstr --target=efi-app-x86_64 $< $@
 	$(PYTHON) tools/gen_reloc.py $(BUILD)/bootx64_diag.so $@
 
 $(BUILD)/esp_diag.img: $(BUILD)/BOOTX64_DIAG.EFI $(BUILD)/kernel_diag.bin $(SFS_IMG) | $(BUILD)
@@ -464,15 +631,108 @@ $(BUILD)/esp_diag.img: $(BUILD)/BOOTX64_DIAG.EFI $(BUILD)/kernel_diag.bin $(SFS_
 	mmd     -i $@ ::/EFI
 	mmd     -i $@ ::/EFI/BOOT
 	mcopy   -i $@ $(BUILD)/BOOTX64_DIAG.EFI ::/EFI/BOOT/BOOTX64.EFI
-	mcopy   -i $@ $(BUILD)/kernel_diag.bin   ::/kernel_diag.bin
-	@echo "==> ESP diag image built: $@"
+	mcopy   -i $@ $(BUILD)/kernel_diag.bin   ::/kernel.bin
 
 $(UEFI_DIAG_IMG): $(BUILD)/esp_diag.img $(BUILD)/sfs_uefi.img $(BUILD)/kernel64.bin tools/make_gpt_uefi.py | $(BUILD)
 	$(PYTHON) tools/make_gpt_uefi.py $(BUILD)/esp_diag.img $@ $(BUILD)/kernel64.bin $(BUILD)/sfs_uefi.img
-	@echo "==> UEFI Diag Image built: $@ (FB_TEST=$(FB_TEST))"
 
 uefi-diag: $(UEFI_DIAG_IMG)
-	@echo "Done. Burn $(UEFI_DIAG_IMG) to media and capture COM1 serial."
+	@echo "==> UEFI diagnostic image: $(UEFI_DIAG_IMG)"
+
+# =====================================================================
+#  Boot-logo load verification (kernel-level early logo)
+#  Independent chain: a kernel compiled with -DBOOT_LOGO_TEST draws a
+#  NexOS boot logo in kmain as the FIRST graphics-mode action (before the
+#  GUI compositor).  Lets you triage real hardware: logo visible => kernel
+#  loaded + framebuffer writable; no logo => kernel never reached graphics.
+#  Does NOT touch the normal kernel.o / gui.o / kernel.bin / kernel.blob.
+#  Output: build/os_uefi_logo.img (auto-boots as BOOTX64.EFI on real hw).
+#  Use:   make boot-logo
+# =====================================================================
+UEFI_LOGO_IMG := $(BUILD)/os_uefi_logo.img
+
+$(BUILD)/kernel_logo.o: kernel.cpp | $(BUILD)
+	$(CC) $(CXXFLAGS) -DBOOT_LOGO_TEST -c kernel.cpp -o $@
+
+$(BUILD)/kernel_logo.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_logo.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/gui.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o | $(BUILD)
+	$(LD) $(LDFLAGS) -o $@ $^
+
+$(BUILD)/kernel_logo.bin: $(BUILD)/kernel_logo.elf | $(BUILD)
+	$(OBJCOPY) -O binary $< $@
+
+# Embed the logo kernel into the blob, link, then restore the normal kernel
+# blob + object so `make uefi` stays intact.
+$(BUILD)/bootx64_logo.so: $(BUILD)/bootuefi.o $(BUILD)/enter_kernel_uefi.o $(BUILD)/get_embedded_uefi.o $(BUILD)/kernel_logo.bin | $(BUILD)
+	cp -f $(BUILD)/kernel_logo.bin $(BUILD)/kernel.blob
+	$(LD) -r -b binary -o $(BUILD)/kernel_blob.o $(BUILD)/kernel.blob
+	$(LD) $(EFI_LDFLAGS) $(BUILD)/bootuefi.o $(BUILD)/enter_kernel_uefi.o $(BUILD)/get_embedded_uefi.o $(BUILD)/kernel_blob.o -o $@ -lefi -lgnuefi
+	cp -f $(BUILD)/kernel.bin $(BUILD)/kernel.blob
+	$(LD) -r -b binary -o $(BUILD)/kernel_blob.o $(BUILD)/kernel.blob
+
+$(BUILD)/BOOTX64_LOGO.EFI: $(BUILD)/bootx64_logo.so tools/gen_reloc.py | $(BUILD)
+	$(OBJCOPY) -j .text -j .sdata -j .data -j .dynamic -j .dynsym -j .dynstr --target=efi-app-x86_64 $< $@
+	$(PYTHON) tools/gen_reloc.py $(BUILD)/bootx64_logo.so $@
+
+$(BUILD)/esp_logo.img: $(BUILD)/BOOTX64_LOGO.EFI $(BUILD)/kernel_logo.bin $(SFS_IMG) | $(BUILD)
+	dd if=/dev/zero of=$@ bs=1M count=16 2>/dev/null
+	mformat -i $@ ::
+	mmd     -i $@ ::/EFI
+	mmd     -i $@ ::/EFI/BOOT
+	mcopy   -i $@ $(BUILD)/BOOTX64_LOGO.EFI ::/EFI/BOOT/BOOTX64.EFI
+	mcopy   -i $@ $(BUILD)/kernel_logo.bin   ::/kernel.bin
+
+$(UEFI_LOGO_IMG): $(BUILD)/esp_logo.img $(BUILD)/sfs_uefi.img $(BUILD)/kernel64.bin tools/make_gpt_uefi.py | $(BUILD)
+	$(PYTHON) tools/make_gpt_uefi.py $(BUILD)/esp_logo.img $@ $(BUILD)/kernel64.bin $(BUILD)/sfs_uefi.img
+
+boot-logo: $(UEFI_LOGO_IMG)
+	@echo "==> UEFI boot-logo verification image: $(UEFI_LOGO_IMG)
+
+# =====================================================================
+#  Text-boot BIOS image (auto-GUI OFF) for headless security tests
+#  Builds kernel.cpp with -DTEXT_BOOT so g_auto_gui defaults to 0: the OS
+#  boots into the textual shell (text login, keyboard goes to the shell),
+#  while VBE stays active so `winapp <file.exe>` still enters the GUI on
+#  demand.  This is what test_perm_failsafe.py and test_win32_robust.py
+#  need -- they type commands at the shell and screendump the framebuffer,
+#  neither of which works once the OS boots straight into the desktop.
+#  Mirrors the kernel_logo.o pattern.  Does NOT touch kernel.o / kernel.bin
+#  / os.img, so the default auto-GUI image is unchanged.
+#  Output: build/os_textboot.img   Use:  make textboot
+# =====================================================================
+TEXTBOOT_IMG := $(BUILD)/os_textboot.img
+
+$(BUILD)/kernel_textboot.o: kernel.cpp | $(BUILD)
+	$(CC) $(CXXFLAGS) -DTEXT_BOOT -c kernel.cpp -o $@
+
+$(BUILD)/kernel_textboot.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_textboot.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/gui.o $(BUILD)/font_vec_stub.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o | $(BUILD)
+	$(LD) $(LDFLAGS) -o $@ $^
+
+$(BUILD)/kernel_textboot.bin: $(BUILD)/kernel_textboot.elf | $(BUILD)
+	$(OBJCOPY) -O binary $< $@
+	@sz=$$(stat -c%s $@); \
+	 if [ $$sz -gt 622592 ]; then \
+	   echo "*** ERROR: kernel_textboot.bin is $$sz bytes (> 608 KiB / 0x98000)."; \
+	   echo "***        stage2.asm loads only KERNEL_SECTORS=1216 sectors."; \
+	   rm -f $@; exit 1; \
+	 elif [ $$sz -gt 560332 ]; then \
+	   echo "    [warn] kernel_textboot.bin $$sz bytes: >90% of the 608 KiB load window"; \
+	 fi
+
+# Same BIOS disk layout as os.img, but with the text-boot kernel.
+$(TEXTBOOT_IMG): $(BUILD)/boot.bin $(BUILD)/stage2.bin $(BUILD)/kernel_textboot.bin $(BUILD)/kernel64.bin $(SFS_IMG) $(LINUX_SFS_IMG) | $(BUILD)
+	cat $(BUILD)/boot.bin $(BUILD)/stage2.bin $(BUILD)/kernel_textboot.bin > $@
+	truncate -s 4M $@
+	dd if=$(BUILD)/kernel64.bin of=$@ bs=512 seek=2048 conv=notrunc 2>/dev/null
+	dd if=$(SFS_IMG) of=$@ bs=512 seek=$(SFS_LBA) conv=notrunc 2>/dev/null
+	dd if=$(LINUX_SFS_IMG) of=$@ bs=512 seek=$(LINUX_SFS_LBA) conv=notrunc 2>/dev/null
+	@echo "==> Linux FS written at LBA $(LINUX_SFS_LBA)"
+	@# NOTE: deliberately NO model embedding here.  The text-boot image is a
+	@# headless shell-test vehicle; embedding the 941 MB test_model.gguf
+	@# bloats it to ~1 GB and blows the C: drive when test scripts copy it.
+	@echo "==> Text-boot BIOS Image built: $(TEXTBOOT_IMG) ($$(stat -c%s $@) bytes)"
+
+textboot: $(TEXTBOOT_IMG)
+	@echo "==> Text-boot image ready: $(TEXTBOOT_IMG)"
 
 # =====================================================================
 #  ISO build (BIOS no-emulation + UEFI for CD/DVD and USB)
@@ -485,9 +745,18 @@ uefi-diag: $(UEFI_DIAG_IMG)
 $(BUILD)/boot_cd.bin: boot_cd.asm | $(BUILD)
 	$(AS) $(ASFLAGS_BIN) boot_cd.asm -o $@
 
-# ----- CD boot image (boot_cd.bin + kernel, 2048-byte aligned) -----
-$(BUILD)/cd_boot.img: $(BUILD)/boot_cd.bin $(BUILD)/kernel.bin tools/make_cd_boot.py | $(BUILD)
-	$(PYTHON) tools/make_cd_boot.py $(BUILD)/boot_cd.bin $(BUILD)/kernel.bin $@
+# ----- Texture-free SFS for the CD/ISO boot path -----
+# The BIOS CD boot has no ATA disk to hold SFS, so boot_cd.asm streams this
+# image off the CD into high RAM.  Textures (tex_*) are only used by the
+# native fallback drawer, never by the managed C# shell, so they are excluded
+# to keep the embedded image small.
+$(BUILD)/sfs_cd.img: $(wildcard $(SFS_DIR)/*) tools/sfs_gen.py tools/tex_pack.py $(SFS_DIR)/shell.mex | $(BUILD)
+	$(PYTHON) tools/tex_pack.py
+	$(PYTHON) tools/sfs_gen.py $(SFS_DIR) $@ --exclude-tex
+
+# ----- CD boot image (boot_cd.bin + kernel + texture-free SFS, 2048-byte aligned) -----
+$(BUILD)/cd_boot.img: $(BUILD)/boot_cd.bin $(BUILD)/kernel.bin $(BUILD)/sfs_cd.img tools/make_cd_boot.py | $(BUILD)
+	$(PYTHON) tools/make_cd_boot.py $(BUILD)/boot_cd.bin $(BUILD)/kernel.bin $@ $(BUILD)/sfs_cd.img
 
 # ----- Prepare ISO root directory -----
 # Includes /EFI/BOOT/BOOTX64.EFI in ISO9660 filesystem as a fallback for
@@ -593,12 +862,20 @@ switch64: $(IMG)
 # exist, GUIENV stays empty, and GTK keeps whatever backend the user prefers.
 GUIENV := $(shell [ -d /mnt/wslg ] && echo GDK_BACKEND=x11 SDL_VIDEODRIVER=x11)
 
+# Display backend: the Windows build of QEMU 11.x ships a GTK frontend that
+# throws  "gtk_window_set_mnemonics_visible: assertion 'GTK_IS_WINDOW (window)'
+# failed"  and then renders a black/blank window.  SDL is the stable backend on
+# native Windows, so default to it unless we are inside WSLg (where GTK+X11 is
+# the intended path).  Override on the command line if you really want GTK:
+#   make play DISPLAY_BACKEND=gtk
+DISPLAY_BACKEND := $(shell [ -d /mnt/wslg ] && echo gtk || echo sdl)
+
 # ----- UEFI: run in a QEMU window (default target) -----
 run: $(UEFI_IMG)
 	cp $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
 	$(GUIENV) qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
-		-drive format=raw,file=$(UEFI_IMG) -m 64M
+		-drive format=raw,file=$(UEFI_IMG) -m 64M -display $(DISPLAY_BACKEND)
 
 # ----- BIOS: run in a QEMU window (legacy) -----
 # NOTE: -m 4096 is used so the 64-bit kernel can map GB-scale model weights
@@ -607,6 +884,7 @@ run: $(UEFI_IMG)
 # no backing RAM and the `user` command faults.
 bios-run: $(IMG)
 	$(GUIENV) qemu-system-x86_64 -drive format=raw,file=$(IMG) -m 4096 \
+		-display $(DISPLAY_BACKEND) \
 		-net nic,model=ne2k_isa -net user,hostfwd=tcp::8080-:8080
 
 # =====================================================================
@@ -621,24 +899,24 @@ play: $(IMG)
 	@echo "try:   user | vfs /system/passwd | perm | perm reset | help"
 	@echo "quit:  close the window, or Ctrl-A X in the terminal"
 	$(GUIENV) qemu-system-x86_64 -drive format=raw,file=$(IMG) -m 4096 \
-		-vga std -display gtk -serial mon:stdio -no-reboot
+		-vga std -display $(DISPLAY_BACKEND) -serial mon:stdio -no-reboot
 
 # Fallback for the rare box where even XWayland misbehaves: SDL instead of GTK.
 #   make play-sdl
-play-sdl: $(IMG)
+play-sdl: $(ISO)
 	@echo "=== NexOS interactive session (SDL backend) ==="
 	@echo "login: root / admin   |   then type 'gui' for the Win11 desktop"
-	$(GUIENV) qemu-system-x86_64 -drive format=raw,file=$(IMG) -m 4096 \
+	$(GUIENV) qemu-system-x86_64 -cdrom $(ISO) -boot d -m 4096 \
 		-vga std -display sdl -serial mon:stdio -no-reboot
 
 # Last resort when no local display works at all (headless host, SSH, broken
 # WSLg). Serves the screen over VNC on 127.0.0.1:5900 -- connect with any VNC
 # client (Windows: TightVNC / RealVNC / mstsc-alternatives).
 #   make play-vnc
-play-vnc: $(IMG)
+play-vnc: $(ISO)
 	@echo "=== NexOS over VNC -- connect a VNC client to 127.0.0.1:5900 ==="
 	@echo "login: root / admin   |   then type 'gui' for the Win11 desktop"
-	qemu-system-x86_64 -drive format=raw,file=$(IMG) -m 4096 \
+	qemu-system-x86_64 -cdrom $(ISO) -boot d -m 4096 \
 		-vga std -display vnc=127.0.0.1:0 -serial mon:stdio -no-reboot
 
 # Inject local files (.exe/.zip/.bat/.com/...) and drive them headlessly.
@@ -647,17 +925,22 @@ inject: $(IMG)
 	python3 tools/vm_inject_test.py $(FILES)
 
 # ----- Security / Foundation 0 test suite -----
+# test-f0 boots the normal os.img with -vga none (g_vbe_active=false => text
+# shell), so it needs no special variant.  test-fail / test-w32 need the
+# text-boot image (auto-GUI OFF) so the shell is reachable and the VBE
+# framebuffer can still be screendumped / entered on demand.
 test-f0:   $(IMG) ; python3 tools/test_foundation0.py
-test-fail: $(IMG) ; python3 tools/test_perm_failsafe.py
-test-w32:  $(IMG) ; python3 tools/test_win32_robust.py
+test-fail: $(TEXTBOOT_IMG) ; python3 tools/test_perm_failsafe.py
+test-w32:  $(TEXTBOOT_IMG) ; python3 tools/test_win32_robust.py
 test-clr:   $(IMG) ; python3 tools/test_clr.py
 test-rclick:$(IMG) ; python3 tools/test_rclick.py
 
 # Run the whole security suite in sequence (sleeps let QEMU release its port).
-test-sec: $(IMG)
+# f0 uses the normal image; the two GUI-sensitive tests use the text-boot one.
+test-sec: $(IMG) $(TEXTBOOT_IMG)
 	@python3 tools/test_foundation0.py    && sleep 2 \
-	&& python3 tools/test_perm_failsafe.py && sleep 2 \
-	&& python3 tools/test_win32_robust.py \
+	&& python3 tools/test_perm_failsafe.py $(TEXTBOOT_IMG) && sleep 2 \
+	&& python3 tools/test_win32_robust.py $(TEXTBOOT_IMG) \
 	&& echo "" && echo "=== ALL SECURITY TESTS PASSED ==="
 
 # ----- GGUF inference: host-side numeric cross-check -----
@@ -684,6 +967,11 @@ test: $(UEFI_IMG)
 # ----- BIOS: automated headless test (legacy) -----
 bios-test: $(IMG)
 	./test.sh $(IMG)
+
+# ----- Disk write: raw ATA round-trip + SFS file round-trip (headless) -----
+# Writes go to a throwaway copy (build/disk_rw.img); os.img itself is untouched.
+test-diskrw: $(IMG)
+	$(PYTHON) tools/test_disk_rw.py $(IMG)
 
 # ----- AI engine: automated headless test -----
 test-ai: $(IMG)
@@ -794,53 +1082,85 @@ $(BUILD)/switch32to64.o: .attic64/switch32to64.asm | $(BUILD)
 	$(AS) $(ASFLAGS_ELF) -o $@ .attic64/switch32to64.asm
 
 $(BUILD)/kernel64.o: .attic64/kernel64.cpp | $(BUILD)
-	$(CC) $(CXX64FLAGS) -c .attic64/kernel64.cpp -o $@
+	$(CC64) $(CXX64FLAGS) -c .attic64/kernel64.cpp -o $@
 
-$(BUILD)/gui64.o: gui.cpp | $(BUILD)
-	$(CC) $(CXX64FLAGS) -c gui.cpp -o $@
+$(BUILD)/gui64.o: gui.cpp logo.h font_vec.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c gui.cpp -o $@
 
 $(BUILD)/ai_engine64.o: ai_engine.cpp | $(BUILD)
-	$(CC) $(CXX64FLAGS) -c ai_engine.cpp -o $@
+	$(CC64) $(CXX64FLAGS) -c ai_engine.cpp -o $@
+
+$(BUILD)/kb64.o: kb.cpp kb.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c kb.cpp -o $@
+
+# Plugin catalogue / manager (Settings > Plugins UI backend + `plugin` cmd).
+$(BUILD)/ai_plugin64.o: ai_plugin.cpp ai_plugin.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c ai_plugin.cpp -o $@
 
 $(BUILD)/gguf64.o: gguf.cpp gguf.h | $(BUILD)
-	$(CC) $(CXX64FLAGS) -c gguf.cpp -o $@
+	$(CC64) $(CXX64FLAGS) -c gguf.cpp -o $@
 
 # Real GGUF inference is 64-bit only: GB-scale weights need the 4 GiB PMM pool
 # and the 1 GiB-page identity map that long mode provides.
 $(BUILD)/gguf_infer64.o: gguf_infer.cpp gguf_infer.h gguf.h | $(BUILD)
-	$(CC) $(CXX64FLAGS) -c gguf_infer.cpp -o $@
+	$(CC64) $(CXX64FLAGS) -c gguf_infer.cpp -o $@
+
+# Phase 0 ggml adapter layer (Route A): memory / file / gguf-loader backends.
+# Freestanding 64-bit C, compiled with the same CC64 driver as the rest of
+# the long-mode kernel.
+$(BUILD)/memory_adapter64.o: memory_adapter.c memory_adapter.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c memory_adapter.c -o $@
+
+$(BUILD)/file_adapter64.o: file_adapter.c file_adapter.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c file_adapter.c -o $@
+
+$(BUILD)/gguf_loader64.o: gguf_loader.c gguf_loader.h file_adapter.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c gguf_loader.c -o $@
+
+# In-kernel verified-fact knowledge base (truth-from-practice + authoritative
+# fallback). Feeds kb_build_prompt() into the chat path (cmd_ask / demo harness).
+$(BUILD)/knowledge_base64.o: knowledge_base.c knowledge_base.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c knowledge_base.c -o $@
 
 $(BUILD)/net64.o: net.cpp | $(BUILD)
-	$(CC) $(CXX64FLAGS) -c net.cpp -o $@
+	$(CC64) $(CXX64FLAGS) -c net.cpp -o $@
+
+# Distributed compute fabric (discovery + task dispatch + AI inference task).
+$(BUILD)/distnet64.o: distnet.cpp distnet.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c distnet.cpp -o $@
 
 $(BUILD)/winloader64.o: winloader.cpp | $(BUILD)
-	$(CC) $(CXX64FLAGS) -c winloader.cpp -o $@
+	$(CC64) $(CXX64FLAGS) -c winloader.cpp -o $@
 
 $(BUILD)/win32_64.o: win32.cpp | $(BUILD)
-	$(CC) $(CXX64FLAGS) -c win32.cpp -o $@
+	$(CC64) $(CXX64FLAGS) -c win32.cpp -o $@
 
 $(BUILD)/gdt64.o: gdt.cpp | $(BUILD)
-	$(CC) $(CXX64FLAGS) -c gdt.cpp -o $@
+	$(CC64) $(CXX64FLAGS) -c gdt.cpp -o $@
 
 $(BUILD)/proc64.o: proc.cpp | $(BUILD)
-	$(CC) $(CXX64FLAGS) -c proc.cpp -o $@
+	$(CC64) $(CXX64FLAGS) -c proc.cpp -o $@
 
 $(BUILD)/vfs64.o: vfs.cpp | $(BUILD)
-	$(CC) $(CXX64FLAGS) -c vfs.cpp -o $@
+	$(CC64) $(CXX64FLAGS) -c vfs.cpp -o $@
 
 $(BUILD)/perm64.o: perm.cpp | $(BUILD)
-	$(CC) $(CXX64FLAGS) -c perm.cpp -o $@
+	$(CC64) $(CXX64FLAGS) -c perm.cpp -o $@
 
 $(BUILD)/clr64.o: clr.cpp | $(BUILD)
-	$(CC) $(CXX64FLAGS) -c clr.cpp -o $@
+	$(CC64) $(CXX64FLAGS) -c clr.cpp -o $@
 
 $(BUILD)/mforms64.o: mforms.cpp | $(BUILD)
-	$(CC) $(CXX64FLAGS) -fno-optimize-sibling-calls -c mforms.cpp -o $@
+	$(CC64) $(CXX64FLAGS) -fno-optimize-sibling-calls -c mforms.cpp -o $@
 
 # ----- Link 64-bit kernel ELF (entry64.o first => _start64 at 0x100000) -----
-$(BUILD)/kernel64.elf: $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/ai_engine64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/net64.o $(BUILD)/gui64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o .attic64/linker64.ld | $(BUILD)
-	$(LD64) $(LDFLAGS64) -o $@ $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/ai_engine64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/net64.o $(BUILD)/gui64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o
+$(BUILD)/kernel64.elf: $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/font_vec64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o .attic64/linker64.ld | $(BUILD)
+	$(LD64) $(LDFLAGS64) -o $@ $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/font_vec64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o
 
 # ----- Extract flat 64-bit kernel binary -----
+# A 32-bit (i686-elf) objcopy cannot read the ELF64 input, so the 64-bit
+# binutils objcopy must be used here (OBJCOPY64).  On multilib Linux builds
+# OBJCOPY64 defaults to $(OBJCOPY) and everything is one toolchain.
+OBJCOPY64 ?= $(OBJCOPY)
 $(BUILD)/kernel64.bin: $(BUILD)/kernel64.elf | $(BUILD)
-	$(OBJCOPY) -O binary $< $@
+	$(OBJCOPY64) -O binary $< $@
