@@ -25,7 +25,67 @@
 
 #define KERNEL_LOAD_ADDR 0x10000ULL
 #define VBE_INFO_ADDR    0x5000ULL
-#define STACK_ADDR       0x90000ULL
+/* Boot scratch region reserved by linker.ld's .lmboot block:
+ *   LMBOOT_BASE + 0x00000 .. +0x10000   32-bit boot stack (grows down from top)
+ *   LMBOOT_BASE + 0x10000 .. +0x18000   long-mode page tables (PML4/PDPT/...)
+ *   LMBOOT_BASE + 0x18000 .. +0x28000   64-bit boot stack
+ * STACK_ADDR is the 32-bit stack TOP that enter_kernel.S loads into ESP.
+ * It was 0x90000, which now lands inside the kernel image -- see the
+ * AllocatePages call below for the full story.
+ * COUPLING: keep in sync with linker.ld and .attic64/kernel64.cpp. */
+#define LMBOOT_BASE      0x1800000ULL
+#define LMBOOT_SIZE      0x0030000ULL
+#define STACK_ADDR       (LMBOOT_BASE + 0x10000ULL)
+/* 64-bit kernel handoff:
+ *   - Loaded to K64_LOAD_ADDR (20 MiB), ABOVE the 32-bit kmalloc heap
+ *     (3-19 MiB) so the two never collide, and below the 32-MiB cap the
+ *     32-bit switch path requires for the staging buffer.
+ *   - A small struct at K64_HANDOFF_ADDR (0x7000, below the kernel at
+ *     0x10000, in the free boot-params zone) tells the 32-bit kernel the
+ *     64-bit image is preloaded so it must NOT use its (UEFI-broken) ATA
+ *     read. */
+#define K64_LOAD_ADDR    0x1400000ULL
+#define K64_HANDOFF_ADDR 0x7000ULL
+#define K64_HANDOFF_MAGIC 0x4B36344EULL  /* "K64N" */
+
+struct __attribute__((packed)) k64_handoff {
+    UINT32 magic;   /* K64_HANDOFF_MAGIC */
+    UINT32 phys;    /* physical address of loaded 64-bit kernel */
+    UINT32 size;    /* size in bytes */
+};
+
+/* ---- RAM-backed SFS handoff -------------------------------------------
+ *  Under UEFI (q35/AHCI) the kernels' legacy IDE PIO ata_read_sector()
+ *  reads all zeros, so Sfs::init() never finds the "SFS\0" superblock.
+ *  Consequence: shell.mex is reported "file not found", the managed Win11
+ *  shell draws nothing and the screen stays black.
+ *
+ *  Fix: embed the whole SFS image in this EFI binary, stage it into RAM
+ *  before ExitBootServices, and publish {magic, base, size} at 0x0900 --
+ *  exactly the handoff the 32-bit CD-boot path already defines, so BOTH
+ *  the 32-bit and the 64-bit kernel pick it up with no protocol change.
+ *
+ *  Address choice 0x50000000 (1280 MiB): above the 32-bit PMM ceiling
+ *  (256 MiB) and above the 64-bit PMM ceiling (~1 GiB), so neither
+ *  kernel's page allocator can ever hand this region out.
+ */
+#define SFS_RAM_ADDR      0x50000000ULL
+#define SFS_HANDOFF_ADDR  0x0900ULL
+#define SFS_RAM_MAGIC     0xC0DE5A5FUL
+
+struct __attribute__((packed)) sfs_handoff {
+    UINT32 magic;   /* SFS_RAM_MAGIC */
+    UINT32 base;    /* physical address of the SFS image in RAM */
+    UINT32 size;    /* size in bytes */
+};
+
+/* Embedded 64-bit kernel blob (linked via tools/build_uefi_gnuefi_free.sh) */
+extern const unsigned char _binary_build_kernel64_blob_start[];
+extern const unsigned char _binary_build_kernel64_blob_end[];
+
+/* Embedded SFS filesystem image blob (same build script, step [1c]) */
+extern const unsigned char _binary_build_sfs_blob_start[];
+extern const unsigned char _binary_build_sfs_blob_end[];
 
 /* VBE info structure (at physical address 0x5000, set by stage2 in BIOS path)
  *
@@ -109,6 +169,16 @@ static void inline_memcpy(void *dst, const void *src, UINTN n) {
 /* File-scope VbeInfo backup - accessible after ExitBootServices */
 static struct VbeInfo g_vbe_backup;
 static int g_vbe_valid = 0;
+
+/* File-scope 64-bit kernel handoff backup - accessible after ExitBootServices */
+static struct k64_handoff g_k64;
+static int g_k64_valid = 0;
+static int g_k64_at_final = 0;
+static EFI_PHYSICAL_ADDRESS g_k64_temp = 0;
+
+/* File-scope RAM-SFS handoff backup - accessible after ExitBootServices */
+static struct sfs_handoff g_sfs;
+static int g_sfs_valid = 0;
 
 EFI_STATUS efi_main(EFI_HANDLE Image, EFI_SYSTEM_TABLE *SystemTable)
 {
@@ -195,6 +265,111 @@ EFI_STATUS efi_main(EFI_HANDLE Image, EFI_SYSTEM_TABLE *SystemTable)
     }
 
     /* ===========================================================
+     *  Step 1b: Preload 64-bit kernel from embedded blob
+     * ===========================================================
+     *  The 32-bit kernel's own ATA driver reads garbage (all zeros)
+     *  under UEFI, so we stage the 64-bit image here and hand its
+     *  address off at 0x7000.  The 32-bit switch path then blits it
+     *  from this known-good buffer instead of re-reading the disk.
+     */
+    {
+        UINTN k64_size = (UINTN)(_binary_build_kernel64_blob_end -
+                                 _binary_build_kernel64_blob_start);
+        EFI_PHYSICAL_ADDRESS k64_target = K64_LOAD_ADDR;
+        int k64_at_final = 0;
+        EFI_PHYSICAL_ADDRESS k64_temp = 0;
+        UINTN k64_pages = (k64_size + 4095) / 4096;
+
+        EFI_STATUS k64st = bs->AllocatePages(
+            AllocateAddress, EfiLoaderData, k64_pages, &k64_target);
+        if (!EFI_ERROR(k64st)) {
+            bs->CopyMem((VOID *)K64_LOAD_ADDR,
+                        (VOID *)_binary_build_kernel64_blob_start, k64_size);
+            k64_at_final = 1;
+            Print(L"      K64 preloaded @0x1400000 (%d bytes)\r\n", k64_size);
+        } else {
+            k64_temp = 0;
+            EFI_STATUS alt = bs->AllocatePages(
+                AllocateAnyPages, EfiLoaderData, k64_pages, &k64_temp);
+            if (!EFI_ERROR(alt)) {
+                bs->CopyMem((VOID *)k64_temp,
+                            (VOID *)_binary_build_kernel64_blob_start, k64_size);
+                Print(L"      K64 temp @0x%lx, will relocate post-ExitBS\r\n", k64_temp);
+            } else {
+                Print(L"      *** K64 preload FAILED ***\r\n");
+            }
+        }
+
+        /* Stash handoff info for post-ExitBootServices write to 0x7000 */
+        g_k64.magic = (UINT32)K64_HANDOFF_MAGIC;
+        g_k64.phys  = (UINT32)K64_LOAD_ADDR;
+        g_k64.size  = (UINT32)k64_size;
+        g_k64_valid = 1;
+        g_k64_at_final = k64_at_final;
+        g_k64_temp = k64_temp;
+    }
+
+    /* ===========================================================
+     *  Step 1c: Preload the SFS filesystem image into RAM
+     * ===========================================================
+     *  Legacy IDE PIO (ata_read_sector) returns all zeros on the q35/AHCI
+     *  machines UEFI runs on, so neither kernel can mount SFS from disk and
+     *  shell.mex -- the managed Win11 shell -- is never found (black screen).
+     *  Stage the embedded image in RAM here; the handoff at 0x0900 is written
+     *  after ExitBootServices (Step 4).
+     */
+    {
+        UINTN sfs_size = (UINTN)(_binary_build_sfs_blob_end -
+                                 _binary_build_sfs_blob_start);
+        UINTN sfs_pages = (sfs_size + 4095) / 4096;
+        EFI_PHYSICAL_ADDRESS sfs_target = SFS_RAM_ADDR;
+
+        EFI_STATUS sst = bs->AllocatePages(
+            AllocateAddress, EfiLoaderData, sfs_pages, &sfs_target);
+
+        if (!EFI_ERROR(sst)) {
+            bs->CopyMem((VOID *)SFS_RAM_ADDR,
+                        (VOID *)_binary_build_sfs_blob_start, sfs_size);
+            g_sfs.base  = (UINT32)SFS_RAM_ADDR;
+            g_sfs.size  = (UINT32)sfs_size;
+            g_sfs.magic = (UINT32)SFS_RAM_MAGIC;
+            g_sfs_valid = 1;
+            Print(L"      SFS staged @0x50000000 (%d bytes)\r\n", sfs_size);
+        } else {
+            /* 0x50000000 unavailable (small-RAM box or firmware squatting).
+             * Fall back to anywhere BELOW 4 GiB -- the 32-bit kernel reads the
+             * image through a 32-bit pointer -- and use the buffer in place
+             * instead of relocating, so we never write to RAM that may not
+             * exist.  The 64-bit kernel reserves this exact range in its PMM
+             * from the handoff, so the allocator cannot recycle it. */
+            EFI_PHYSICAL_ADDRESS any = 0xFFFFF000ULL;
+            EFI_STATUS alt = bs->AllocatePages(
+                AllocateMaxAddress, EfiLoaderData, sfs_pages, &any);
+            if (!EFI_ERROR(alt)) {
+                bs->CopyMem((VOID *)any,
+                            (VOID *)_binary_build_sfs_blob_start, sfs_size);
+                g_sfs.base  = (UINT32)any;
+                g_sfs.size  = (UINT32)sfs_size;
+                g_sfs.magic = (UINT32)SFS_RAM_MAGIC;
+                g_sfs_valid = 1;
+                Print(L"      SFS staged @0x%lx (fallback, %d bytes)\r\n",
+                      any, sfs_size);
+            } else {
+                Print(L"      *** SFS preload FAILED - GUI will be blank ***\r\n");
+                g_sfs_valid = 0;
+            }
+        }
+
+        /* Serial trace so headless runs can confirm the staging address */
+        SERIAL_PUTC('['); SERIAL_PUTC('S'); SERIAL_PUTC('F');
+        SERIAL_PUTC('S'); SERIAL_PUTC(']'); SERIAL_PUTC(' ');
+        SERIAL_PUTHEX32(g_sfs.base);
+        SERIAL_PUTC(' ');
+        SERIAL_PUTHEX32(g_sfs.size);
+        SERIAL_PUTC('\n');
+    }
+
+    /* ===========================================================
      *  Step 2: Set up graphics (GOP)
      * =========================================================== */
     Print(L"\r\n[2/5] Setting up graphics mode\r\n");
@@ -212,14 +387,33 @@ EFI_STATUS efi_main(EFI_HANDLE Image, EFI_SYSTEM_TABLE *SystemTable)
         vbe_at_final = 0;
     }
 
-    /* ---- Allocate stack at 0x90000 ---- */
-    EFI_PHYSICAL_ADDRESS stack_addr_val = STACK_ADDR;
-    EFI_STATUS stack_alloc = bs->AllocatePages(
-        AllocateAddress, EfiLoaderData, 1, &stack_addr_val);
-    if (!EFI_ERROR(stack_alloc)) {
-        Print(L"      Stack at 0x90000 allocated\r\n");
+    /* ---- Reserve the boot scratch region (.lmboot) ----------------------
+     *  enter_kernel.S's 32-bit stack USED to be 0x90000, which stopped being
+     *  safe once the flat kernel image grew to 0x90568: the stack grew DOWN
+     *  from 0x90000 straight into .data, where gdt64/gdt64_desc sit only 512
+     *  bytes below.  switch_to_64bit's `lgdt` then loaded a shredded GDT and
+     *  `mov ss, 0x10` #GP'd -> triple fault + reboot loop.
+     *
+     *  linker.ld now reserves LMBOOT_BASE..+LMBOOT_SIZE for the 32-bit boot
+     *  stack, the long-mode page tables and the 64-bit boot stack.  We ask
+     *  UEFI for it here as well, for two reasons:
+     *    1. If the firmware has something live there (its own image, its
+     *       stack, a runtime service) the allocation FAILS and we get a loud
+     *       warning instead of a mystery reboot on real hardware.
+     *    2. On success the firmware will not hand the range to anything else
+     *       between now and ExitBootServices.
+     *  COUPLING: LMBOOT_* must match the .lmboot block in linker.ld and
+     *  LMBOOT_BASE/LMBOOT_SIZE in .attic64/kernel64.cpp. */
+    EFI_PHYSICAL_ADDRESS lmboot_addr = LMBOOT_BASE;
+    EFI_STATUS lmboot_alloc = bs->AllocatePages(
+        AllocateAddress, EfiLoaderData, LMBOOT_SIZE / 4096, &lmboot_addr);
+    if (!EFI_ERROR(lmboot_alloc)) {
+        Print(L"      Boot scratch (stacks+PML4) reserved at 0x%lx\r\n",
+              (UINT64)LMBOOT_BASE);
     } else {
-        Print(L"      0x90000 alloc failed (OK - will use after ExitBS)\r\n");
+        Print(L"      WARNING: 0x%lx reserve FAILED - firmware may own it;\r\n",
+              (UINT64)LMBOOT_BASE);
+        Print(L"               page tables/stacks will still be written after ExitBS\r\n");
     }
 
     /* ---- GOP setup ---- */
@@ -237,7 +431,7 @@ EFI_STATUS efi_main(EFI_HANDLE Image, EFI_SYSTEM_TABLE *SystemTable)
             UINT32 pxformat = PXF_BGRX32;
             UINT8  bpp_val = 32;
 
-            /* ---- Determine pixel format and bpp ---- */
+            /* ---- Determine pixel format and bpp from the CURRENT mode ---- */
             switch (ginfo->PixelFormat) {
             case PixelBlueGreenRedReserved8BitPerColor:
                 pxformat = PXF_BGRX32;
@@ -266,54 +460,23 @@ EFI_STATUS efi_main(EFI_HANDLE Image, EFI_SYSTEM_TABLE *SystemTable)
             case PixelBltOnly:
                 pxformat = PXF_BLT_ONLY;
                 bpp_val = 0;
-                Print(L"      GOP is BltOnly - searching for LFB mode\r\n");
-                {
-                    /* Prefer a COMPACT resolution (<= 1280x800) so the emulator
-                     * window stays smaller than the host screen. Only if no such
-                     * mode exists do we accept the smallest oversized one. */
-                    UINTN best_mode = 0xFFFFFFFF;
-                    UINT32 best_area = 0;          /* largest area within cap  */
-                    UINTN small_mode = 0xFFFFFFFF;
-                    UINT32 small_area = 0xFFFFFFFFu; /* smallest area overall  */
-                    const UINT32 AREA_CAP = 1280u * 800u;
-                    UINTN mi;
-                    for (mi = 0; mi < gop->Mode->MaxMode; mi++) {
-                        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *m_info = NULL;
-                        UINTN size_of_info = 0;
-                        EFI_STATUS st = gop->QueryMode(gop, mi, &size_of_info, &m_info);
-                        if (EFI_ERROR(st) || !m_info) continue;
-                        if (m_info->PixelFormat == PixelBltOnly) {
-                            bs->FreePool(m_info);
-                            continue;
-                        }
-                        UINT32 area = m_info->HorizontalResolution * m_info->VerticalResolution;
-                        if (area > best_area && area <= AREA_CAP) {
-                            best_area = area;
-                            best_mode = mi;
-                        }
-                        if (area < small_area) {
-                            small_area = area;
-                            small_mode = mi;
-                        }
-                        bs->FreePool(m_info);
-                    }
-                    if (best_mode == 0xFFFFFFFF) best_mode = small_mode;
-                    if (best_mode != 0xFFFFFFFF) {
-                        Print(L"      Setting GOP mode %d\r\n", best_mode);
-                        EFI_STATUS ss = gop->SetMode(gop, best_mode);
-                        if (!EFI_ERROR(ss)) {
-                            ginfo = gop->Mode->Info;
-                            pxformat = (ginfo->PixelFormat == PixelRedGreenBlueReserved8BitPerColor)
-                                       ? PXF_RGBX32 : PXF_BGRX32;
-                            bpp_val = 32;
-                        }
-                    }
-                }
                 break;
             default:
                 pxformat = PXF_BGRX32;
                 bpp_val = 32;
                 break;
+            }
+
+            /* ---- Keep the firmware's CURRENT GOP mode.  On real hardware the
+             *      UEFI firmware powers on with the panel's NATIVE resolution
+             *      already programmed, so leaving it alone makes the GUI fill
+             *      the whole screen.  We deliberately do NOT enumerate/SetMode
+             *      to a "larger" mode: OVMF's ramfb GOP QueryMode() lies and
+             *      reports the current resolution for every mode index, so
+             *      picking by area is unreliable and can DOWNgrade the mode
+             *      (e.g. selecting 640x480 when 800x600 was already active). */
+            if (pxformat == PXF_BLT_ONLY) {
+                Print(L"      GOP is BltOnly - no linear framebuffer available\r\n");
             }
 
             if (pxformat == PXF_BLT_ONLY || gop->Mode->FrameBufferBase == 0) {
@@ -363,6 +526,46 @@ EFI_STATUS efi_main(EFI_HANDLE Image, EFI_SYSTEM_TABLE *SystemTable)
                 vbe_local.pixel_format = pxformat;
                 vbe_local.vbe_ok  = 1;
                 vbe_local.vbe_mode_set = 1;
+
+#ifdef TEST_HIGH_FB
+                /* TEST ONLY (never set in shipping builds): pretend the GOP
+                 * framebuffer lives above 4GB so the switch32to64.asm
+                 * high-framebuffer mapping path is exercised under QEMU.
+                 *
+                 * 2026-08-19 -- WHY THE OLD VALUE MADE THIS TEST USELESS.
+                 * The fake used to be 0x100000000 (4 GiB).  Its high dword is
+                 * non-zero, so switch32to64.asm's `test edx,edx` did enter the
+                 * high-FB branch -- but the resulting index is
+                 *   pdpt_idx = 0x100000000 >> 30 = 4
+                 * and PDPT[0..7] was ALREADY filled with 1 GiB identity pages
+                 * covering 0..8 GiB.  The branch therefore just rewrote an
+                 * entry that was already correct.  Every "high framebuffer
+                 * path verified" run was really testing nothing, which is why
+                 * the real bug (boot_beacon/diag_mark drawing to the
+                 * 0xF0000000 compat window instead of fb64) survived so long.
+                 *
+                 * Real hardware (Intel Iris Xe) reports the LFB at
+                 * 0x4000000000 == 256 GiB, i.e. pdpt_idx = 0x4000000000 >> 30
+                 * = 256, an entry NOTHING else touches -- so it is the high-FB
+                 * code, and only that code, which must create it.  Default to
+                 * the genuine hardware address.
+                 *
+                 * QEMU obviously has no RAM at 256 GiB, so stores land in a
+                 * black hole and the visible screen stays at whatever the
+                 * 32-bit stage drew.  That is fine and intended: this test
+                 * validates the MAPPING (now reported explicitly by
+                 * fb_mapping_selfcheck()'s [FBMAP] serial lines) and proves no
+                 * #PF/freeze -- it does not check on-screen pixels.  Pixel
+                 * output is covered by the normal (low-FB) build. */
+#ifndef TEST_HIGH_FB_ADDR
+#define TEST_HIGH_FB_ADDR 0x4000000000ULL   /* real Intel Iris Xe GOP address */
+#endif
+                vbe_local.framebuffer_phys   = 0;
+                vbe_local.framebuffer_phys64 = TEST_HIGH_FB_ADDR;
+                Print(L"      [TEST_HIGH_FB] faking FB at 0x%lx (pdpt_idx=%d, exercises the real-metal high-FB path)\r\n",
+                      (UINT64)TEST_HIGH_FB_ADDR,
+                      (int)((TEST_HIGH_FB_ADDR >> 30) & 511));
+#endif
 
                 Print(L"      Graphics OK: %dx%d @%dbpp\r\n", width, height, bpp_val);
             }
@@ -461,6 +664,30 @@ EFI_STATUS efi_main(EFI_HANDLE Image, EFI_SYSTEM_TABLE *SystemTable)
         /* Copy VbeInfo from file-scope backup to 0x5000 */
         inline_memcpy((void *)VBE_INFO_ADDR, &g_vbe_backup, sizeof(g_vbe_backup));
         SERIAL_PUTC('V');  /* V = VbeInfo written to 0x5000 */
+    }
+
+    /* Relocate 64-bit kernel to K64_LOAD_ADDR if it was staged in a temp
+     * buffer, then publish the handoff struct at 0x7000 so the 32-bit
+     * kernel knows it must use this buffer instead of reading the disk. */
+    if (g_k64_valid) {
+        if (!g_k64_at_final && g_k64_temp != 0) {
+            inline_memcpy((void *)K64_LOAD_ADDR, (const void *)g_k64_temp,
+                          (UINTN)g_k64.size);
+            SERIAL_PUTC('6');  /* 6 = K64 relocated to 0x1400000 */
+        } else if (g_k64_at_final) {
+            SERIAL_PUTC('6');  /* 6 = K64 already at 0x1400000 */
+        }
+        inline_memcpy((void *)K64_HANDOFF_ADDR, &g_k64, sizeof(g_k64));
+        SERIAL_PUTC('7');  /* 7 = handoff struct written to 0x7000 */
+    }
+
+    /* Publish the RAM-SFS handoff at 0x0900.  Both kernels probe this: the
+     * 32-bit one in kmain (before fs_init) and the 64-bit one in fs_init.
+     * The image itself was staged before ExitBootServices and is NOT moved,
+     * so only the descriptor needs writing here. */
+    if (g_sfs_valid) {
+        inline_memcpy((void *)SFS_HANDOFF_ADDR, &g_sfs, sizeof(g_sfs));
+        SERIAL_PUTC('9');  /* 9 = RAM-SFS handoff written to 0x0900 */
     }
 
     /* Write a simple test pattern to VGA text buffer to prove we're alive */

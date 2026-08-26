@@ -38,6 +38,8 @@ CHARS = (
     "软件硬件设备驱动程序固件兼容模式启动选项引导菜单命令行提示符"
     "帮助文档手册教程示例演示体验反馈问题建议报告日志记录历史"
     "任务计划排程优先级别高级中级低级普通标准默认自定义选项参数"
+    # AI desktop labels that were missing from the original set.
+    "虚拟聊天助手点框打送我指调令后"
 )
 
 def gb_code(ch):
@@ -93,6 +95,9 @@ def main():
     print("Font:", font_path)
 
     entries = {}
+    font = ImageFont.truetype(font_path, 16)
+
+    # Explicit UI chars first.
     for ch in CHARS:
         code = gb_code(ch)
         if code is None or ch == ' ':
@@ -100,9 +105,26 @@ def main():
         if code in entries:
             continue
         try:
-            font = ImageFont.truetype(font_path, 16)
             entries[code] = render_glyph(ch, font)
-        except Exception as e:
+        except Exception:
+            pass
+
+    # Pull in every CJK char that appears in the C# source so all UI labels
+    # render.  This only covers hardcoded strings, not free-form user input.
+    import glob
+    for path in glob.glob('csharp/**/*.cs', recursive=True):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                for ch in f.read():
+                    if '\u4e00' <= ch <= '\u9fff':
+                        code = gb_code(ch)
+                        if code is None or code in entries:
+                            continue
+                        try:
+                            entries[code] = render_glyph(ch, font)
+                        except Exception:
+                            pass
+        except Exception:
             pass
     print("Rendered %d unique CJK glyphs" % len(entries))
 

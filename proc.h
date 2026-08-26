@@ -24,6 +24,7 @@ extern Process* g_current;
 
 // Allocate/register a process. Sets pid, copies name + root_path.
 // Returns 0 on success, -1 if the table is full.
-int proc_spawn(const char* name, uint32_t uid, const char* root_path, Process** out);
+// extern "C": also called from C-compiled translation units (e.g. linux_compat).
+extern "C" int proc_spawn(const char* name, uint32_t uid, const char* root_path, Process** out);
 
 #endif // NexOS_PROC_H

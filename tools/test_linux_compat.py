@@ -8,10 +8,18 @@ import os, sys, socket, time, subprocess
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
-IMG = sys.argv[1] if len(sys.argv) > 1 else "build/os.img"
+# NOTE: must use the TEXT-BOOT image. The default os.img boots into the
+# C# GUI lock screen, where headless sendkey cannot trigger login.
+IMG = sys.argv[1] if len(sys.argv) > 1 else "build/os_textboot.img"
 WORK = "build/linuxcompat.img"
 LOG = "build/serial_linuxcompat.log"
 PORT = 4451
+
+# QEMU is not on PATH on this machine (known pitfall); the real binary lives
+# under D:\qemu. Fall back to plain "qemu-system-x86_64" if that path is gone.
+QEMU = r"D:\qemu\qemu-system-x86_64.exe"
+if not os.path.exists(QEMU):
+    QEMU = "qemu-system-x86_64"
 
 
 def wait_sock(port, timeout=30.0):
@@ -41,9 +49,11 @@ def main():
         os.remove(LOG)
     errf = open("build/qemu_linuxcompat.err", "wb")
     qemu = subprocess.Popen([
-        "qemu-system-x86_64",
-        "-drive", f"format=raw,file={WORK}",
-        "-m", "128M",
+        QEMU,
+        "-machine", "pc",
+        "-drive", f"format=raw,file={WORK},if=ide",
+        "-m", "256M",   # guest stack lives at 224 MiB (0x0E000000); 128M -> #PF
+        "-accel", "tcg",
         "-vga", "std",
         "-display", "none",
         "-no-reboot",

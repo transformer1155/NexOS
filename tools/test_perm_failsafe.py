@@ -22,7 +22,10 @@ import os, sys, socket, time, subprocess
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
-IMG = sys.argv[1] if len(sys.argv) > 1 else "build/os.img"
+# Default to the text-boot image (auto-GUI OFF) so the OS lands in the
+# textual shell and the consent dialog can be screendumped.  `make test-fail`
+# builds build/os_textboot.img and passes it as argv[1].
+IMG = sys.argv[1] if len(sys.argv) > 1 else "build/os_textboot.img"
 WORK = "build/permfs.img"
 LOG = "build/serial_permfs.log"
 SHOT = "build/perm_prompt.ppm"

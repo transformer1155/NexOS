@@ -25,6 +25,7 @@ namespace NexOS.Forms
         public const int Browser      = 8;
         public const int AiSetup      = 9;   // one-tap AI enablement wizard
         public const int AiAgent      = 10;  // AI Agent runner (Planner/Actor/Critic)
+        public const int Demo         = 11;  // button-shrink + reply "啊" demo window
     }
 
     public static class Shell
@@ -41,22 +42,41 @@ namespace NexOS.Forms
         // ---- lifecycle ------------------------------------------------
         public static void Init()
         {
+            Lang.Init();   // load language pack before any Lang.T() call
             // Static field initialisers never run under MiniCLR, so every
             // Theme field would stay 0 (black wallpaper, no accent).  Prime
             // the defaults here; Settings > ApplyTheme() overrides later.
-            Theme.WallTop    = 0x05162C;   // wallpaper gradient (light theme)
-            Theme.WallBot    = 0x0B4A83;
+            Theme.WallTop    = 0x218FD9;   // wallpaper gradient (Win11 blue)
+            Theme.WallBot    = 0x05216B;
             Theme.Accent     = 0x0078D4;   // Fluent blue
-            Theme.Dark       = 0;
+            Theme.Dark       = 1;            // dark is the default shipped theme
             Theme.TaskbarLeft = 0;
             Theme.ShowLabels = 1;
             Theme.ActiveNet  = 0;
-            Theme.VoiceOn    = 0;
+            // Master microphone switch.  When 0 NOTHING registers or fires;
+            // when 1, only the controls explicitly tagged with W.Voice(...)
+            // respond.  Toggle at runtime with the `voice on` / `voice off`
+            // shell commands.  Default ON so the curated seed controls work
+            // out of the box; untagged controls never respond regardless.
+            Theme.VoiceOn    = 1;
+            Theme.DesktopMode = 0;   // clean Win11 desktop by default; toggle in R-click / Settings
+            Theme.PixelMode  = 1;    // retro pixel / CRT-monitor look ON by default
+            Theme.PixelScale = 1;    // full spatial detail (no chunkiness) by default
+            Theme.PixelScan  = 0;    // scanlines off by default (toggle in Settings)
+
+            // Re-apply any persisted personalization from a previous session
+            // (nexos.cfg on the MKFS data disk).  Safe no-op if the file is
+            // missing or empty.
+            Theme.Load();
+            Theme.ApplyPixel();      // push pixel-mode settings to the kernel
 
             apps = new App[MAX];   // heap_alloc zeroes -> all null
             count = 0;
+            Voice.Init();           // allocate the voice registry / queue
             Desktop.Init();        // wallpaper / icon / taskbar tables
             Login.Init();          // lock screen (no-op if already signed in)
+            Toast.Init();          // transient notification stack
+            Toast.Show("NexOS", "系统就绪", 3000);
             Host.Log("NexOS.Forms.Shell initialised");
         }
 
@@ -70,6 +90,7 @@ namespace NexOS.Forms
             App a = Make(kind);
             if (a == null) return -1;
             a.id = id;
+            a.KindId = kind;
             apps[id] = a;
             if (id + 1 > count) count = id + 1;
             return id;
@@ -88,12 +109,32 @@ namespace NexOS.Forms
             if (kind == Kind.Browser)      return new BrowserApp();
             if (kind == Kind.AiSetup)      return new AiSetupApp();
             if (kind == Kind.AiAgent)      return new AiAgentApp();
+            if (kind == Kind.Demo)         return new DemoApp();
             return null;
         }
 
         public static void Close(int id)
         {
             if (id >= 0 && id < MAX) apps[id] = null;
+        }
+
+        // Close every open window whose launch kind matches (used when an
+        // app is uninstalled from the Control Panel so its windows vanish too).
+        public static void CloseKind(int kind)
+        {
+            for (int i = 0; i < MAX; i++)
+            {
+                App a = apps[i];
+                if (a != null && a.KindId == kind) apps[i] = null;
+            }
+        }
+
+        // Return the live window instance by id (null if none).  Used by
+        // the WinHost --termtest harness to drive and introspect a window.
+        public static App Get(int id)
+        {
+            if (id < 0 || id >= MAX) return null;
+            return apps[id];
         }
 
         // ---- per-frame dispatch --------------------------------------
@@ -120,6 +161,47 @@ namespace NexOS.Forms
             App a = apps[id];
             if (a == null) { return 0; }
             a.OnKey(ch);
+            return 1;
+        }
+
+        // New input surfaces for the terminal emulator.  They mirror Click
+        // (set App.Current, guard the id, dispatch to the virtual) so the
+        // kernel bridge and the WinHost can feed richer events without any
+        // behavioural change to apps that don't override them.
+        public static int MouseDown(int id, int btn, int mx, int my)
+        {
+            if (id < 0 || id >= MAX) return 0;
+            App a = apps[id];
+            if (a == null) return 0;
+            App.Current = a;
+            a.OnMouseDown(btn, mx, my);
+            return 1;
+        }
+        public static int MouseUp(int id, int btn, int mx, int my)
+        {
+            if (id < 0 || id >= MAX) return 0;
+            App a = apps[id];
+            if (a == null) return 0;
+            App.Current = a;
+            a.OnMouseUp(btn, mx, my);
+            return 1;
+        }
+        public static int MouseMove(int id, int mx, int my)
+        {
+            if (id < 0 || id >= MAX) return 0;
+            App a = apps[id];
+            if (a == null) return 0;
+            App.Current = a;
+            a.OnMouseMove(mx, my);
+            return 1;
+        }
+        public static int Wheel(int id, int dy)
+        {
+            if (id < 0 || id >= MAX) return 0;
+            App a = apps[id];
+            if (a == null) return 0;
+            App.Current = a;
+            a.OnWheel(dy);
             return 1;
         }
 
@@ -170,14 +252,28 @@ namespace NexOS.Forms
 
         public static void PaintDesktop(int w, int h)
         {
+            // Advance all control tweens once per frame (drives hover/press
+            // transitions and keeps Host.SetAnim alive while anything moves).
+            Anim.Tick();
             if (Login.IsActive() != 0) { Login.Paint(w, h); return; }
+            // Start a fresh voice frame: clear last frame's control registry
+            // (the desktop surface has no App instance, so force App.Current
+            // null so W.Voice() registers entries as screen-coordinate
+            // desktop controls rather than window controls).
+            App.Current = null;
+            Voice.BeginFrame();
             Desktop.Paint(w, h);
         }
 
         public static void PaintOverlay(int w, int h)
         {
             if (Login.IsActive() != 0) return;   // no taskbar while locked
+            App.Current = null;
             Desktop.PaintOverlay(w, h);
+            // All controls (desktop + windows + taskbar/Start) have
+            // re-registered this frame; dispatch any pending voice phrases
+            // as synthetic clicks on the matched control.
+            Voice.Drain();
         }
 
         // -1 == "handled, do not open anything"; -2 == "not mine".
@@ -186,6 +282,12 @@ namespace NexOS.Forms
             if (Login.IsActive() != 0) { Login.Click(mx, my); return -1; }
             return Desktop.Click(mx, my);
         }
+
+        // ---- voice engine bridge (called from the kernel via clr_call) --
+        // These are the single, uniform ingestion points any interaction
+        // backend uses: a recognised phrase (Say) or a master on/off (Set).
+        public static void VoiceSay(string phrase) { Voice.Say(phrase); }
+        public static void VoiceSet(int    on)     { Voice.SetEnabled(on != 0); }
 
         public static int  DesktopMenuOpen() { return Desktop.IsMenuOpen() | Desktop.ContextOpen(); }
 

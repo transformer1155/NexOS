@@ -1,0 +1,47 @@
+<Project>
+
+  <!-- Shared build settings for every standalone per-application .mex.
+       Each app is compiled into a SINGLE assembly (the whole managed core:
+       NexOS.Forms + NexOS.Core + every Shell app) plus one tiny Program::Main
+       entry that opens just that one app.  The assembly is then flattened by
+       tools/mex_pack.py into a NexOS .mex the kernel's MiniCLR can run.
+
+       IMPORTANT: this set is the *managed layer only* - no Windows host files
+       (Backend.cs / ShellForm.cs / AppHost.cs) and no WINHOST define.  All Gfx /
+       Host / Shell primitives are [InternalCall]s the kernel supplies. -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <OutputType>Library</OutputType>
+    <AssemblyName>app</AssemblyName>
+    <RootNamespace>App</RootNamespace>
+    <NoWarn>CS0169;CS0649;CS0414;CS0168;CS0219;CS0618</NoWarn>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <!-- Self-contained BCL (Corelib.cs) so the assembly has no AssemblyRef
+         rows and tools/mex_pack.py can resolve every metadata token locally. -->
+    <NoStdLib>true</NoStdLib>
+    <DisableImplicitFrameworkReferences>true</DisableImplicitFrameworkReferences>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)../NexOS.Core/Corelib.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../NexOS.Core/Sys.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../NexOS.Forms/Forms.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../NexOS.Forms/Voice.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Shell.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Apps.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Desktop.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Lang.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Browser.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Popup.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Login.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/AiSetup.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/AiAgent.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Demo.cs" />
+  </ItemGroup>
+
+</Project>

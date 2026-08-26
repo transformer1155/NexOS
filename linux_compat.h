@@ -17,7 +17,9 @@ extern "C" {
 void linux_compat_init(int (*reader)(const char*, unsigned char*, int));
 
 // Load and execute a Linux ELF32 image by name (from the registered reader).
-int  linux_run(const char* name);
+// argv/argc are copied onto the guest stack (Linux i386 ABI: [esp]=argc,
+// [esp+4..]=argv pointers, NULL-terminated, then envp NULL).
+int  linux_run(const char* name, int argc, const char** argv);
 
 // int 0x80 trap entry — wired into the IDT by kernel.cpp.
 void linux_syscall_entry(void);

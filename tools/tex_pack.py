@@ -8,7 +8,7 @@ Texture ids (agreed with gui.cpp / Desktop.cs):
    2    start menu 256x128 RGB565   -> sfs_files/tex_menu.tex
    3    title bar  256x32  RGB565   -> sfs_files/tex_chrome.tex
    4    window bg  128x128 RGB565   -> sfs_files/tex_winbg.tex
-   100+ icon_k<kind> 64x64 ARGB32   -> sfs_files/tex_k<kind>.tex
+   100+ icon_k<kind> 128x128 ARGB32 -> sfs_files/tex_k<kind>.tex
 
 Any asset missing from assets/ is generated procedurally (gradient + bloom +
 noise), so a build works offline.  Drop real PNGs into assets/ to override:
@@ -191,8 +191,8 @@ def main():
 
     for kind, _name, col, letter in KINDS:
         pack("k%d" % kind, 1,
-             load_or_gen("icon_k%d.png" % kind, (64, 64),
-                         lambda c=col, l=letter: gen_icon(c, l),
+             load_or_gen("icon_k%d.png" % kind, (128, 128),
+                         lambda c=col, l=letter: gen_icon(c, l, size=128),
                          keep_alpha=True))
 
     stale = 0

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# dotnet shim for pure-Windows NexOS builds.
+#
+# MSYS2 strips/converts Windows environment variables when it spawns native
+# processes, which breaks NuGet restore ("Value cannot be null (Parameter
+# 'path1')" at NuGet.targets:782).  Delegate to PowerShell, which re-establishes
+# a clean Windows environment before launching the real dotnet.exe.
+exec /c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\MyOS\bootloader\tools\dotnet.ps1" "$@"

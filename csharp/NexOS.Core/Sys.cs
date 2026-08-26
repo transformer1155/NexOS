@@ -36,6 +36,16 @@ namespace NexOS
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static extern int StrLen(string s);
 
+        // Substring / control-char flattening in ONE native allocation each.
+        // Building these in managed code with a per-character StrConcat loop
+        // costs O(n^2) bytes on the CLR's bump heap and used to exhaust it
+        // (which faulted and silently retired the whole managed shell).
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern string StrSub(string s, int start, int len);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern string StrFlat(string s);
+
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static extern bool StrEq(string a, string b);
 

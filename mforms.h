@@ -64,6 +64,11 @@ struct MFormsHost {
 
     int  (*list_files)(int fs, char* buf, int bufsize);
     int  (*read_file) (int fs, const char* name, unsigned char* buf, int bufsize);
+    // Write a file body to durable storage (MKFS data disk).  Used by the
+    // managed shell to persist personalization settings ("nexos.cfg") and to
+    // save Notepad documents.  fs selects the volume (0=MKFS). Returns bytes
+    // written, or -1 on error.
+    int  (*write_file)(int fs, const char* name, const unsigned char* buf, int size);
     int  (*mkdir)(int fs, const char* name);
     int  (*remove)(int fs, const char* name);
     int  (*rename)(int fs, const char* old_name, const char* new_name);
@@ -167,6 +172,12 @@ void mforms_set_mouse(int mx, int my);
 // ---------------------------------------------------------------------
 // Non-zero when shell.mex provides a managed desktop.
 int  mforms_has_desktop(void);
+
+// Managed shell requests continuous repaints (AI desktop thinking dots /
+// typewriter reveal).  The GUI main loop polls this and throttles
+// render_all() to ~30 fps while it is set, because nothing else triggers
+// repaints between input events.
+extern int g_mforms_anim;
 
 // Layer 1: wallpaper + desktop icons, painted *behind* the windows.
 void mforms_paint_desktop(int w, int h);

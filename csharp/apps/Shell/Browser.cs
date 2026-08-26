@@ -74,6 +74,7 @@ namespace NexOS.Forms
 
             // Go button (registered as a control for right-click).
             W.Primary(GoX(), GoY(), GoW(), GoH(), "Go");
+            W.Voice("前往 go", GoX(), GoY(), GoW(), GoH());
 
             // Status line.
             int sy = BarY + BarH + 6;

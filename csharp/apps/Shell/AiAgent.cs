@@ -26,7 +26,7 @@ namespace NexOS.Forms
         {
             t = new TBox();
             output = "Type a goal above, then press Run (or Enter).";
-            editMode = 0;
+            editMode = 1;   // focus the goal box immediately so typing works
             modelMsg = "Default model: Qwen-1.7B (Q4_K_M, GGUF).";
             envMsg = Host.Exec("model env");
         }
@@ -89,7 +89,7 @@ namespace NexOS.Forms
             Gfx.FillRound(BoxX(), BoxY(), BoxW(), BoxH(), 6, 0xFFFFFFFF);
             Gfx.DrawRound(BoxX(), BoxY(), BoxW(), BoxH(), 6, C.Accent);
             string shown = t.text;
-            if (shown.Length == 0 && editMode == 0) shown = "e.g. create a report and email it";
+            if (shown.Length == 0) shown = "e.g. create a report and email it";
             Gfx.Text(BoxX() + 8, BoxY() + 9, shown, editMode == 1 ? C.Text : C.TextSub);
             if (editMode == 1 && (Host.Ticks() / 30) % 2 == 0) {
                 string before = "";
@@ -100,9 +100,11 @@ namespace NexOS.Forms
 
             // Run button (right of the goal box).
             W.Primary(RunX(), BoxY(), RunW(), RunH(), "Run Agent");
+            W.Voice("运行 run", RunX(), BoxY(), RunW(), RunH());
 
             // Model: default Qwen-1.7B + Load button.
             W.Primary(LoadX(), LoadY(), LoadW(), LoadH(), "Load Qwen-1.7B");
+            W.Voice("加载模型 load model", LoadX(), LoadY(), LoadW(), LoadH());
             Gfx.Text(LoadX() + LoadW() + 10, LoadY() + 9,
                      "selects the default model", C.TextSub);
 
@@ -125,15 +127,28 @@ namespace NexOS.Forms
         {
             editMode = 0;
             Host.Exec("agent init");                 // idempotent at AI level
-            output = Host.Exec(U.Cat("agent run ", t.text));
+            output = SafeCap(Host.Exec(U.Cat("agent run ", t.text)));
         }
 
         // Select the default open-source model (Qwen-1.7B) for the engine.
         void DoLoadModel()
         {
-            output = Host.Exec("model run qwen1.7b");
+            output = SafeCap(Host.Exec("model run qwen1.7b"));
             modelMsg = "Active model: Qwen-1.7B (selected).";
-            envMsg = Host.Exec("model env");
+            envMsg = SafeCap(Host.Exec("model env"));
+        }
+
+        // A `agent run` transcript can be several KB; the MiniCLR bump heap
+        // is only 512 KB with no GC, so an uncapped string exhausts it and
+        // takes the whole managed shell down (the AI desktop hit the same
+        // trap).  Cap every exec result we display.
+        static string SafeCap(string res)
+        {
+            if (res == null) return "";
+            if (res.Length <= 480) return res;
+            int cut = 480;
+            while (cut > 0 && ((int)res[cut] & 0xC0) == 0x80) cut--;  // UTF-8 safe
+            return U.Cat(U.Sub(res, 0, cut), "...");
         }
 
         public override void OnClick(int mx, int my)

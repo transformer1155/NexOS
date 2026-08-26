@@ -72,7 +72,14 @@ def main():
         "qemu-system-x86_64",
         "-drive", f"format=raw,file={WORK}",
         "-m", "128M",
-        "-vga", "std",
+        # `-vga none` on purpose.  Since the kernel started booting straight
+        # into the graphical shell (g_auto_gui), a VGA-equipped guest hands
+        # the keyboard to the GUI and the text shell is never reachable --
+        # every keystroke below went to the desktop and the whole suite failed
+        # with "`user` never reached the shell".  With no VGA adapter,
+        # g_vbe_active stays false and the kernel falls back to the text
+        # shell, which is what this (serial-only) test actually exercises.
+        "-vga", "none",
         "-display", "none",
         "-no-reboot",
         "-monitor", f"tcp:127.0.0.1:{PORT},server,nowait",

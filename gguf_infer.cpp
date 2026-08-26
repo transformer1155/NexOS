@@ -789,7 +789,13 @@ int qwen_load(const uint8_t* blob, uint64_t size, uint32_t max_ctx){
     R.out_w = tptr("output.weight", &R.out_t, &ne);
     if (!R.out_w){ R.out_w = R.tok_w; R.out_t = R.tok_t; R.tie_embd = 1; }
     if (!type_supported(R.tok_t) || !type_supported(R.out_t)){
-        set_err("unsupported quantisation in embeddings"); return -12;
+        static char m[24];
+        m[0]='t'; m[1]=':';
+        m[2]="0123456789abcdef"[(R.tok_t>>4)&15]; m[3]="0123456789abcdef"[R.tok_t&15];
+        m[4]='o'; m[5]=':';
+        m[6]="0123456789abcdef"[(R.out_t>>4)&15]; m[7]="0123456789abcdef"[R.out_t&15];
+        m[8]=0;
+        set_err(m); return -12;
     }
 
     // ---- activations ----
@@ -1124,4 +1130,54 @@ int qwen_generate(const char* prompt, int max_new, float temp, QwenEmitFn emit){
         lg = qwen_forward(next, pos++);
     }
     return produced;
+}
+
+// ---------------------------------------------------------------------
+//  chat template (ChatML) — route B: borrow Ollama/llama.cpp's approach
+// ---------------------------------------------------------------------
+// Most modern GGUF models (qwen2 / 2.5 / 3, llama3, deepseek, ...) use the
+// ChatML convention.  We emit the role/content wrappers as literal text and
+// let the byte-level BPE tokenizer turn <|im_start|>, <|im_end|>, <s>, </s>
+// into their single vocabulary ids.  No Jinja interpreter needed for the
+// common case; we can later branch on R.info->arch for Llama2-style [INST].
+static void chat_append(char* out, int* po, int cap, const char* role, const char* content){
+    const char* head = "<|im_start|>";
+    int p = *po;
+    for (int i = 0; head[i] && p < cap - 1; i++) out[p++] = head[i];
+    for (int i = 0; role[i] && p < cap - 1; i++) out[p++] = role[i];
+    if (p < cap - 1) out[p++] = '\n';
+    for (int i = 0; content[i] && p < cap - 1; i++) out[p++] = content[i];
+    const char* tail = "<|im_end|>\n";
+    for (int i = 0; tail[i] && p < cap - 1; i++) out[p++] = tail[i];
+    *po = p;
+}
+
+// Build a full ChatML prompt.  `system` (optional) becomes the first system
+// message; `roles`/`contents` carry N prior turns (last one is the active
+// user turn).  Ends with the <|im_start|>assistant\n generation prompt.
+// Returns the number of characters written (excluding the NUL terminator).
+int qwen_format_chat(const char* system, const char** roles, const char** contents,
+                     int n_turns, char* out, int cap){
+    int p = 0;
+    if (system && system[0]) chat_append(out, &p, cap, "system", system);
+    for (int t = 0; t < n_turns; t++){
+        if (roles[t] && contents[t]) chat_append(out, &p, cap, roles[t], contents[t]);
+    }
+    const char* gp = "<|im_start|>assistant\n";
+    for (int i = 0; gp[i] && p < cap - 1; i++) out[p++] = gp[i];
+    out[p] = 0;
+    return p;
+}
+
+// End-to-end chat: wrap an optional system prompt + one user turn in the chat
+// template, then run the standard generation loop.  Mirrors how Ollama feeds
+// llama.cpp's chat template output straight into the decode loop.
+int qwen_chat(const char* system, const char* user, int max_new, float temp, QwenEmitFn emit){
+    if (!R.loaded) return -1;
+    char buf[8192];
+    const char* roles[1] = { "user" };
+    const char* conts[1] = { user ? user : "" };
+    int n = (user && user[0]) ? 1 : 0;
+    qwen_format_chat(system, roles, conts, n, buf, sizeof(buf));
+    return qwen_generate(buf, max_new, temp, emit);
 }

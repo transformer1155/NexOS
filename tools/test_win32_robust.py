@@ -6,7 +6,11 @@ import os, sys, socket, time, subprocess
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
-IMG = sys.argv[1] if len(sys.argv) > 1 else "build/os.img"
+# Default to the text-boot image (auto-GUI OFF) so the shell is reachable
+# for the missing-file command, while VBE stays active so `winapp hello32.exe`
+# still enters the GUI on demand.  `make test-w32` builds build/os_textboot.img
+# and passes it as argv[1].
+IMG = sys.argv[1] if len(sys.argv) > 1 else "build/os_textboot.img"
 WORK = "build/w32rb.img"
 LOG = "build/serial_robust.log"
 PORT = 4448

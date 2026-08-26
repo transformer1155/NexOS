@@ -24,7 +24,7 @@ IMG = "build/os.img"
 LOG = "build/serial_dnspy.log"
 PORT = 4459
 MON_ERR = "build/qemu_dnspy.err"
-SFS_LBA = 3328
+SFS_LBA = 3368
 WORK = "build/dnspy_test.img"
 
 

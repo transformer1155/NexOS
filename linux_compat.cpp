@@ -14,6 +14,7 @@
 #include "syscall.h"     // shared SysRegs
 #include "gdt.h"         // gdt_set_tls (set_thread_area)
 #include <stdint.h>
+#include <stddef.h>
 #include "kernel/vmm.h"  // vmm_map_page (real 4 KiB page mapping; auto-splits PSE)
 #include "kernel/pmm.h"  // pmm_alloc_page / pmm_free_page
 #include "remote_desktop.h"  // remote-desktop ABI (nexos_fb_query / nexos_input_*)
@@ -55,6 +56,7 @@ static inline void outb(uint16_t port, uint8_t val){
     __asm__ __volatile__("outb %0, %1" :: "a"(val), "Nd"(port));
 }
 static void serial_puts(const char* s){ while(*s) outb(0x3F8, (uint8_t)*s++); }
+static void serial_putc(char c){ outb(0x3F8, (uint8_t)c); }
 static void serial_puthex(uint32_t v){
     const char* h = "0123456789ABCDEF";
     for (int i = 28; i >= 0; i -= 4) outb(0x3F8, (uint8_t)h[(v >> i) & 0xF]);
@@ -1776,12 +1778,22 @@ typedef struct { uint32_t r_offset; uint32_t r_info; } Elf32_Rel;
 #define DYN_DT_REL      17
 #define DYN_DT_RELSZ    18
 #define DYN_DT_JMPREL   23
+#define DYN_DT_INIT      12
+#define DYN_DT_INIT_ARRAY 25
+#define DYN_DT_FINI_ARRAY 26
+#define DYN_DT_INIT_ARRAYSZ 28
+#define DYN_DT_FINI_ARRAYSZ 27
+#define DYN_DT_GNU_HASH  0x6ffffef5
 #define DYN_R_NONE      0
 #define DYN_R_32        1
 #define DYN_R_PC32      2
+#define DYN_R_COPY      5
 #define DYN_R_GLOB_DAT  6
 #define DYN_R_JMP_SLOT  7
 #define DYN_R_RELATIVE  8
+#define DYN_R_TLS_TPOFF 14
+#define DYN_R_TLS_IE    15
+#define DYN_R_IRELATIVE 42
 
 #define DYN_LIB_BASE  0x0A400000u   /* free guest region: above argv strings
                                      * (0x0A000000) and below the stack top
@@ -1798,6 +1810,12 @@ typedef struct {
     uint32_t  relsz;
     uint32_t* jmprel;       /* .rel.plt runtime ptr (may be 0)                */
     uint32_t  jmprelsz;
+    uint32_t  dt_gnu_hash;  /* DT_GNU_HASH table (0 if absent)                */
+    uint32_t  init_func;    /* DT_INIT single init routine (0 if absent)      */
+    uint32_t  init_array;   /* DT_INIT_ARRAY (0 if absent)                    */
+    uint32_t  init_array_sz;/* DT_INIT_ARRAYSZ                                */
+    uint32_t  fini_array;   /* DT_FINI_ARRAY (0 if absent)                    */
+    uint32_t  fini_array_sz;/* DT_FINI_ARRAYSZ                               */
 } dyn_mod_t;
 
 static int dl_strcmp(const char* a, const char* b){
@@ -1835,6 +1853,11 @@ static uint32_t dyn_map_image(const unsigned char* elf, int sz, uint32_t bias){
 /* Parse PT_DYNAMIC of a mapped image into *mod.  Returns 0 on success, -1 if
  * there is no PT_DYNAMIC.  DT entries are read from guest memory. */
 static int dyn_parse(const unsigned char* elf, uint32_t bias, dyn_mod_t* mod){
+    uint32_t saved_base = mod->base;   /* caller sets bias BEFORE parse on first use,
+                                        * but keep any externally-assigned base so it
+                                        * survives the memset below. */
+    for (size_t z = 0; z < sizeof(*mod); z++) ((unsigned char*)mod)[z] = 0;
+    mod->base = saved_base;
     uint32_t phoff = *(uint32_t*)(elf + 28);
     uint16_t phentsz = *(uint16_t*)(elf + 42);
     uint16_t phnum = *(uint16_t*)(elf + 44);
@@ -1844,32 +1867,105 @@ static int dyn_parse(const unsigned char* elf, uint32_t bias, dyn_mod_t* mod){
         uint32_t d_vaddr = *(uint32_t*)(ph + 8);
         const uint32_t* d = (const uint32_t*)(bias + d_vaddr);
         uint32_t dt_hash=0, dt_strtab=0, dt_symtab=0, dt_rel=0, dt_relsz=0,
-                 dt_jmprel=0, dt_jmprelsz=0;
+                 dt_jmprel=0, dt_jmprelsz=0, dt_gnu_hash=0, dt_init=0,
+                 dt_init_array=0, dt_init_array_sz=0, dt_fini_array=0,
+                 dt_fini_array_sz=0;
         for (int k = 0; d[2*k] != DYN_DT_NULL; k++){
             uint32_t t = d[2*k], v = d[2*k+1];
             switch (t){
-                case DYN_DT_HASH:     dt_hash     = v; break;
-                case DYN_DT_STRTAB:   dt_strtab   = v; break;
-                case DYN_DT_SYMTAB:   dt_symtab   = v; break;
-                case DYN_DT_PLTRELSZ: dt_jmprelsz = v; break;
-                case DYN_DT_REL:      dt_rel      = v; break;
-                case DYN_DT_RELSZ:    dt_relsz    = v; break;
-                case DYN_DT_JMPREL:   dt_jmprel   = v; break;
+                case DYN_DT_HASH:         dt_hash            = v; break;
+                case DYN_DT_STRTAB:       dt_strtab          = v; break;
+                case DYN_DT_SYMTAB:       dt_symtab          = v; break;
+                case DYN_DT_PLTRELSZ:     dt_jmprelsz        = v; break;
+                case DYN_DT_REL:          dt_rel             = v; break;
+                case DYN_DT_RELSZ:        dt_relsz           = v; break;
+                case DYN_DT_JMPREL:       dt_jmprel          = v; break;
+                case DYN_DT_GNU_HASH:     dt_gnu_hash        = v; break;
+                case DYN_DT_INIT:         dt_init            = v; break;
+                case DYN_DT_INIT_ARRAY:   dt_init_array      = v; break;
+                case DYN_DT_INIT_ARRAYSZ: dt_init_array_sz   = v; break;
+                case DYN_DT_FINI_ARRAY:   dt_fini_array      = v; break;
+                case DYN_DT_FINI_ARRAYSZ: dt_fini_array_sz   = v; break;
                 default: break;
             }
         }
-        if (dt_symtab == 0 || dt_strtab == 0 || dt_hash == 0) return -1;
+        if (dt_symtab == 0 || dt_strtab == 0 || (dt_hash == 0 && dt_gnu_hash == 0)) return -1;
         mod->symtab   = (uint32_t*)(bias + dt_symtab);
         mod->strtab   = (const char*)(bias + dt_strtab);
         mod->rel      = (uint32_t*)(bias + dt_rel);
         mod->relsz    = dt_relsz;
         mod->jmprel   = (uint32_t*)(bias + dt_jmprel);
         mod->jmprelsz = dt_jmprelsz;
-        const uint32_t* hash = (const uint32_t*)(bias + dt_hash);
-        mod->nsyms = hash[1];   /* nchain == number of .dynsym entries */
+        mod->dt_gnu_hash     = dt_gnu_hash;
+        mod->init_func       = dt_init;
+        mod->init_array      = dt_init_array;
+        mod->init_array_sz   = dt_init_array_sz;
+        mod->fini_array      = dt_fini_array;
+        mod->fini_array_sz   = dt_fini_array_sz;
+        if (dt_hash){
+            const uint32_t* hash = (const uint32_t*)(bias + dt_hash);
+            mod->nsyms = hash[1];   /* nchain == number of .dynsym entries */
+        } else {
+            /* GNU_HASH only: nsyms is not directly available; dyn_resolve uses
+             * the bloom/bucket chain so we don't need it here. */
+            mod->nsyms = 0;
+        }
         return 0;
     }
     return -1;
+}
+
+static void dyn_parse_trace(dyn_mod_t* mod){
+    serial_puts("dyn: parse ok (gnu_hash_present=");
+    serial_puts(mod->dt_gnu_hash ? "Y" : "N");
+    serial_puts(", init_array=");
+    serial_puts(mod->init_array ? "Y" : "N");
+    serial_puts(")\n");
+}
+
+/* GNU hash (the variant used by modern linkers for DT_GNU_HASH). */
+static uint32_t dyn_gnu_hash(const char* s){
+    uint32_t h = 5381;
+    int i = 0;
+    while (i < 256 && s[i]) { h = h * 33u + (uint8_t)s[i]; i++; }
+    return h;
+}
+
+/* Lookup a symbol via DT_GNU_HASH (buckets + chain; the bloom filter is
+ * intentionally skipped -- it is only a search optimization and the bucket/chain
+ * walk below is authoritative). */
+static int dyn_lookup_gnu(dyn_mod_t* mod, const char* name){
+    if (!mod->dt_gnu_hash) return -1;
+    const uint32_t* gh = (const uint32_t*)(mod->base + mod->dt_gnu_hash);
+    /* Read the GNU_HASH header one byte at a time.  The loader maps guest
+     * images into a char buffer, so reading it back through uint32_t* is a
+     * type-pun; with -fno-strict-aliasing this is fine, but byte-wise loads
+     * keep the code robust regardless of optimization. */
+    volatile uint8_t* gbp = (volatile uint8_t*)(uintptr_t)gh;
+    uint32_t nbuckets    = ((uint32_t)gbp[0]) | ((uint32_t)gbp[1]<<8) | ((uint32_t)gbp[2]<<16) | ((uint32_t)gbp[3]<<24);
+    uint32_t symoffset   = ((uint32_t)gbp[4]) | ((uint32_t)gbp[5]<<8) | ((uint32_t)gbp[6]<<16) | ((uint32_t)gbp[7]<<24);
+    uint32_t bloom_size  = ((uint32_t)gbp[8]) | ((uint32_t)gbp[9]<<8) | ((uint32_t)gbp[10]<<16) | ((uint32_t)gbp[11]<<24);
+    uint32_t h = dyn_gnu_hash(name);
+    uint32_t hashval = h & 0xfffffff;
+    /* buckets[] starts after the bloom filter. nexOS guests emit a 32-bit
+     * bloom filter (4 bytes per word), not the standard 64-bit GNU_HASH layout. */
+    uint32_t buckets_off = 16 + bloom_size * 4;
+    uint32_t chain_off   = buckets_off + nbuckets * 4;
+    uint32_t n_off = buckets_off + (h % nbuckets) * 4;
+    uint32_t n = ((uint32_t)gbp[n_off]) | ((uint32_t)gbp[n_off+1]<<8) | ((uint32_t)gbp[n_off+2]<<16) | ((uint32_t)gbp[n_off+3]<<24);
+    if (n < symoffset) return -1;
+    uint32_t guard = 0;
+    for (;;){
+        if (guard++ > 4096) return -1;
+        Elf32_Sym* sym = (Elf32_Sym*)((unsigned char*)mod->symtab + (size_t)n * 16);
+        const char* sn = mod->strtab + sym->st_name;
+        if ((dyn_gnu_hash(sn) & 0xfffffff) == hashval && dl_strcmp(sn, name) == 0)
+            return (int)n;
+        uint32_t c_off = chain_off + (n - symoffset) * 4;
+        uint32_t c = ((uint32_t)gbp[c_off]) | ((uint32_t)gbp[c_off+1]<<8) | ((uint32_t)gbp[c_off+2]<<16) | ((uint32_t)gbp[c_off+3]<<24);
+        if (c & 1) return -1;   /* end of chain -> not found */
+        n++;
+    }
 }
 
 /* Resolve a symbol name to its runtime address across mods[0..nmods-1].
@@ -1877,11 +1973,22 @@ static int dyn_parse(const unsigned char* elf, uint32_t bias, dyn_mod_t* mod){
 static uint32_t dyn_resolve(dyn_mod_t* mods, int nmods, const char* name){
     for (int m = 0; m < nmods; m++){
         dyn_mod_t* mod = &mods[m];
-        for (uint32_t s = 0; s < mod->nsyms; s++){
-            Elf32_Sym* sym = (Elf32_Sym*)((unsigned char*)mod->symtab + s * 16);
-            if (sym->st_shndx == 0) continue;   /* undefined */
-            const char* sn = mod->strtab + sym->st_name;
-            if (dl_strcmp(sn, name) == 0) return mod->base + sym->st_value;
+        uint32_t idx = 0xffffffffu;
+        if (mod->dt_gnu_hash){
+            int g = dyn_lookup_gnu(mod, name);
+            if (g >= 0) idx = (uint32_t)g;
+        }
+        if (idx == 0xffffffffu){
+            for (uint32_t s = 0; s < mod->nsyms; s++){
+                Elf32_Sym* sym = (Elf32_Sym*)((unsigned char*)mod->symtab + s * 16);
+                if (sym->st_shndx == 0) continue;   /* undefined */
+                const char* sn = mod->strtab + sym->st_name;
+                if (dl_strcmp(sn, name) == 0){ idx = s; break; }
+            }
+        }
+        if (idx != 0xffffffffu){
+            Elf32_Sym* sym = (Elf32_Sym*)((unsigned char*)mod->symtab + (size_t)idx * 16);
+            return mod->base + sym->st_value;
         }
     }
     return 0;
@@ -1889,7 +1996,7 @@ static uint32_t dyn_resolve(dyn_mod_t* mods, int nmods, const char* name){
 
 /* Apply one relocation entry of `mod` (resolving symbols against mods[]). */
 static void dyn_apply_one(dyn_mod_t* mod, const uint32_t* relp,
-                          dyn_mod_t* mods, int nmods){
+                          dyn_mod_t* mods,  int nmods){
     Elf32_Rel r;
     r.r_offset = relp[0];
     r.r_info   = relp[1];
@@ -1916,7 +2023,49 @@ static void dyn_apply_one(dyn_mod_t* mod, const uint32_t* relp,
             addr = dyn_resolve(mods, nmods, name);
             if (addr) *slot = addr - (uint32_t)slot + *slot;  /* addend in slot */
             break;
-        default: break;
+        case DYN_R_COPY: {
+            /* Copy relocation: copy symbol data from its (library) definition
+             * into this module's copy slot. */
+            Elf32_Sym* csym = (Elf32_Sym*)((unsigned char*)mod->symtab + (size_t)sym * 16);
+            uint32_t src = dyn_resolve(mods, nmods, name);
+            uint32_t cpsz = csym->st_size;
+            if (src && cpsz){
+                uint8_t* dstp = (uint8_t*)slot;
+                const uint8_t* srcp = (const uint8_t*)src;
+                for (uint32_t j = 0; j < cpsz; j++) dstp[j] = srcp[j];
+            } else if (!src){
+                serial_puts("dyn: copy-reloc unresolved "); serial_puts(name); serial_puts("\n");
+            }
+            break;
+        }
+        case DYN_R_TLS_TPOFF:
+        case DYN_R_TLS_IE: {
+            /* Static TLS: slot holds (TLS offset + addend). The addend for a REL
+             * entry is stored in the relocated word itself. */
+            Elf32_Sym* tsym = (Elf32_Sym*)((unsigned char*)mod->symtab + (size_t)sym * 16);
+            uint32_t tls_off = mod->base + tsym->st_value;   /* static TLS offset */
+            *slot = tls_off + *slot;
+            break;
+        }
+        case DYN_R_IRELATIVE: {
+            /* The (REL) addend stores the relative address of an IFUNC resolver;
+             * call it and store the computed real address. */
+            uint32_t resolver = mod->base + *slot;
+            uint32_t (*fn)(void) = (uint32_t(*)(void))resolver;
+            *slot = fn();
+            break;
+        }
+        default:
+            serial_puts("dyn: UNHANDLED reloc type=");
+            { char tmp[16]; int ti=0; uint32_t t=type;
+              if(t==0){ tmp[ti++]='0'; } else { while(t){ tmp[ti++]=(char)('0'+(t%10)); t/=10; } }
+              for(int x=ti-1;x>=0;x--) serial_puts(tmp+x); }
+            serial_puts(" sym=");
+            { char tmp[16]; int ti=0; uint32_t t=sym;
+              if(t==0){ tmp[ti++]='0'; } else { while(t){ tmp[ti++]=(char)('0'+(t%10)); t/=10; } }
+              for(int x=ti-1;x>=0;x--) serial_puts(tmp+x); }
+            serial_puts("\n");
+            break;
     }
 }
 
@@ -1984,34 +2133,60 @@ static int linux_dynload_and_exec(const char* name, int argc, const char** argv,
     uint32_t lib_base = DYN_LIB_BASE;
     int nmods = 1;
     for (int i = 0; i < nneeded; i++){
-        if (nmods >= DYN_MAX_LIBS + 1){ serial_puts("dyn: too many libs\n"); return -1; }
+        if (nmods >= DYN_MAX_LIBS){ serial_puts("dyn: too many libs\n"); return -1; }
+        nmods++;                                   /* reserve slot mods[nmods] for this lib (mods[0] stays main) */
         static unsigned char lelf[2 * 1024 * 1024];
-        int ls = g_reader(needed[i], lelf, (int)sizeof(lelf));
+        int ls = g_reader(needed[i], lelf, (int)  sizeof(lelf));
         if (ls <= 0){ serial_puts("dyn: lib not found: "); serial_puts(needed[i]); serial_puts("\n"); return -1; }
         if (lelf[0]!=0x7F||lelf[1]!='E'||lelf[2]!='L'||lelf[3]!='F'){
             serial_puts("dyn: lib not ELF: "); serial_puts(needed[i]); serial_puts("\n"); return -1;
         }
         uint32_t lmax = dyn_map_image(lelf, ls, lib_base);
         if (lmax == 0){ serial_puts("dyn: lib map fail\n"); return -1; }
-        dyn_mod_t* lib = &mods[nmods];
+        dyn_mod_t* lib = &mods[nmods - 1];
         lib->base = lib_base;
+        serial_puts("dyn: parsing lib "); serial_puts(needed[i]); serial_puts("\n");
         if (dyn_parse(lelf, lib_base, lib) < 0){
             serial_puts("dyn: lib no PT_DYNAMIC: "); serial_puts(needed[i]); serial_puts("\n"); return -1;
         }
+        dyn_parse_trace(lib);
         /* Apply the .so's own relocations (RELATIVE GOT + internal GLOB_DAT)
          * with the lib itself included in the symbol search set. */
-        dyn_apply(lib, mods, nmods + 1);
+        dyn_apply(lib, mods, nmods);
         serial_puts("dyn: loaded "); serial_puts(needed[i]); serial_puts(" at 0x");
         { static const char* h="0123456789ABCDEF"; char b[9]; int bi=0;
           uint32_t v=lib_base; for(int s=24;s>=0;s-=8){ uint8_t x=(uint8_t)(v>>s); b[bi++]=h[x>>4]; b[bi++]=h[x&0xF]; } b[bi]=0; serial_puts(b); }
         serial_puts("\n");
-        nmods++;
         lib_base = (lmax + 0xFFFu) & ~0xFFFu;
         if (lib_base >= 0x0C000000u){ serial_puts("dyn: lib region overflow\n"); return -1; }
     }
 
     /* Resolve the main's cross-object relocations against the loaded libs. */
     dyn_apply(&mods[0], mods, nmods);
+
+    /* Run library constructors (DT_INIT and DT_INIT_ARRAY) in dependency
+     * order: libraries first, then the main executable.  This is required by
+     * musl and other toolchain outputs that use .init_array for C++ ctors /
+     * TLS setup.  Skipped entries (0) are allowed. */
+    for (int m = 1; m < nmods; m++){
+        dyn_mod_t* mod = &mods[m];
+        if (mod->init_func)
+            ((void(*)(void))(mod->base + mod->init_func))();
+        if (mod->init_array){
+            uint32_t n = mod->init_array_sz / 4;
+            uint32_t* arr = (uint32_t*)(mod->base + mod->init_array);
+            for (uint32_t i = 0; i < n; i++)
+                if (arr[i]) ((void(*)(void))(mod->base + arr[i]))();
+        }
+    }
+    if (mods[0].init_func)
+        ((void(*)(void))(mods[0].base + mods[0].init_func))();
+    if (mods[0].init_array){
+        uint32_t n = mods[0].init_array_sz / 4;
+        uint32_t* arr = (uint32_t*)(mods[0].base + mods[0].init_array);
+        for (uint32_t i = 0; i < n; i++)
+            if (arr[i]) ((void(*)(void))(mods[0].base + arr[i]))();
+    }
 
     /* Compute phdr load base (runtime address of the first PT_LOAD). */
     uint32_t load_base = main_bias + (first_v - first_o);

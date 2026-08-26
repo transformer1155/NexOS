@@ -1,0 +1,109 @@
+# ============================================================================
+#  NexOS language pack - English (en)
+#  Mirrors zh.txt key-for-key.  Switch at runtime via Lang.SetLang("en").
+#  Proper nouns stay in English (NexOS, Windows, Segoe, MiniCLR, BGA, VBE,
+#  WinUI, GUI, BIOS, UEFI, CLI, HTTP, TCP, IP, CJK, YaHei, Segoe UI).
+# ============================================================================
+
+# ---- lock screen ---------------------------------------------------------
+lock.title      = Sign in to NexOS
+lock.subtitle   = Sign in to continue
+lock.user       = User name
+lock.pass       = Password
+lock.signin     = Sign in
+lock.hint       = Tab switches field - Enter signs in
+lock.noaccount  = (no account)
+lock.err.user   = Enter a user name.
+lock.err.cred   = Incorrect user name or password.
+lock.defaccounts = default accounts:
+
+# ---- start menu / taskbar pins ------------------------------------------
+app.start       = Start
+app.search      = Search
+app.settings    = Settings
+app.files       = File Explorer
+app.calc        = Calculator
+app.notepad     = Notepad
+app.browser     = Browser
+app.terminal    = Terminal
+app.pictures    = Pictures
+app.music       = Music
+app.videos      = Videos
+app.recycle     = Recycle Bin
+app.thispc      = This PC
+app.network     = Network
+app.power       = Power
+app.shutdown    = Shut down
+app.restart     = Restart
+app.sleep       = Sleep
+app.lock        = Lock
+app.signout     = Sign out
+app.taskview    = Task view
+app.widgets     = Widgets
+app.notifications = Notifications
+app.controlpanel = Control Panel
+app.about       = About
+app.help        = Help
+app.run         = Run
+app.store       = Store
+
+# ---- context / right-click menus ----------------------------------------
+menu.refresh    = Refresh
+menu.empty      = Empty Recycle Bin
+menu.view       = View
+menu.sort       = Sort
+menu.properties = Properties
+menu.new        = New
+menu.rename     = Rename
+menu.delete     = Delete
+menu.copy       = Copy
+menu.paste      = Paste
+menu.cut        = Cut
+menu.open       = Open
+menu.pin        = Pin to Start
+menu.unpin      = Unpin from Start
+
+# ---- desktop / shell chrome ---------------------------------------------
+desk.clock      = Clock
+desk.wallpaper  = Wallpaper
+desk.greeting   = Welcome
+
+# ---- generic dialogs -----------------------------------------------------
+dlg.ok          = OK
+dlg.cancel      = Cancel
+dlg.close       = Close
+dlg.yes         = Yes
+dlg.no          = No
+dlg.apply       = Apply
+dlg.save        = Save
+dlg.openf       = Open file
+
+# ---- start menu / power / window system menus -------------------------
+menu.pintostart   = Pin to Start
+menu.runasadmin   = Run as administrator
+menu.appsettings  = App settings
+menu.startsettings = Start settings
+menu.personalize  = Personalize
+menu.sortby       = Sort by
+menu.display      = Display settings
+menu.moreoptions  = Show more options
+menu.openinterminal = Open in terminal
+menu.taskmgr      = Task manager
+menu.switchaidesk = Switch to AI desktop
+menu.showdesktopicons = Show desktop icons
+menu.autoarrange  = Auto arrange icons
+menu.aligngrid    = Align icons to grid
+menu.typename     = Type
+menu.target       = Target
+menu.namecolon    = Name:
+menu.close        = Close
+win.restore       = Restore
+win.move          = Move
+win.size          = Size
+win.min           = Minimize
+win.max           = Maximize
+win.closewin      = Close window
+win.endprocess    = End process
+win.taskbarsettings = Taskbar settings
+start.lock        = Lock
+start.signout     = Sign out

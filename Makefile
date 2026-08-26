@@ -2,11 +2,48 @@
 #  Makefile  -  BIOS + UEFI bootloader, C++ kernel, MKFS + SFS file systems
 # =====================================================================
 
-AS      := nasm
-CC      := g++
-LD      := ld
-OBJCOPY := objcopy
-PYTHON  := python3
+# ===== Toolchain =====
+# On a WSL / native-Linux host we use the system toolchain directly.
+# Windows-side cross compilers (e.g. /d/nexos-tc/i686-elf/bin/...) are NOT
+# used from WSL -- see tools/wsl_setup.mk which provisions nasm/g++/ld/...
+# on first build.  Everything below is overridable from the command line.
+# Override GNU make's built-in defaults (cc/as/...) but still allow an
+# explicit command-line / environment override:  make CC=clang ...
+ifeq ($(origin AS),default)
+  AS      := nasm
+endif
+ifeq ($(origin CC),default)
+  CC      := g++
+endif
+ifeq ($(origin LD),default)
+  LD      := ld
+endif
+# OBJCOPY / PYTHON / QEMU are NOT GNU-make built-ins, so their `origin` is
+# "undefined" (never "default") when unset.  Using `ifeq ($(origin X),default)`
+# therefore SKIPS the assignment and leaves them empty.  Use `?=` instead so a
+# missing (or empty) value falls back to a sane default while still allowing an
+# explicit command-line / environment override (make OBJCOPY=...).
+OBJCOPY ?= objcopy
+PYTHON  ?= python3
+
+# =====================================================================
+#  WSL / native-Linux auto-provisioning
+#  When this Makefile runs inside WSL (kernel contains "microsoft"),
+#  include tools/wsl_setup.mk which resolves the system toolchain and,
+#  on first build, apt-get installs anything that is missing
+#  (nasm, g++, binutils, gnu-efi, ovmf, qemu, mtools, xorriso, ...).
+#  Override detection with:  make WSL=0 ...   (force non-WSL behaviour)
+# =====================================================================
+ifeq ($(origin WSL),default)
+  ifneq ($(shell uname -r 2>/dev/null | grep -i -c microsoft),0)
+    WSL := 1
+  else
+    WSL := 0
+  endif
+endif
+ifeq ($(WSL),1)
+  include tools/wsl_setup.mk
+endif
 
 BUILD   := build
 IMG     := $(BUILD)/os.img
@@ -14,12 +51,32 @@ UEFI_IMG := $(BUILD)/os_uefi.img
 SFS_IMG := $(BUILD)/sfs.img
 SFS_DIR := sfs_files
 
+# =====================================================================
+#  QEMU executable
+#  QEMU resolution:
+#   - When invoked from inside WSL we use the *native* Linux qemu that
+#     tools/wsl_setup.mk provisions (qemu-system-x86).  This keeps the
+#     whole build loop inside WSL (no dependency on a Windows-side
+#     qemu.exe).  WSLg / GTK frontend works on Windows 11 WSL.
+#   - On a plain Linux host we use the system `qemu-system-x86_64`.
+#   - If you really want the Windows QEMU instead, override with:
+#        make run QEMU=/mnt/d/qemu/qemu-system-x86_64.exe
+#  The actual provisioning (apt-get install qemu-system-x86) happens in
+#  tools/wsl_setup.mk; here we just resolve a sensible default.
+# =====================================================================
+# QEMU is not a GNU-make built-in (origin "undefined" when unset), so the old
+# `ifeq ($(origin QEMU),default)` test never matched and left QEMU empty.
+# Use `?=` to fall back to qemu-system-x86_64 unless overridden.  tools/wsl_setup.mk
+# refines this to a found binary on WSL; `?=` lets that override win too.
+QEMU ?= qemu-system-x86_64
+
 # ----- Flags -----
 ASFLAGS_BIN := -f bin
 ASFLAGS_ELF := -f elf32
 
 CXXFLAGS := -m32 -ffreestanding -fno-exceptions -fno-rtti \
             -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none \
+            -fno-strict-aliasing \
             -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra
 
 LDFLAGS  := -m elf_i386 -nostdlib -T linker.ld -z noexecstack
@@ -32,7 +89,7 @@ CC64       ?= $(CC)
 CXX64FLAGS := -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1
 AS64FLAGS  := -f elf64
 LD64       := ld
-LDFLAGS64  := -m elf_x86_64 -nostdlib -T .attic64/linker64.ld -z noexecstack
+LDFLAGS64  := -m elf_x86_64 -nostdlib -T .attic64/linker64.ld -z noexecstack --unresolved-symbols=ignore-all
 
 # ----- UEFI build variables -----
 EFI_INC   := /usr/include/efi
@@ -57,7 +114,7 @@ EFI_LDFLAGS := -nostdlib -znocombreloc -T $(EFI_LDS) -shared -Bsymbolic \
 # entry64.asm, linker64.ld, switch32to64.asm, switch64to32.asm) and the
 # PE32+/amd64 browser were retired to .attic64/ -- nothing in the build,
 # the disk layout or the shell references them any more.
-SFS_LBA      := 3488
+SFS_LBA      := 3496
 SFS_BYTE_OFF := $(shell echo $$(( $(SFS_LBA) * 512 )))
 
 # Real GGUF weights bypass SFS entirely (768-sector cap) and are appended to
@@ -245,11 +302,11 @@ LINUX_SFS_IMG  := $(BUILD)/linux_sfs.img
 # 12288 (6 MiB mark): main SFS grows past 8704 on the BIOS image, so 8704
 # would overlap it and clobber zfont.bin's tail.  12288 leaves ~2.8k sectors
 # of free space in the main SFS (usable by Sfs::create) before the Linux vol.
-LINUX_SFS_LBA  := 12288
+LINUX_SFS_LBA  := 3800
 
 # Stage 6 dynamic-link test guest + libc.so are both packed into the Linux
 # SFS volume so `linux linux_dynlink` can load libc.so from there.
-$(LINUX_SFS_IMG): $(LINUX_ROOT)/python $(LINUX_ROOT)/linux_argv $(LINUX_ROOT)/linux_net $(LINUX_ROOT)/linux_dynlink $(LINUX_ROOT)/libc.so $(wildcard $(LINUX_ROOT)/*) tools/sfs_gen.py | $(BUILD)
+$(LINUX_SFS_IMG): $(LINUX_ROOT)/python $(LINUX_ROOT)/linux_argv $(LINUX_ROOT)/linux_net $(LINUX_ROOT)/linux_dynlink $(LINUX_ROOT)/libc.so $(LINUX_ROOT)/gnu_dynlink $(LINUX_ROOT)/libgnu.so $(wildcard $(LINUX_ROOT)/*) tools/sfs_gen.py | $(BUILD)
 	$(PYTHON) tools/sfs_gen.py $(LINUX_ROOT) $@
 
 sfs: $(SFS_IMG)
@@ -287,6 +344,7 @@ PEFLAGS  = -O2 -nostdlib -ffreestanding -fno-asynchronous-unwind-tables \
 #  browser, and MINGW64 is kept only so the attic can be rebuilt by hand.
 .PHONY: winpe
 winpe: winpe/iexplore.exe winpe/ntbrowser.exe winpe/notepad.exe
+	$(call ensure-pkg, i686-w64-mingw32-gcc, $(PKG_MINGW))
 	cp winpe/iexplore.exe $(SFS_DIR)/iexplore.exe
 	$(PYTHON) tools/pe_gap.py winpe/iexplore.exe
 	cp winpe/ntbrowser.exe $(SFS_DIR)/ntbrowser.exe
@@ -337,6 +395,7 @@ SHELL_SRC := csharp/apps/Shell/Shell.cs csharp/apps/Shell/Apps.cs \
              csharp/apps/Shell/AiSetup.cs csharp/apps/Shell/AiAgent.cs \
              csharp/apps/Shell/Login.cs \
              csharp/apps/Shell/Popup.cs \
+             csharp/apps/Shell/Lang.cs \
              csharp/apps/Shell/Demo.cs \
              csharp/NexOS.Forms/Forms.cs csharp/NexOS.Forms/Voice.cs \
              csharp/apps/Shell/Shell.csproj
@@ -349,6 +408,7 @@ $(SFS_DIR)/shell.mex: $(SHELL_SRC) $(CS_CORE) tools/mex_pack.py
 	@echo "==> C# shell packed: $@ ($$(stat -c%s $@) bytes)"
 
 csharp: $(SFS_DIR)/hello.mex $(SFS_DIR)/shell.mex
+	$(call ensure-pkg, dotnet, $(PKG_DOTNET))
 
 # ----- Windows harness: run the very same C# shell on .NET ------------
 #  csharp/winhost compiles Shell.cs / Apps.cs / Desktop.cs / Forms.cs /
@@ -471,6 +531,28 @@ $(LINUX_ROOT)/linux_dynlink: usr/dynlink_crt.c usr/linux_dynlink.c usr/libc.h \
 	          -L$(LINUX_ROOT) -o $@ $(BUILD)/dlcrt.o $(BUILD)/dlink_app.o -lc
 	@echo "==> Linux dynamic-link test packed: $@ ($$(stat -c%s $@) bytes)"
 
+# Stage 7 GNU_HASH test: a shared lib built with --hash-style=gnu (no SysV hash)
+# plus a PIE guest that DT_NEEDED it.  Exercises the kernel's DT_GNU_HASH symbol
+# lookup path (bloom filter + bucket chain).  Reuses the same guest runtime as
+# the Stage 6 test but against a gnu-hash-only .so to prove the new code path.
+$(LINUX_ROOT)/libgnu.so: usr/libc_impl.c usr/libc.h | $(LINUX_ROOT)
+	$(NEX_CC) $(NEX_CFLAGS) -fPIC -fno-plt -c usr/libc_impl.c -o $(BUILD)/libgnu_pic.o
+	$(NEX_LD) -m elf_i386 -shared -nostdlib --soname=libgnu.so \
+	          --hash-style=gnu -z now -o $@ $(BUILD)/libgnu_pic.o
+	@echo "==> libgnu.so (gnu hash) packed: $@ ($$(stat -c%s $@) bytes)"
+
+$(LINUX_ROOT)/gnu_dynlink: usr/dynlink_crt.c usr/linux_dynlink.c usr/libc.h \
+                            $(LINUX_ROOT)/libgnu.so | $(LINUX_ROOT)
+	$(NEX_CC) -x c -m32 -ffreestanding -nostdlib -fno-stack-protector \
+	          -fno-asynchronous-unwind-tables -O2 -Wall -Wextra -Iusr \
+	          -fPIE -fno-plt -c usr/dynlink_crt.c -o $(BUILD)/gnudlcrt.o
+	$(NEX_CC) -x c -m32 -ffreestanding -nostdlib -fno-stack-protector \
+	          -fno-asynchronous-unwind-tables -O2 -Wall -Wextra -Iusr \
+	          -fPIE -fno-plt -c usr/linux_dynlink.c -o $(BUILD)/gnudlink_app.o
+	$(NEX_LD) -m elf_i386 -nostdlib -e _start --no-dynamic-linker -pie \
+	          -L$(LINUX_ROOT) -o $@ $(BUILD)/gnudlcrt.o $(BUILD)/gnudlink_app.o -lgnu
+	@echo "==> Linux GNU_HASH dynamic-link test packed: $@ ($$(stat -c%s $@) bytes)"
+
 # =====================================================================
 #  Disk image assembly
 #  boot + stage2 + kernel (32-bit) + SFS at LBA 3488, padded to 4 MiB
@@ -522,15 +604,20 @@ $(IMG): $(BUILD)/boot.bin $(BUILD)/stage2.bin $(BUILD)/kernel.bin $(BUILD)/kerne
 
 # ----- Compile UEFI bootloader C -----
 $(BUILD)/bootuefi.o: uefi/bootuefi.c | $(BUILD)
-	gcc $(EFI_CFLAGS) -I. -c $< -o $@
+	@if [ ! -e "$(EFI_CRT0)" ]; then \
+	  echo "[wsl] gnu-efi not installed -- installing $(PKG_GNUEFI) ..."; \
+	  sudo apt-get update -qq && sudo apt-get install -y -qq $(PKG_GNUEFI) || \
+	    { echo "!! failed; run: sudo apt-get install $(PKG_GNUEFI)"; exit 1; }; \
+	fi
+	$(CC) -m64 $(EFI_CFLAGS) -I. -c $< -o $@
 
 # ----- Assemble UEFI mode-transition stub -----
 $(BUILD)/enter_kernel_uefi.o: uefi/enter_kernel.S | $(BUILD)
-	gcc -c $< -o $@
+	$(CC) -m64 -c $< -o $@
 
 # ----- Assemble RIP-relative embedded kernel accessor (avoids PE32+ relocation issues) -----
 $(BUILD)/get_embedded_uefi.o: uefi/get_embedded.S | $(BUILD)
-	gcc -c $< -o $@
+	$(CC) -m64 -c $< -o $@
 
 # ----- Generate relocatable object with kernel.bin embedded (avoids OVMF FAT12 bug) -----
 $(BUILD)/kernel_blob.o: $(BUILD)/kernel.bin | $(BUILD)
@@ -557,12 +644,13 @@ $(BUILD)/BOOTX64.EFI: $(BUILD)/bootx64.so tools/gen_reloc.py | $(BUILD)
 # boot-load-size = 32768 (16MB / 512) fits in 16-bit El Torito field.
 # VirtualBox UEFI: FAT16 + non-zero boot-load-size + ISO9660 fallback = compatible.
 $(BUILD)/esp.img: $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(SFS_IMG) | $(BUILD)
+	$(call ensure-pkg, mformat, $(PKG_MTOOLS))
 	dd if=/dev/zero of=$@ bs=1M count=16 2>/dev/null
-	mformat -i $@ ::
-	mmd     -i $@ ::/EFI
-	mmd     -i $@ ::/EFI/BOOT
-	mcopy   -i $@ $(BUILD)/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
-	mcopy   -i $@ $(BUILD)/kernel.bin   ::/kernel.bin
+	$(MFORMAT) -i $@ ::
+	$(MMD)     -i $@ ::/EFI
+	$(MMD)     -i $@ ::/EFI/BOOT
+	$(MCOPY)   -i $@ $(BUILD)/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
+	$(MCOPY)   -i $@ $(BUILD)/kernel.bin   ::/kernel.bin
 	@echo "==> ESP image built: $(BUILD)/esp.img ($$(stat -c%s $@) bytes, FAT16)"
 
 # ----- Combined UEFI disk image (GPT + ESP + SFS) -----
@@ -626,12 +714,13 @@ $(BUILD)/BOOTX64_DIAG.EFI: $(BUILD)/bootx64_diag.so tools/gen_reloc.py | $(BUILD
 	$(PYTHON) tools/gen_reloc.py $(BUILD)/bootx64_diag.so $@
 
 $(BUILD)/esp_diag.img: $(BUILD)/BOOTX64_DIAG.EFI $(BUILD)/kernel_diag.bin $(SFS_IMG) | $(BUILD)
+	$(call ensure-pkg, mformat, $(PKG_MTOOLS))
 	dd if=/dev/zero of=$@ bs=1M count=16 2>/dev/null
-	mformat -i $@ ::
-	mmd     -i $@ ::/EFI
-	mmd     -i $@ ::/EFI/BOOT
-	mcopy   -i $@ $(BUILD)/BOOTX64_DIAG.EFI ::/EFI/BOOT/BOOTX64.EFI
-	mcopy   -i $@ $(BUILD)/kernel_diag.bin   ::/kernel.bin
+	$(MFORMAT) -i $@ ::
+	$(MMD)     -i $@ ::/EFI
+	$(MMD)     -i $@ ::/EFI/BOOT
+	$(MCOPY)   -i $@ $(BUILD)/BOOTX64_DIAG.EFI ::/EFI/BOOT/BOOTX64.EFI
+	$(MCOPY)   -i $@ $(BUILD)/kernel_diag.bin   ::/kernel.bin
 
 $(UEFI_DIAG_IMG): $(BUILD)/esp_diag.img $(BUILD)/sfs_uefi.img $(BUILD)/kernel64.bin tools/make_gpt_uefi.py | $(BUILD)
 	$(PYTHON) tools/make_gpt_uefi.py $(BUILD)/esp_diag.img $@ $(BUILD)/kernel64.bin $(BUILD)/sfs_uefi.img
@@ -674,12 +763,13 @@ $(BUILD)/BOOTX64_LOGO.EFI: $(BUILD)/bootx64_logo.so tools/gen_reloc.py | $(BUILD
 	$(PYTHON) tools/gen_reloc.py $(BUILD)/bootx64_logo.so $@
 
 $(BUILD)/esp_logo.img: $(BUILD)/BOOTX64_LOGO.EFI $(BUILD)/kernel_logo.bin $(SFS_IMG) | $(BUILD)
+	$(call ensure-pkg, mformat, $(PKG_MTOOLS))
 	dd if=/dev/zero of=$@ bs=1M count=16 2>/dev/null
-	mformat -i $@ ::
-	mmd     -i $@ ::/EFI
-	mmd     -i $@ ::/EFI/BOOT
-	mcopy   -i $@ $(BUILD)/BOOTX64_LOGO.EFI ::/EFI/BOOT/BOOTX64.EFI
-	mcopy   -i $@ $(BUILD)/kernel_logo.bin   ::/kernel.bin
+	$(MFORMAT) -i $@ ::
+	$(MMD)     -i $@ ::/EFI
+	$(MMD)     -i $@ ::/EFI/BOOT
+	$(MCOPY)   -i $@ $(BUILD)/BOOTX64_LOGO.EFI ::/EFI/BOOT/BOOTX64.EFI
+	$(MCOPY)   -i $@ $(BUILD)/kernel_logo.bin   ::/kernel.bin
 
 $(UEFI_LOGO_IMG): $(BUILD)/esp_logo.img $(BUILD)/sfs_uefi.img $(BUILD)/kernel64.bin tools/make_gpt_uefi.py | $(BUILD)
 	$(PYTHON) tools/make_gpt_uefi.py $(BUILD)/esp_logo.img $@ $(BUILD)/kernel64.bin $(BUILD)/sfs_uefi.img
@@ -787,7 +877,8 @@ $(ISO_ROOT):
 $(ISO): $(ISO_ROOT)/boot/cd_boot.img $(ISO_ROOT)/boot/esp.img \
         $(ISO_ROOT)/EFI/BOOT/BOOTX64.EFI \
         $(ISO_ROOT)/kernel.bin | $(BUILD)
-	xorriso -as mkisofs \
+	$(call ensure-pkg, xorriso, $(PKG_XORRISO))
+	$(XORRISO) -as mkisofs \
 	  -R -J -V MINIOS \
 	  -c boot/boot.cat \
 	  -b boot/cd_boot.img \
@@ -872,8 +963,10 @@ DISPLAY_BACKEND := $(shell [ -d /mnt/wslg ] && echo gtk || echo sdl)
 
 # ----- UEFI: run in a QEMU window (default target) -----
 run: $(UEFI_IMG)
+	$(call ensure-pkg, qemu-system-x86_64, $(PKG_QEMU))
+	$(if $(filter undefined,$(origin OVMF_CODE)),,$(if $(OVMF_CODE),,$(error OVMF_CODE not resolved -- install ovmf: sudo apt-get install $(PKG_OVMF))))
 	cp $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
-	$(GUIENV) qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	$(GUIENV) $(QEMU) -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
 		-drive format=raw,file=$(UEFI_IMG) -m 64M -display $(DISPLAY_BACKEND)
 
@@ -883,7 +976,8 @@ run: $(UEFI_IMG)
 # (USER_BASE 0x04000000 .. USER_END 0x08000000); with -m 64M that range has
 # no backing RAM and the `user` command faults.
 bios-run: $(IMG)
-	$(GUIENV) qemu-system-x86_64 -drive format=raw,file=$(IMG) -m 4096 \
+	$(call ensure-pkg, qemu-system-x86_64, $(PKG_QEMU))
+	$(GUIENV) $(QEMU) -drive format=raw,file=$(IMG) -m 4096 \
 		-display $(DISPLAY_BACKEND) \
 		-net nic,model=ne2k_isa -net user,hostfwd=tcp::8080-:8080
 
@@ -898,7 +992,7 @@ play: $(IMG)
 	@echo "login: root / admin"
 	@echo "try:   user | vfs /system/passwd | perm | perm reset | help"
 	@echo "quit:  close the window, or Ctrl-A X in the terminal"
-	$(GUIENV) qemu-system-x86_64 -drive format=raw,file=$(IMG) -m 4096 \
+	$(GUIENV) $(QEMU) -drive format=raw,file=$(IMG) -m 4096 \
 		-vga std -display $(DISPLAY_BACKEND) -serial mon:stdio -no-reboot
 
 # Fallback for the rare box where even XWayland misbehaves: SDL instead of GTK.
@@ -906,7 +1000,7 @@ play: $(IMG)
 play-sdl: $(ISO)
 	@echo "=== NexOS interactive session (SDL backend) ==="
 	@echo "login: root / admin   |   then type 'gui' for the Win11 desktop"
-	$(GUIENV) qemu-system-x86_64 -cdrom $(ISO) -boot d -m 4096 \
+	$(GUIENV) $(QEMU) -cdrom $(ISO) -boot d -m 4096 \
 		-vga std -display sdl -serial mon:stdio -no-reboot
 
 # Last resort when no local display works at all (headless host, SSH, broken
@@ -916,7 +1010,7 @@ play-sdl: $(ISO)
 play-vnc: $(ISO)
 	@echo "=== NexOS over VNC -- connect a VNC client to 127.0.0.1:5900 ==="
 	@echo "login: root / admin   |   then type 'gui' for the Win11 desktop"
-	qemu-system-x86_64 -cdrom $(ISO) -boot d -m 4096 \
+	$(QEMU) -cdrom $(ISO) -boot d -m 4096 \
 		-vga std -display vnc=127.0.0.1:0 -serial mon:stdio -no-reboot
 
 # Inject local files (.exe/.zip/.bat/.com/...) and drive them headlessly.
@@ -984,7 +1078,7 @@ test-net: $(IMG)
 # ----- UEFI: run in a QEMU window with OVMF -----
 uefi-run: $(UEFI_IMG)
 	cp $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
-	qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	$(QEMU) -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
 		-drive format=raw,file=$(UEFI_IMG) -m 64M
 
@@ -994,7 +1088,7 @@ uefi-test: $(UEFI_IMG)
 
 # ----- ISO: run in QEMU (BIOS mode, x86_64 for switch support) -----
 iso-run: $(ISO)
-	qemu-system-x86_64 -cdrom $(ISO) -boot d -m 2G
+	$(QEMU) -cdrom $(ISO) -boot d -m 2G
 
 # ----- User data disk (secondary ATA VHD). Files persist across reboots. -----
 data-vhd: build/data.vhd
@@ -1003,12 +1097,12 @@ build/data.vhd: tools/make_data_vhd.py
 
 # ----- ISO + data VHD: run with a persistent user disk (recommended) -----
 iso-run-data: $(ISO) build/data.vhd
-	qemu-system-x86_64 -cdrom $(ISO) -boot d -m 2G \
+	$(QEMU) -cdrom $(ISO) -boot d -m 2G \
 		-drive file=build/data.vhd,format=raw,if=ide,index=1
 # ----- ISO: run in QEMU (UEFI mode) -----
 iso-run-uefi: $(ISO)
 	cp $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
-	qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	$(QEMU) -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
 		-cdrom $(ISO) -m 64M
 
@@ -1022,13 +1116,13 @@ iso-test-uefi: $(ISO)
 
 # ----- Hybrid USB: run in QEMU (BIOS mode, x86_64 for switch support) -----
 hybrid-run: $(HYBRID_IMG)
-	qemu-system-x86_64 -drive format=raw,file=$(HYBRID_IMG) -m 64M \
+	$(QEMU) -drive format=raw,file=$(HYBRID_IMG) -m 64M \
 		-net nic,model=ne2k_isa -net user,hostfwd=tcp::8080-:8080
 
 # ----- Hybrid USB: run in QEMU (UEFI mode) -----
 hybrid-run-uefi: $(HYBRID_IMG)
 	cp $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
-	qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	$(QEMU) -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
 		-drive format=raw,file=$(HYBRID_IMG) -m 64M
 
@@ -1154,9 +1248,14 @@ $(BUILD)/mforms64.o: mforms.cpp | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -fno-optimize-sibling-calls -c mforms.cpp -o $@
 
 # ----- Link 64-bit kernel ELF (entry64.o first => _start64 at 0x100000) -----
-$(BUILD)/kernel64.elf: $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/font_vec64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o .attic64/linker64.ld | $(BUILD)
-	$(LD64) $(LDFLAGS64) -o $@ $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/font_vec64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o
+$(BUILD)/kernel64.elf: $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/font_vec64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_bringup.o $(BUILD)/ap_trampoline.o .attic64/linker64.ld | $(BUILD)
+	$(LD64) $(LDFLAGS64) -o $@ $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/font_vec64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_bringup.o $(BUILD)/ap_trampoline.o
 
+$(BUILD)/smp_bringup.o: .attic64/smp_bringup.cpp .attic64/smp64.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c .attic64/smp_bringup.cpp -o $@
+
+# ELF relocations are needed, then wrap it in an ELF64 object via objcopy
+# so it can be linked.  This exposes _binary_ap_trampoline_bin_start/end.
 # ----- Extract flat 64-bit kernel binary -----
 # A 32-bit (i686-elf) objcopy cannot read the ELF64 input, so the 64-bit
 # binutils objcopy must be used here (OBJCOPY64).  On multilib Linux builds

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Wrapper so `python3` resolves inside the pure-Windows MSYS2 build where only
+# the managed `python.exe` exists. tools/ is first on PATH via build_win.sh.
+exec /c/Users/trans/.workbuddy/binaries/python/versions/3.13.12/python.exe "$@"

@@ -15,6 +15,17 @@
 
 [BITS 64]
 
+%macro DBG 1
+    mov dx, 0x3FD
+%%w:
+    in al, dx
+    test al, 0x20             ; THRE
+    jz %%w
+    mov dx, 0x3F8
+    mov al, %1
+    out dx, al
+%endmacro
+
 global _start64
 extern kmain64
 extern __bss_start
@@ -23,34 +34,34 @@ extern __bss_end
 section .text
 
 _start64:
-    ; ---- Serial debug: '6' for 64-bit ----
+    ; ---- Serial debug: 'E' for entry64 reached (immediate, no wait so it
+    ;      can never be dropped/delayed before a possible early crash) ----
     mov dx, 0x3F8
-    mov al, 0x36           ; '6'
+    mov al, 0x45           ; 'E'
     out dx, al
 
     ; ---- Set up 64-bit stack ----
-    ; NOTE: keep above 0x90000 -- cmd_switch32() loads the 32-bit kernel
-    ; into 0x10000-0x90000 and would clobber a low stack during the
-    ; 64->32 switch-back, causing non-deterministic crashes.
     mov rsp, 0x1F0000
 
     ; ---- Enable FPU (x87) + SSE ----
     mov rax, cr0
-    and rax, ~(1 << 2)     ; Clear EM (use FPU, not emulation)
+    and rax, ~(1 << 2)     ; Clear EM
     and rax, ~(1 << 3)     ; Clear TS
     or rax, (1 << 1)       ; Set MP
     or rax, (1 << 5)       ; Set NE
     mov cr0, rax
+    DBG 0x46               ; 'F' FPU/cr0 done
 
     mov rax, cr4
     or rax, (1 << 9)       ; OSFXSR (SSE)
     or rax, (1 << 10)      ; OSXMMEXCPT
     mov cr4, rax
-
     fninit                  ; Init x87 FPU
+    DBG 0x47               ; 'G' cr4+fninit done
 
     ; ---- Load permanent GDT ----
     lgdt [rel gdt64_desc]
+    DBG 0x48               ; 'H' lgdt done
 
     ; Reload segment registers with new GDT selectors
     mov ax, 0x10            ; 64-bit data segment
@@ -59,20 +70,20 @@ _start64:
     mov fs, ax
     mov gs, ax
     mov ss, ax
-
-    ; Far jump to refresh CS with 64-bit code segment
-    ; (Not strictly necessary since we're already in 64-bit, but clean)
-    ; Skip far jump - CS is already 0x08 from switch32to64
+    DBG 0x49               ; 'I' segs reloaded
 
     ; ---- Clear BSS ----
     mov rdi, __bss_start
     mov rcx, __bss_end
     sub rcx, rdi            ; byte count
+    DBG 0x4A               ; 'J' about to clear bss (rcx below)
     xor rax, rax
     cld
     rep stosb
+    DBG 0x4B               ; 'K' bss cleared
 
     ; ---- Call C++ kernel ----
+    DBG 0x4C               ; 'L' about to call kmain64
     call kmain64
 
 .hang:
@@ -99,3 +110,77 @@ gdt64_end:
 gdt64_desc:
     dw gdt64_end - gdt64 - 1
     dq gdt64
+
+; =====================================================================
+;  64-bit IDT + fault ISRs (diagnostic)
+;  Generated so that ANY exception / fault (#PF, #GP, #UD, #DE, ...) lands
+;  in fault_common() (C, kernel64.cpp), which prints CR2/RIP/step to the
+;  serial port and writes a 512-byte record to LBA34 on disk.  This replaces
+;  the old "paint a full-screen color and guess where we hung" approach.
+;
+;  Safety: the 64-bit kernel NEVER enables hardware interrupts (no STI
+;  anywhere in kernel64.cpp), so loading a real IDT only catches synchronous
+;  CPU faults (page fault / GPF / #UD / ...).  It CANNOT trigger an IRQ storm.
+;  The table is identity-mapped already (link base 0x100000 == physical).
+; =====================================================================
+section .text
+
+; --- Per-vector stubs -------------------------------------------------
+; Vectors the CPU pushes an error code for: push only the vector number.
+; All other vectors: push a dummy errcode (0) then the vector number.
+; Both branches fall through to isr_common with a uniform 7-qword frame:
+;   [intno, errcode, rip, cs, rflags, rsp, ss]
+%assign v 0
+%rep 256
+    %assign iserr 0
+    %if (v == 8) || (v == 10) || (v == 11) || (v == 12) || (v == 13) || (v == 14) || (v == 17) || (v == 30)
+        %assign iserr 1
+    %endif
+    isr_stub_%+ v:
+    %if iserr
+        push v                      ; error code already on stack -> just vector#
+    %else
+        push 0                      ; dummy error code
+        push v                      ; vector number
+    %endif
+        jmp isr_common
+    %assign v v+1
+%endrep
+
+; --- Common fault entry ----------------------------------------------
+; Stack at entry: [intno(8), errcode(8), rip(8), cs(8), rflags(8), rsp(8), ss(8)]
+; Pass to fault_common(intno, errcode, rip, cs, rflags, cr2) per SysV ABI
+; (rdi, rsi, rdx, rcx, r8, r9).  CR2 is read before any other faulting
+; access so it stays accurate for #PF.
+global isr_common
+global isr_stub_0
+isr_common:
+    mov rdi, [rsp + 0]             ; intno
+    mov rsi, [rsp + 8]             ; errcode
+    mov rdx, [rsp + 16]            ; rip
+    mov rcx, [rsp + 24]            ; cs
+    mov r8,  [rsp + 32]            ; rflags
+    mov rax, cr2
+    mov r9,  rax                   ; cr2
+    call fault_common
+    ; fault_common never returns (it halts).  If it does, halt hard.
+.halt:
+    cli
+    hlt
+    jmp .halt
+
+section .data
+align 8
+; Table of 256 stub entry points.  C-side build_idt() reads this table and
+; packs each address into a gate.  Addresses are identity-mapped (physical
+; == virtual at 0x100000 base), so they can be split into offlow/offmid/offhigh
+; directly.
+global isr_stub_table
+isr_stub_table:
+%assign v 0
+%rep 256
+    dq isr_stub_%+ v
+    %assign v v+1
+%endrep
+
+extern fault_common

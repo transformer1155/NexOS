@@ -6,26 +6,30 @@
 extern "C" {
 #endif
 
-// GGML tensor types we support (subset of ggml_type from llama.cpp)
+// GGML tensor types we support (subset of ggml_type from llama.cpp).
+// IMPORTANT: these must match the official GGML type numbers used in GGUF
+// files (see llama.cpp ggml_type).  The older custom ordering broke Q8_0
+// (was 6, files use 8) and shifted every K-quant, so real-world Qwen/Qwen2
+// models failed with "unsupported quantisation".
 enum {
     GGUF_T_F32  = 0,
     GGUF_T_F16  = 1,
     GGUF_T_Q4_0 = 2,
     GGUF_T_Q4_1 = 3,
-    GGUF_T_Q5_0 = 4,
-    GGUF_T_Q5_1 = 5,
-    GGUF_T_Q8_0 = 6,
-    GGUF_T_Q8_1 = 7,
-    GGUF_T_Q2_K = 8,
-    GGUF_T_Q3_K = 9,
-    GGUF_T_Q4_K = 10,
-    GGUF_T_Q5_K = 11,
-    GGUF_T_Q6_K = 12,
-    GGUF_T_Q8_K = 13,
+    GGUF_T_Q5_0 = 6,
+    GGUF_T_Q5_1 = 7,
+    GGUF_T_Q8_0 = 8,
+    GGUF_T_Q8_1 = 9,
+    GGUF_T_Q2_K = 10,
+    GGUF_T_Q3_K = 11,
+    GGUF_T_Q4_K = 12,
+    GGUF_T_Q5_K = 13,
+    GGUF_T_Q6_K = 14,
+    GGUF_T_Q8_K = 15,
     GGUF_T_I8   = 23,
     GGUF_T_I16  = 24,
     GGUF_T_I32  = 25,
-    GGUF_T_BF16 = 29
+    GGUF_T_BF16 = 20
 };
 
 #define GGUF_MAX_TENSORS 1024

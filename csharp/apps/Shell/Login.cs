@@ -60,11 +60,20 @@ namespace NexOS.Forms
             // The kernel is the single source of truth: it reports -1 for
             // "nobody is signed in".  A text-mode boot that already ran
             // login_prompt() therefore lands straight on the desktop.
-            active   = Host.LoginUid() < 0;
+            // Arm the graphical lock screen only when there are accounts
+            // to sign into.  (The 64-bit VM's machine-state callbacks are
+            // not wired, so UserCount() is 0 there -> boot straight to the
+            // desktop instead of a dead-end lock screen with no accounts.)
+            active   = nuser > 0;
             Host.Log(active ? "[LOGIN] lock screen armed" : "[LOGIN] session already signed in");
         }
 
         public static int IsActive() { return active ? 1 : 0; }
+
+        // WinHost / --shot only: skip the lock screen so the desktop is
+        // visible in headless previews.  Not used by the VM (which boots
+        // straight into the lock screen for security).
+        public static void BypassForHost() { active = false; }
 
         // Re-arm the lock screen (Start menu -> Sign out, screen lock...).
         public static void Lock()
@@ -139,23 +148,23 @@ namespace NexOS.Forms
             Gfx.Text(cx - Gfx.Measure(ini) / 2, ay - 8, ini, FG);
 
             // ---- account name -----------------------------------------
-            string nm = (user == null || user.Length == 0) ? "(no account)" : user;
+            string nm = (user == null || user.Length == 0) ? Lang.T("lock.noaccount") : user;
             Gfx.TextCenter(cardX, cardY + 138, cardW, nm, FG);
-            Gfx.TextCenter(cardX, cardY + 158, cardW, "Sign in to continue", FG_DIM);
+            Gfx.TextCenter(cardX, cardY + 158, cardW, Lang.T("lock.subtitle"), FG_DIM);
 
             // ---- fields ------------------------------------------------
-            Field(fieldX, userY, "User name", user, focus == 0, false);
-            Field(fieldX, passY, "Password",  Mask(),  focus == 1, true);
+            Field(fieldX, userY, Lang.T("lock.user"), user, focus == 0, false);
+            Field(fieldX, passY, Lang.T("lock.pass"),  Mask(),  focus == 1, true);
 
             // ---- sign-in button ----------------------------------------
             Gfx.FillRound(fieldX, btnY, fieldW, fieldH, 6, Theme.Accent);
-            Gfx.TextCenter(fieldX, btnY + 10, fieldW, "Sign in", FG);
+            Gfx.TextCenter(fieldX, btnY + 10, fieldW, Lang.T("lock.signin"), FG);
 
             // ---- error / hint ------------------------------------------
             if (err != null && err.Length > 0)
                 Gfx.TextCenter(cardX, btnY + 46, cardW, err, ERR_FG);
             else
-                Gfx.TextCenter(cardX, btnY + 46, cardW, "Tab switches field  -  Enter signs in", FG_DIM);
+                Gfx.TextCenter(cardX, btnY + 46, cardW, Lang.T("lock.hint"), FG_DIM);
 
             // ---- account chips (only worth drawing for >1 account) -----
             if (nuser > 1) Chips();
@@ -164,7 +173,7 @@ namespace NexOS.Forms
             // credentials instead of letting them lock themselves out of
             // their own VM.
             if (attempts >= 2)
-                Gfx.TextCenter(0, h - 24, w, "default accounts:  root / admin      guest / guest", FG_DIM);
+                Gfx.TextCenter(0, h - 24, w, U.Cat(Lang.T("lock.defaccounts"), "  root / admin      guest / guest"), FG_DIM);
         }
 
         // One labelled input box.  `masked` only changes the caret maths
@@ -265,7 +274,7 @@ namespace NexOS.Forms
         {
             if (user == null || user.Length == 0)
             {
-                err = "Enter a user name."; focus = 0; return;
+                err = Lang.T("lock.err.user"); focus = 0; return;
             }
             int uid = Host.LoginCheck(user, pass);
             if (uid >= 0)
@@ -278,7 +287,7 @@ namespace NexOS.Forms
             attempts = attempts + 1;
             pass  = "";
             focus = 1;
-            err   = "Incorrect user name or password.";
+            err   = Lang.T("lock.err.cred");
             Host.Log(U.Cat("[LOGIN] rejected ", user));
         }
 

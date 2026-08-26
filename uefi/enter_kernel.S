@@ -33,6 +33,17 @@
     /* I/O port for QEMU serial (already initialised by OVMF) */
     .equ SERIAL_PORT, 0x3F8
 
+    /* 32-bit boot stack top.  This was 0x90000 until the flat kernel image
+       grew to 0x90568: the stack grows DOWN from here, and gdt64/gdt64_desc
+       (loaded by switch_to_64bit's lgdt) sit at 0x8FE00, i.e. 512 bytes
+       below.  A deep enough call chain shredded the 64-bit GDT and
+       `mov ss, 0x10` in long mode #GP'd -> triple fault + reboot loop.
+       0x1810000 is the top of the 32-bit stack inside linker.ld's .lmboot
+       region, the same stack entry.asm re-establishes a few instructions
+       later, so the two agree.
+       COUPLING: __k32_stack_top in linker.ld, STACK_ADDR in bootuefi.c. */
+    .equ K32_STACK_TOP, 0x1810000
+
 enter_kernel:
     cli
 
@@ -110,6 +121,15 @@ enter_kernel:
      * --------------------------------------------------------------- */
     .code64
 fault_handler:
+    /* Record a fault marker at low RAM 0x5100 (identity-mapped by both the
+       UEFI firmware tables and g_pml4, so it is always safe to write).  A
+       downstream diagnostic can then tell a captured #PF/#GP/#UD apart from
+       a plain hang.  Do NOT touch the framebuffer here: in the 32-bit compat
+       path CR3 may be g_pml4, which does NOT map a >4GB LFB, and a second
+       #PF would triple-fault and mask the original one. */
+    movq    $0x5100, %rdi
+    movb    $0xFA, %al
+    movb    %al, (%rdi)
     movb    $0x21, %al                 /* '!' = fault caught */
     movw    $SERIAL_PORT, %dx
     outb    %al, %dx
@@ -130,7 +150,7 @@ compat32:
     movw    %ax, %fs
     movw    %ax, %gs
     movw    %ax, %ss
-    movl    $0x90000, %esp
+    movl    $K32_STACK_TOP, %esp
 
     /* ---- Debug: '3' = now in 32-bit compat mode ---- */
     movb    $0x33, %al

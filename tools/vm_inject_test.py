@@ -60,7 +60,7 @@ LOG = "build/serial_inject.log"
 PORT = 4456
 SFS_DIR = "sfs_files"
 SFS_IMG = "build/sfs.img"
-SFS_ALT_LBA = 3328          # matches SFS_ALT_LBA in kernel.cpp
+SFS_ALT_LBA = 3368          # matches SFS_ALT_LBA in kernel.cpp
 MONITOR_ERR = "build/qemu_inject.err"
 
 # ---- name policy: SFS ceiling is 19 chars, flat, ASCII -------------------

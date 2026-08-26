@@ -15,6 +15,10 @@
 
 extern "C" void* kmalloc(uint32_t size);
 extern "C" void  kfree(void* ptr);
+// Kernel file-system write back (MKFS data FS) -- used to make CreateFileA/
+// WriteFile/CloseHandle actually persist a file written by a Win32 program.
+// Declared WITHOUT extern "C" to match the C++ mangled name in kernel.cpp.
+int kern_fs_create(const char* name, const unsigned char* data, int len);
 
 #if defined(__i386__)
 #  define WINAPI __attribute__((stdcall))
@@ -747,11 +751,6 @@ static int WINAPI K_WriteConsoleA(uint32_t, const char* buf, uint32_t n, uint32_
     if (written) *written = n;
     return 1;
 }
-static int WINAPI K_WriteFile(uint32_t h, const void* buf, uint32_t n, uint32_t* written, void*){
-    if ((h & 0xFFF0) == 0x00F0 && buf && n) con_put((const char*)buf, (int)n);
-    if (written) *written = n;
-    return 1;
-}
 static void WINAPI K_ExitProcess(uint32_t code){
     g_exitcode = (int)code;
     g_quit = true;
@@ -759,6 +758,25 @@ static void WINAPI K_ExitProcess(uint32_t code){
     // control when it returns.  A real ExitProcess never returns, but we
     // cannot longjmp out of ring-0 app code safely.
 }
+
+// ---------------------------------------------------------------------
+//  Threading (stage-1: cooperative / inline execution)
+//
+//  NexOS does not yet have a pre-emptive scheduler for PE threads, so
+//  CreateThread runs the worker inline (synchronously) and returns a fake
+//  handle.  This is enough for real Windows programs that only need the
+//  API to exist and link (e.g. a worker that prints and returns).  A real
+//  scheduler is a later milestone (roadmap P4 stage 3+).
+// ---------------------------------------------------------------------
+typedef uint32_t (WINAPI *K_THREAD_START)(void*);
+static uint32_t WINAPI K_CreateThread(uint32_t, uint32_t, uint32_t start,
+                                       uint32_t param, uint32_t, uint32_t* tid){
+    if (!start) return 0;
+    if (tid) *tid = 1;
+    ((K_THREAD_START)(void*)start)((void*)(uintptr_t)param);
+    return 0x00E0;   // fake thread handle
+}
+static void WINAPI K_ExitThread(uint32_t){ /* no-op for stage-1 */ }
 static void WINAPI K_OutputDebugStringA(const char* s){ if (s) { w32_serial("[app] "); w32_serial(s); } }
 
 static uint32_t WINAPI K_GetModuleHandleA(const char*){ return 0x00400000u; }
@@ -890,8 +908,30 @@ static int WINAPI K_lstrcmpiA(const char* a, const char* b){ return w_icmp(a, b)
 // file APIs backed by the NexOS file systems
 static uint8_t  g_fbuf[4096];
 static int      g_fsize = 0, g_fpos = 0;
-static uint32_t WINAPI K_CreateFileA(const char* name, uint32_t, uint32_t, void*, uint32_t, uint32_t, uint32_t){
-    if (!name || !g_reader) return 0xFFFFFFFFu;
+
+// write session (CREATE_ALWAYS / GENERIC_WRITE): accumulates bytes and is
+// flushed to the MKFS data FS by K_CloseHandle via kern_fs_create().
+static uint8_t* g_wbuf = 0;
+static int      g_wcap = 0, g_wsize = 0;
+static char     g_wname[256];
+static const uint32_t H_WRITE = 0x00F6;
+
+static uint32_t WINAPI K_CreateFileA(const char* name, uint32_t access, uint32_t,
+                                      void*, uint32_t disp, uint32_t, uint32_t){
+    if (!name) return 0xFFFFFFFFu;
+    // A write session is opened when the caller asks for write access or a
+    // creation/disposition that implies writing.  GENERIC_WRITE = 0x40000000.
+    bool writing = (access & 0x40000000u) || disp == 1 /*CREATE_NEW*/ ||
+                   disp == 2 /*CREATE_ALWAYS*/ || disp == 4 /*OPEN_ALWAYS*/ ||
+                   disp == 5 /*TRUNCATE_EXISTING*/;
+    if (writing){
+        if (!g_wbuf){ g_wbuf = (uint8_t*)app_alloc(8192); g_wcap = 8192; }
+        g_wsize = 0;
+        int i = 0; for (; name[i] && i < 255; i++) g_wname[i] = name[i];
+        g_wname[i] = 0;
+        return H_WRITE;
+    }
+    if (!g_reader) return 0xFFFFFFFFu;
     int r = g_reader(name, g_fbuf, (int)sizeof(g_fbuf));
     if (r < 0) { g_last_error = 2; return 0xFFFFFFFFu; }
     g_fsize = r; g_fpos = 0;
@@ -907,7 +947,33 @@ static int WINAPI K_ReadFile(uint32_t h, void* buf, uint32_t n, uint32_t* got, v
     return 1;
 }
 static uint32_t WINAPI K_GetFileSize(uint32_t, uint32_t*){ return (uint32_t)g_fsize; }
-static int WINAPI K_CloseHandle(uint32_t){ return 1; }
+static int WINAPI K_WriteFile(uint32_t h, const void* buf, uint32_t n, uint32_t* written, void*){
+    if (h == H_WRITE){
+        if (!buf || !n) { if (written) *written = 0; return 1; }
+        if (g_wsize + (int)n > g_wcap){
+            int nc = g_wcap * 2;
+            while (nc < g_wsize + (int)n) nc *= 2;
+            uint8_t* nb = (uint8_t*)app_alloc((uint32_t)nc);
+            for (int i = 0; i < g_wsize; i++) nb[i] = g_wbuf[i];
+            g_wbuf = nb; g_wcap = nc;
+        }
+        for (uint32_t i = 0; i < n; i++) g_wbuf[g_wsize + (int)i] = ((const uint8_t*)buf)[i];
+        g_wsize += (int)n;
+        if (written) *written = n;
+        return 1;
+    }
+    if ((h & 0xFFF0) == 0x00F0 && buf && n) con_put((const char*)buf, (int)n);
+    if (written) *written = n;
+    return 1;
+}
+static int WINAPI K_CloseHandle(uint32_t h){
+    if (h == H_WRITE){
+        int rc = kern_fs_create(g_wname, g_wbuf, g_wsize);
+        g_wsize = 0;
+        return rc >= 0 ? 1 : 0;
+    }
+    return 1;
+}
 static uint32_t WINAPI K_FindFirstFileA(const char*, void*){ g_last_error = 2; return 0xFFFFFFFFu; }
 static int      WINAPI K_FindNextFileA(uint32_t, void*){ g_last_error = 18; return 0; }
 static int      WINAPI K_FindClose(uint32_t h){ return (h != 0xFFFFFFFFu) ? 1 : 0; }
@@ -988,6 +1054,7 @@ static uint32_t WINAPI U_CreateWindowExA(uint32_t, const char* cls, const char* 
         d.kind  = btn ? (uint8_t)W32_CMD_BUTTON : (uint8_t)W32_CMD_TEXT;
         d.x=(int16_t)x; d.y=(int16_t)y; d.w=(int16_t)w; d.h=(int16_t)h;
         d.color = 0x202020;
+        d.id = (uint16_t)menu;          // control id for hit-testing
         w_ncpy(d.text, title ? title : "", 48);
         // remember it so every repaint keeps the control alive
         if (g_win[pw].ctl_n < 8) g_win[pw].ctl[g_win[pw].ctl_n++] = d;
@@ -1822,6 +1889,7 @@ static const W32Export EX_KERNEL32[] = {
     EXP("lstrcmpA", K_lstrcmpA), EXP("lstrcmpiA", K_lstrcmpiA),
     EXP("CreateFileA", K_CreateFileA), EXP("ReadFile", K_ReadFile),
     EXP("GetFileSize", K_GetFileSize), EXP("CloseHandle", K_CloseHandle),
+    EXP("CreateThread", K_CreateThread), EXP("ExitThread", K_ExitThread),
     EXP("MultiByteToWideChar", K_MultiByteToWideChar),
     EXP("WideCharToMultiByte", K_WideCharToMultiByte),
 };
@@ -2695,6 +2763,28 @@ extern "C" int win32_window_dispatch(int idx, uint32_t msg, uint32_t wp, uint32_
 extern "C" void win32_window_close(int idx){
     if (idx < 0 || idx >= W32_MAX_WINDOWS) return;
     g_win[idx].used = false;
+}
+
+// Hit-test a click in client-local coordinates against this window's BUTTON
+// controls.  Returns the control id (the menu/resource id passed to
+// CreateWindowExA), or 0 if no button was hit.  Coordinates match the
+// (x,y) the child control was created with, i.e. relative to the parent's
+// client area.
+extern "C" int win32_window_button_hit(int idx, int lx, int ly){
+#if W32_EXEC
+    if (idx < 0 || idx >= W32_MAX_WINDOWS || !g_win[idx].used) return 0;
+    for (int c = 0; c < g_win[idx].ctl_n; c++){
+        const W32DrawCmd& d = g_win[idx].ctl[c];
+        if (d.kind != W32_CMD_BUTTON) continue;
+        int w = d.w > 0 ? d.w : 76;
+        int h = d.h > 0 ? d.h : 26;
+        if (lx >= d.x && lx < d.x + w && ly >= d.y && ly < d.y + h)
+            return (int)d.id;
+    }
+    return 0;
+#else
+    (void)idx; (void)lx; (void)ly; return 0;
+#endif
 }
 
 // ---- popup menu bridge (consumed by gui.cpp) --------------------------

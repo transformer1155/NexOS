@@ -21,6 +21,7 @@
 // =====================================================================
 using System;
 using System.Collections.Generic;
+using System.Text;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
@@ -30,7 +31,9 @@ using NexOS.Forms;
 namespace NexOS.WinHost
 {
     // One live window: the host owns geometry, the shell owns content.
-    internal sealed class WinRec
+    // Public so the standalone AppHost (single-app .exe) can find the live
+    // window record it opened via Shell.Open().
+    public sealed class WinRec
     {
         public int Id;
         public int Kind;
@@ -38,41 +41,39 @@ namespace NexOS.WinHost
         public bool Minimized;
     }
 
-    public sealed partial class ShellForm : Form
+    public partial class ShellForm : Form
     {
         // Chrome metrics, matching the kernel's window frame.
-        const int TitleH = 34;
+        // protected so the standalone AppHost (ShellForm subclass) can read them.
+        protected const int TitleH = 34;
         const int Edge = 1;
         const int TaskH = 48;          // must equal Desktop.TaskH
-        const int BtnW = 44;
+        protected const int BtnW = 44;
 
-        // Palette for the host-drawn chrome (Win11 light).
-        static readonly Color CFrame = Color.FromArgb(0xCF, 0xCF, 0xCF);
-        static readonly Color CBarAct = Color.FromArgb(0xFF, 0xFF, 0xFF);
-        static readonly Color CBarIn = Color.FromArgb(0xF3, 0xF3, 0xF3);
-        static readonly Color CInk = Color.FromArgb(0x1B, 0x1B, 0x1B);
-        static readonly Color CInkDim = Color.FromArgb(0x77, 0x77, 0x77);
-        static readonly Color CClose = Color.FromArgb(0xC4, 0x2B, 0x1C);
-        static readonly Color CHover = Color.FromArgb(0xE8, 0xE8, 0xE8);
+        // Palette for the host-drawn chrome - DARK to match the shell's
+        // dark acrylic panels (TaskBarBg rgba(26,26,28,.82), Start/Menu
+        // rgba(28,28,31,.95) / rgba(39,39,43,.97)).  Mirrors the Canvas
+        // Win11-design reference rather than the old light Win11 look.
+        static readonly Color CFrame   = Color.FromArgb(0x1C, 0x1C, 0x1F);   // window body
+        static readonly Color CBarAct  = Color.FromArgb(0x2A, 0x2A, 0x2E);   // active title bar
+        static readonly Color CBarIn   = Color.FromArgb(0x21, 0x21, 0x25);   // inactive title bar
+        static readonly Color CInk     = Color.FromArgb(0xF3, 0xF3, 0xF3);   // title text
+        static readonly Color CInkDim  = Color.FromArgb(0x9A, 0xA0, 0xA6);   // dim text
+        static readonly Color CClose   = Color.FromArgb(0xC4, 0x2B, 0x1C);   // close (design red)
+        static readonly Color CHover   = Color.FromArgb(0x3A, 0x3A, 0x40);   // button hover
 
-        readonly List<WinRec> wins = new List<WinRec>();   // back -> front
+        protected readonly List<WinRec> wins = new List<WinRec>();   // back -> front
         int nextId = 0;
         int cascade = 0;
 
         WinRec drag; int dragDX, dragDY;
         int hoverBtnWin = -1, hoverBtnIdx = -1;
         int mouseX = -1, mouseY = -1;
-        string clipboardPath = null;      // for the file "Copy" action
 
-        // Native WebBrowser overlay for the Browser app (real Windows
-        // Forms WebBrowser control, backed by the system's engine).  The
-        // managed BrowserApp draws only inside the MiniCLR VM; on Windows
-        // we host the genuine control instead so web pages render fully.
-        System.Windows.Forms.WebBrowser browserCtl;
-        TextBox browserUrl;
-        Button browserGo;
-        int browserWinId = -1;
-
+        // All UI is drawn by the shared NexOS.Forms shell (Gfx / Popup /
+        // BrowserApp) — no WinForms child controls live on this form.  The
+        // only "native" widgets left are the host Form itself, its Timer
+        // and the GDI+ surface it hands to Gfx.SetContext().
         readonly Font chromeFont = new Font("Segoe UI", 9f);
 
         // --shot support (parsed from the command line in the ctor).
@@ -80,6 +81,14 @@ namespace NexOS.WinHost
         internal string ShotPath = "winhost.png";
         internal int ShotDelay = 700;
         internal string ShotKinds = "";
+
+        // --termtest support: scripted behavioural drive of the terminal
+        // emulator (open, type, select, scroll, tab) with a PASS/FAIL
+        // report and an optional screenshot -- proves the GNOME-Terminal
+        // alignment without a human at the keyboard.
+        internal bool TermTestRequested;
+        internal string TermTestReport = "termtest.txt";
+        internal string TermTestShot = "";
 
         public ShellForm(string[] args)
         {
@@ -100,9 +109,15 @@ namespace NexOS.WinHost
                 Invalidate();
             };
             Host.ExitGuiHook = () => Close();
+            // Shared context-menu actions (OpenApp) must land as real
+            // windows, exactly like gui.cpp's launch_app does in the VM.
+            Host.OpenAppHook = LaunchOrFocus;
+            Host.WinActionHook = WinAction;
 
             Shell.Init();
             LoadTextures();
+            Host.StartTimeSync();   // network-accurate clock (fire-and-forget)
+            if (ShotRequested) Login.BypassForHost();   // headless preview skips the lock screen
 
             var t = new System.Windows.Forms.Timer { Interval = 40 };   // ~25 fps
             t.Tick += (s, e) => Invalidate();
@@ -117,29 +132,229 @@ namespace NexOS.WinHost
                 st.Tick += (s, e) =>
                 {
                     st.Stop();
-                    if (ShotKinds.Length > 0)
-                        foreach (string k in ShotKinds.Split(','))
-                            OpenKind(int.Parse(k.Trim()));
 
-                    int w = ClientSize.Width, h = ClientSize.Height;
-                    using (var bmp = new Bitmap(w, h))
+                    // Parse kinds.  A trailing ":c" means "open it and then
+                    // script a click into its centred button" (used to drive
+                    // the Demo animation to its settled "啊" state for the
+                    // headless screenshot); ":r" means "open it and then
+                    // right-click the client centre" to pop the OS's own
+                    // Popup context menu for the screenshot.
+                    var clickKinds = new List<int>();
+                    var rclickKinds = new List<int>();
+                    bool deskRClick = false;
+                    bool deskView = false, deskSort = false, deskNew = false, deskMore = false;
+                    bool startX = false;
+                    bool startAll = false, startTileR = false, startSet = false;
+                    bool fileRClick = false;
+                    int pinJump = -1;
+                    int winMenuKind = -1;
+                    if (ShotKinds.Length > 0)
+                        foreach (string tok in ShotKinds.Split(','))
+                        {
+                            string t = tok.Trim();
+                            if (t.Length == 0) continue;
+                            if (t == "desk:r") { deskRClick = true; continue; }
+                            if (t == "desk:view") { deskRClick = true; deskView = true; continue; }
+                            if (t == "desk:sort") { deskRClick = true; deskSort = true; continue; }
+                            if (t == "desk:new")  { deskRClick = true; deskNew  = true; continue; }
+                            if (t == "desk:more") { deskRClick = true; deskMore = true; continue; }
+                            if (t == "start:x")  { startX = true; continue; }
+                            if (t == "start:all") { startAll = true; continue; }
+                            if (t == "start:r")   { startTileR = true; continue; }
+                            if (t == "start:set") { startSet = true; continue; }
+                            if (t == "file:r")  { fileRClick = true; continue; }
+                            if (t.StartsWith("pin:")) { pinJump = int.Parse(t.Substring(4)); continue; }
+                            if (t.StartsWith("win:") && t.EndsWith(":m"))
+                                { winMenuKind = int.Parse(t.Substring(4, t.Length - 6)); continue; }
+                            // "N@P" opens app kind N pre-navigated to
+                            // settings page P (e.g. 0@2 = Control Panel /
+                            // Display, where the Layout + Dark/Light toggles
+                            // live).  WinHost-only convenience for screenshots.
+                            if (t.Contains("@"))
+                            {
+                                int at = t.IndexOf('@');
+                                int kind = int.Parse(t.Substring(0, at));
+                                int page = int.Parse(t.Substring(at + 1));
+                                if (kind == 0) Shell.OpenSettings(page);
+                                else OpenKind(kind);
+                                continue;
+                            }
+                            if (t.EndsWith(":c"))
+                                clickKinds.Add(int.Parse(t.Substring(0, t.Length - 2)));
+                            else if (t.EndsWith(":r"))
+                                rclickKinds.Add(int.Parse(t.Substring(0, t.Length - 2)));
+                            else
+                                OpenKind(int.Parse(t));
+                        }
+                    foreach (int k in clickKinds) OpenKind(k);
+                    foreach (int k in rclickKinds) OpenKind(k);
+
+                    Action save = () =>
                     {
-                        using (var g = Graphics.FromImage(bmp))
-                            RenderFrame(g, w, h);
-                        bmp.Save(Path.GetFullPath(ShotPath),
-                                 System.Drawing.Imaging.ImageFormat.Png);
-                    }
-                    Console.WriteLine("saved " + Path.GetFullPath(ShotPath));
-                    Close();
+                        int w = ClientSize.Width, h = ClientSize.Height;
+                        using (var bmp = new Bitmap(w, h))
+                        {
+                            using (var g = Graphics.FromImage(bmp))
+                                RenderFrame(g, w, h);
+                            bmp.Save(Path.GetFullPath(ShotPath),
+                                     System.Drawing.Imaging.ImageFormat.Png);
+                        }
+                        Console.WriteLine("saved " + Path.GetFullPath(ShotPath));
+                        Close();
+                    };
+
+                    if (clickKinds.Count == 0 && rclickKinds.Count == 0 && !deskRClick
+                        && !startX && !startAll && !startTileR && !startSet
+                        && !fileRClick && pinJump < 0 && winMenuKind < 0) { save(); return; }
+
+                    // Let the freshly opened window paint at least once
+                    // (so its button hit-box is computed), then dispatch a
+                    // click on the centred button, then wait for the
+                    // shrink animation to finish before saving.
+                    var ct = new System.Windows.Forms.Timer { Interval = 160 };
+                    ct.Tick += (s2, e2) =>
+                    {
+                        ct.Stop();
+                        if (deskRClick)
+                        {
+                            Gfx.SetContext(CreateGraphicsSafe(), 0, 0,
+                                           ClientSize.Width, ClientSize.Height);
+                            Shell.DesktopRClick(ClientSize.Width / 2,
+                                                ClientSize.Height / 2);
+                            int cx = ClientSize.Width / 2, cy = ClientSize.Height / 2;
+                            if (deskView || deskSort || deskNew || deskMore)
+                            {
+                                // Row = cy + PadY(6) + idx*ItemH(34) + ItemH/2(17)
+                                int rowY = cy + 23, rowX = cx + 24;
+                                int idx = deskView ? 0 : deskSort ? 1 : deskNew ? 3 : 6;
+                                rowY = cy + 6 + idx * 34 + 17;
+                                Shell.DesktopClick(rowX, rowY);
+                            }
+                        }
+                        if (startX)
+                        {
+                            Gfx.SetContext(CreateGraphicsSafe(), 0, 0,
+                                           ClientSize.Width, ClientSize.Height);
+                            int bx = (ClientSize.Width - ((7 + 1) * 40 + 7 * 6)) / 2;
+                            int sx = bx + 20, sy = ClientSize.Height - 24;
+                            NexOS.Forms.Desktop.OpenWinX(sx, sy);
+                        }
+                        if (startAll || startTileR || startSet)
+                        {
+                            Gfx.SetContext(CreateGraphicsSafe(), 0, 0,
+                                           ClientSize.Width, ClientSize.Height);
+                            NexOS.Forms.Desktop.OpenStartMenu(startAll ? 1 : 0,
+                                                                ClientSize.Width, ClientSize.Height);
+                            if (startTileR)
+                            {
+                                // Right-click the first pinned tile (top-left of grid).
+                                int W = ClientSize.Width, H = ClientSize.Height;
+                                int smw = 520; if (smw > W - 40) smw = W - 40;
+                                int smh = 430; int lim = H - 40 - 40; if (smh > lim) smh = lim;
+                                int x = (W - smw) / 2, y = H - 40 - smh - 10;
+                                int gx = x + 28, gy = y + 94;
+                                int tw = (smw - 56) / 4;
+                                Shell.DesktopRClick(gx + tw / 2, gy + 42);
+                            }
+                            else if (startSet)
+                            {
+                                // Right-click the footer account chip (bottom-left).
+                                int W = ClientSize.Width, H = ClientSize.Height;
+                                int smw = 520; if (smw > W - 40) smw = W - 40;
+                                int smh = 430; int lim = H - 40 - 40; if (smh > lim) smh = lim;
+                                int x = (W - smw) / 2, y = H - 40 - smh - 10;
+                                int fy = y + smh - 56;
+                                Shell.DesktopRClick(x + 40, fy + 24);
+                            }
+                        }
+                        if (pinJump >= 0)
+                        {
+                            Gfx.SetContext(CreateGraphicsSafe(), 0, 0,
+                                           ClientSize.Width, ClientSize.Height);
+                            int bx = (ClientSize.Width - ((7 + 1) * 40 + 7 * 6)) / 2;
+                            int px = bx + 46 + 20, py = ClientSize.Height - 24;
+                            NexOS.Forms.Desktop.OpenJumpList(pinJump, px, py);
+                        }
+                        if (fileRClick)
+                        {
+                            WinRec fe = null;
+                            foreach (var w in wins) if (w.Kind == 1) { fe = w; break; }
+                            if (fe == null) OpenKind(1);
+                            foreach (var w in wins) if (w.Kind == 1) { fe = w; break; }
+                            if (fe != null)
+                            {
+                                Rectangle cr = ClientRectOf(fe);
+                                Gfx.SetContext(CreateGraphicsSafe(),
+                                               cr.X, cr.Y, cr.Width, cr.Height);
+                                // File list row ~y=100 lands on the 2nd item.
+                                Shell.RightClick(fe.Id, cr.Width / 2, 100, cr.X, cr.Y);
+                            }
+                        }
+                        if (winMenuKind >= 0)
+                        {
+                            WinRec wr = null;
+                            foreach (var w in wins) if (w.Kind == winMenuKind) { wr = w; break; }
+                            if (wr == null) OpenKind(winMenuKind);
+                            foreach (var w in wins) if (w.Kind == winMenuKind) { wr = w; break; }
+                            if (wr != null)
+                            {
+                                Gfx.SetContext(CreateGraphicsSafe(), 0, 0,
+                                               ClientSize.Width, ClientSize.Height);
+                                NexOS.Forms.Desktop.OpenWinMenu(wr.Id, wr.X + 60, wr.Y + 17);
+                            }
+                        }
+                        foreach (int k in clickKinds)
+                        {
+                            WinRec wnd = null;
+                            foreach (var w in wins) if (w.Kind == k) wnd = w;
+                            if (wnd == null) continue;
+                            Rectangle cr = ClientRectOf(wnd);
+                            Gfx.SetContext(CreateGraphicsSafe(),
+                                           cr.X, cr.Y, cr.Width, cr.Height);
+                            // Demo's "点我" button is centred horizontally
+                            // and sits at client y ~128 (pad 18 + 80 + 30).
+                            Shell.Click(wnd.Id, cr.Width / 2, 128);
+                        }
+                        foreach (int k in rclickKinds)
+                        {
+                            WinRec wnd = null;
+                            foreach (var w in wins) if (w.Kind == k) wnd = w;
+                            if (wnd == null) continue;
+                            Rectangle cr = ClientRectOf(wnd);
+                            Gfx.SetContext(CreateGraphicsSafe(),
+                                           cr.X, cr.Y, cr.Width, cr.Height);
+                            Shell.RightClick(wnd.Id, cr.Width / 2, 120,
+                                             cr.X, cr.Y);
+                        }
+                        var rt = new System.Windows.Forms.Timer { Interval = 1200 };
+                        rt.Tick += (s3, e3) => { rt.Stop(); save(); };
+                        rt.Start();
+                    };
+                    ct.Start();
                 };
                 st.Start();
+            }
+
+            // Scripted terminal behavioural drive (--termtest).  Exercises
+            // the GNOME-Terminal-aligned emulator through the public Shell
+            // dispatch and writes a PASS/FAIL report (+ optional screenshot).
+            if (TermTestRequested)
+            {
+                var tt = new System.Windows.Forms.Timer { Interval = 300 };
+                tt.Tick += (s, e) =>
+                {
+                    tt.Stop();
+                    RunTermTest();
+                    Close();
+                };
+                tt.Start();
             }
         }
 
         // Best-effort: load the shared UI textures (same ids as the VM) from
         // assets/ near the repo root.  Missing files are ignored; the shell
         // falls back to flat theme colours via Gfx.HasImage.
-        void LoadTextures()
+        protected void LoadTextures()
         {
             string cwd = Directory.GetCurrentDirectory();
             string[] roots = new string[] {
@@ -173,18 +388,163 @@ namespace NexOS.WinHost
             if (args == null) return;
             for (int i = 0; i < args.Length; i++)
             {
-                if (args[i] != "--shot") continue;
-                ShotRequested = true;
-                ShotPath = (i + 1 < args.Length) ? args[i + 1] : "winhost.png";
-                ShotDelay = (i + 2 < args.Length) ? int.Parse(args[i + 2]) : 700;
-                ShotKinds = (i + 3 < args.Length) ? args[i + 3] : "";
-                break;
+                if (args[i] == "--shot")
+                {
+                    ShotRequested = true;
+                    ShotPath = (i + 1 < args.Length) ? args[i + 1] : "winhost.png";
+                    ShotDelay = (i + 2 < args.Length) ? int.Parse(args[i + 2]) : 700;
+                    ShotKinds = (i + 3 < args.Length) ? args[i + 3] : "";
+                }
+                else if (args[i] == "--termtest")
+                {
+                    TermTestRequested = true;
+                    TermTestReport = (i + 1 < args.Length) ? args[i + 1] : "termtest.txt";
+                    TermTestShot = (i + 2 < args.Length) ? args[i + 2] : "";
+                }
             }
+        }
+
+        // -----------------------------------------------------------------
+        //  --termtest  :  scripted behavioural verification of TerminalApp
+        // -----------------------------------------------------------------
+        //  Drives the emulator through the same public Shell dispatch the
+        //  kernel / host use, then asserts on observable state.  A PASS/FAIL
+        //  report is written to TermTestReport; if TermTestShot is set, a
+        //  final frame (with coloured demo lines) is saved for visual proof.
+        void RunTermTest()
+        {
+            var sb = new StringBuilder();
+            int pass = 0, fail = 0;
+            void Check(string name, bool ok, string detail)
+            {
+                if (ok) { pass++; sb.Append("PASS  "); }
+                else    { fail++; sb.Append("FAIL  "); }
+                sb.Append(name);
+                if (detail != null && detail.Length > 0)
+                    sb.Append("  [" + detail + "]");
+                sb.Append("\n");
+            }
+
+            // Open the terminal window (creates both the window and the App).
+            OpenKind(Kind.Terminal);
+            WinRec tw = null;
+            foreach (var w in wins) if (w.Kind == Kind.Terminal) { tw = w; break; }
+            if (tw == null) { Check("launch", false, "no terminal window"); WriteTermReport(sb, pass, fail); return; }
+            int id = tw.Id;
+            var ta = (TerminalApp)Shell.Get(id);
+            if (ta == null) { Check("launch", false, "no TerminalApp instance"); WriteTermReport(sb, pass, fail); return; }
+            Check("launch", true, "window id=" + id);
+
+            // Title follows user@host:cwd$ (GNOME-style dynamic title).
+            Check("title", ta.GetTitle().IndexOf("root@nexos") >= 0, ta.GetTitle());
+
+            // Banner present on open.
+            int baseCount = ta.ActiveTerm().count;
+            Check("banner", baseCount >= 1, "lines=" + baseCount);
+
+            // Prime a real off-screen paint so the terminal's layout cache
+            // (contentX / rows / lastTotalRows ...) is populated.  Headless
+            // Invalidate() paints may not fire before the scripted drive,
+            // and the cache is otherwise only built inside OnPaint -- which
+            // would leave CellAt() invalid (selection empty) and MaxView 0
+            // (scrollback unable to move).
+            void Prime()
+            {
+                using (var pb = new Bitmap(ClientSize.Width, ClientSize.Height))
+                using (var pg = Graphics.FromImage(pb))
+                    RenderFrame(pg, ClientSize.Width, ClientSize.Height);
+            }
+            Prime();
+
+            // ---- triple-click line selection -> primary clipboard --------
+            // contentX=PAD(8), contentY=TAB_H(26)+PAD(8)=34.  Three clicks
+            // on row 0 select the whole logical line and copy it.
+            int cx = 8 + 3, cy = 34 + 3;
+            Shell.MouseDown(id, 0, cx, cy);
+            Shell.MouseUp(id, 0, cx, cy);
+            Shell.MouseDown(id, 0, cx, cy);
+            Shell.MouseUp(id, 0, cx, cy);
+            Shell.MouseDown(id, 0, cx, cy);
+            Shell.MouseUp(id, 0, cx, cy);
+            string sel = Host.GetClipboard();
+            string line0 = ta.ActiveTerm().lines[0];   // oldest = banner line 0
+            Check("select-line", sel == line0 && sel.Length > 0, "\"" + sel + "\"");
+
+            // ---- type a command, run it, expect echoed output -----------
+            void Type(string s) { for (int i = 0; i < s.Length; i++) Shell.Key(id, (int)s[i]); }
+            int c0 = ta.ActiveTerm().count;
+            Type("echo hello world"); Shell.Key(id, VK.Enter);
+            int c1 = ta.ActiveTerm().count;
+            Check("echo-output", c1 == c0 + 2, "delta=" + (c1 - c0));
+            Check("echo-text", ta.LastLine().IndexOf("hello world") >= 0, ta.LastLine());
+
+            // ---- command history (Up recalls last command) -------------
+            Shell.Key(id, VK.Up);
+            Check("history-up", ta.ActiveTerm().input == "echo hello world", "\"" + ta.ActiveTerm().input + "\"");
+            Shell.Key(id, VK.CtrlU);   // clear the input line
+
+            // ---- reverse search (Ctrl+R) --------------------------------
+            Shell.Key(id, VK.CtrlR);
+            Type("cho");               // matches "echo hello world"
+            Check("reverse-search", ta.ActiveTerm().input.IndexOf("cho") >= 0, "\"" + ta.ActiveTerm().input + "\"");
+            Shell.Key(id, VK.Enter);   // accept the match (runs it)
+            Shell.Key(id, VK.CtrlU);
+
+            // ---- scrollback: fill > a screen, then PageUp ---------------
+            for (int k = 0; k < 40; k++) { Type("echo line " + k); Shell.Key(id, VK.Enter); }
+            Prime();   // refresh lastTotalRows so MaxView is non-zero
+            Shell.Key(id, VK.PageUp);
+            Check("scrollback", ta.ActiveTerm().view > 0, "view=" + ta.ActiveTerm().view);
+            Shell.Key(id, VK.PageDown);
+
+            // ---- new tab (Ctrl+Shift+T) ---------------------------------
+            int tabs0 = ta.TabCount();
+            Shell.Key(id, VK.CsT);
+            Check("new-tab", ta.TabCount() == tabs0 + 1, "tabs=" + ta.TabCount());
+
+            // ---- clear screen (Ctrl+L) ----------------------------------
+            Shell.Key(id, VK.CtrlL);
+            Check("clear", ta.ActiveTerm().count == 0, "lines=" + ta.ActiveTerm().count);
+
+            // ---- insert a few ANSI-coloured lines for the screenshot ----
+            ta.TestAppend("\u001b[1;31mNexOS\u001b[0m Terminal - 16/256/true-colour demo:");
+            ta.TestAppend("\u001b[31mred\u001b[0m \u001b[32mgreen\u001b[0m \u001b[34mblue\u001b[0m  (16-colour SGR)");
+            ta.TestAppend("\u001b[38;5;46mbright green (256)\u001b[0m \u001b[38;5;201mmagenta (256)\u001b[0m");
+            ta.TestAppend("\u001b[48;5;21mblue background (256)\u001b[0m \u001b[38;2;255;128;0morange (true)\u001b[0m");
+            ta.TestAppend("user@nexos:~$ _");   // shows the block cursor
+
+            if (TermTestShot != null && TermTestShot.Length > 0)
+            {
+                try
+                {
+                    int w = ClientSize.Width, h = ClientSize.Height;
+                    using (var bmp = new Bitmap(w, h))
+                    {
+                        using (var g = Graphics.FromImage(bmp))
+                            RenderFrame(g, w, h);
+                        bmp.Save(Path.GetFullPath(TermTestShot),
+                                 System.Drawing.Imaging.ImageFormat.Png);
+                    }
+                    sb.Append("shot  " + Path.GetFullPath(TermTestShot) + "\n");
+                }
+                catch (Exception ex) { sb.Append("shot  FAIL " + ex.Message + "\n"); }
+            }
+
+            WriteTermReport(sb, pass, fail);
+        }
+
+        void WriteTermReport(StringBuilder sb, int pass, int fail)
+        {
+            sb.Insert(0, "== NexOS TerminalApp --termtest ==\n");
+            sb.Append("== " + pass + " passed, " + fail + " failed ==\n");
+            try { File.WriteAllText(Path.GetFullPath(TermTestReport), sb.ToString()); }
+            catch (Exception ex) { Console.WriteLine("termtest report write failed: " + ex.Message); }
+            Console.WriteLine(sb.ToString());
         }
 
         // The shell's file browser reads two volumes; give it real folders
         // on disk so File Explorer / Notepad have something to show.
-        static void SeedSandbox()
+        public static void SeedSandbox()
         {
             string root = Environment.GetEnvironmentVariable("NexOS_WINHOST_FS");
             if (string.IsNullOrEmpty(root))
@@ -198,6 +558,20 @@ namespace NexOS.WinHost
             Directory.CreateDirectory(Path.Combine(mkfs, "Documents"));
             Directory.CreateDirectory(Path.Combine(mkfs, "Downloads"));
 
+            // Desktop shortcuts live as real .lnk files on MKFS (fs==3),
+            // mirroring the kernel's seed_desktop_shortcuts() so the icons
+            // are ordinary files (rename / delete / properties all work).
+            string desk = Path.Combine(mkfs, "Desktop");
+            Directory.CreateDirectory(desk);
+            string[] lnkNames = { "This PC.lnk", "Terminal.lnk", "Calculator.lnk",
+                                  "Task Mgr.lnk", "Settings.lnk", "Optimizer.lnk",
+                                  "Notepad.lnk", "About.lnk", "Browser.lnk",
+                                  "AI Setup.lnk", "AI Agent.lnk", "Demo.lnk" };
+            string[] lnkKinds = { "1", "3", "4", "2", "0", "6", "7", "5", "8",
+                                  "9", "10", "11" };
+            for (int i = 0; i < lnkNames.Length; i++)
+                Seed(Path.Combine(desk, lnkNames[i]), lnkKinds[i]);
+
             Seed(Path.Combine(sfs, "readme.txt"),
                  "NexOS.Forms running on the WinForms host.\n" +
                  "Every pixel here is drawn by the same C# sources the VM runs.");
@@ -209,7 +583,17 @@ namespace NexOS.WinHost
 
         static void Seed(string path, string body)
         {
-            if (!File.Exists(path)) File.WriteAllText(path, body);
+            // A concurrent host may be seeding the same sandbox; a transient
+            // file lock must not take the whole preview down.
+            try { if (!File.Exists(path)) File.WriteAllText(path, body); }
+            catch { }
+        }
+
+        // ---- helpers reused by the standalone AppHost --------------------
+        public WinRec FindWin(int id)
+        {
+            foreach (var w in wins) if (w.Id == id) return w;
+            return null;
         }
 
         // Bit i set when a window of Kind i is open -> taskbar indicators.
@@ -220,7 +604,7 @@ namespace NexOS.WinHost
             return m;
         }
 
-        Rectangle ClientRectOf(WinRec w)
+        protected Rectangle ClientRectOf(WinRec w)
         {
             return new Rectangle(w.X + Edge, w.Y + TitleH,
                                  w.W - Edge * 2, w.H - TitleH - Edge);
@@ -233,7 +617,9 @@ namespace NexOS.WinHost
         }
 
         // The whole frame, driven exactly like mforms.cpp drives it.
-        internal void RenderFrame(Graphics g, int W, int H)
+        // Protected so the standalone AppHost (single-app .exe) can render
+        // just one window instead of the full desktop stack.
+        protected void RenderFrame(Graphics g, int W, int H)
         {
             var p = PointToClient(Cursor.Position);
             bool inside = p.X >= 0 && p.Y >= 0 && p.X < W && p.Y < H;
@@ -259,13 +645,7 @@ namespace NexOS.WinHost
                 Shell.Paint(w.Id, cr.Width, cr.Height);
             }
 
-            // Layer 2b: native WebBrowser overlay for the Browser app.
-            // The shared BrowserApp still paints its text fallback behind
-            // this; the real control is a child HWND that owns the client
-            // area on Windows.
-            SyncBrowser();
-
-            // Layer 3: taskbar + Start menu, above everything.
+            // Layer 3: taskbar + Start menu + context menus, above everything.
             g.ResetTransform();
             g.ResetClip();
             Gfx.SetContext(g, 0, 0, W, H);
@@ -275,7 +655,7 @@ namespace NexOS.WinHost
             g.ResetClip();
         }
 
-        void DrawChrome(Graphics g, WinRec w)
+        protected void DrawChrome(Graphics g, WinRec w)
         {
             g.ResetTransform();
             g.ResetClip();
@@ -297,24 +677,34 @@ namespace NexOS.WinHost
                 }
             }
 
-            // Window body + acrylic-ish title bar.
+            // Frosted translucent rim (mirrors gui.cpp draw_window): a thin
+            // neutral band just outside the frame so the surface behind
+            // shows through — the Windows 11 acrylic edge.  No blue glow.
+            using (var gp = RoundRectPath(w.X - 3, w.Y - 3, w.W + 6, w.H + 6, rad + 2))
+            using (var gb = new SolidBrush(Color.FromArgb(55, 0xD2, 0xD2, 0xD2)))
+                g.FillPath(gb, gp);
+
+            // Window body + dark acrylic-ish title bar (Canvas reference:
+            // dark surfaces, near-white ink).
             using (var bp = RoundRectPath(w.X, w.Y, w.W, w.H, rad))
-                g.FillPath(new SolidBrush(Color.FromArgb(0xF3, 0xF3, 0xF3)), bp);
+                g.FillPath(new SolidBrush(CFrame), bp);
             using (var tp = RoundRectPath(w.X, w.Y, w.W, TitleH, rad))
-                g.FillPath(new SolidBrush(active ? Color.White : Color.FromArgb(0xF3, 0xF3, 0xF3)), tp);
-            g.FillRectangle(new SolidBrush(Color.FromArgb(0xF3, 0xF3, 0xF3)),
+                g.FillPath(new SolidBrush(active ? CBarAct : CBarIn), tp);
+            g.FillRectangle(new SolidBrush(CFrame),
                             w.X, w.Y + TitleH - rad, w.W, rad);
-            using (var pn = new Pen(Color.FromArgb(0xCF, 0xCF, 0xCF)))
-                g.DrawPath(pn, RoundRectPath(w.X, w.Y, w.W, w.H, rad));
-            g.DrawLine(new Pen(Color.FromArgb(0xD5, 0xD5, 0xD5)),
+            // 1px hairline border: subtle light edge so the dark surface
+            // reads against the blue wallpaper.
+            using (var pn = new Pen(active ? Color.FromArgb(0x4E, 0x57, 0x66)
+                                           : Color.FromArgb(0x33, 0x33, 0x38)))
+                g.DrawPath(pn, RoundRectPath(w.X, w.Y, w.W, w.H,    rad));
+            g.DrawLine(new Pen(Color.FromArgb(0x33, 0x33, 0x38)),
                        w.X, w.Y + TitleH, w.X + w.W - 1, w.Y + TitleH);
 
             // Accent dot + title.
             using (var b = new SolidBrush(Color.FromArgb(0x00, 0x78, 0xD4)))
                 g.FillEllipse(b, w.X + 12, w.Y + TitleH / 2 - 4, 8, 8);
             g.SmoothingMode = SmoothingMode.None;
-            using (var b = new SolidBrush(active ? Color.FromArgb(0x1B, 0x1B, 0x1B)
-                                                 : Color.FromArgb(0x77, 0x77, 0x77)))
+            using (var b = new SolidBrush(active ? CInk : CInkDim))
                 g.DrawString(Shell.Title(w.Id), chromeFont, b, w.X + 28, w.Y + 9);
 
             // Minimise / maximise / close, drawn as vector glyphs so they
@@ -325,12 +715,11 @@ namespace NexOS.WinHost
                 bool hot = hoverBtnWin == w.Id && hoverBtnIdx == i;
                 if (hot)
                     g.FillRectangle(
-                        new SolidBrush(i == 2 ? Color.FromArgb(0xC4, 0x2B, 0x1C)
-                                              : Color.FromArgb(0xE8, 0xE8, 0xE8)),
+                        new SolidBrush(i == 2 ? CClose : CHover),
                         bx, w.Y + 1, BtnW, TitleH - 2);
                 int cx = bx + BtnW / 2, cy = w.Y + TitleH / 2;
                 using (var pen = new Pen(i == 2 && hot ? Color.White
-                                                      : Color.FromArgb(0x1B, 0x1B, 0x1B)))
+                                                      : CInk))
                 {
                     if (i == 0) g.DrawLine(pen, cx - 5, cy, cx + 5, cy);
                     else if (i == 1) g.DrawRectangle(pen, cx - 5, cy - 5, 10, 10);
@@ -354,76 +743,6 @@ namespace NexOS.WinHost
             p.AddArc(x, y + h - d - 1, d, d, 90, 90);
             p.CloseFigure();
             return p;
-        }
-
-        // ---- native WebBrowser overlay (Browser app only) --------------
-        // The shared BrowserApp draws a text fallback inside the MiniCLR VM;
-        // on Windows we host the genuine WebBrowser control (plus a real
-        // address box and Go button) so pages render fully.  The managed
-        // Shell.Paint still runs for the window, but these child controls
-        // sit on top of the client area and own all input there.
-        void SyncBrowser()
-        {
-            WinRec b = null;
-            foreach (var w in wins)
-                if (!w.Minimized && w.Kind == Kind.Browser) { b = w; break; }
-
-            if (b == null) { CleanupBrowser(); return; }
-
-            Rectangle cr = ClientRectOf(b);
-            int barH = 34, goW = 56;
-            if (browserCtl == null)
-            {
-                browserUrl = new TextBox
-                {
-                    Left = cr.X + 8, Top = cr.Y + 8,
-                    Width = cr.Width - goW - 16, Height = 23,
-                    Text = "http://example.com/",
-                    Font = chromeFont,
-                };
-                browserGo = new Button
-                {
-                    Left = cr.X + cr.Width - goW - 4, Top = cr.Y + 8,
-                    Width = goW, Height = 23, Text = "Go",
-                };
-                browserGo.Click += (s, e2) => NavigateBrowser();
-                browserCtl = new System.Windows.Forms.WebBrowser
-                {
-                    ScriptErrorsSuppressed = true,
-                    Location = new Point(cr.X, cr.Y + barH + 4),
-                    Size = new Size(cr.Width, cr.Height - barH - 4),
-                };
-                // Start on a blank page so the client area is white instead
-                // of the uninitialized black background that shows through
-                // while no document is loaded.
-                browserCtl.Navigate("about:blank");
-                Controls.Add(browserCtl);
-                Controls.Add(browserUrl);
-                Controls.Add(browserGo);
-            }
-            browserWinId = b.Id;
-            browserUrl.SetBounds(cr.X + 8, cr.Y + 8, cr.Width - goW - 16, 23);
-            browserGo.SetBounds(cr.X + cr.Width - goW - 4, cr.Y + 8, goW, 23);
-            browserCtl.SetBounds(cr.X, cr.Y + barH + 4, cr.Width, cr.Height - barH - 4);
-            browserUrl.Visible = browserGo.Visible = browserCtl.Visible = true;
-        }
-
-        void NavigateBrowser()
-        {
-            if (browserCtl == null || browserUrl == null) return;
-            string u = browserUrl.Text;
-            if (u == null || u.Length == 0) return;
-            if (!u.StartsWith("http://") && !u.StartsWith("https://")) u = "http://" + u;
-            try { browserCtl.Navigate(u); }
-            catch { /* offline / bad URL - ignore */ }
-        }
-
-        void CleanupBrowser()
-        {
-            if (browserCtl != null) { Controls.Remove(browserCtl); browserCtl.Dispose(); browserCtl = null; }
-            if (browserUrl != null) { Controls.Remove(browserUrl); browserUrl.Dispose(); browserUrl = null; }
-            if (browserGo != null) { Controls.Remove(browserGo); browserGo.Dispose(); browserGo = null; }
-            browserWinId = -1;
         }
 
         // ---- input -----------------------------------------------------
@@ -456,7 +775,7 @@ namespace NexOS.WinHost
         }
 
         // Scripted launch, used by --shot.
-        internal void OpenKind(int kind) { LaunchOrFocus(kind); }
+        protected void OpenKind(int kind) { LaunchOrFocus(kind); }
 
         // Launch a Kind, or focus/restore it when it is already open -
         // the same behaviour gui.cpp gives a taskbar button.
@@ -488,28 +807,63 @@ namespace NexOS.WinHost
             wins.Add(rec);
         }
 
+        // Window-geometry action from the Alt+Space / title-bar menu.
+        // Mirrors gui.cpp's handling of the Win11 window menu: minimise,
+        // maximise (toggle), restore (un-minimise / un-maximise).  Move /
+        // Size are live drag gestures the harness does not capture, so they
+        // are accepted but ignored here - the menu request closes cleanly.
+        void WinAction(int id, int code)
+        {
+            WinRec w = null;
+            foreach (var r in wins) if (r.Id == id) { w = r; break; }
+            if (w == null) return;
+            switch (code)
+            {
+                case 13: w.Minimized = true; break;                    // Minimize
+                case 14: if (w.W < ClientSize.Width - 4) ToggleMax(w); break;  // Maximize
+                case 10:                                                     // Restore
+                    if (w.Minimized) w.Minimized = false;
+                    else if (w.W >= ClientSize.Width - 4) ToggleMax(w);
+                    break;
+                default: break;                                       // Move / Size -> no-op
+            }
+            Invalidate();
+        }
+
         protected override void OnMouseDown(MouseEventArgs e)
         {
             int W = ClientSize.Width, H = ClientSize.Height;
             Gfx.SetScreen(W, H);
             Gfx.SetMouse(e.X, e.Y);
 
-            // Right button -> contextual menus (desktop / taskbar / file).
+            // Arm the button press animation for every left click (screen
+            // coords) - W.Button/Primary/Key shrink to half for 0.5 s.
+            if (e.Button == MouseButtons.Left) Btn.PressScreen(e.X, e.Y);
+
+            // Right button -> the OS's own context menus (Popup), exactly
+            // like mforms_desktop_rclick / mforms_rclick in the VM.
             if (e.Button == MouseButtons.Right)
             {
-                ShowContextMenu(e.X, e.Y, W, H);
+                var rhit = HitWindow(e.X, e.Y);
+                if (rhit != null)
+                {
+                    if (e.Y < rhit.Y + TitleH)
+                        Desktop.OpenWinMenu(rhit.Id, e.X, e.Y);
+                    else
+                    {
+                        Rectangle cr = ClientRectOf(rhit);
+                        Shell.RightClick(rhit.Id, e.X - cr.X, e.Y - cr.Y,
+                                         cr.X, cr.Y);
+                    }
+                }
+                else Shell.DesktopRClick(e.X, e.Y);
+                Invalidate();
                 return;
             }
 
-            // Left-click on a tray button is owned by the host (popups).
-            if (e.Y >= H - TaskH)
-            {
-                int tray = Desktop.TrayHit(e.X, e.Y, W, H);
-                if (tray >= 0) { ShowTrayPopup(tray, e.X, e.Y); return; }
-            }
-
-            // 1. The Start menu is modal, and 2. the taskbar floats above
-            //    every window - both go straight to the shell.
+            // 1. The Start menu is modal, and 2. the taskbar (incl. tray
+            //    popups) floats above every window - both go straight to
+            //    the shared shell, which owns tray popups too.
             bool menuOpen = Shell.DesktopMenuOpen() != 0;
             if (menuOpen || e.Y >= H - TaskH)
             {
@@ -535,14 +889,6 @@ namespace NexOS.WinHost
                     Invalidate();
                     return;
                 }
-                // The Browser app hosts a real WebBrowser + address box as
-                // child controls; the form's click handler must not also
-                // forward to the (hidden) managed control for the client area.
-                if (hit.Kind == Kind.Browser && e.Y >= hit.Y + TitleH)
-                {
-                    Invalidate();
-                    return;
-                }
                 if (e.Y < hit.Y + TitleH)
                 {
                     drag = hit; dragDX = e.X - hit.X; dragDY = e.Y - hit.Y;
@@ -550,8 +896,12 @@ namespace NexOS.WinHost
                     return;
                 }
                 Rectangle cr = ClientRectOf(hit);
+                int lx = e.X - cr.X, ly = e.Y - cr.Y;
+                int b = (e.Button == MouseButtons.Middle) ? 1
+                      : (e.Button == MouseButtons.Right) ? 2 : 0;
                 Gfx.SetContext(CreateGraphicsSafe(), cr.X, cr.Y, cr.Width, cr.Height);
-                Shell.Click(hit.Id, e.X - cr.X, e.Y - cr.Y);
+                Shell.MouseDown(hit.Id, b, lx, ly);
+                if (b == 0) Shell.Click(hit.Id, lx, ly);   // left click still fires
                 Invalidate();
                 return;
             }
@@ -610,15 +960,56 @@ namespace NexOS.WinHost
                 hoverBtnWin = hw; hoverBtnIdx = hb;
                 Invalidate();
             }
+
+            // Route pointer motion to the window under the cursor so the
+            // terminal can update hover state and extend a drag-selection.
+            var wm = HitWindow(e.X, e.Y);
+            if (wm != null && e.Y >= wm.Y + TitleH)
+            {
+                Rectangle cr = ClientRectOf(wm);
+                Gfx.SetContext(CreateGraphicsSafe(), cr.X, cr.Y, cr.Width, cr.Height);
+                Shell.MouseMove(wm.Id, e.X - cr.X, e.Y - cr.Y);
+            }
         }
 
-        protected override void OnMouseUp(MouseEventArgs e) { drag = null; }
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            drag = null;
+            var wu = HitWindow(e.X, e.Y);
+            if (wu != null && e.Y >= wu.Y + TitleH)
+            {
+                Rectangle cr = ClientRectOf(wu);
+                Gfx.SetContext(CreateGraphicsSafe(), cr.X, cr.Y, cr.Width, cr.Height);
+                int b = (e.Button == MouseButtons.Middle) ? 1
+                      : (e.Button == MouseButtons.Right) ? 2 : 0;
+                Shell.MouseUp(wu.Id, b, e.X - cr.X, e.Y - cr.Y);
+            }
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            if (wins.Count == 0) return;
+            var w = HitWindow(e.X, e.Y);
+            if (w != null && e.Y >= w.Y + TitleH)
+            {
+                Rectangle cr = ClientRectOf(w);
+                Gfx.SetContext(CreateGraphicsSafe(), cr.X, cr.Y, cr.Width, cr.Height);
+                Shell.Wheel(w.Id, e.Delta);   // +delta = wheel up = scroll toward older
+                Invalidate();
+            }
+        }
 
         protected override void OnKeyPress(KeyPressEventArgs e)
         {
             if (wins.Count == 0) return;
+            // Literal text only.  OnKeyDown already handled (and suppressed)
+            // every control / Ctrl / Alt / arrow / F-key combination, so a
+            // control codepoint reaching here is spurious.  Forwarding the
+            // real character also delivers IME / non-ASCII input (Chinese,
+            // emoji) to the terminal exactly as GNOME Terminal does.
+            if ((int)e.KeyChar < 32) { e.Handled = true; return; }
             var top = wins[wins.Count - 1];
-            Shell.Key(top.Id, e.KeyChar);
+            Shell.Key(top.Id, (int)e.KeyChar);
             Invalidate();
         }
 
@@ -631,12 +1022,86 @@ namespace NexOS.WinHost
             }
             if (wins.Count == 0) return;
             var top = wins[wins.Count - 1];
-            if (e.KeyCode == Keys.Back) { Shell.Key(top.Id, 8); Invalidate(); }
-            else if (e.KeyCode == Keys.Enter) { Shell.Key(top.Id, 13); Invalidate(); }
-            else if (e.KeyCode == Keys.Escape) { Shell.Key(top.Id, 27); Invalidate(); }
-            else if (e.KeyCode == Keys.W && e.Control)
+
+            // Ctrl+W closes any non-terminal window; in the terminal it is
+            // "delete previous word" (handled below), so it must not close.
+            if (e.Control && !e.Alt && e.KeyCode == Keys.W
+                && top.Kind != NexOS.Forms.Kind.Terminal)
             {
-                Shell.Close(top.Id); wins.Remove(top); Invalidate();
+                Shell.Close(top.Id); wins.Remove(top); Invalidate(); e.Handled = true;
+                return;
+            }
+
+            int code = 0;
+            bool handled = true;
+            if (e.Control && e.Shift && !e.Alt)
+            {
+                if      (e.KeyCode == Keys.C) code = VK.CsC;
+                else if (e.KeyCode == Keys.V) code = VK.CsV;
+                else if (e.KeyCode == Keys.T) code = VK.CsT;
+                else if (e.KeyCode == Keys.W) code = VK.CsW;
+                else handled = false;
+            }
+            else if (e.Control && !e.Alt)
+            {
+                if      (e.KeyCode == Keys.C) code = VK.CtrlC;
+                else if (e.KeyCode == Keys.V) code = VK.CtrlV;
+                else if (e.KeyCode == Keys.Z) code = VK.CtrlZ;
+                else if (e.KeyCode == Keys.A) code = VK.CtrlA;
+                else if (e.KeyCode == Keys.E) code = VK.CtrlE;
+                else if (e.KeyCode == Keys.U) code = VK.CtrlU;
+                else if (e.KeyCode == Keys.K) code = VK.CtrlK;
+                else if (e.KeyCode == Keys.W) code = VK.CtrlW;
+                else if (e.KeyCode == Keys.L) code = VK.CtrlL;
+                else if (e.KeyCode == Keys.D) code = VK.CtrlD;
+                else if (e.KeyCode == Keys.R) code = VK.CtrlR;
+                else if (e.KeyCode == Keys.Oemplus || e.KeyCode == Keys.Add) code = VK.CtrlPlus;
+                else if (e.KeyCode == Keys.OemMinus || e.KeyCode == Keys.Subtract) code = VK.CtrlMinus;
+                else if (e.KeyCode == Keys.D0 || e.KeyCode == Keys.NumPad0) code = VK.Ctrl0;
+                else handled = false;
+            }
+            else if (e.Alt && !e.Control)
+            {
+                if      (e.KeyCode == Keys.F) code = VK.AltF;
+                else if (e.KeyCode == Keys.B) code = VK.AltB;
+                else handled = false;
+            }
+            else
+            {
+                if      (e.KeyCode == Keys.Back)     code = VK.Back;
+                else if (e.KeyCode == Keys.Return)   code = VK.Enter;
+                else if (e.KeyCode == Keys.Escape)   code = VK.Esc;
+                else if (e.KeyCode == Keys.Tab)      code = VK.Tab;
+                else if (e.KeyCode == Keys.Delete)   code = VK.Delete;
+                else if (e.KeyCode == Keys.Up)       code = VK.Up;
+                else if (e.KeyCode == Keys.Down)     code = VK.Down;
+                else if (e.KeyCode == Keys.Left)     code = VK.Left;
+                else if (e.KeyCode == Keys.Right)    code = VK.Right;
+                else if (e.KeyCode == Keys.Home)     code = VK.HomeK;
+                else if (e.KeyCode == Keys.End)      code = VK.EndK;
+                else if (e.KeyCode == Keys.PageUp)   code = VK.PageUp;
+                else if (e.KeyCode == Keys.PageDown) code = VK.PageDown;
+                else if (e.KeyCode == Keys.F1)  code = VK.F1;
+                else if (e.KeyCode == Keys.F2)  code = VK.F2;
+                else if (e.KeyCode == Keys.F3)  code = VK.F3;
+                else if (e.KeyCode == Keys.F4)  code = VK.F4;
+                else if (e.KeyCode == Keys.F5)  code = VK.F5;
+                else if (e.KeyCode == Keys.F6)  code = VK.F6;
+                else if (e.KeyCode == Keys.F7)  code = VK.F7;
+                else if (e.KeyCode == Keys.F8)  code = VK.F8;
+                else if (e.KeyCode == Keys.F9)  code = VK.F9;
+                else if (e.KeyCode == Keys.F10) code = VK.F10;
+                else if (e.KeyCode == Keys.F11) code = VK.F11;
+                else if (e.KeyCode == Keys.F12) code = VK.F12;
+                else handled = false;
+            }
+
+            if (handled)
+            {
+                e.Handled = true;
+                e.SuppressKeyPress = true;   // don't let OnKeyPress re-deliver
+                Shell.Key(top.Id, code);
+                Invalidate();
             }
         }
 
@@ -646,287 +1111,17 @@ namespace NexOS.WinHost
             {
                 if (components != null) components.Dispose();
                 if (scratchDc != null) scratchDc.Dispose();
-                CleanupBrowser();
             }
             base.Dispose(disposing);
         }
 
         // =============================================================
-        //  Context menus (right-click) and tray popups (left-click)
+        //  Context menus, tray popups, file ops and dialogs
         // =============================================================
-        void ShowAt(ToolStripDropDown m, int x, int y) { m.Show(this, new Point(x, y)); }
-
-        void ShowContextMenu(int x, int y, int W, int H)
-        {
-            // 1. System tray buttons -> tray popup (tasks / voice / network).
-            int tray = Desktop.TrayHit(x, y, W, H);
-            if (tray >= 0) { ShowTrayPopup(tray, x, y); return; }
-
-            // 2. Taskbar strip -> a right-click on a running pin offers
-            //    Close window / End process; empty bar keeps the generic
-            //    Task Manager / Taskbar settings menu.
-            if (y >= H - TaskH)
-            {
-                int pin = Desktop.TaskbarButtonAt(x, y, W);
-                WinRec pw = null!;
-                if (pin >= 0)
-                    foreach (var w in wins)
-                        if (w.Kind == pin) { pw = w; break; }
-                if (pw != null && !pw.Minimized)
-                {
-                    int pid = pw.Id;
-                    var m = new ContextMenuStrip();
-                    m.Items.Add("Close window", null, (s, e2) =>
-                        { Shell.Close(pid); wins.Remove(pw); Invalidate(); });
-                    m.Items.Add("End process", null, (s, e2) =>
-                        { Shell.Close(pid); wins.Remove(pw); Invalidate(); });
-                    ShowAt(m, x, y);
-                    return;
-                }
-                var tb = new ContextMenuStrip();
-                tb.Items.Add("Task Manager", null, (s, e2) => LaunchOrFocus(Kind.TaskManager));
-                tb.Items.Add("Taskbar settings", null, (s, e2) => Shell.OpenSettings(7));
-                ShowAt(tb, x, y);
-                return;
-            }
-
-            // 3. A window under the cursor: File Explorer with a selected
-            //    file gets the file menu; every other window gets the
-            //    generic Refresh / Close window menu.
-            var hit = HitWindow(x, y);
-            if (hit != null)
-            {
-                Rectangle cr = ClientRectOf(hit);
-                bool inClient = x >= cr.X && x < cr.X + cr.Width &&
-                                y >= cr.Y && y < cr.Y + cr.Height;
-                if (hit.Kind == Kind.FileExplorer && inClient)
-                {
-                    string fn = Shell.FileContext(hit.Id);
-                    if (fn != null && fn != "")
-                    {
-                        ShowFileMenu(fn, Shell.FileContextFs(hit.Id),
-                                    Shell.FileContextDir(hit.Id) != 0, x, y);
-                        return;
-                    }
-                }
-                int hid = hit.Id;
-                var wm = new ContextMenuStrip();
-                wm.Items.Add("Refresh", null, (s, e2) => Shell.WinAction(hid, WAct.Refresh));
-                wm.Items.Add("Close window", null, (s, e2) =>
-                    { Shell.Close(hid); wins.Remove(hit); Invalidate(); });
-                ShowAt(wm, x, y);
-                return;
-            }
-
-            // 4. Desktop icon -> launch menu.  The icons are virtual
-            //    (SyncFromFs falls back to defaults in WinHost), so the
-            //    menu offers Open + shell actions, not file surgery.
-            int icon = Desktop.IconAt(x, y);
-            if (icon >= 0)
-            {
-                string iname = Desktop.DesktopIconName(icon);
-                if (iname != "")
-                {
-                    ShowDesktopIconMenu(icon, iname, x, y);
-                    return;
-                }
-            }
-
-            // 5. Bare desktop.
-            ShowDesktopMenu(x, y);
-        }
-
-        void ShowDesktopIconMenu(int idx, string name, int x, int y)
-        {
-            int kind = Desktop.DesktopKind(idx);
-            var m = new ContextMenuStrip();
-            if (kind >= 0)
-                m.Items.Add("Open", null, (s, e2) => LaunchOrFocus(kind));
-            m.Items.Add("New folder", null, (s, e2) => NewFolder());
-            m.Items.Add("Refresh", null, (s, e2) => { Desktop.Refresh(); Invalidate(); });
-            ShowAt(m, x, y);
-        }
-
-        void ShowDesktopMenu(int x, int y)
-        {
-            var m = new ContextMenuStrip();
-            var view = new ToolStripMenuItem("View");
-            var sort = new ToolStripMenuItem("Sort by");
-            string[] sorts = { "Name", "Size", "Type", "Date modified" };
-            for (int i = 0; i < 4; i++)
-            {
-                int mode = i;
-                var it = new ToolStripMenuItem(sorts[i]);
-                if (Desktop.GetSortMode() == i) it.Checked = true;
-                it.Click += (s, e2) => { Desktop.SortBy(mode); Invalidate(); };
-                sort.DropDownItems.Add(it);
-            }
-            view.DropDownItems.Add(sort);
-            view.DropDownItems.Add(new ToolStripMenuItem("Refresh", null,
-                (s, e2) => { Desktop.Refresh(); Invalidate(); }));
-            m.Items.Add(view);
-            m.Items.Add(new ToolStripMenuItem("Refresh", null,
-                (s, e2) => { Desktop.Refresh(); Invalidate(); }));
-            m.Items.Add(new ToolStripMenuItem("Personalize", null,
-                (s, e2) => Shell.OpenSettings(6)));
-            m.Items.Add(new ToolStripMenuItem("Open in terminal", null,
-                (s, e2) => LaunchOrFocus(Kind.Terminal)));
-            m.Items.Add(new ToolStripMenuItem("New folder", null,
-                (s, e2) => NewFolder()));
-            ShowAt(m, x, y);
-        }
-
-        void ShowFileMenu(string fn, int fs, bool isDir, int x, int y)
-        {
-            var m = new ContextMenuStrip();
-            m.Items.Add("Open", null, (s, e2) => OpenFile(fn, fs, isDir));
-            var ow = new ToolStripMenuItem("Open with");
-            ow.DropDownItems.Add("Notepad", null, (s, e2) => Shell.OpenNotepad(fn));
-            ow.DropDownItems.Add("Terminal (folder)", null, (s, e2) => LaunchOrFocus(Kind.Terminal));
-            m.Items.Add(ow);
-            m.Items.Add("Copy", null, (s, e2) => { clipboardPath = PathFor(fs, fn); });
-            m.Items.Add("Delete", null, (s, e2) => DeleteFile(fn, fs));
-            m.Items.Add("Rename", null, (s, e2) => RenameFile(fn, fs));
-            m.Items.Add("Properties", null, (s, e2) => ShowFileProps(fn, fs, isDir));
-            ShowAt(m, x, y);
-        }
-
-        void ShowTrayPopup(int which, int x, int y)
-        {
-            if (which == 0) ShowTasksPopup(x, y);
-            else if (which == 1) ShowVoicePopup(x, y);
-            else ShowNetworkPopup(x, y);
-        }
-
-        void ShowTasksPopup(int x, int y)
-        {
-            var m = new ContextMenuStrip();
-            if (wins.Count == 0) m.Items.Add("(no running apps)");
-            for (int i = wins.Count - 1; i >= 0; i--)
-            {
-                var w = wins[i];
-                int id = w.Id;
-                m.Items.Add(Shell.Title(id), null, (s, e2) =>
-                {
-                    w.Minimized = false; Raise(w); Invalidate();
-                });
-            }
-            ShowAt(m, x, y);
-        }
-
-        void ShowVoicePopup(int x, int y)
-        {
-            var m = new ContextMenuStrip();
-            var t = new ToolStripMenuItem("Voice input: " + (Theme.VoiceOn != 0 ? "On" : "Off"));
-            t.Click += (s, e2) =>
-            {
-                Theme.VoiceOn = Theme.VoiceOn != 0 ? 0 : 1;
-                Desktop.SetVoice(Theme.VoiceOn); Invalidate();
-            };
-            m.Items.Add(t);
-            m.Items.Add("Microphone settings", null, (s, e2) => Shell.OpenSettings(2));
-            ShowAt(m, x, y);
-        }
-
-        void ShowNetworkPopup(int x, int y)
-        {
-            var m = new ContextMenuStrip();
-            var eth = new ToolStripMenuItem("Ethernet" + (Theme.ActiveNet == 0 ? "  (active)" : ""));
-            eth.Click += (s, e2) => { Theme.ActiveNet = 0; Invalidate(); };
-            var wifi = new ToolStripMenuItem("Wi-Fi" + (Theme.ActiveNet == 1 ? "  (active)" : ""));
-            wifi.Click += (s, e2) => { Theme.ActiveNet = 1; Invalidate(); };
-            m.Items.Add(eth);
-            m.Items.Add(wifi);
-            m.Items.Add(new ToolStripSeparator());
-            m.Items.Add("Network settings", null, (s, e2) => Shell.OpenSettings(3));
-            ShowAt(m, x, y);
-        }
-
-        // ---- file operations against the sandbox -----------------------
-        string PathFor(int fs, string name)
-        {
-            string sub = fs == 1 ? "sfs" : "mkfs";
-            return Path.Combine(Host.FsRoot, sub, name);
-        }
-
-        void OpenFile(string fn, int fs, bool isDir)
-        {
-            if (isDir) LaunchOrFocus(Kind.FileExplorer);
-            else Shell.OpenNotepad(fn);
-        }
-
-        void DeleteFile(string fn, int fs)
-        {
-            try
-            {
-                string p = PathFor(fs, fn);
-                if (File.Exists(p)) File.Delete(p);
-                else if (Directory.Exists(p)) Directory.Delete(p, true);
-                Host.FileRefresh(); Invalidate();
-            }
-            catch (Exception ex) { MessageBox.Show(this, ex.Message, "Delete failed"); }
-        }
-
-        void RenameFile(string fn, int fs)
-        {
-            using (var dlg = new InputDialog("Rename", "New name:", fn))
-                if (dlg.ShowDialog(this) == DialogResult.OK)
-                {
-                    string np = dlg.TextValue;
-                    if (np != "" && np != fn)
-                        try
-                        {
-                            string p = PathFor(fs, fn), d = PathFor(fs, np);
-                            if (File.Exists(p)) File.Move(p, d);
-                            else if (Directory.Exists(p)) Directory.Move(p, d);
-                            Host.FileRefresh(); Invalidate();
-                        }
-                        catch (Exception ex) { MessageBox.Show(this, ex.Message, "Rename failed"); }
-                }
-        }
-
-        void ShowFileProps(string fn, int fs, bool isDir)
-        {
-            string p = PathFor(fs, fn);
-            long size = 0; bool exists = false;
-            if (File.Exists(p)) { size = new FileInfo(p).Length; exists = true; }
-            else if (Directory.Exists(p)) exists = true;
-            string info = "Name:    " + fn + "\n" +
-                          "Type:    " + (isDir ? "Folder" : "File") + "\n" +
-                          "Volume:  " + (fs == 1 ? "System (SFS)" : "Local (MKFS)") + "\n" +
-                          "Size:    " + (size / 1024) + " KB\n" +
-                          "Exists:  " + (exists ? "yes" : "no");
-            MessageBox.Show(this, info, "Properties - " + fn);
-        }
-
-        void NewFolder()
-        {
-            string baseDir = Path.Combine(Host.FsRoot, "mkfs");
-            string name = "New folder";
-            string p = Path.Combine(baseDir, name);
-            int n = 1;
-            while (Directory.Exists(p)) { p = Path.Combine(baseDir, name + " (" + n + ")"); n++; }
-            try { Directory.CreateDirectory(p); Host.FileRefresh(); Invalidate(); }
-            catch (Exception ex) { MessageBox.Show(this, ex.Message, "New folder failed"); }
-        }
-
-        // A tiny modal text-entry dialog (used by Rename).
-        sealed class InputDialog : Form
-        {
-            readonly TextBox box = new TextBox();
-            public string TextValue { get { return box.Text; } }
-            public InputDialog(string title, string label, string initial)
-            {
-                Text = title;
-                ClientSize = new Size(320, 110);
-                StartPosition = FormStartPosition.CenterParent;
-                var lbl = new Label { Left = 12, Top = 12, Text = label, AutoSize = true };
-                box.Left = 12; box.Top = 36; box.Width = 296; box.Text = initial;
-                var ok = new Button { Left = 148, Top = 70, Width = 80, Text = "OK", DialogResult = DialogResult.OK };
-                var cancel = new Button { Left = 236, Top = 70, Width = 80, Text = "Cancel", DialogResult = DialogResult.Cancel };
-                Controls.AddRange(new Control[] { lbl, box, ok, cancel });
-                AcceptButton = ok; CancelButton = cancel;
-            }
-        }
+        //  All of these are owned by the shared shell now (Desktop.OnRightClick
+        //  -> Popup, inline rename editor, ShowDeskProps, BrowserApp).  The
+        //  host only routes right-clicks / tray clicks into Shell.DesktopRClick
+        //  / Shell.RightClick / Shell.DesktopClick -- see OnMouseDown.  No
+        //  WinForms menu, message box or input dialog exists here anymore.
     }
 }

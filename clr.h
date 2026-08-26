@@ -22,6 +22,12 @@ void clr_init(clr_read_fn reader);
 //   -4 unbound internal call               -5 execution fault
 int  clr_run(const char* filename);
 
+// Load a .mex as the RESIDENT image and run its entry point (Program::Main).
+// Unlike clr_run() (throwaway + return), the assembly stays the persistent
+// managed context so the native GUI loop keeps painting/inputting any windows
+// its Main opens.  Returns the same codes as clr_run().
+int  clr_run_resident(const char* filename);
+
 // Human readable description of the last load/run.
 const char* clr_last_report(void);
 

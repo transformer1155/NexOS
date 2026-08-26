@@ -30,6 +30,7 @@ static void serial_hex(uint32_t v){
 
 // Ring-0 path lives in linux_compat.cpp.
 extern "C" void linux_syscall_dispatch(SysRegs* r);
+extern "C" void linux_deliver_signals(SysRegs* r, int from_trap);
 
 // ---------------------------------------------------------------------
 //  User pointer validation
@@ -188,6 +189,16 @@ __asm__(
     "    pushl %eax\n"           // SysRegs* (first cdecl arg)
     "    call sys_dispatch\n"
     "    addl $4, %esp\n"        // drop the SysRegs* argument
+    // Stage 2: deliver any pending & unblocked signal for the current thread
+    // BEFORE returning to the guest.  linux_deliver_signals() may rewrite the
+    // trap frame and switch into a signal handler (it does not return); if
+    // there is nothing to deliver it returns here and we pop+iret as normal.
+    // At this point %esp points at the saved eax slot == SysRegs* (r).
+    "    movl %esp, %eax\n"
+    "    pushl $1\n"             // from_trap = 1 (int 0x80 path: real user ESP)
+    "    pushl %eax\n"           // SysRegs* (r)
+    "    call linux_deliver_signals\n"
+    "    addl $8, %esp\n"
     "    popl %eax\n"            // <- syscall return value reaches the guest
     "    popl %ebx\n"
     "    popl %ecx\n"

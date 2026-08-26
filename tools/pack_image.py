@@ -5,7 +5,7 @@ pack_image.py - Inject your own applications into a NexOS disk image.
 This script works on Windows, Linux and macOS using only the Python standard
 library.  It rebuilds the Simple File System (SFS) payload from sfs_files/ plus
 any files you supply, then writes the new SFS back into a bootable os.img at
-LBA 3328 (byte offset 3328*512 = 1703936).
+LBA 3368 (byte offset 3368*512 = 1724416).
 
 Usage examples:
   python tools/pack_image.py --list
@@ -23,7 +23,7 @@ ENTRY_SIZE = 32
 ENTRIES_PER_SECTOR = SECTOR // ENTRY_SIZE
 DIR_SECTORS = 16
 DATA_START_LBA = 817           # Relative to the start of the SFS image
-SFS_LBA = 3328                 # Where SFS is written on the BIOS disk
+SFS_LBA = 3368                 # Where SFS is written on the BIOS disk
 SFS_BYTE_OFF = SFS_LBA * SECTOR
 MAX_NAME_LEN = 19              # name[20] with null terminator
 

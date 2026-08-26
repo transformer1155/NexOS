@@ -59,8 +59,11 @@ namespace NexOS.Forms
         }
 
         // Trim trailing newlines / spaces so command output displays clean.
+        // O(n) single U.Sub slice (a per-character U.Cat loop is O(n^2) on
+        // the 512 KB bump heap and can fault on longer `ai init` output).
         static string TrimTail(string s)
         {
+            if (s == null) return "";
             int n = s.Length;
             while (n > 0)
             {
@@ -68,9 +71,13 @@ namespace NexOS.Forms
                 if (ch == '\n' || ch == '\r' || ch == ' ') n--;
                 else break;
             }
-            string r = "";
-            for (int i = 0; i < n; i++) r = U.Cat(r, Host.CharStr((int)s[i]));
-            return r;
+            if (n > 480)   // cap: never hold a multi-KB transcript on the heap
+            {
+                n = 480;
+                while (n > 0 && ((int)s[n] & 0xC0) == 0x80) n--;  // UTF-8 safe
+            }
+            if (n >= s.Length) return s;
+            return U.Sub(s, 0, n);
         }
 
         public override void OnPaint()

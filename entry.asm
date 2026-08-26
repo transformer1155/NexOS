@@ -18,6 +18,7 @@
 [EXTERN kmain]
 [EXTERN __bss_start]
 [EXTERN __bss_end]
+[EXTERN __k32_stack_top]
 
 section .text
 _start:
@@ -26,7 +27,15 @@ _start:
     mov  al, 0x53               ; 'S' = kernel _start reached
     out  dx, al
 
-    mov  esp, 0x90000              ; establish a valid 32-bit stack
+    ; ---- Establish the 32-bit kernel stack ----
+    ; Was hard-coded 0x90000 (growing DOWN).  That silently destroyed the
+    ; kernel's own .data once .text+.rodata pushed .data up to 0x8FE00:
+    ; gdt64/gdt64_desc (the GDT `lgdt` loads in switch_to_64bit) sat only
+    ; 512 bytes below the stack top, so any moderately deep call chain
+    ; shredded it -> #GP on `mov ss` in long mode -> triple-fault reboot
+    ; loop.  __k32_stack_top is a 64 KiB region reserved by linker.ld
+    ; ABOVE .bss, so it tracks the image instead of colliding with it.
+    mov  esp, __k32_stack_top      ; establish a valid 32-bit stack
 
     ; ---- Enable FPU (x87) + SSE ----
     ; CR0: clear EM (bit 2), set MP (bit 1), set NE (bit 5), clear TS (bit 3)

@@ -7,7 +7,7 @@ Stage1 引导扇区 → Stage2 二阶引导 → 切换到 32 位保护模式 →
 
 - 滚动回看终端 + 剪贴板(鼠标选择/中键粘贴/Ctrl+C/V)
 - PS/2 键盘(Set 1)+ 鼠标(Intellimouse 滚轮)驱动
-- PowerShell 风格 shell(`PS user@NexOS /path>`),48+ 命令
+- PowerShell 风格 shell(`PS user@minios /path>`),48+ 命令
 - **用户系统**:登录/多用户/密码哈希(影子文件持久化)
 - **权限系统**:9 位 rwxrwxrwx,`chmod`/`stat`,文件命令自动鉴权
 - **sudo**:验证密码后临时提权执行
@@ -85,17 +85,33 @@ UEFI 路径下,`BOOTX64.EFI` 从 ESP 读取 `kernel.bin` 复制到 `0x10000`,
 
 ## 依赖
 
-### BIOS 构建
+在 **WSL / 原生 Linux** 下，`make` 会**自动探测并 apt-get 安装**缺失的依赖
+(首次构建时，会提示 sudo 密码):
+
+| 目标 | 需要的包(自动安装) |
+|------|--------------------|
+| 基础(`make`) | `nasm g++ binutils python3 make` |
+| 32 位内核(`-m32`) | `gcc-multilib`(或 `g++-multilib`) |
+| UEFI(`make uefi`) | `gnu-efi ovmf` |
+| 镜像/ISO(`make iso`/`uefi`) | `mtools xorriso` |
+| 运行(`make run`) | `qemu-system-x86` |
+| Windows PE(`make winpe`) | `gcc-mingw-w64-x86-64 gcc-mingw-w64-i686` |
+| C# 应用(`make csharp`) | `dotnet-sdk-8.0` |
+
+手动预装(可选):
 
 ```bash
-sudo apt install nasm g++ gcc-multilib make qemu-system-x86 python3
+# BIOS + 32 位内核
+sudo apt install nasm g++ gcc-multilib binutils make python3 qemu-system-x86
+# UEFI
+sudo apt install gnu-efi ovmf mtools xorriso
 ```
 
-### UEFI 构建
-
-```bash
-sudo apt install gnu-efi ovmf mtools
-```
+> **WSL 说明**: 从 WSL 终端(`cd /mnt/d/MyOS/bootloader`)直接 `make` 即可,
+> 全程使用 WSL 内原生工具链(nasm/g++/ld/objcopy/qemu/...),不再依赖
+> Windows 侧的跨编译工具(如 `/d/nexos-tc/...`)。UEFI 固件用系统 OVMF,
+> QEMU 用原生 `qemu-system-x86_64`(WSLg 下自动走 X11 后端)。
+> 若不希望自动探测 WSL,可用 `make WSL=0 ...` 强制按原生 Linux 行为。
 
 ### 中文字库 / 拼音字典(可选,构建时自动)
 
@@ -122,9 +138,8 @@ SFS 镜像由 `tools/sfs_gen.py` 从 `sfs_files/` 打包;中文与拼音字典�
 ### BIOS
 
 ```bash
-make run              # QEMU 窗口(图形环境),可敲键盘/滚鼠标
 make test             # 无头自动测试:shell + 翻页 + save/load + 文件系统 + 脚本
-make bios-run         # BIOS 镜像 (os.img)
+make iso-run         # ISO 镜像 (os.iso)
 ```
 
 ### ISO + 数据盘(推荐,文件持久化)
@@ -152,7 +167,7 @@ OVMF 退出后 monitor 读 VGA 返回 `0xFFFFFFFF`,改用 `screendump` 截图
 ## 命令行 shell
 
 启动后进入**登录提示**,输入用户名/密码(预置 `root`/`admin`、
-`guest`/`guest`),成功后进入 shell,提示符 `PS user@NexOS /path>`。
+`guest`/`guest`),成功后进入 shell,提示符 `PS user@minios /path>`。
 
 ### 基础命令
 
@@ -280,7 +295,7 @@ MKFS 文件条目兼容,支持任意类型(`.sh`/`.txt` 等),文件名最长 23 
 > echo Hello from SFS script!
 Hello from SFS script!
 > about
-NexOS v2.0  -  C++ freestanding kernel
+MiniOS v2.0  -  C++ freestanding kernel
 ...
 --- end of script ---
 ```
@@ -369,3 +384,94 @@ UEFI 启动后 CPU 在长模式,而内核是 32 位代码。**兼容模式方案
 `L=0, D=1` 段在长模式内执行 32 位指令,UEFI 页表保持有效,所有
 I/O/VGA/内存行为与 32 位保护模式一致,避免完整切换(关分页→关 PAE→
 关 LME)的三重错误风险。CR0/CR4/EFER 仍保持长模式配置,对内核透明。
+好的，以下是纯文本 Markdown 格式的完整协议，你可以直接复制粘贴到 `README.md` 中使用：
+
+---
+
+# NexOS 开源协议
+
+**NexOS 开源协议（MiniOS Open Source License）**  
+版权所有 (c) 2026 transformer1155
+
+贡献者许可：任何人向本仓库提交代码，即表示同意将其贡献
+按本协议授权给项目所有者。项目所有者保留对协议解释、
+商业授权和代码合并的最终决定权。
+
+允许并鼓励任何个人或组织出于学习、研究、教学、个人兴趣或非商业目的，使用、复制、修改、合并、发布、分发本软件及其衍生版本。
+
+---
+
+## 一、定义
+
+1.1 “软件”指本协议所约束的源代码、二进制文件、文档及相关资源。
+
+1.2 “衍生版本”指在原始软件基础上进行修改、扩展、移植后形成的新版本。
+
+---
+
+## 二、允许的行为
+
+2.1 **学习与研究**  
+任何人有权查看、分析、运行本软件，用于学习操作系统原理、编程技术或进行科学研究。
+
+2.2 **修改与扩展**  
+任何人有权对本软件进行修改、优化、功能增强，并创建衍生版本。
+
+2.3 **分发衍生版本**  
+任何人有权在遵守本协议的前提下，分发其基于本软件创建的衍生版本。分发时须清晰标注衍生版本的修改范围，并保留本协议及版权声明。
+
+2.4 **内部使用**  
+企业或组织内部出于教育、培训或内部技术验证目的使用本软件，不受商业使用限制。
+
+---
+
+## 三、禁止的行为
+
+3.1 **商业使用**  
+未经项目方书面明确许可，任何人不得将本软件或其衍生版本用于任何商业目的，包括但不限于：
+
+a) 直接或间接通过本软件收费、盈利或获取商业利益；  
+b) 将本软件作为商品或服务的一部分进行销售；  
+c) 将本软件集成到用于出售或出租的软件产品中；  
+d) 使用本软件为商业客户提供技术服务、外包或咨询服务并以此获利。
+
+3.2 **盗用或剽窃**  
+任何人不得将本软件或其衍生版本声称为自己原创，不得移除或篡改版权声明、作者信息及本协议内容。
+
+3.3 **恶意使用**  
+任何人不得使用本软件从事任何违法、危害网络安全、侵犯他人权益的活动。
+
+---
+
+## 四、衍生版本要求
+
+4.1 任何衍生版本必须在显著位置保留本协议全文或提供明确的本协议引用链接。
+
+4.2 衍生版本的分发者须明确说明其对原始软件的修改内容，并确保衍生版本不误导他人认为其与原始项目方有直接关联。
+
+4.3 衍生版本同样适用本协议的条款，特别是禁止商业使用的限制。
+
+---
+
+## 五、免责声明
+
+本软件以“现状”（AS IS）提供，项目方不对其适销性、特定用途适用性、安全性或任何其他方面提供任何明示或暗示的保证。项目方不对因使用本软件而导致的任何直接、间接、特殊、偶然或结果性损失承担责任。
+
+---
+
+## 六、终止
+
+如违反本协议任何条款，本协议授予的权利将自动终止。违反者须立即停止使用并销毁所有副本。
+
+---
+
+## 七、最终解释权
+
+本协议最终解释权归项目方所有。项目方保留根据实际情况调整本协议条款的权利，调整后的条款将通过适当方式通知用户。
+
+---
+
+**版本：2.0**  
+**生效日期：2026-08-12**
+
+---

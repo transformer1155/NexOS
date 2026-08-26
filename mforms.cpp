@@ -31,6 +31,12 @@ static inline void mf_outb(uint16_t port, uint8_t val) {
 static void serial_puts(const char* s) {
     while (s && *s) mf_outb(0x3F8, (uint8_t)*s++);
 }
+static void serial_putdec(int v) {
+    char b[12]; int i = 0;
+    if (v == 0) b[i++] = '0';
+    else { int t = v; if (v < 0){ b[i++]='-'; t=-t; } while(t){ b[i++]=(char)('0'+t%10); t/=10; } }
+    for (int j = i-1; j >= 0; j--) mf_outb(0x3F8, (uint8_t)b[j]);
+}
 
 // =====================================================================
 //  local string helpers (freestanding: no libc)
@@ -296,6 +302,19 @@ int32_t g_screen_w(int32_t*)   { return (int32_t)g_h.screen_w; }
 int32_t g_screen_h(int32_t*)   { return (int32_t)g_h.screen_h; }
 int32_t g_mouse_x(int32_t*)    { return g_msx < 0 ? -1 : g_msx - g_ox; }
 int32_t g_mouse_y(int32_t*)    { return g_msy < 0 ? -1 : g_msy - g_oy; }
+int32_t g_origin_x(int32_t*)   { return g_ox; }
+int32_t g_origin_y(int32_t*)   { return g_oy; }
+
+// Arm the shared button press animation (screen coords).  The managed
+// Btn class turns this into a shrink-to-half-and-restore on whichever
+// W.Button/Primary/Key sits under the point.
+static void press_screen(int sx, int sy) {
+    int32_t a[2] = { sx, sy }, r = 0;
+    clr_call("NexOS.Forms.Btn::PressScreen", a, 2, &r);
+}
+// Synthetic pointer position for voice / automation clicks: set the native
+// cursor to (x,y) in the CURRENT client context so Gfx.MouseX/Y report it.
+int32_t g_set_mouse(int32_t* a) { g_msx = a[0] + g_ox; g_msy = a[1] + g_oy; return 0; }
 
 // =====================================================================
 //  NexOS.Forms.Host  --  machine state
@@ -428,12 +447,26 @@ int32_t h_file_name(int32_t* a) {
     const char* l = flist_line(a[0], a[1]);
     if (l[0] == '[' && l[1] == 'D' && l[2] == ']') l += 3;
     while (*l == ' ') l++;
-    // SFS lines are stored with fixed-width names padded with spaces and
-    // then " (sizeB)"; MKFS names have no size annotation but may still be
-    // padded.  Return only the actual file name (up to the first trailing
-    // space or '(') so the managed shell can reliably match extensions.
-    int len = 0;
-    while (l[len] && l[len] != '\n' && l[len] != ' ' && l[len] != '(') len++;
+    // File names may contain spaces (e.g. desktop shortcuts "This PC.lnk",
+    // "AI Agent.lnk").  The ONLY reliable name boundary is the SFS size
+    // annotation " (digitsB)" the kernel appends after the name; MKFS and
+    // the Desktop folder emit a bare "<name>\n" with no suffix, so for those
+    // the name runs to end of line.  Stopping at the first space (the old
+    // behaviour) made every space-containing file un-deletable / un-openable
+    // / un-renamable, because FileDelete/Open/Rename then looked up a
+    // truncated name ("This", "AI") and silently no-op'd.
+    const char* end = l;
+    while (end[0]) end++;                       // end -> NUL terminator
+    for (const char* p = l; *p; p++) {
+        if (*p == '(' && p > l && p[-1] == ' ' &&
+            p[1] >= '0' && p[1] <= '9') {
+            const char* q = p + 1;
+            while (*q >= '0' && *q <= '9') q++;
+            if (*q == 'B' && q[1] == ')') { end = p; break; }
+        }
+    }
+    while (end > l && (end[-1] == '\n' || end[-1] == ' ')) end--;
+    int len = (int)(end - l);
     char buf[64];
     if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
     for (int i = 0; i < len; i++) buf[i] = l[i];
@@ -467,6 +500,12 @@ int32_t h_file_rename(int32_t* a) {
 constexpr int TEXT_MAX = 3072;
 char g_textread[TEXT_MAX + 1];
 
+// Write buffer for Host.WriteText (settings + Notepad docs).  Large enough
+// for a modest document; the kernel mkfs.create path truncates at the volume
+// limit anyway, and the managed side keeps its own copy of the text.
+constexpr int WRITE_MAX = 65536;
+char g_textwrite[WRITE_MAX + 1];
+
 int32_t h_read_text(int32_t* a) {
     if (!g_h.read_file) return clr_new_str("");
     int n = g_h.read_file(a[0], clr_str(a[1]),
@@ -481,6 +520,20 @@ int32_t h_read_text(int32_t* a) {
     }
     g_textread[n] = 0;
     return clr_new_str(g_textread);
+}
+
+// Host.WriteText(fs, name, text): persist a UTF-8 text body to stable
+// storage.  Returns bytes written (>=0) or -1 on error.  Used by the
+// managed shell to save personalization settings ("nexos.cfg") and Notepad
+// documents.  Matches the read side's clr_str/a[] indexing convention.
+int32_t h_write_text(int32_t* a) {
+    if (!g_h.write_file) return -1;
+    const char* s = clr_str(a[2]);
+    int len = 0; while (s && s[len]) len++;          // local strlen (no libc in freestanding 64-bit)
+    if (len > WRITE_MAX) len = WRITE_MAX;
+    for (int i = 0; i < len; i++) g_textwrite[i] = s[i];
+    int n = g_h.write_file(a[0], clr_str(a[1]), (const unsigned char*)g_textwrite, len);
+    return (int32_t)n;
 }
 
 constexpr int EXEC_MAX = 4096;
@@ -517,15 +570,55 @@ int32_t h_http_get(int32_t* a) {
 
 // A one-character managed string.  Managed code has no char[]->string
 // constructor, so text entry (terminal, notepad) builds strings a glyph
-// at a time through this.
+// at a time through this.  The argument is a Unicode codepoint, encoded
+// here as UTF-8 so CJK input survives the C# <-> runtime boundary.
 int32_t h_charstr(int32_t* a) {
-    char b[2]; b[0] = (char)a[0]; b[1] = 0;
+    uint32_t cp = (uint32_t)a[0];
+    char b[8];
+    int n = 0;
+    if (cp < 0x80) {
+        b[n++] = (char)cp;
+    } else if (cp < 0x800) {
+        b[n++] = (char)(0xC0 | (cp >> 6));
+        b[n++] = (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        b[n++] = (char)(0xE0 | (cp >> 12));
+        b[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        b[n++] = (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x110000) {
+        b[n++] = (char)(0xF0 | (cp >> 18));
+        b[n++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        b[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        b[n++] = (char)(0x80 | (cp & 0x3F));
+    }
+    b[n] = 0;
     return clr_new_str(b);
 }
 
 // Host.GetClipboard(): return the shared kernel clipboard as a managed string.
 int32_t h_clip_get(int32_t*) {
     return clr_new_str(g_clipboard);
+}
+
+// Host.SetAnim(on): the managed shell asks the host to keep repainting so
+// its animations (AI desktop thinking dots, typewriter reveal) can progress.
+// The GUI main loop polls g_mforms_anim and throttles render_all() to ~30 fps
+// while set, because between input events nothing else triggers a repaint.
+extern "C" { int g_mforms_anim = 0; }
+int32_t h_set_anim(int32_t* a) { g_mforms_anim = (a && a[0]) ? 1 : 0; return 0; }
+
+// Host.SetPixel(mode, scale, scan): the managed shell (Theme) pushes its
+// retro "pixel / CRT monitor" settings down to the kernel so the single
+// framebuffer post-process in gui.cpp::pixelate_framebuffer() can read them.
+//   mode  : 0 off, 1 on
+//   scale : block size in pixels (1 = full detail, >1 = chunkier pixels)
+//   scan  : 0 off, 1 on (CRT scanline darkening)
+extern "C" { int g_pixel_mode = 0; int g_pixel_scale = 1; int g_pixel_scan = 0; }
+int32_t h_set_pixel(int32_t* a) {
+    g_pixel_mode  = (a && a[0]) ? 1 : 0;
+    g_pixel_scale = (a && a[1] > 1) ? a[1] : 1;
+    g_pixel_scan  = (a && a[2]) ? 1 : 0;
+    return 0;
 }
 
 // Host.SetClipboard(text): copy a managed string into the shared clipboard.
@@ -565,6 +658,9 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Gfx::ScreenH",     g_screen_h     },
     { "NexOS.Forms.Gfx::MouseX",      g_mouse_x      },
     { "NexOS.Forms.Gfx::MouseY",      g_mouse_y      },
+    { "NexOS.Forms.Gfx::SetMouse",    g_set_mouse    },
+    { "NexOS.Forms.Gfx::OriginX",     g_origin_x     },
+    { "NexOS.Forms.Gfx::OriginY",     g_origin_y     },
     // ---- Host ----
     { "NexOS.Forms.Host::MemTotalKb",   h_mem_total   },
     { "NexOS.Forms.Host::PagesFree",    h_pages_free  },
@@ -587,6 +683,7 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::NicPresent",   h_nic         },
     { "NexOS.Forms.Host::Ticks",        h_ticks       },
     { "NexOS.Forms.Host::TickMs",       h_tick_ms     },
+    { "NexOS.Forms.Host::SetAnim",      h_set_anim    },
     { "NexOS.Forms.Host::RunningMask",  h_run_mask    },
     { "NexOS.Forms.Host::FileCount",    h_file_count  },
     { "NexOS.Forms.Host::FileName",     h_file_name   },
@@ -596,6 +693,7 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::FileDelete",   h_file_delete },
     { "NexOS.Forms.Host::FileRename",   h_file_rename },
     { "NexOS.Forms.Host::ReadText",     h_read_text   },
+    { "NexOS.Forms.Host::WriteText",    h_write_text  },
     { "NexOS.Forms.Host::Exec",         h_exec        },
     { "NexOS.Forms.Host::RunExe",       h_run_exe     },
     { "NexOS.Forms.Host::Shutdown",     h_shutdown    },
@@ -612,6 +710,7 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::LoginUid",     h_login_uid   },
     { "NexOS.Forms.Host::UserCount",    h_user_count  },
     { "NexOS.Forms.Host::UserName",     h_user_name   },
+    { "NexOS.Forms.Host::SetPixel",     h_set_pixel   },
 };
 const int G_REG_COUNT = (int)(sizeof(g_regs) / sizeof(g_regs[0]));
 
@@ -635,6 +734,16 @@ void rebaseline() {
     }
 }
 
+// A managed event handler that faulted (typically by exhausting the bump
+// heap) leaves the watermark at its high point.  Every later call would then
+// fault immediately on its first allocation, so rewind to the last
+// known-good persistent watermark and let the next frame try again.
+// Without this the shell was one bad event away from being dead for good.
+void heap_recover() {
+    clr_heap_reset(g_persist);
+    serial_puts("[MFORMS] managed heap rewound after fault\n");
+}
+
 char g_title[64];
 
 } // namespace
@@ -642,6 +751,11 @@ char g_title[64];
 // =====================================================================
 //  public API
 // =====================================================================
+// diag_step (defined in kernel64.cpp for 64-bit, no-op stub in kernel.cpp for
+// 32-bit) replaces colour beacons for progress tracing -- logs step name to
+// serial, never paints the whole screen.
+extern "C" void diag_step(uint32_t id, const char* name);
+
 extern "C" void mforms_init(const MFormsHost* host) {
     if (!host) return;
     g_h = *host;
@@ -684,6 +798,7 @@ extern "C" int mforms_open(int kind) {
     int32_t a = kind, r = -1;
     if (clr_call("NexOS.Forms.Shell::Open", &a, 1, &r) != 0) {
         scpy(g_report, clr_last_report(), sizeof(g_report));
+        heap_recover();
         return -1;
     }
     rebaseline();                    // the new app's state must persist
@@ -693,8 +808,10 @@ extern "C" int mforms_open(int kind) {
 extern "C" void mforms_close(int id) {
     if (!mforms_ready() || id < 0) return;
     int32_t a = id, r = 0;
-    clr_call("NexOS.Forms.Shell::Close", &a, 1, &r);
-    rebaseline();
+    // Only re-baseline on success: baselining after a fault would bake the
+    // blown watermark into the persistent floor and never give it back.
+    if (clr_call("NexOS.Forms.Shell::Close", &a, 1, &r) == 0) rebaseline();
+    else heap_recover();
 }
 
 extern "C" const char* mforms_title(int id) {
@@ -724,8 +841,9 @@ extern "C" int mforms_click(int id, int ox, int oy, int w, int h,
     set_context(ox, oy, w, h);
     g_msx = mx; g_msy = my;
     g_flist_fs = -1;
+    press_screen(mx, my);            // arm button press animation (screen)
     int32_t a[3] = { id, mx - ox, my - oy }, r = 0;
-    if (clr_call("NexOS.Forms.Shell::Click", a, 3, &r) != 0) return 0;
+    if (clr_call("NexOS.Forms.Shell::Click", a, 3, &r) != 0) { heap_recover(); return 0; }
     rebaseline();                    // a click may create durable state
     return (int)r;
 }
@@ -734,7 +852,7 @@ extern "C" int mforms_key(int id, int ch) {
     if (!mforms_ready() || id < 0) return 0;
     int32_t a[2] = { id, ch }, r = 0;
     int rc = clr_call("NexOS.Forms.Shell::Key", a, 2, &r);
-    if (rc != 0) return 0;
+    if (rc != 0) { heap_recover(); return 0; }
     rebaseline();
     return (int)r;
 }
@@ -745,7 +863,7 @@ extern "C" void mforms_set_mouse(int mx, int my) { g_msx = mx; g_msy = my; }
 extern "C" int mforms_desktop_key(int ch) {
     if (!mforms_ready()) return 0;
     int32_t a[1] = { ch }, r = 0;
-    if (clr_call("NexOS.Forms.Desktop::Key", a, 1, &r) != 0) return 0;
+    if (clr_call("NexOS.Forms.Desktop::Key", a, 1, &r) != 0) { heap_recover(); return 0; }
     rebaseline();
     return (int)r;
 }
@@ -761,12 +879,23 @@ extern "C" int mforms_has_desktop(void) {
 
 extern "C" void mforms_paint_desktop(int w, int h) {
     if (!mforms_ready()) return;
+    diag_step(200, "mforms_paint_desktop enter");
+    extern int g_clr_trace;
+    g_clr_trace = 1;
     set_context(0, 0, w, h);
     g_flist_fs = -1;
     uint32_t mark = clr_heap_mark();
     int32_t a[2] = { w, h }, r = 0;
     clr_call("NexOS.Forms.Shell::PaintDesktop", a, 2, &r);
     clr_heap_reset(mark);
+    diag_step(201, "mforms_paint_desktop returned -> DeferredRun");
+    // AI desktop deferred work (e.g. agent run) must happen AFTER the paint
+    // heap is reset so its allocations survive as persistent state.
+    if (clr_call("NexOS.Forms.Desktop::DeferredRun", nullptr, 0, &r) == 0)
+        rebaseline();
+    else
+        heap_recover();
+    // g_clr_trace left ON intentionally for diagnosis (every frame traced).
 }
 
 // Taskbar and Start menu, painted after the windows so the shell chrome
@@ -779,6 +908,13 @@ extern "C" void mforms_paint_overlay(int w, int h) {
     int32_t a[2] = { w, h }, r = 0;
     clr_call("NexOS.Forms.Shell::PaintOverlay", a, 2, &r);
     clr_heap_reset(mark);
+    // Voice: execute deferred synthetic clicks now that the paint heap is
+    // reset, so any window/app a handler opens survives as persistent
+    // state (mirrors the Desktop::DeferredRun pattern above).
+    if (clr_call("NexOS.Forms.Voice::Dispatch", nullptr, 0, &r) != 0)
+        heap_recover();
+    else
+        rebaseline();
 }
 
 // -2 == "not mine, hit-test your windows".  Note the failure path also
@@ -788,8 +924,9 @@ extern "C" int mforms_desktop_click(int mx, int my) {
     if (!mforms_ready()) return -2;
     set_context(0, 0, g_h.screen_w, g_h.screen_h);
     g_msx = mx; g_msy = my;
+    press_screen(mx, my);            // arm button press animation (screen)
     int32_t a[2] = { mx, my }, r = 0;
-    if (clr_call("NexOS.Forms.Shell::DesktopClick", a, 2, &r) != 0) return -2;
+    if (clr_call("NexOS.Forms.Shell::DesktopClick", a, 2, &r) != 0) { heap_recover(); return -2; }
     rebaseline();
     return (int)r;
 }
@@ -800,7 +937,7 @@ extern "C" int mforms_desktop_rclick(int mx, int my) {
     set_context(0, 0, g_h.screen_w, g_h.screen_h);
     g_msx = mx; g_msy = my;
     int32_t a[2] = { mx, my }, r = 0;
-    if (clr_call("NexOS.Forms.Shell::DesktopRClick", a, 2, &r) != 0) return -2;
+    if (clr_call("NexOS.Forms.Shell::DesktopRClick", a, 2, &r) != 0) { heap_recover(); return -2; }
     rebaseline();
     return (int)r;
 }
@@ -814,7 +951,7 @@ extern "C" int mforms_rclick(int id, int ox, int oy, int w, int h,
     set_context(ox, oy, w, h);
     g_msx = mx; g_msy = my;
     int32_t a[5] = { id, mx - ox, my - oy, ox, oy }, r = 0;
-    if (clr_call("NexOS.Forms.Shell::RightClick", a, 5, &r) != 0) return 0;
+    if (clr_call("NexOS.Forms.Shell::RightClick", a, 5, &r) != 0) { heap_recover(); return 0; }
     rebaseline();
     return (int)r;
 }

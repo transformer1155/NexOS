@@ -18,7 +18,7 @@ static Process g_kernel_proc = { 0, "kernel", SYSTEM_UID, 0, "/", 0, 0x01800000 
 
 Process* g_current = &g_kernel_proc;
 
-int proc_spawn(const char* name, uint32_t uid, const char* root_path, Process** out){
+extern "C" int proc_spawn(const char* name, uint32_t uid, const char* root_path, Process** out){
     if (g_proc_count >= 16) return -1;
     Process* p = &g_procs[g_proc_count];
 

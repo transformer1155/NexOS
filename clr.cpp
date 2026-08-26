@@ -125,10 +125,10 @@ struct MexStr { uint32_t off, len; };
 // ---------------------------------------------------------------------
 #define CLR_IMAGE_MAX   (192 * 1024)
 #define CLR_HEAP_SIZE   (512 * 1024)
-#define CLR_STACK_SLOTS 4096
+#define CLR_STACK_SLOTS 32768
 #define CLR_MAX_DEPTH   48
-#define CLR_MAX_STRINGS 512
-#define CLR_MAX_STATICS 512
+#define CLR_MAX_STRINGS 1024
+#define CLR_MAX_STATICS 1024
 #define CLR_STEP_LIMIT  20000000
 
 static clr_read_fn  g_reader = 0;
@@ -151,9 +151,20 @@ static int32_t      g_statics[CLR_MAX_STATICS];
 static int32_t      g_strobj[CLR_MAX_STRINGS];
 static int16_t      g_icall_bind[128];
 
+// DIAG-ONLY: when non-zero, every clr_call / native icall prints its name to
+// the serial log.  Used to pinpoint a triple-fault inside the managed desktop
+// paint (mforms_paint_desktop sets this around its PaintDesktop call).
+int g_clr_trace = 0;
+
 static int          g_fault = 0;
 static char         g_report[512];
 static uint32_t     g_steps = 0;
+
+// Consecutive clr_call failures before the image is declared dead.  A single
+// fault is treated as recoverable (see clr_call): the managed shell is a
+// long-lived resident image and one bad frame must not retire it.
+#define CLR_FAIL_STREAK_MAX 12
+static int          g_fail_streak = 0;
 
 static const char* mex_name(uint32_t off) { return g_names + off; }
 
@@ -229,6 +240,41 @@ static int32_t ic_str_concat(int32_t* a) {
     return (int32_t)(uint32_t)o;
 }
 
+// Substring in a single allocation.
+//
+// The managed side used to build substrings with a per-character StrConcat
+// loop.  On a bump allocator with no GC that costs O(n^2) BYTES: flattening
+// a 2 KB `agent run` transcript allocated ~2 MB and blew the 512 KB managed
+// heap, which faulted the whole shell (see clr_call's failure streak).
+static int32_t ic_str_sub(int32_t* a) {
+    if (!a[0]) return 0;
+    int n = str_len(a[0]);
+    int s = a[1], l = a[2];
+    if (s < 0) s = 0;
+    if (s > n) s = n;
+    if (l < 0) l = 0;
+    if (s + l > n) l = n - s;
+    return make_string(str_data(a[0]) + s, l);
+}
+
+// Collapse every control byte (CR/LF/TAB/...) to a space, one allocation.
+// Same motivation as ic_str_sub: the managed flatten loop was quadratic.
+static int32_t ic_str_flat(int32_t* a) {
+    if (!a[0]) return 0;
+    int n = str_len(a[0]);
+    uint8_t* o = heap_alloc(8 + (uint32_t)n + 1);
+    if (!o) return 0;
+    *(uint32_t*)o = OBJ_STRING;
+    *(uint32_t*)(o + 4) = (uint32_t)n;
+    const char* p = str_data(a[0]);
+    for (int i = 0; i < n; i++) {
+        uint8_t c = (uint8_t)p[i];
+        o[8 + i] = (c < 0x20 || c == 0x7F) ? (uint8_t)' ' : c;
+    }
+    o[8 + n] = 0;
+    return (int32_t)(uint32_t)o;
+}
+
 static int32_t ic_str_eq(int32_t* a) {
     // null-safe UTF-8 byte compare; both null => equal, one null => not.
     if (a[0] == a[1]) return 1;            // same ref (covers both null)
@@ -294,6 +340,8 @@ static const IcallEntry g_icalls[] = {
     { "NexOS.Sys::StrConcat",  ic_str_concat  },
     { "NexOS.Sys::StrCharAt",  ic_str_char_at },
     { "NexOS.Sys::StrLen",     ic_str_len     },
+    { "NexOS.Sys::StrSub",     ic_str_sub     },
+    { "NexOS.Sys::StrFlat",    ic_str_flat    },
     { "NexOS.Sys::StrEq",      ic_str_eq      },
     { "NexOS.Sys::IntToStr",   ic_int_to_str  },
     { "NexOS.Sys::TickCount",  ic_tick_count  },
@@ -375,6 +423,7 @@ done:
 }
 
 static int call_icall(const MexMethod* m, int32_t* args, int32_t* out) {
+    if (g_clr_trace) { ser("[icall] "); ser(mex_name(m->name_off)); ser("\n"); }
     uint32_t id = m->icall_id;
     if (id >= 128 || g_icall_bind[id] == -1) {
         char buf[128];
@@ -479,6 +528,12 @@ static int exec_method(uint32_t midx, int depth) {
         // ---- calls --------------------------------------------
         case 0x28: {                                        // call
             uint32_t t = rd32(il + pc); pc += 4;
+            if (t >= g_hdr->n_methods) {
+                ser("[CLR] call: bad token "); ser_int(t);
+                ser(" >= "); ser_int(g_hdr->n_methods);
+                ser(" in "); ser(mex_name(m->name_off)); ser("\n");
+                fault("call: bad token"); return -1;
+            }
             if (exec_method(t, depth + 1) < 0) return -1;
         } break;
 
@@ -592,6 +647,9 @@ static int exec_method(uint32_t midx, int depth) {
         case 0x67: { int32_t a=POP(); PUSH((int32_t)(int8_t)a); } break;   // conv.i1
         case 0x68: { int32_t a=POP(); PUSH((int32_t)(int16_t)a); } break;  // conv.i2
         case 0x69: break;                                                  // conv.i4
+        case 0x6D: break;                                                  // conv.u4 (int->uint, no-op on 32-bit)
+        case 0x6C: break;                                                  // conv.r8 (int->float64, no-op on 32-bit host)
+        case 0x6E: break;                                                  // conv.u8 (int->uint64, no-op on 32-bit host)
         case 0x6A: break;                                                  // conv.i8 (truncated)
         case 0xD1: { int32_t a=POP(); PUSH((int32_t)(uint16_t)a); } break; // conv.u2
         case 0xD2: { int32_t a=POP(); PUSH((int32_t)(uint8_t)a); } break;  // conv.u1
@@ -916,6 +974,7 @@ extern "C" int clr_load(const char* filename) {
     g_steps = 0;
     g_sp = 0;
     g_resident = 0;
+    g_fail_streak = 0;
     scpy_(g_report, "", sizeof(g_report));
 
     int rc = load_image(filename);
@@ -933,6 +992,37 @@ extern "C" int clr_load(const char* filename) {
 extern "C" int clr_loaded(void) { return g_resident && !g_fault; }
 
 extern "C" void clr_unload(void) { g_resident = 0; }
+
+// Load a .mex as the RESIDENT image and run its entry point (Program::Main).
+// Unlike clr_run() (which loads a throwaway image and returns), this makes the
+// assembly the persistent managed context, so the native GUI loop (render_all)
+// keeps painting and forwarding input to any windows it opens.  This is how a
+// standalone per-application .mex (e.g. Calc.mex) becomes a live app: its
+// Main calls Shell.Init() then Host.OpenApp(kind), and the kernel drives it.
+extern "C" int clr_run_resident(const char* filename) {
+    g_fault = 0; g_steps = 0; g_sp = 0;
+    scpy_(g_report, "", sizeof(g_report));
+
+    int rc = clr_load(filename);
+    if (rc != 0) return rc;
+
+    uint32_t entry = g_hdr->entry;
+    if (entry >= g_hdr->n_methods) {
+        // No entry point (e.g. shell.mex, which boots via mforms_start): just
+        // leave it resident so the desktop is restored.
+        scpy_(g_report, "CLR: resident (no entry), desktop restored",
+              sizeof(g_report));
+        return 0;
+    }
+
+    ser("[CLR] resident entry "); ser(mex_name(g_methods[entry].name_off)); ser("\n");
+    const MexMethod* em = &g_methods[entry];
+    for (int i = 0; i < em->n_args; i++) g_stack[g_sp++] = 0;
+    if (exec_method(entry, 0) < 0) return -5;
+    if (g_fault) return -5;
+    return 0;
+}
+
 
 extern "C" uint32_t clr_heap_mark(void) { return g_heap_used; }
 
@@ -965,6 +1055,7 @@ extern "C" int clr_call(const char* fqname, const int32_t* args,
     }
 
     const MexMethod* m = &g_methods[mi];
+    if (g_clr_trace) { ser("[clr] "); ser(fqname); ser("\n"); }
     if (nargs != m->n_args) {
         scpy_(g_report, "CLR: argument count mismatch on ", sizeof(g_report));
         scat_(g_report, fqname, sizeof(g_report));
@@ -979,9 +1070,31 @@ extern "C" int clr_call(const char* fqname, const int32_t* args,
     for (int i = 0; i < nargs; i++) g_stack[g_sp++] = args[i];
 
     if (exec_method((uint32_t)mi, 0) < 0 || g_fault) {
-        g_resident = 0;              // stop calling into a broken image
+        // Do NOT unload on a single fault.  A transient managed-heap
+        // exhaustion in one frame used to set g_resident = 0 permanently,
+        // which made clr_loaded()/mforms_ready() false forever: the Win11
+        // shell silently degraded to the native fallback desktop, the
+        // managed taskbar vanished and desktop key routing (Ctrl+Left /
+        // Ctrl+Right virtual-desktop switching) died with no way back.
+        // The caller rewinds the heap and retries next frame instead; only
+        // a sustained streak means the image is genuinely broken.
+        if (++g_fail_streak >= CLR_FAIL_STREAK_MAX) {
+            g_resident = 0;
+            ser("[CLR] image unloaded after repeated faults: ");
+            ser(g_report); ser("\n");
+        } else {
+            ser("[CLR] recoverable fault ("); ser_int(g_fail_streak);
+            ser("/"); ser_int(CLR_FAIL_STREAK_MAX); ser("): ");
+            ser(g_report); ser("\n");
+            // clr_loaded() also gates on g_fault, and every mforms entry
+            // point checks it *before* calling in.  Leaving it latched would
+            // deadlock the shell exactly the way g_resident = 0 did: no
+            // further clr_call would ever run to clear it.
+            g_fault = 0;
+        }
         return -5;
     }
+    g_fail_streak = 0;
     if (ret && (m->flags & MF_HASRET) && g_sp > 0) *ret = g_stack[g_sp - 1];
     return 0;
 }

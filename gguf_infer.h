@@ -43,6 +43,16 @@ void qwen_reset(void);       // clear KV cache / position
 typedef void (*QwenEmitFn)(const char* piece);
 int  qwen_generate(const char* prompt, int max_new, float temp, QwenEmitFn emit);
 
+// ---- chat (ChatML template) -----------------------------------------
+// Wrap an optional system prompt + N (role, content) turns in a ChatML
+// template, ending with the <|im_start|>assistant generation prompt.
+// Returns the number of characters written (excl. NUL).  roles/contents are
+// parallel arrays of length n_turns.
+int  qwen_format_chat(const char* system, const char** roles, const char** contents,
+                      int n_turns, char* out, int cap);
+// End-to-end chat: format system + single user turn, then generate.
+int  qwen_chat(const char* system, const char* user, int max_new, float temp, QwenEmitFn emit);
+
 // PRNG seed for sampling (mixed with the TSC by the caller if desired).
 void qwen_seed(uint32_t s);
 

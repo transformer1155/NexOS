@@ -292,6 +292,8 @@ namespace NexOS.Forms
         public static int ScreenH() { return 720; }
         public static int MouseX() { return msx < 0 ? -1 : msx - ox; }
         public static int MouseY() { return msy < 0 ? -1 : msy - oy; }
+        public static int OriginX() { return ox; }
+        public static int OriginY() { return oy; }
     }
 
     // -----------------------------------------------------------------
@@ -303,11 +305,13 @@ namespace NexOS.Forms
         internal static Action ShutdownHook;
         internal static Action RebootHook;
         internal static Action<int> CloseAppHook;    // close windows of a Kind
+        internal static Action<int> OpenAppHook;     // create a real window for a Kind
+        internal static Action<int, int> WinActionHook;  // window geometry action (id, WAct)
         internal static Action ExitGuiHook;          // leave GUI mode
         internal static string FsRoot = "";
 
-        static string[][] listing = new string[2][];
-        static bool[][] isdir = new bool[2][];
+        static string[][] listing = new string[4][];
+        static bool[][] isdir = new bool[4][];
         static readonly int startTick = Environment.TickCount;
 
         // ---- memory ---------------------------------------------------
@@ -331,14 +335,62 @@ namespace NexOS.Forms
         public static void Optimize() { GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect(); }
 
         // ---- clock ----------------------------------------------------
-        public static int Hour() { return DateTime.Now.Hour; }
-        public static int Minute() { return DateTime.Now.Minute; }
-        public static int Second() { return DateTime.Now.Second; }
+        // The VM has no network in QEMU, so it keeps the kernel RTC time
+        // (which QEMU seeds from the host).  On the host we fetch the
+        // accurate time from a server's HTTP Date header once and remember
+        // the offset, calibrating the displayed clock against the network.
+        static long timeOffsetMs;
+        static bool timeSyncStarted;
+
+        public static void StartTimeSync()
+        {
+            if (timeSyncStarted) return;
+            timeSyncStarted = true;
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    string u = "http://example.com/";
+                    var resp = Http().GetAsync(u).GetAwaiter().GetResult();
+                    var hdr = resp.Headers.Date;      // DateTimeOffset?
+                    resp.Dispose();
+                    if (hdr.HasValue)
+                    {
+                        timeOffsetMs = (hdr.Value.UtcTicks - DateTime.UtcNow.Ticks)
+                                       / TimeSpan.TicksPerMillisecond;
+                        Console.WriteLine("[time] network sync offset=" + timeOffsetMs + "ms");
+                    }
+                    else Console.WriteLine("[time] no Date header; keeping local clock");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("[time] sync failed (keeping local): " + ex.Message);
+                }
+            });
+        }
+
+        public static int Hour()   { return DateTime.Now.AddMilliseconds(timeOffsetMs).Hour; }
+        public static int Minute() { return DateTime.Now.AddMilliseconds(timeOffsetMs).Minute; }
+        public static int Second() { return DateTime.Now.AddMilliseconds(timeOffsetMs).Second; }
         public static int Ticks() { return Environment.TickCount - startTick; }
         public static int TickMs() { return Environment.TickCount - startTick; }
+        // WinForms host repaints on its own timer, so this is a no-op stub.
+        public static void SetAnim(int on) { }
 
         // ---- identity -------------------------------------------------
         public static string OsName() { return "NexOS (WinForms host)"; }
+
+        // Account database stubs for the WinForms host (the real kernel
+        // keeps a hashed account table; here we seed a single "root"
+        // account and accept it for any password so the demo flows).
+        public static int UserCount() { return 1; }
+        public static string UserName(int i) { return (i == 0) ? "root" : ""; }
+        public static int LoginCheck(string user, string pass)
+        {
+            if (user == null) return -1;
+            if (user == "root") return 0;     // accept the seeded account
+            return -1;
+        }
 
         public static string CpuVendor()
         {
@@ -382,20 +434,26 @@ namespace NexOS.Forms
 
         public static int RunningMask() { return Running; }
 
-        // ---- file system (fs: 0 = MKFS user disk, 1 = SFS system) -----
+        // ---- file system (fs: 0 = MKFS user disk, 1 = SFS system,
+        //      3 = desktop shortcuts inside MKFS/Desktop) -------------
         static string Dir(int fs)
         {
+            if (fs == 3) return Path.Combine(FsRoot, "mkfs", "Desktop");
             string sub = fs == 1 ? "sfs" : "mkfs";
             return Path.Combine(FsRoot, sub);
         }
 
+        // fs==2 is reserved (FAT32); anything above 3 is out of range.
+        static bool FsOk(int fs) { return fs >= 0 && fs <= 3 && fs != 2; }
+
         static void Load(int fs)
         {
-            if (fs < 0 || fs > 1) return;
+            if (!FsOk(fs)) return;
             if (listing[fs] != null) return;
             try
             {
                 var dir = new DirectoryInfo(Dir(fs));
+                if (!dir.Exists) { listing[fs] = new string[0]; isdir[fs] = new bool[0]; return; }
                 var subs = dir.GetDirectories();
                 var files = dir.GetFiles();
                 var names = new string[subs.Length + files.Length];
@@ -410,14 +468,14 @@ namespace NexOS.Forms
 
         public static int FileCount(int fs)
         {
-            if (fs < 0 || fs > 1) return 0;
+            if (!FsOk(fs)) return 0;
             Load(fs);
             return listing[fs].Length;
         }
 
         public static string FileName(int fs, int idx)
         {
-            if (fs < 0 || fs > 1) return "";
+            if (!FsOk(fs)) return "";
             Load(fs);
             if (idx < 0 || idx >= listing[fs].Length) return "";
             return listing[fs][idx];
@@ -425,27 +483,27 @@ namespace NexOS.Forms
 
         public static int FileIsDir(int fs, int idx)
         {
-            if (fs < 0 || fs > 1) return 0;
+            if (!FsOk(fs)) return 0;
             Load(fs);
             if (idx < 0 || idx >= isdir[fs].Length) return 0;
             return isdir[fs][idx] ? 1 : 0;
         }
 
-        public static int FileRefresh() { listing[0] = null; listing[1] = null; return 1; }
+        public static int FileRefresh() { listing[0] = null; listing[1] = null; listing[3] = null; return 1; }
 
         // File-system mutations (context-menu: new folder / delete / rename).
         // Backed by the real Windows directories under FsRoot, so the same
         // managed code path works on both the kernel and WinHost.
         public static int FileMkDir(int fs, string name)
         {
-            if (fs < 0 || fs > 1 || string.IsNullOrEmpty(name)) return -1;
+            if (!FsOk(fs) || string.IsNullOrEmpty(name)) return -1;
             try { Directory.CreateDirectory(Path.Combine(Dir(fs), name)); FileRefresh(); return 1; }
             catch { return -1; }
         }
 
         public static int FileDelete(int fs, string name)
         {
-            if (fs < 0 || fs > 1 || string.IsNullOrEmpty(name)) return -1;
+            if (!FsOk(fs) || string.IsNullOrEmpty(name)) return -1;
             try
             {
                 string p = Path.Combine(Dir(fs), name);
@@ -460,7 +518,7 @@ namespace NexOS.Forms
 
         public static int FileRename(int fs, string oldName, string newName)
         {
-            if (fs < 0 || fs > 1 || string.IsNullOrEmpty(oldName) || string.IsNullOrEmpty(newName)) return -1;
+            if (!FsOk(fs) || string.IsNullOrEmpty(oldName) || string.IsNullOrEmpty(newName)) return -1;
             try
             {
                 string o = Path.Combine(Dir(fs), oldName);
@@ -498,7 +556,7 @@ namespace NexOS.Forms
 
         public static string ReadText(int fs, string name)
         {
-            if (fs < 0 || fs > 1 || string.IsNullOrEmpty(name)) return "";
+            if (!FsOk(fs) || string.IsNullOrEmpty(name)) return "";
             try
             {
                 string p = Path.Combine(Dir(fs), Path.GetFileName(name));
@@ -554,8 +612,15 @@ namespace NexOS.Forms
         public static void Shutdown() { if (ShutdownHook != null) ShutdownHook(); }
         public static void Reboot() { if (RebootHook != null) RebootHook(); }
 
-        // Managed code opens an app (Notepad from the File Explorer).
-        public static void OpenApp(int kind) { Shell.Open(kind); }
+        // Managed code opens an app (context-menu actions, Notepad from
+        // the File Explorer).  The host must create a REAL window (WinRec),
+        // mirroring gui.cpp launch_app in the VM; without the hook the app
+        // would exist only as an unpainted C# instance.
+        public static void OpenApp(int kind)
+        {
+            if (OpenAppHook != null) { OpenAppHook(kind); return; }
+            Shell.Open(kind);
+        }
 
         // Execute a native Windows PE image.  On the real kernel this runs
         // the .exe through the win32 / win64 PE loader; the Windows-hosted
@@ -571,7 +636,23 @@ namespace NexOS.Forms
         public static void CloseApp(int kind) { if (CloseAppHook != null) CloseAppHook(kind); }
         public static void ExitGui() { if (ExitGuiHook != null) ExitGuiHook(); }
 
+        // Window-geometry action from the Alt+Space / title-bar menu.
+        // The WinForms harness (ShellForm) owns WinRec geometry, so it
+        // performs minimise / maximise / restore; others are no-ops here.
+        public static void WinAction(int id, int code)
+        {
+            if (WinActionHook != null) WinActionHook(id, code);
+        }
+
         public static void Log(string s) { Console.WriteLine("[shell] " + s); }
+
+        // Persist a text body (dev harness: write to the working directory).
+        public static int WriteText(int fs, string name, string text)
+        {
+            try { System.IO.File.WriteAllText(name, text);
+                  return System.Text.Encoding.UTF8.GetByteCount(text); }
+            catch { return -1; }
+        }
 
         public static string CharStr(int ch)
         {
@@ -583,6 +664,12 @@ namespace NexOS.Forms
         private static string g_clipboard = "";
         public static string GetClipboard() { return g_clipboard ?? ""; }
         public static void SetClipboard(string s) { g_clipboard = s ?? ""; }
+
+        // Retro "pixel / CRT" framebuffer post-process.  On the VM this is
+        // an InternalCall into the kernel; on the WinForms host there is no
+        // kernel framebuffer, so it is a no-op.  Kept for Theme.ApplyPixel
+        // parity between the two build targets.
+        public static void SetPixel(int mode, int scale, int scan) { }
     }
 }
 
@@ -604,6 +691,27 @@ namespace NexOS
             return s[index];
         }
         public static int StrLen(string s) { return s == null ? 0 : s.Length; }
+        public static string StrSub(string s, int start, int len)
+        {
+            if (s == null) return null;
+            int n = s.Length;
+            if (start < 0) start = 0;
+            if (start > n) start = n;
+            if (len < 0) len = 0;
+            if (start + len > n) len = n - start;
+            return s.Substring(start, len);
+        }
+        public static string StrFlat(string s)
+        {
+            if (s == null) return null;
+            var b = new System.Text.StringBuilder(s.Length);
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                b.Append((c < ' ' || c == (char)0x7F) ? ' ' : c);
+            }
+            return b.ToString();
+        }
         public static bool StrEq(string a, string b) { return string.Equals(a, b, StringComparison.Ordinal); }
         public static string IntToStr(int v) { return v.ToString(System.Globalization.CultureInfo.InvariantCulture); }
 

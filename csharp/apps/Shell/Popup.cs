@@ -23,12 +23,23 @@ namespace NexOS.Forms
         const int    CAP   = 24;        // max items per menu
         const int    ItemH = 34;        // row height
         const int    PadY  = 6;         // top/bottom inner padding
-        const uint   BG    = 0xF7F9FC;  // menu surface (light)
-        const uint   Edge  = 0xD5DDE8;  // hairline border
-        const uint   Ink   = 0x1B1B1B;  // label ink
-        const uint   Sub   = 0x606060;  // secondary / prefix
-        const uint   Hover = 0xE7EEF8;  // row hover fill
-        const uint   Danger= 0xC42B1C;  // destructive action ink
+        static uint   BG    = 0xF227272B;  // menu surface rgba(39,39,43,0.97)
+        static uint   Edge  = 0x3A3A3A;    // hairline border (opaque-dark; VM-safe)
+        static uint   Ink   = 0xEAEAEA;    // label ink (design #EAEAEA)
+        static uint   Sub   = 0x9AA0A6;    // secondary / prefix
+        static uint   Hover = 0xFF3A3A40;  // row hover rgba(58,58,64,1)
+        static uint   Danger= 0xC42B1C;    // destructive action ink
+
+        // Match the desktop shell palette so the right-click menu switches
+        // with Theme.Dark (dark wallpaper + dark taskbar => dark menu).
+        static void Shell()
+        {
+            if (Theme.Dark != 0) {
+                BG = 0xF227272B; Edge = 0x3A3A3A; Ink = 0xEAEAEA; Sub = 0x9AA0A6; Hover = 0xFF3A3A40;
+            } else {
+                BG = 0xF7F9FC; Edge = 0xD5DDE8; Ink = 0x1B1B1B; Sub = 0x606060; Hover = 0xE7EEF8;
+            }
+        }
 
         // Action code 0x40000000 marks a destructive (red) row.
         public const int DangerBit = 0x40000000;
@@ -99,33 +110,46 @@ namespace NexOS.Forms
             return s_act[idx];
         }
 
+        const int POPUP_KEY = unchecked((int)0x5E3779B1);   // stable Anim key for open/close transition
+
         public static void Paint(int W, int H)
         {
-            if (!open) return;
-            int mh = n * ItemH + PadY * 2;
-            Gfx.FillRound(x, y, w, mh, 8, BG);
-            if (Gfx.HasImage(Tex.Menu) != 0)
-                Gfx.Image(Tex.Menu, x + 2, y + 2, w - 4, mh - 4);
-            Gfx.DrawRound(x, y, w, mh, 8, Edge);
+            Shell();
+            // drive the open/close transition (Back overshoot, 170ms)
+            Anim.Set(POPUP_KEY, open ? 1000 : 0, 170, 1);
+            int enter = (int)Anim.Get(POPUP_KEY);
+            if (!open && enter == 0) return;          // fully closed -> skip
 
+            int mh = n * ItemH + PadY * 2;
+            int oy = -((10 * (1000 - enter)) / 1000); // slide in from above
+            int px = x, py = y + oy;
+
+            uint bg = U.Fade(BG, enter);
+            uint ed = U.Fade(0xFF000000 | Edge, enter);
+            Gfx.FillRound(px, py, w, mh, 8, bg);
+            if (Gfx.HasImage(Tex.Menu) != 0)
+                Gfx.Image(Tex.Menu, px + 2, py + 2, w - 4, mh - 4);
+            Gfx.DrawRound(px, py, w, mh, 8, ed);
+
+            if (enter < 340) return;                  // delay rows until faded in
             int mx = Gfx.MouseX(), my = Gfx.MouseY();
             int hy = -1;
-            if (mx >= x && mx < x + w && my >= y && my < y + mh)
-                hy = (my - y - PadY) / ItemH;
+            if (mx >= px && mx < px + w && my >= py && my < py + mh)
+                hy = (my - py - PadY) / ItemH;
 
             for (int i = 0; i < n; i++)
             {
-                int iy = y + PadY + i * ItemH;
+                int iy = py + PadY + i * ItemH;
                 if (s_act[i] == -1)             // separator
                 {
-                    Gfx.DrawLine(x + 10, iy + ItemH / 2, x + w - 10, iy + ItemH / 2, Edge);
+                    Gfx.DrawLine(px + 10, iy + ItemH / 2, px + w - 10, iy + ItemH / 2, Edge);
                     continue;
                 }
                 if (i == hy)
-                    Gfx.FillRound(x + 4, iy + 1, w - 8, ItemH - 2, 4, Hover);
+                    Gfx.FillRound(px + 4, iy + 1, w - 8, ItemH - 2, 4, Hover);
                 bool danger = (s_act[i] & DangerBit) != 0;
                 uint col = danger ? Danger : Ink;
-                Gfx.Text(x + 16, iy + (ItemH - 16) / 2, s_lab[i], col);
+                Gfx.Text(px + 16, iy + (ItemH - 16) / 2, s_lab[i], col);
             }
         }
     }

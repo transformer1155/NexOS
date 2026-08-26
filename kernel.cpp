@@ -33,6 +33,10 @@
 #include "clr.h"          // MiniCLR: CIL interpreter for Roslyn-compiled C# apps
 #include "ai_model.h"     // open-source model recognition + registry
 #include "ai_env.h"       // VM vs bare-metal detection
+#include "skill.h"        // P4: AI skill registry + intent dispatch
+#include "addrman.h"       // Address Management Registry (single source of truth)
+#include "ai_plugin.h"      // NexOS plugin catalogue / manager
+#include "distnet.h"        // Minimal distributed compute network (distnet.cpp)
 
 // =====================================================================
 //  Port I/O helpers
@@ -728,8 +732,11 @@ extern "C" {
     int   ai_set_mode(int mode);
     int   ai_transformer_test(void);
     void  agent_init(void);
+    void  agent_plan(const char* goal);
     int   agent_run(const char* goal, char* output, int outsize);
     int   agent_get_status(char* buf, int bufsize);
+    void  agent_abort(void);
+    void  agent_set_confirm(int on);
 }
 static bool g_ai_initialized = false;
 
@@ -739,6 +746,7 @@ static bool g_ai_initialized = false;
 extern "C" {
     int  net_init(void);
     void net_poll(void);
+    const char* net_ip_str(void);
     int  net_status(char* buf, int bufsize);
     // Browser HTTP client API
     int  browser_navigate(const char* url);
@@ -749,8 +757,16 @@ extern "C" {
     int  browser_status_code(void);
     // Synchronous HTTP GET for the managed Browser control.
     int  net_http_get(const char* url, char* out, int outsize);
+    // Ask a question through the host-side LLM bridge (10.0.2.2:18080).
+    int  net_ask_host(const char* question, char* out, int outsize);
     // ICMP ping client: returns 1 if any attempt got a reply, 0 on timeout.
     int  net_ping(const char* host, int attempts);
+    // WiFi manager (control plane) + time-server client (net.cpp)
+    int  net_wifi_scan(char* out, int n);
+    int  net_wifi_connect(const char* arg, char* out, int n);
+    int  net_wifi_disconnect(char* out, int n);
+    int  net_wifi_status(char* out, int n);
+    int  net_time(char* out, int n);
 }
 static bool g_net_initialized = false;
 
@@ -972,7 +988,7 @@ static void clipboard_hist_next(){
     memcpy_(g_clipboard, g_clip_hist[g_clip_hist_idx], CLIP_LEN);
     g_clipboard_len = strlen_(g_clipboard);
 }
-
+extern "C" int gui_is_active(void);   // forward decl (defined in gui.cpp); used by Keyboard::process to resolve GUI vs text mode
 namespace {
 
 // ----- VGA constants -----
@@ -1013,6 +1029,23 @@ static char g_exec_output[2048];
 static int  g_exec_output_len;
 static bool g_capturing;
 
+// ---- terminal -> COM1 mirror ----
+// Terminal::put_char writes only to VGA text memory, so headless runs
+// (-vga none / -display none) had no way to observe shell output; only
+// serial_puts() diagnostics reached COM1.  Mirroring every terminal
+// character to 0x3F8 makes the whole shell scriptable from a test harness.
+// Toggle at runtime with the `serialecho on|off` command.
+static bool g_term_serial = true;
+
+// ---- SSH output sink ----
+// When a remote SSH command is executing, g_ssh_out_fn (if non-null) receives
+// every terminal character so the output can be forwarded over the encrypted
+// channel instead of (or in addition to) the local VGA/serial console.  Set by
+// kernel_exec_line() around the run_command() call and cleared afterwards.
+typedef void (*ssh_out_fn_t)(const char* data, int len);
+static ssh_out_fn_t g_ssh_out_fn = 0;
+static void ssh_out_dummy(const char*, int){}
+
 // =====================================================================
 //  Terminal  -  VGA output with scrollback history + view scrolling
 // =====================================================================
@@ -1038,6 +1071,9 @@ public:
         // Capture output for GUI terminal when in capture mode
         if(g_capturing && g_exec_output_len < (int)sizeof(g_exec_output)-1)
             g_exec_output[g_exec_output_len++] = c;
+        // Forward to an active SSH channel if one is consuming shell output
+        if(g_ssh_out_fn) g_ssh_out_fn(&c, 1);
+        if(g_term_serial) serial_putc(c);
         if(c=='\n'){ commit_line(); return; }
         if(c=='\b'){
             // Backspace must never eat the prompt ("PS user@NexOS /path> "):
@@ -1077,6 +1113,14 @@ public:
         if(v==0){ put_char('0'); return; }
         while(v){ uint8_t d=v&0xF; b[i++]=(d<10)?('0'+d):('A'+d-10); v>>=4; }
         while(i) put_char(b[--i]);
+    }
+    // Zero-padded full 64-bit hex (for >4GB physical addresses).
+    void write_hex64(uint64_t v){
+        put_char('0'); put_char('x');
+        for (int i = 15; i >= 0; i--) {
+            uint8_t d = (uint8_t)((v >> (i * 4)) & 0xF);
+            put_char(d < 10 ? (char)('0' + d) : (char)('A' + d - 10));
+        }
     }
 
     void scroll_view(int delta){
@@ -1311,21 +1355,23 @@ private:
     }
 };
 
+
 // =====================================================================
 //  Keyboard  -  PS/2, Scan Code Set 1, with extended (arrow) keys
 // =====================================================================
 enum KbdType {
     K_NONE, K_CHAR, K_UP, K_DOWN, K_LEFT, K_RIGHT, K_TAB,
     K_CTRL_C, K_CTRL_V, K_CTRL_L, K_CTRL_UP, K_CTRL_DOWN,
-    K_CTRL_Z, K_CTRL_A,
-    K_PAGEUP, K_PAGEDN, K_HOME, K_END, K_SHIFT
+    K_CTRL_Z, K_CTRL_A, K_CTRL_S,
+    K_PAGEUP, K_PAGEDN, K_HOME, K_END, K_SHIFT,
+    K_DESK_L, K_DESK_R, K_DESK_TGL
 };
 struct KbdEvent { KbdType type; char ch; };
 
 enum ScanCode : uint8_t {
     SC_BACKSPACE=0x0E, SC_TAB=0x0F, SC_ENTER=0x1C, SC_LSHIFT=0x2A,
     SC_RSHIFT=0x36, SC_CAPSLOCK=0x3A, SC_SPACE=0x39,
-    SC_LCTRL=0x1D,
+    SC_LCTRL=0x1D, SC_LGUI=0x5B, SC_RGUI=0x5C,
 };
 const char SC_ASCII_NORMAL[128]={
     0,0x1B,'1','2','3','4','5','6','7','8','9','0','-','=',0x08,'\t',
@@ -1352,21 +1398,29 @@ public:
         if(brk){
             if(key==SC_LSHIFT||key==SC_RSHIFT) m_shift=false;
             if(key==SC_LCTRL) m_ctrl=false;
+            if(key==SC_LGUI||key==SC_RGUI) m_gui=false;
             m_ext=false;
             return e;
         }
         if(m_ext){
             m_ext=false;
+            if(key==SC_LGUI||key==SC_RGUI){ m_gui=true; return e; }
             if(key==0x48){
-                if(m_ctrl) e.type=K_CTRL_UP;
-                else       e.type=K_UP;
+                if(m_ctrl && (m_gui || gui_is_active())) e.type=K_DESK_TGL;
+                else if(m_ctrl)                          e.type=K_CTRL_UP;
+                else                                     e.type=K_UP;
             }
             else if(key==0x50){
                 if(m_ctrl) e.type=K_CTRL_DOWN;
                 else       e.type=K_DOWN;
             }
-            else if(key==0x4B) e.type=K_LEFT;
-            else if(key==0x4D) e.type=K_RIGHT;
+            // Virtual-desktop switch: Ctrl+arrows (no Win key needed while
+            // the GUI desktop is active).  Win is still accepted so the old
+            // Ctrl+Win+arrows combo keeps working; text mode (no GUI, no Win)
+            // falls through to the plain arrow events so its Ctrl+arrow
+            // shortcuts (cursor / clipboard history) are untouched.
+            else if(key==0x4B) e.type = (m_ctrl && (m_gui || gui_is_active())) ? K_DESK_L : K_LEFT;
+            else if(key==0x4D) e.type = (m_ctrl && (m_gui || gui_is_active())) ? K_DESK_R : K_RIGHT;
             else if(key==0x49) e.type=K_PAGEUP;
             else if(key==0x51) e.type=K_PAGEDN;
             else if(key==0x47) e.type=K_HOME;
@@ -1389,6 +1443,7 @@ public:
             if(key==0x26){ e.type=K_CTRL_L; return e; }   // Ctrl+L
             if(key==0x2C){ e.type=K_CTRL_Z; return e; }   // Ctrl+Z (undo)
             if(key==0x1E){ e.type=K_CTRL_A; return e; }   // Ctrl+A (select all)
+            if(key==0x1F){ e.type=K_CTRL_S; return e; }   // Ctrl+S (save)
             return e;  // swallow other Ctrl combos
         }
 
@@ -1403,8 +1458,25 @@ public:
         else if(m_caps && c>='A'&&c<='Z') c+=32;
         e.type=K_CHAR; e.ch=c; return e;
     }
+    // Clear any stuck modifier / extended-key state.  Called before
+    // each discrete input read so a stale 0xE0 (extended-key prefix)
+    // left in the PS/2 buffer at boot cannot swallow the first real
+    // keystroke (symptom: first typed character silently lost).
+    void reset(){ m_shift=m_caps=m_ext=m_ctrl=m_gui=false; }
+    // Discard bytes already queued in the PS/2 output buffer (keyboard
+    // BAT / ACK / identify responses from power-on) so they are not
+    // misinterpreted as the start of a key.  Always paired with reset().
+    void drain(){
+        for(int i=0;i<64;i++){
+            uint8_t s = inb(0x64);
+            if(s==0xFF) break;
+            if(!(s & 0x01)) break;
+            (void)inb(0x60);
+        }
+        reset();
+    }
 private:
-    bool m_shift=false, m_caps=false, m_ext=false, m_ctrl=false;
+    bool m_shift=false, m_caps=false, m_ext=false, m_ctrl=false, m_gui=false;
 };
 
 // =====================================================================
@@ -1431,42 +1503,64 @@ public:
             serial_puts("[MOUSE] no i8042 controller - mouse init skipped\n");
             return;
         }
-        outb(0x64,0xAD);
-        outb(0x64,0xA7);
-        // Drain output buffer (bounded - see guard note above)
-        for (int g = 0; (inb(0x64)&0x01) && g < 100000; g++) inb(0x60);
-        outb(0x64,0xA8);
-        cmd(0xF3); param(200);
-        cmd(0xF3); param(100);
-        cmd(0xF3); param(80);
-        cmd(0xF3); param(60);
-        cmd(0xF4);
-        outb(0x64,0xAE);
+        outb(0x64,0xA8);          // enable auxiliary (mouse) port
+        drain();                  // flush any stale output
+        cmd(0xFF); drain();       // reset mouse (resp: 0xFA,0xAA,0x00)
+        // Probe the device id.  A standard PS/2 mouse reports 0x00 and uses
+        // 3-byte relative packets.  Intellimouse-wheel devices report 0x03
+        // (or 0x04) after the 200,100,80 sample-rate magic, and then need
+        // 4-byte packets.  Mismatching the packet length is exactly what made
+        // a plain 3-byte touchpad desync on real hardware (the next packet's
+        // start byte got swallowed as a phantom wheel value).
+        uint8_t id = get_id();
+        m_pkt_len = 3;
+        if (id == 0x00){
+            cmd(0xF3); param(200);
+            cmd(0xF3); param(100);
+            cmd(0xF3); param(80);
+            if (get_id() >= 0x03) m_pkt_len = 4;   // wheel -> 4-byte
+        }
+        cmd(0xF4);                // enable streaming
+        serial_puts(m_pkt_len == 4
+            ? "[MOUSE] Intellimouse (4-byte packets, wheel)\n"
+            : "[MOUSE] standard PS/2 mouse (3-byte packets)\n");
+        outb(0x64,0xAE);          // re-enable keyboard controller
     }
     MouseEvent process(uint8_t b){
         MouseEvent ev={0,0,0,false,false,false,false};
-        if(m_i==0 && !(b&0x08)) return ev;
-        m_pkt[m_i++]=b;
-        if(m_i>=4){
-            m_i=0;
+        // The first byte of every PS/2 mouse packet has bit 3 set; bytes 1..n
+        // are raw signed deltas that may LEGITIMATELY have bit 3 set (e.g.
+        // 0xFE/0xFF for negative movement), so we only use bit 3 to validate
+        // the START byte.  A stray byte at idle is dropped; once a packet is
+        // in progress we accept the next (len-1) bytes unconditionally and
+        // resync on the next genuine start byte.  (Using bit 3 to resync
+        // mid-packet would wrongly treat 0xFE/0xFF deltas as new packets.)
+        if (m_i == 0 && !(b & 0x08)) return ev;
+        m_pkt[m_i++] = b;
+        if (m_i >= m_pkt_len){
+            m_i = 0;
             ev.valid  = true;
-            ev.left   = m_pkt[0]&0x01;
-            ev.right  = m_pkt[0]&0x02;
-            ev.middle = m_pkt[0]&0x04;
+            ev.left   = m_pkt[0] & 0x01;
+            ev.right  = m_pkt[0] & 0x02;
+            ev.middle = m_pkt[0] & 0x04;
             ev.dx     = (int8_t)m_pkt[1];
             ev.dy     = (int8_t)m_pkt[2];
-            ev.dz     = (int8_t)m_pkt[3];
+            ev.dz     = (m_pkt_len >= 4) ? (int8_t)m_pkt[3] : 0;
         }
         return ev;
     }
 private:
-    // Bounded wait - an absent/wedged i8042 leaves bit 1 set forever.
+    // Bounded waits - an absent/wedged i8042 leaves a status bit set forever.
     void wait_write(){ for(int g=0; (inb(0x64)&0x02) && g<100000; g++){} }
+    void wait_read(){  for(int g=0; (inb(0x64)&0x01) && g<100000; g++){} }
+    void ack(){ for(int i=0;i<1000;i++){ if(inb(0x64)&0x01){ if(inb(0x60)==0xFA) return; } } }
+    void drain(){ for(int g=0; (inb(0x64)&0x01) && g<100000; g++) inb(0x60); }
     void cmd(uint8_t c){ outb(0x64,0xD4); wait_write(); outb(0x60,c); ack(); }
     void param(uint8_t p){ outb(0x64,0xD4); wait_write(); outb(0x60,p); ack(); }
-    void ack(){ for(int i=0;i<1000;i++){ if(inb(0x64)&0x01){ if(inb(0x60)==0xFA) return; } } }
+    uint8_t get_id(){ cmd(0xF2); wait_read(); return inb(0x60); }
     uint8_t m_pkt[4];
-    int     m_i=0;
+    int     m_i       = 0;
+    int     m_pkt_len = 3;
 };
 
 } // namespace
@@ -1489,6 +1583,7 @@ struct GuiCallbacks {
     void     (*optimize_memory)(void);
     int      (*list_files)(int fs_type, char* buf, int bufsize);
     int      (*read_file)(int fs_type, const char* name, uint8_t* buf, int bufsize);
+    int      (*write_file)(int fs_type, const char* name, const uint8_t* buf, int size);
     void     (*get_time)(int* h, int* m, int* s);
     // File-mutation (context-menu actions: new folder / delete / rename).
     int      (*mkdir)(int fs, const char* name);
@@ -1540,7 +1635,6 @@ extern "C" {
     int  gui_app_id_by_name(const char* n);
     int  gui_available(void);
     void gui_enter(void);
-    int  gui_is_active(void);
     void gui_mouse_move(int dx, int dy);
     void gui_mouse_down(void);
     void gui_mouse_up(void);
@@ -1633,7 +1727,15 @@ static bool g_fb_console_mode = false;
 #define SFS_DATA_LBA      817
 // The BIOS os.img build places the same SFS image further out on the disk so
 // it does not collide with the 64-bit kernel payload.  Probe both locations.
-#define SFS_ALT_LBA       3328
+#define SFS_ALT_LBA       3496   // must match Makefile SFS_LBA (kernel64 payload ends at 2048+1448=3496)
+#define SFS_LINUX_LBA     3800   // independent Linux user-space partition (after main SFS vol; kept < 4 MiB so QEMU IDE (CHS-limited) can reach it)
+
+// CD/ISO-boot RAM-SFS handoff.  boot_cd.asm streams the (texture-free) SFS
+// image off the CD into high RAM and leaves a flag at 0x0900 so the kernel
+// can mount it without an ATA disk (none exists on a CD/ISO boot).
+#define SFS_RAM_MAGIC     0xC0DE5A5F
+#define SFS_RAM_TARGET    0x01400000   // 20 MiB: free window (heap ends 19 MiB, identity-mapped to 32 MiB)
+#define SFS_RAM_RESERVE   0x00400000   // 4 MiB reserved in PMM for the RAM-SFS image
 
 #define FS_NAME_LEN       20
 #define FS_ENTRY_SIZE     32
@@ -2134,15 +2236,52 @@ public:
     int32_t    delta;     // base - SFS_SUPER_LBA (image may be relocated on disk)
     Superblock sb;
 
+    // CD/ISO-boot RAM-SFS support: when the bootloader has already streamed
+    // the SFS image into high RAM (no ATA disk is present on a CD boot), the
+    // kernel mounts it from there instead of probing the disk.
+    bool       ram_mode;       // true => image is in RAM at ram_base
+    uint32_t   ram_base;       // physical address of the SFS image in RAM
+    uint32_t   ram_size;       // size of the SFS image in bytes
+
+    void set_ram(uint32_t base, uint32_t size){
+        ram_mode = true; ram_base = base; ram_size = size;
+    }
+
+    // Unified sector read: from RAM when ram_mode, else from the ATA disk.
+    // lba is the canonical SFS LBA (superblock=800, dir=801+, data=817+);
+    // in RAM the image is laid out from byte 0, so offset = (lba-800)*512.
+    void rd(uint32_t lba, uint16_t* buf){
+        if (ram_mode) {
+            const uint8_t* src = (const uint8_t*)ram_base
+                                + (int32_t)((int32_t)lba - (int32_t)SFS_SUPER_LBA) * 512;
+            memcpy_(buf, src, 512);
+        } else {
+            fs_read_sector(lba, buf);
+        }
+    }
+
     // The image is always generated with the canonical 800/801/817 layout, but
     // the build places it at different disk offsets (UEFI: LBA 800,
-    // BIOS os.img: LBA 3328).  Probe the known spots and derive a delta that is
+    // BIOS os.img: LBA 3368).  Probe the known spots and derive a delta that is
     // applied to every directory / data LBA, so one kernel handles both.
     void init(){
-        static const uint32_t cand[] = { SFS_SUPER_LBA, SFS_ALT_LBA };
         mounted = false; base = SFS_SUPER_LBA; delta = 0;
+        if (ram_mode) {
+            const uint8_t* sbp = (const uint8_t*)ram_base;
+            if (sbp[0]=='S' && sbp[1]=='F' && sbp[2]=='S' && sbp[3]==0) {
+                memcpy_(&sb, sbp, sizeof(sb));
+                mounted = true;
+                serial_puts("[SFS] RAM-backed image mounted at ");
+                serial_hex(ram_base);
+                serial_puts("\n");
+            } else {
+                serial_puts("[SFS] RAM flag set but no 'SFS' magic at base\n");
+            }
+            return;
+        }
+        static const uint32_t cand[] = { SFS_SUPER_LBA, SFS_ALT_LBA };
         for (unsigned i = 0; i < sizeof(cand)/sizeof(cand[0]); i++) {
-            ata_read_sector(cand[i], (uint16_t*)g_fsbuf);
+            rd(cand[i], (uint16_t*)g_fsbuf);
             if (g_fsbuf[0]=='S' && g_fsbuf[1]=='F' && g_fsbuf[2]=='S' && g_fsbuf[3]==0) {
                 memcpy_(&sb, g_fsbuf, sizeof(sb));
                 base    = cand[i];
@@ -2156,11 +2295,31 @@ public:
     inline uint32_t dir_lba(int s)  const { return (uint32_t)((int32_t)SFS_DIR_LBA + delta) + (uint32_t)s; }
     inline uint32_t data_lba(uint32_t l) const { return (uint32_t)((int32_t)l + delta); }
 
+    // Mount an SFS image placed at an arbitrary disk LBA (used for the
+    // independent Linux user-space partition).  delta is derived from the
+    // canonical SFS_SUPER_LBA layout, exactly like the probing init() does.
+    bool mount_at(uint32_t lba){
+        fs_read_sector(lba, (uint16_t*)g_fsbuf);
+        if (!(g_fsbuf[0]=='S' && g_fsbuf[1]=='F' && g_fsbuf[2]=='S' && g_fsbuf[3]==0)) {
+            serial_puts("[SFS] mount_at(");
+            serial_puts_dec(lba);
+            serial_puts(") magic Fail bytes=");
+            for (int i=0;i<4;i++){ static const char* h="0123456789ABCDEF"; serial_putc(h[(g_fsbuf[i]>>4)&0xF]); serial_putc(h[g_fsbuf[i]&0xF]); }
+            serial_puts("\n");
+            return false;
+        }
+        memcpy_(&sb, g_fsbuf, sizeof(sb));
+        base  = lba;
+        delta = (int32_t)lba - (int32_t)SFS_SUPER_LBA;
+        mounted = true;
+        return true;
+    }
+
     void ls(){
         if (!mounted) { term.write("SFS not found on disk.\n"); return; }
         int count = 0;
         for (int s = 0; s < SFS_DIR_SECT; s++) {
-            ata_read_sector(dir_lba(s), (uint16_t*)g_fsbuf);
+            rd(dir_lba(s), (uint16_t*)g_fsbuf);
             for (int e = 0; e < FS_ENTRY_PER_SEC; e++) {
                 FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
                 if (fe->name[0] != 0) {
@@ -2177,7 +2336,7 @@ public:
     int find(const char* name){
         if (!mounted) return -1;
         for (int s = 0; s < SFS_DIR_SECT; s++) {
-            ata_read_sector(dir_lba(s), (uint16_t*)g_fsbuf);
+            rd(dir_lba(s), (uint16_t*)g_fsbuf);
             for (int e = 0; e < FS_ENTRY_PER_SEC; e++) {
                 FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
                 if (fe->name[0] != 0 && strcmp_(fe->name, name) == 0)
@@ -2192,7 +2351,7 @@ public:
         if (idx < 0) return -1;
         int s = idx / FS_ENTRY_PER_SEC;
         int e = idx % FS_ENTRY_PER_SEC;
-        ata_read_sector(dir_lba(s), (uint16_t*)g_fsbuf);
+        rd(dir_lba(s), (uint16_t*)g_fsbuf);
         // IMPORTANT: private copy - the loop below reloads g_fsbuf with file
         // data, so a pointer into g_fsbuf would decay into garbage after the
         // first sector and every following LBA would be random.
@@ -2204,7 +2363,7 @@ public:
         uint8_t* dst = (uint8_t*)buf;
         int remaining = size;
         for (int i = 0; i < sectors && remaining > 0; i++) {
-            ata_read_sector(data_lba(fent.start_lba + (uint32_t)i), (uint16_t*)g_fsbuf);
+            rd(data_lba(fent.start_lba + (uint32_t)i), (uint16_t*)g_fsbuf);
             int to_copy = (remaining > 512) ? 512 : remaining;
             memcpy_(dst, g_fsbuf, to_copy);
             dst += to_copy;
@@ -2219,9 +2378,159 @@ public:
         if (idx < 0) return -1;
         int s = idx / FS_ENTRY_PER_SEC;
         int e = idx % FS_ENTRY_PER_SEC;
-        ata_read_sector(dir_lba(s), (uint16_t*)g_fsbuf);
+        rd(dir_lba(s), (uint16_t*)g_fsbuf);
         FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
         return (int)fe->size;
+    }
+
+    // ---- write support (SFS becomes RW) ----
+    // Unified sector write: to the ATA disk, or into the RAM-backed image
+    // (CD/ISO boot).  lba is the canonical SFS LBA; delta is applied by the
+    // callers exactly like rd().
+    void wr(uint32_t lba, const uint16_t* buf){
+        if (ram_mode) {
+            uint8_t* dst = (uint8_t*)ram_base
+                         + (int32_t)((int32_t)lba - (int32_t)SFS_SUPER_LBA) * 512;
+            memcpy_(dst, buf, 512);
+        } else {
+            ata_write_sector(lba, buf);
+        }
+    }
+
+    void flush_sb(){
+        memset_(g_fsbuf, 0, 512);
+        memcpy_(g_fsbuf, &sb, sizeof(Superblock));   // struct is packed 20 bytes
+        wr(base, (const uint16_t*)g_fsbuf);
+    }
+
+    // Find a free directory slot, or -1 if the directory is full.
+    int find_free(){
+        for (int s = 0; s < SFS_DIR_SECT; s++) {
+            rd(dir_lba(s), (uint16_t*)g_fsbuf);
+            for (int e = 0; e < FS_ENTRY_PER_SEC; e++) {
+                FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
+                if (fe->name[0] == 0) return s * FS_ENTRY_PER_SEC + e;
+            }
+        }
+        return -1;
+    }
+
+    // Create (or overwrite-size) a file.  Data sectors are carved out of the
+    // superblock's free area; the superblock is flushed afterwards.
+    int create(const char* name, const void* data, int size){
+        if (!mounted) return -1;
+        if (size < 0 || size > 4*1024*1024) return -2;
+        int idx = find(name);
+        if (idx >= 0) {
+            // overwrite: drop the old entry first, then re-create
+            remove(name);
+            idx = find(name);
+        }
+        idx = find_free();
+        if (idx < 0) return -3;                        // directory full
+        int sectors = (size + 511) / 512;
+        if (sectors == 0) sectors = 1;
+        uint32_t start = sb.free_lba;
+        // Bounds checks in ON-DISK coordinates: delta relocates the volume
+        // (BIOS os.img puts SFS at 3368 => delta=2568, UEFI keeps 800 =>
+        // delta=0).  The main SFS volume must not cross into the independent
+        // Linux user-space volume at SFS_LINUX_LBA; the Linux volume itself
+        // may only extend to the end of the disk.
+        uint32_t vol_end = (base == SFS_LINUX_LBA) ? g_hw.disk_sectors : SFS_LINUX_LBA;
+        uint32_t on_disk_end = (start + (uint32_t)sectors) + (uint32_t)delta;
+        if (on_disk_end > vol_end) return -4;            // would hit Linux vol / disk end
+        if (ram_mode && (start + (uint32_t)sectors) * 512 > ram_size) return -5;
+
+        // write payload sectors (last one zero-padded)
+        const uint8_t* src = (const uint8_t*)data;
+        int remaining = size;
+        for (int i = 0; i < sectors; i++) {
+            memset_(g_fsbuf, 0, 512);
+            if (remaining > 0) {
+                int n = (remaining > 512) ? 512 : remaining;
+                memcpy_(g_fsbuf, src, n);
+                src += n; remaining -= n;
+            }
+            wr(data_lba(start + (uint32_t)i), (const uint16_t*)g_fsbuf);
+        }
+
+        // write directory entry
+        int s = idx / FS_ENTRY_PER_SEC;
+        int e = idx % FS_ENTRY_PER_SEC;
+        rd(dir_lba(s), (uint16_t*)g_fsbuf);
+        FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
+        memset_(fe, 0, FS_ENTRY_SIZE);
+        int nl = strlen_(name);
+        if (nl > FS_NAME_LEN - 1) nl = FS_NAME_LEN - 1;
+        for (int i = 0; i < nl; i++) fe->name[i] = name[i];
+        fe->size      = (uint32_t)size;
+        fe->start_lba = start;
+        fe->type      = FS_TYPE_FILE;
+        fe->parent    = FS_ROOT_PARENT;
+        fe->reserved  = 0;
+        wr(dir_lba(s), (const uint16_t*)g_fsbuf);
+
+        // update + flush superblock
+        sb.free_lba   = start + (uint32_t)sectors;
+        sb.file_count++;
+        flush_sb();
+        return 0;
+    }
+
+    int remove(const char* name){
+        if (!mounted) return -1;
+        int idx = find(name);
+        if (idx < 0) return -2;
+        int s = idx / FS_ENTRY_PER_SEC;
+        int e = idx % FS_ENTRY_PER_SEC;
+        rd(dir_lba(s), (uint16_t*)g_fsbuf);
+        FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
+        memset_(fe, 0, FS_ENTRY_SIZE);
+        wr(dir_lba(s), (const uint16_t*)g_fsbuf);
+        if (sb.file_count > 0) sb.file_count--;
+        flush_sb();
+        return 0;
+    }
+
+    int rename(const char* oldname, const char* newname){
+        if (!mounted) return -1;
+        int idx = find(oldname);
+        if (idx < 0) return -2;
+        if (find(newname) >= 0) return -3;
+        int s = idx / FS_ENTRY_PER_SEC;
+        int e = idx % FS_ENTRY_PER_SEC;
+        rd(dir_lba(s), (uint16_t*)g_fsbuf);
+        FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
+        memset_(fe->name, 0, FS_NAME_LEN);
+        int nl = strlen_(newname);
+        if (nl > FS_NAME_LEN - 1) nl = FS_NAME_LEN - 1;
+        for (int i = 0; i < nl; i++) fe->name[i] = newname[i];
+        wr(dir_lba(s), (const uint16_t*)g_fsbuf);
+        return 0;
+    }
+
+    int mkdir(const char* name){
+        if (!mounted) return -1;
+        if (find(name) >= 0) return -3;
+        int idx = find_free();
+        if (idx < 0) return -4;
+        int s = idx / FS_ENTRY_PER_SEC;
+        int e = idx % FS_ENTRY_PER_SEC;
+        rd(dir_lba(s), (uint16_t*)g_fsbuf);
+        FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
+        memset_(fe, 0, FS_ENTRY_SIZE);
+        int nl = strlen_(name);
+        if (nl > FS_NAME_LEN - 1) nl = FS_NAME_LEN - 1;
+        for (int i = 0; i < nl; i++) fe->name[i] = name[i];
+        fe->size      = 0;
+        fe->start_lba = 0;
+        fe->type      = FS_TYPE_DIR;
+        fe->parent    = FS_ROOT_PARENT;
+        fe->reserved  = 0;
+        wr(dir_lba(s), (const uint16_t*)g_fsbuf);
+        sb.file_count++;
+        flush_sb();
+        return 0;
     }
 };
 
@@ -2433,6 +2742,7 @@ private:
 
 static Mkfs   mkfs;
 static Sfs    sfs;
+static Sfs    linux_fs;   // independent Linux user-space partition (SFS_LINUX_LBA)
 static Fat32  fat32;
 
 // =====================================================================
@@ -2447,14 +2757,16 @@ static Fat32  fat32;
 constexpr uint32_t PAGE_SIZE       = 4096;
 constexpr uint32_t PAGE_SHIFT      = 12;
 constexpr uint32_t PMM_BASE_ADDR   = 0x100000;     // 1 MiB – managed start
-constexpr uint32_t PMM_BITMAP_ADDR = 0x80000;      // 8 KiB bitmap (256 MB max)
 constexpr uint32_t PMM_MAX_PAGES   = 65536;        // 256 MB / 4 KiB
-// The relocated .bss lives at 0x120000 and has grown to ~0x20B460, i.e. it
-// already spilled past the old 2 MiB heap base -- the first ~46 KiB of heap
-// blocks were being carved straight out of live global storage.  Start the
-// heap at 3 MiB so it clears __bss_end with ~1 MiB of head-room.
-constexpr uint32_t HEAP_START      = 0x300000;     // 3 MiB (must stay > __bss_end)
-constexpr uint32_t HEAP_SIZE       = 0x1000000;    // 16 MiB (expanded for AI engine)
+// The relocated .bss lives at 0x120000 and now ends at 0x0087AE74 (verified
+// via i686-elf-readelf on kernel_textboot.elf: __bss_end = 0x0087AE74).  A
+// previous edit bumped HEAP_START to 0x500000, which sits INSIDE .bss and made
+// the 64-bit staging kmalloc overlap .bss -> "switch" aborted.  Start the heap
+// just past __bss_end and keep HEAP_END below the RAM-SFS reserve at 0x1400000
+// (and well clear of .lmboot @ 0x1800000).  The 64-bit staging buffer (720 KiB
+// kmalloc) therefore lands in 0x880000..0xF20000, clear of both.
+constexpr uint32_t HEAP_START      = 0x900000;     // 9 MiB (must stay > __bss_end; CLR globals enlarged .bss)
+constexpr uint32_t HEAP_SIZE       = 0xA00000;     // 10 MiB (HEAP_END = 0x1300000 < RAM-SFS @ 0x1400000)
 constexpr uint32_t HEAP_END        = HEAP_START + HEAP_SIZE;
 
 // Page-table / PDE flags
@@ -2475,7 +2787,18 @@ static inline void invlpg(uint32_t addr){ __asm__ __volatile__("invlpg (%0)"::"r
 // =====================================================================
 //  Physical Memory Manager (PMM)
 // =====================================================================
-static uint32_t* pmm_bitmap   = (uint32_t*)PMM_BITMAP_ADDR;
+// The bitmap used to live at a hard-coded physical 0x80000.  That was safe
+// only while the kernel image stayed below 448 KiB.  It no longer does: the
+// flat binary is linked at 0x10000 and .rodata now ends past 0x83000, so the
+// bitmap sat *inside* the kernel's own .rodata.  pmm_init() then marked the
+// kernel/heap pages used, writing runs of 0xFFFFFFFF over live string
+// literals -- string constants silently turned into 0xFF garbage (the P4
+// skill registry's `keywords` pointer was one victim).
+//
+// Letting the linker place it in .bss makes overlap impossible by
+// construction, whatever the image grows to.
+alignas(PAGE_SIZE) static uint32_t pmm_bitmap_store[PMM_MAX_PAGES / 32];
+static uint32_t* pmm_bitmap   = pmm_bitmap_store;
 static uint32_t  pmm_total_pages = 0;
 static uint32_t  pmm_free_pages  = 0;
 static uint32_t  pmm_used_pages  = 0;
@@ -2504,8 +2827,30 @@ static uint32_t detect_memory_kb(){
 // Provided by linker.ld -- bounds of the relocated .bss section.
 extern "C" char __bss_start[];
 extern "C" char __bss_end[];
+// Provided by linker.ld -- bounds of the boot-critical .lmboot scratch region
+// (32-bit boot stack + long-mode page tables + 64-bit boot stack).  It sits at
+// 0x1800000 (24 MiB), i.e. ABOVE the kernel heap and the RAM-SFS window, not
+// just above .bss: CR3 keeps pointing at those tables for the whole life of
+// the 64-bit kernel, so the region has to clear BOTH kernels' allocators.
+// PMM must treat it as used -- handing out the pages holding the live
+// PML4/PDPT would corrupt CR3 under the CPU.
+extern "C" char __lmboot_start[];
+extern "C" char __lmboot_end[];
 
-static void pmm_init_builtin(){
+// Do the half-open intervals [a0,a1) and [b0,b1) intersect?
+//
+// The guards below used to be single-sided comparisons ("x < __lmboot_end"),
+// which silently assumed .lmboot sat between .bss and the heap.  Once it moved
+// above the heap those tests became permanently true and started rejecting
+// perfectly good addresses -- the staging-buffer guard refused every kmalloc
+// result and blocked the 64-bit transition outright, so the machine quietly
+// stayed on the 32-bit GUI.  Always compare ranges, never edges.
+static inline bool ranges_overlap(uint32_t a0, uint32_t a1,
+                                  uint32_t b0, uint32_t b1){
+    return a0 < b1 && b0 < a1;
+}
+
+static void pmm_init(){
     pmm_mem_kb = detect_memory_kb();
     uint32_t total_bytes = pmm_mem_kb * 1024;
     pmm_total_pages = (total_bytes - PMM_BASE_ADDR) / PAGE_SIZE;
@@ -2531,9 +2876,12 @@ static void pmm_init_builtin(){
 
     // Mark the kernel .bss (relocated above 1 MiB by linker.ld) as used,
     // otherwise pmm_alloc_page() would hand out pages holding live globals.
+    // The range deliberately extends through .lmboot (boot stacks + the
+    // long-mode page tables) -- those pages stay live all the way into the
+    // 64-bit kernel, so they must never be allocatable.
     {
         uint32_t bs = (uint32_t)(uintptr_t)__bss_start & ~(PAGE_SIZE - 1);
-        uint32_t be = ((uint32_t)(uintptr_t)__bss_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        uint32_t be = ((uint32_t)(uintptr_t)__lmboot_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
         for (uint32_t a = bs; a < be; a += PAGE_SIZE) {
             if (a < PMM_BASE_ADDR) continue;
             uint32_t page_idx = (a - PMM_BASE_ADDR) / PAGE_SIZE;
@@ -2543,13 +2891,34 @@ static void pmm_init_builtin(){
             pmm_free_pages--;
             pmm_used_pages++;
         }
-        serial_puts("[PMM] .bss reserved "); serial_hex(bs);
+        serial_puts("[PMM] .bss+lmboot reserved "); serial_hex(bs);
         serial_puts(" .. "); serial_hex(be); serial_puts("\n");
+        serial_puts("[PMM] lmboot "); serial_hex((uint32_t)(uintptr_t)__lmboot_start);
+        serial_puts(" .. "); serial_hex((uint32_t)(uintptr_t)__lmboot_end);
+        serial_puts(" (k32 stack/PML4/k64 stack)\n");
+    }
+    // Reserve the CD-boot RAM-SFS region (SFS_RAM_TARGET, SFS_RAM_RESERVE) so
+    // pmm_alloc_page() never hands those pages to a caller and clobbers the
+    // read-only SFS image that boot_cd.asm streamed off the CD.
+    {
+        uint32_t rs = SFS_RAM_TARGET & ~(PAGE_SIZE - 1);
+        uint32_t re = rs + SFS_RAM_RESERVE;
+        for (uint32_t a = rs; a < re; a += PAGE_SIZE) {
+            if (a < PMM_BASE_ADDR) continue;
+            uint32_t page_idx = (a - PMM_BASE_ADDR) / PAGE_SIZE;
+            if (page_idx >= pmm_total_pages) break;
+            if (pmm_bitmap[page_idx / 32] & (1u << (page_idx % 32))) continue;
+            pmm_bitmap[page_idx / 32] |= (1u << (page_idx % 32));
+            pmm_free_pages--;
+            pmm_used_pages++;
+        }
+        serial_puts("[PMM] RAM-SFS region reserved "); serial_hex(rs);
+        serial_puts(" .. "); serial_hex(re); serial_puts("\n");
     }
     serial_puts("[PMM] Initialised\n");
 }
 
-static uint32_t pmm_alloc_page(){
+extern "C" uint32_t pmm_alloc_page(){
     for (uint32_t i = 0; i < pmm_total_pages; i++){
         uint32_t w = i / 32, b = i % 32;
         if (!(pmm_bitmap[w] & (1u << b))){
@@ -2562,7 +2931,7 @@ static uint32_t pmm_alloc_page(){
     return 0;  // OOM
 }
 
-static void pmm_free_page(uint32_t phys){
+extern "C" void pmm_free_page(uint32_t phys){
     if (phys < PMM_BASE_ADDR) return;
     uint32_t i = (phys - PMM_BASE_ADDR) / PAGE_SIZE;
     if (i >= pmm_total_pages) return;
@@ -2611,10 +2980,12 @@ static bool vmm_long_mode  = false;
 static bool vmm_our_paging = false;  // true only when WE set up paging (BIOS path)
 
 static bool vmm_check_long_mode(){
-    // EFER MSR (0xC0000080), bit 8 = LME
+    // EFER MSR (0xC0000080).  Bit 8 = LME (Long Mode Enable),
+    // bit 10 = LMA (Long Mode Active).  rdmsr returns MSR bits 0..31 in EAX,
+    // bits 32..63 in EDX.  We check LMA (active long mode) in EAX.
     uint32_t eax, edx;
     __asm__ __volatile__("rdmsr":"=a"(eax),"=d"(edx):"c"(0xC0000080u));
-    return (edx & (1u << 8)) != 0;
+    return (eax & (1u << 10)) != 0;
 }
 
 // ---- High-framebuffer 4-level mapping (for >4GB GOP framebuffers) ----
@@ -2626,10 +2997,17 @@ static bool vmm_check_long_mode(){
 // long mode (we run 32-bit compat code), so CR4.PAE/EFER.LME stay set and
 // CR3 is a PML4 -- no fragile LME teardown required.
 #define FB_WIN_VA  0xF0000000u
+// A PAE / long-mode page table page holds 512 x 8-byte entries (NOT 1024 like
+// a classic 32-bit PTE page).  Getting this wrong silently mapped only the
+// first 2 MiB of the window: 800x600x4 = 1.92 MiB just fit, but any real
+// native resolution (1920x1080x4 = 8.3 MiB) ran off the end of the mapping
+// and #PF'd on the first pixel past 2 MiB -> black screen on real hardware.
+#define FB_WIN_PT_ENTRIES 512u
+#define FB_WIN_PTS        32u                      // 32 x 2 MiB = 64 MiB window
 alignas(4096) static uint64_t g_pml4[512];
 alignas(4096) static uint64_t g_pdpt[512];
 alignas(4096) static uint64_t g_pd[4][512];
-alignas(4096) static uint64_t g_win_pt[16][1024];   // up to 64 MiB window
+alignas(4096) static uint64_t g_win_pt[FB_WIN_PTS][FB_WIN_PT_ENTRIES];
 static bool g_fb_high_mapped = false;
 
 static void vmm_map_high_fb(void);
@@ -2708,11 +3086,12 @@ static void vmm_init(){
         }
     }
 
-    // Foundation 0: ring-3 user region (PG_USER). Identity-map 64-128 MiB
-    // as 4 MiB PSE pages. This memory is real RAM (QEMU -m 128M) and is
+    // Foundation 0: ring-3 user region (PG_USER). Identity-map 64-256 MiB
+    // as 4 MiB PSE pages. This memory is real RAM (QEMU -m 512M) and is
     // separate from the supervisor-only lower 32 MiB, so a ring-3 process
     // can execute here but cannot reach kernel/heap without a #PF.
-    for (int i = 0x10; i < 0x20; i++)
+    // 128-256 MiB covers real Linux static ELF link addresses (0x08048000).
+    for (int i = 0x10; i < 0x40; i++)
         page_directory[i] = (i * 0x400000u) | PG_PRESENT | PG_RW | PG_USER | PG_PSE;
     serial_puts("[VMM] ring-3 user region 0x04000000-0x08000000 (PG_USER)\n");
 
@@ -2744,8 +3123,10 @@ static void vmm_map_high_fb(void){
     uint32_t total = (uint32_t)pitch * (uint32_t)h;
     if (total == 0) total = (uint32_t)w * (uint32_t)h * 4u;          // bpp fallback
     uint32_t pages = (total + 4095u) >> 12;
-    if (pages > 16384u) pages = 16384u;                             // 64 MiB cap
-    uint32_t pt_count = (pages + 1023u) >> 10;
+    const uint32_t max_pages = FB_WIN_PTS * FB_WIN_PT_ENTRIES;      // 64 MiB cap
+    if (pages > max_pages) pages = max_pages;
+    uint32_t pt_count = (pages + FB_WIN_PT_ENTRIES - 1u) / FB_WIN_PT_ENTRIES;
+    if (pt_count > FB_WIN_PTS) pt_count = FB_WIN_PTS;
 
     // Zero the page-table structures.
     for (int i = 0; i < 512; i++) g_pml4[i] = 0;
@@ -2753,7 +3134,7 @@ static void vmm_map_high_fb(void){
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 512; j++) g_pd[i][j] = 0;
     for (uint32_t p = 0; p < pt_count; p++)
-        for (int j = 0; j < 1024; j++) g_win_pt[p][j] = 0;
+        for (uint32_t j = 0; j < FB_WIN_PT_ENTRIES; j++) g_win_pt[p][j] = 0;
 
     // Identity-map the low 4GB with 2MiB pages (covers kernel/heap/MMIO).
     for (int i = 0; i < 4; i++)
@@ -2766,13 +3147,16 @@ static void vmm_map_high_fb(void){
 
     // Override the window PDE(s): VA FB_WIN_VA lives in PDPT[3] (3..4 GiB).
     uint32_t win_pde = (FB_WIN_VA & 0x3FFFFFFFu) >> 21;            // index within PD
+    if (win_pde + pt_count > 512u) pt_count = 512u - win_pde;      // stay in the PD
     for (uint32_t p = 0; p < pt_count; p++)
         g_pd[3][win_pde + p] = ((uint64_t)(uintptr_t)&g_win_pt[p][0]) | 0x7;
+    if (pages > pt_count * FB_WIN_PT_ENTRIES) pages = pt_count * FB_WIN_PT_ENTRIES;
 
     // Fill the window page tables: VA FB_WIN_VA + k*4K -> PA fb + k*4K.
+    // 512 entries per table -- see FB_WIN_PT_ENTRIES note above.
     for (uint32_t k = 0; k < pages; k++) {
         uint64_t pa = fb + (uint64_t)k * 4096u;
-        g_win_pt[k >> 10][k & 1023] = pa | 0x3;
+        g_win_pt[k / FB_WIN_PT_ENTRIES][k % FB_WIN_PT_ENTRIES] = pa | 0x3;
     }
 
     // PML4[0] -> PDPT (covers 0..512 GiB: 0..4GB + window).
@@ -2785,12 +3169,22 @@ static void vmm_map_high_fb(void){
     *(volatile uint32_t*)(vb)      = FB_WIN_VA;                    // framebuffer_phys
     *(volatile uint32_t*)(vb + 0x18) = 1;                         // shadow_buffer = 1 (mapped)
 
+    // Registry: in the 32-bit compat stage the framebuffer is reached through
+    // the 0xF0000000 window, so FB_VIRT must point there (the 64-bit kernel
+    // later overrides this to the real high address via Gfx::init).
+    addr_set_phys(ADDR_FB_PHYS, fb);
+    addr_set_virt(ADDR_FB_VIRT, (uint64_t)FB_WIN_VA);
+
     g_fb_high_mapped = true;
     serial_puts("[VMM] high FB 0x");
     serial_hex((uint32_t)(fb >> 32));
     serial_hex((uint32_t)(fb & 0xFFFFFFFFULL));
     serial_puts(" mapped to VA 0x");
     serial_hex(FB_WIN_VA);
+    serial_puts(" span=0x");
+    serial_hex(pages << 12);
+    serial_puts(" pts=0x");
+    serial_hex(pt_count);
     serial_puts("\n");
 }
 static bool vmm_split_4mb(uint32_t pd_idx){
@@ -2812,7 +3206,7 @@ static bool vmm_split_4mb(uint32_t pd_idx){
 }
 
 // Map a 4 KiB virtual page to a physical page
-static bool vmm_map_page(uint32_t virt, uint32_t phys, uint32_t flags){
+extern "C" int vmm_map_page(uint32_t virt, uint32_t phys, uint32_t flags){
     if (!vmm_our_paging) return false;  // can't modify firmware page tables
 
     uint32_t pd_idx = virt >> 22;
@@ -2839,7 +3233,7 @@ static bool vmm_map_page(uint32_t virt, uint32_t phys, uint32_t flags){
 }
 
 // Translate virtual → physical (returns 0 if not mapped)
-static uint32_t vmm_get_phys(uint32_t virt){
+extern "C" uint32_t vmm_get_phys(uint32_t virt){
     if (!vmm_paging_on) return virt;  // identity (no paging)
 
     uint32_t pd_idx = virt >> 22;
@@ -2879,15 +3273,28 @@ static uint32_t   heap_bytes_alloc   = 0;
 static uint32_t   heap_bytes_freed   = 0;
 
 static void heap_init(){
-    // The 16 MiB region at HEAP_START is identity-mapped (first 32 MiB).
-    // Guard: the heap must start above the relocated .bss, otherwise the
-    // allocator hands out memory that already holds live kernel globals.
-    if ((uint32_t)(uintptr_t)__bss_end > HEAP_START) {
-        serial_puts("[HEAP] FATAL: .bss end ");
+    // The 14 MiB region at HEAP_START is identity-mapped (first 32 MiB).
+    // Guards: the heap must not overlap the relocated .bss (live globals) nor
+    // the .lmboot scratch region (boot stacks + live long-mode page tables).
+    // linker.ld already ASSERTs the layout at build time; these are runtime
+    // belt-and-braces checks that survive a bad HEAP_START edit.
+    if (ranges_overlap(HEAP_START, HEAP_END,
+                       (uint32_t)(uintptr_t)__bss_start,
+                       (uint32_t)(uintptr_t)__bss_end)) {
+        serial_puts("[HEAP] FATAL: heap overlaps .bss ");
+        serial_hex((uint32_t)(uintptr_t)__bss_start);
+        serial_puts("..");
         serial_hex((uint32_t)(uintptr_t)__bss_end);
-        serial_puts(" overlaps HEAP_START ");
-        serial_hex(HEAP_START);
         serial_puts(" -- raise HEAP_START in kernel.cpp\n");
+    }
+    if (ranges_overlap(HEAP_START, HEAP_END,
+                       (uint32_t)(uintptr_t)__lmboot_start,
+                       (uint32_t)(uintptr_t)__lmboot_end)) {
+        serial_puts("[HEAP] FATAL: heap overlaps .lmboot ");
+        serial_hex((uint32_t)(uintptr_t)__lmboot_start);
+        serial_puts("..");
+        serial_hex((uint32_t)(uintptr_t)__lmboot_end);
+        serial_puts(" -- move .lmboot in linker.ld or shrink the heap\n");
     }
     heap_head = (HeapBlock*)HEAP_START;
     heap_head->magic = HEAP_MAGIC_FREE;
@@ -2898,7 +3305,7 @@ static void heap_init(){
     heap_free_count  = 0;
     heap_bytes_alloc = 0;
     heap_bytes_freed = 0;
-    serial_puts("[HEAP] Initialised: 16 MiB at 0x200000\n");
+    serial_puts("[HEAP] Initialised: 14 MiB at 0x500000\n");
 }
 
 extern "C" void* kmalloc(uint32_t size){
@@ -3038,6 +3445,19 @@ static void cmd_meminfo(){
     term.write("  0x100000 - 0x1FFFFF  Free (PMM-managed)\n");
     term.write("  0x200000 - 0x2FFFFF  Kernel heap (1 MiB)\n");
     term.write("  0x300000+            Free (PMM-managed)\n");
+
+    // Address Management Registry (single source of truth for key addresses)
+    term.write("\nAddress Registry:\n");
+    for (int i = 0; i < ADDR_COUNT; i++) {
+        if (!addr_is_set((addr_key_t)i)) continue;
+        term.write("  ");
+        term.write(addr_name((addr_key_t)i));
+        term.write("  phys=0x");
+        term.write_hex64(addr_phys((addr_key_t)i));
+        term.write("  virt=0x");
+        term.write_hex64(addr_virt((addr_key_t)i));
+        term.write("\n");
+    }
 }
 
 static void cmd_memtest(){
@@ -3235,6 +3655,9 @@ static void cmd_help(){
     term.write("  mount <n>   Mount FAT32 partition (1-4)\n");
     term.write("  lsfat       List files on mounted FAT32\n");
     term.write("  fatinfo     Show mounted FAT32 info\n");
+    term.write("  disk        Show disk + SFS info\n");
+    term.write("  disk rw     Raw ATA sector write/read-back test\n");
+    term.write("  disk sfs    SFS file create/read/rename/remove round-trip\n");
     term.write("\nScript execution:\n");
     term.write("  run <f>     Run .sh script from MKFS\n");
     term.write("  runfs <f>   Run .sh script from SFS\n");
@@ -3256,6 +3679,7 @@ static void cmd_help(){
     term.write("  agent init  Initialize multi-agent framework\n");
     term.write("  agent run <g> Run agent pipeline (Planner->Actor->Critic)\n");
     term.write("  agent status Show agent framework status\n");
+    term.write("  agent skills List registered AI skills\n");
     term.write("  webapi help Agent bridge into the browser (password gated)\n");
     term.write("\nNetwork (HTTP server on port 8080):\n");
     term.write("  netstart    Initialize NE2000 NIC and HTTP server\n");
@@ -3659,6 +4083,119 @@ static void cmd_fatinfo(){
     fat32.info();
 }
 
+// ----- Disk write tests -----
+// "disk"        - show disk + SFS info
+// "disk rw"     - raw ATA sector round-trip (write -> read back -> verify)
+// "disk sfs"    - SFS file round-trip (create -> read -> rename -> remove)
+static void cmd_disk_rw_raw();
+static void cmd_disk_sfs_rw();
+static void cmd_disk(const char* args){
+    if (!args[0] || !strcmp_(args, "info")) {
+        term.write("Disk: ");
+        if (!g_hw.disk_present) { term.write("not present\n"); return; }
+        term.write(g_hw.disk_model);
+        term.write("  "); term.write_dec((int)g_hw.disk_size_mb);
+        term.write(" MB ("); term.write_dec((int)g_hw.disk_sectors); term.write(" sectors)\n");
+        if (sfs.mounted) {
+            term.write("SFS @ LBA "); term.write_dec((int)sfs.base);
+            term.write("  data_start="); term.write_dec((int)sfs.sb.data_start);
+            term.write("  free_lba="); term.write_dec((int)sfs.sb.free_lba);
+            term.write("  files="); term.write_dec((int)sfs.sb.file_count); term.write("\n");
+        }
+        return;
+    }
+    if (!strcmp_(args, "rw")) { cmd_disk_rw_raw(); return; }
+    if (!strcmp_(args, "sfs")) { cmd_disk_sfs_rw(); return; }
+    term.write("Usage: disk [info|rw|sfs]\n");
+}
+
+// Raw single-sector ATA round-trip at a safe scratch LBA.
+// Preferred target: the main SFS volume's free data area (on-disk), which is
+// guaranteed unused once SFS_LINUX_LBA (12288) leaves room after the packed
+// image.  Fallback: the BIOS growth gap (kernel.bin ends ~LBA 1075, kernel64
+// starts at 2048), used when SFS is not mounted.
+static void cmd_disk_rw_raw(){
+    if (!g_hw.disk_present) { term.write("disk rw: no disk present\n"); return; }
+    uint32_t scratch = 0;
+    if (sfs.mounted) scratch = sfs.sb.free_lba + (uint32_t)sfs.delta;  // on-disk free space
+    if (scratch == 0 || scratch >= SFS_LINUX_LBA - 1)
+        scratch = 1600;                                                 // BIOS growth gap
+    term.write("disk rw: raw sector round-trip @ LBA ");
+    term.write_dec((int)scratch); term.write("...\n");
+
+    memset_(g_fsbuf, 0, 512);
+    g_fsbuf[0]='D'; g_fsbuf[1]='I'; g_fsbuf[2]='S'; g_fsbuf[3]='K';
+    g_fsbuf[4]='R'; g_fsbuf[5]='W'; g_fsbuf[6]='1';
+    g_fsbuf[8]=(uint8_t)(scratch & 0xFF); g_fsbuf[9]=(uint8_t)((scratch>>8)&0xFF);
+    g_fsbuf[10]=(uint8_t)((scratch>>16)&0xFF); g_fsbuf[11]=(uint8_t)((scratch>>24)&0xFF);
+    for (int i = 12; i < 512; i++) g_fsbuf[i] = (uint8_t)(i & 0xFF);
+
+    ata_write_sector(scratch, (const uint16_t*)g_fsbuf);
+    serial_puts("[DISKRW] sector written\n");
+
+    memset_(g_fsbuf, 0xAA, 512);
+    ata_read_sector(scratch, (uint16_t*)g_fsbuf);
+
+    bool ok = (g_fsbuf[0]=='D' && g_fsbuf[1]=='I' && g_fsbuf[2]=='S' &&
+               g_fsbuf[3]=='K' && g_fsbuf[4]=='R' && g_fsbuf[5]=='W' && g_fsbuf[6]=='1');
+    if (ok) for (int i = 12; i < 512; i++)
+        if (g_fsbuf[i] != (uint8_t)(i & 0xFF)) { ok = false; break; }
+    term.write(ok ? "disk rw: PASS (read-back matches)\n" : "disk rw: FAIL (read-back mismatch)\n");
+    serial_puts(ok ? "[DISKRW] PASS\n" : "[DISKRW] FAIL\n");
+}
+
+// SFS file round-trip: create a 3-sector file, read back, rename, remove.
+static void cmd_disk_sfs_rw(){
+    if (!sfs.mounted) { term.write("disk sfs: SFS not mounted\n"); return; }
+    term.write("disk sfs: SFS file round-trip (create->read->rename->remove)\n");
+
+    // 3-sector payload with a repeatable pattern
+    static uint8_t payload[1600];
+    for (int i = 0; i < (int)sizeof(payload); i++) payload[i] = (uint8_t)((i * 7 + 3) & 0xFF);
+    const char* fname = "rwtest.bin";
+    const char* fname2 = "rwtest2.bin";
+
+    // idempotent: clean leftovers from a previous failed run
+    sfs.remove(fname);
+    sfs.remove(fname2);
+
+    int r = sfs.create(fname, payload, (int)sizeof(payload));
+    if (r != 0) { term.write("disk sfs: FAIL (create rc="); term.write_dec(r); term.write(")\n");
+                  serial_puts("[DISKSFS] FAIL create\n"); return; }
+    serial_puts("[DISKSFS] create ok\n");
+
+    int sz = sfs.size_of(fname);
+    if (sz != (int)sizeof(payload)) {
+        term.write("disk sfs: FAIL (size "); term.write_dec(sz);
+        term.write(" != "); term.write_dec((int)sizeof(payload)); term.write(")\n");
+        serial_puts("[DISKSFS] FAIL size\n"); return;
+    }
+    static uint8_t rdbuf[2000];
+    int n = sfs.read(fname, rdbuf, (int)sizeof(rdbuf));
+    bool ok = (n == (int)sizeof(payload));
+    if (ok) for (int i = 0; i < n; i++)
+        if (rdbuf[i] != payload[i]) { ok = false; break; }
+    term.write(ok ? "disk sfs: create+read PASS\n" : "disk sfs: FAIL (data mismatch)\n");
+    serial_puts(ok ? "[DISKSFS] read PASS\n" : "[DISKSFS] FAIL read\n");
+    if (!ok) return;
+
+    r = sfs.rename(fname, fname2);
+    if (r != 0) { term.write("disk sfs: FAIL (rename rc="); term.write_dec(r); term.write(")\n");
+                  serial_puts("[DISKSFS] FAIL rename\n"); return; }
+    bool renamed = (sfs.find(fname) < 0 && sfs.find(fname2) >= 0 &&
+                    sfs.size_of(fname2) == (int)sizeof(payload));
+    term.write(renamed ? "disk sfs: rename PASS\n" : "disk sfs: FAIL (rename verify)\n");
+    serial_puts(renamed ? "[DISKSFS] rename PASS\n" : "[DISKSFS] FAIL rename\n");
+
+    r = sfs.remove(fname2);
+    bool removed = (r == 0 && sfs.find(fname2) < 0);
+    term.write(removed ? "disk sfs: remove PASS (cleanup done)\n" : "disk sfs: FAIL (remove)\n");
+    serial_puts(removed ? "[DISKSFS] remove PASS\n" : "[DISKSFS] FAIL remove\n");
+
+    bool all = ok && renamed && removed;
+    serial_puts(all ? "[DISKSFS] ALL PASS\n" : "[DISKSFS] FAIL\n");
+}
+
 // ----- Script runner -----
 static bool g_in_script = false;
 static void run_command(const char* line);  // forward declaration
@@ -3740,6 +4277,16 @@ static void cmd_run(const char* name){
             wl_registered = true;
         }
         gui_open_file(wl_file, wl_args[0] ? wl_args : nullptr);
+        return;
+    }
+    // NexOS 原生用户程序 (.nex): 平铺 ELF32, 经 linux_compat ELF32 加载器运行
+    // (int 0x80 系统调用 ABI; 内核已在启动时注册 SFS 读取器).
+    if (strncmp_(ext, ".nex", 4) == 0) {
+        term.set_color(make_color(GREEN, BLACK));
+        term.write("Running NexOS native app: "); term.write(wl_file); term.put_char('\n');
+        term.set_color(make_color(LIGHT_GREY, BLACK));
+        const char* nex_av[1] = { wl_file };
+        linux_run(wl_file, 1, nex_av);
         return;
     }
     // 默认: NexOS shell 脚本 (.sh)
@@ -4358,6 +4905,7 @@ static bool perm_check(const char* name, char need, bool quiet){
 // ---- Read a line from keyboard (password: hidden with '*') ----
 static void read_line_quiet(char* buf, int* len, bool hidden){
     *len = 0;
+    kbd.reset();
     for(;;){
         uint8_t st = inb(0x64);
         if(st == 0xFF) st = 0;      // no i8042 (floating bus) - treat as idle
@@ -4746,6 +5294,99 @@ static void cmd_sudo(const char* args){
 //  AI Engine commands
 // =====================================================================
 
+// AI code generator (defined in ai_engine.cpp) -- deterministic, no weights.
+extern "C" int ai_generate_code(const char* intent, char* out, int outsize);
+
+// Knowledge-base + reasoning framework hooks (kb.cpp / ai_engine.cpp).
+#include "kb.h"
+extern "C" int ai_reason(const char* prompt, char* out, int outsize);
+
+// ---- Knowledge-base command (dynamic, rule-driven KB) -------------------
+static void kb_console(const char* s){ term.write(s); serial_puts(s); }
+
+static int kb_atoi(const char* s){
+    if (!s) return -1;
+    if (*s == '#') s++;
+    int v = 0;
+    while (*s >= '0' && *s <= '9'){ v = v * 10 + (*s - '0'); s++; }
+    return v;
+}
+static void kb_itoa(int v, char* b){
+    int i = 0;
+    if (v == 0){ b[0] = '0'; b[1] = 0; return; }
+    char t[12]; int n = 0;
+    while (v){ t[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n > 0) b[i++] = t[--n];
+    b[i] = 0;
+}
+static void kb_report_status(int idx, int st){
+    char b[16]; kb_itoa(idx, b);
+    kb_console("KB #"); kb_console(b); kb_console(" -> status=");
+    kb_console(st == KB_ACCEPTED ? "ACCEPTED" : (st == KB_REJECTED ? "REJECTED" : "CANDIDATE"));
+    kb_console("\n");
+}
+
+static void cmd_kb(const char* args){
+    kb_init();
+    if (!*args){ kb_console("Usage: kb <add|prove|cite|list|query|info>\n"); return; }
+    char sub[16]; int si = 0;
+    while (*args && *args != ' ' && si < 15) sub[si++] = *args++;
+    sub[si] = 0;
+    while (*args == ' ') args++;
+
+    if (!strcmp_(sub, "list")){
+        char buf[2200];
+        int n = kb_list(buf, (int)sizeof(buf));
+        if (n > 0) kb_console(buf);
+    } else if (!strcmp_(sub, "query")){
+        if (!*args){ kb_console("Usage: kb query <keyword>\n"); return; }
+        char buf[600];
+        if (kb_query(args, buf, (int)sizeof(buf))){
+            kb_console("[KB hit] "); kb_console(buf); kb_console("\n");
+        } else {
+            kb_console("[KB miss] no accepted fact matches.\n");
+        }
+    } else if (!strcmp_(sub, "add")){
+        if (!*args){ kb_console("Usage: kb add <statement>\n"); return; }
+        int id = kb_add(args);
+        if (id < 0){ kb_console("KB: add failed (full or empty).\n"); return; }
+        char b[16]; kb_itoa(id, b);
+        kb_console("KB: added candidate #"); kb_console(b); kb_console(": ");
+        kb_console(args); kb_console("\n");
+    } else if (!strcmp_(sub, "prove")){
+        char idtok[16]; int ii = 0;
+        while (*args && *args != ' ' && ii < 15) idtok[ii++] = *args++;
+        idtok[ii] = 0; while (*args == ' ') args++;
+        int pass = (!strcmp_(args, "pass") || !strcmp_(args, "1") || !strcmp_(args, "true"));
+        int idx = kb_atoi(idtok);
+        int st = kb_prove(idx, pass);
+        if (st < 0){ kb_console("KB: no such fact #"); kb_console(idtok); kb_console("\n"); }
+        else kb_report_status(idx, st);
+    } else if (!strcmp_(sub, "cite")){
+        char idtok[16]; int ii = 0;
+        while (*args && *args != ' ' && ii < 15) idtok[ii++] = *args++;
+        idtok[ii] = 0; while (*args == ' ') args++;
+        char src[KB_SRC_LEN]; int k = 0;
+        while (*args && *args != ' ' && k < (int)sizeof(src) - 1) src[k++] = *args++;
+        src[k] = 0; while (*args == ' ') args++;
+        int idx = kb_atoi(idtok);
+        int st = kb_cite(idx, src, args);
+        if (st < 0){ kb_console("KB: no such fact #"); kb_console(idtok); kb_console("\n"); }
+        else kb_report_status(idx, st);
+    } else if (!strcmp_(sub, "info")){
+        char idtok[16]; int ii = 0;
+        while (*args && *args != ' ' && ii < 15) idtok[ii++] = *args++;
+        idtok[ii] = 0;
+        int idx = kb_atoi(idtok);
+        char buf[1200];
+        int n = kb_info(idx, buf, (int)sizeof(buf));
+        if (n > 0) kb_console(buf);
+        else { kb_console("KB: no such fact #"); kb_console(idtok); kb_console("\n"); }
+    } else {
+        kb_console("Usage: kb <add|prove|cite|list|query|info>\n");
+    }
+}
+
 static void cmd_ai(const char* args){
     if(!*args){
         if(!g_ai_initialized){
@@ -4805,8 +5446,40 @@ static void cmd_ai(const char* args){
         } else {
             term.write("AI not initialized.\n");
         }
+    } else if(!strcmp_(sub,"py") || !strcmp_(sub,"code")){
+        // OS AI engine authors a Python program and runs it in the Linux
+        // compat layer. Deterministic generator -- no model weights needed.
+        term.write("NexOS AI: generating Python code");
+        if (*args){ term.write(" for intent: "); term.write(args); }
+        term.put_char('\n');
+        static const unsigned int AI_CODE_PHYS = 0x0B800000u;  // 184 MiB (free guest RAM)
+        char* code = (char*)AI_CODE_PHYS;
+        int n = ai_generate_code(*args ? args : "hello world", code, 16384);
+        if (n <= 0){ term.write("AI code generation failed.\n"); return; }
+        serial_puts("[AI] generated Python source:\n");
+        serial_puts(code);
+        serial_puts("\n[AI] launching python interpreter on the generated code...\n");
+        char arg1[32];
+        { unsigned int a = AI_CODE_PHYS, l = (unsigned int)n; int i = 0;
+          arg1[i++] = 'm'; arg1[i++] = 'e'; arg1[i++] = 'm'; arg1[i++] = ':';
+          char t[16]; int ti;
+          ti = 0; if (a==0) t[ti++]='0'; else { while(a){ t[ti++]=(char)('0'+(a%10)); a/=10; } } while(ti>0) arg1[i++]=t[--ti];
+          arg1[i++] = ':';
+          ti = 0; if (l==0) t[ti++]='0'; else { while(l){ t[ti++]=(char)('0'+(l%10)); l/=10; } } while(ti>0) arg1[i++]=t[--ti];
+          arg1[i] = 0; }
+        serial_puts("[AI] argv[1] = mem:"); serial_puts(arg1); serial_puts("\n");
+        const char* av[3];
+        av[0] = "python"; av[1] = arg1;
+        linux_run("python", 2, av);
+    } else if(!strcmp_(sub,"reason") || !strcmp_(sub,"infer")){
+        if(!*args){ term.write("Usage: ai reason <prompt>\n"); return; }
+        term.write("NexOS AI reasoning framework:\n");
+        char out[1400];
+        int n = ai_reason(args, out, (int)sizeof(out));
+        if(n>0) term.write(out);
+        else term.write("(reasoning failed)\n");
     } else {
-        term.write("Usage: ai [init|info|mode|test|cleanup]\n");
+        term.write("Usage: ai [init|info|mode|test|cleanup|py|reason]\n");
     }
 }
 
@@ -4853,6 +5526,80 @@ static void cmd_ask(const char* args){
     }
 }
 
+// ---------------------------------------------------------------------
+//  Plugin manager command
+// ---------------------------------------------------------------------
+static bool g_plugin_inited = false;
+
+static void term_write_int(int v){
+    char t[16]; int n = 0;
+    if (v == 0) { t[0] = '0'; n = 1; }
+    else { int neg = 0; if (v < 0) { neg = 1; v = -v; }
+           while (v > 0 && n < 15) { t[n++] = (char)('0' + (v % 10)); v /= 10; }
+           if (neg && n < 15) t[n++] = '-'; }
+    for (int k = n - 1; k >= 0; k--) term.put_char(t[k]);
+}
+
+static void cmd_plugin(const char* args){
+    if (!g_plugin_inited) { ai_plugin_init(); g_plugin_inited = true; }
+
+    // No args -> list
+    if (!*args) { char buf[3072]; ai_plugin_list(buf, sizeof(buf)); term.write(buf); return; }
+
+    char sub[16]; int si = 0;
+    while (*args && *args != ' ' && si < 15) sub[si++] = *args++;
+    sub[si] = 0;
+    while (*args == ' ') args++;
+
+    if (!strcmp_(sub, "list") || !strcmp_(sub, "ls")) {
+        char buf[3072]; ai_plugin_list(buf, sizeof(buf)); term.write(buf);
+    } else if (!strcmp_(sub, "persist")) {
+        char buf[3072]; int n = ai_plugin_serialize(buf, sizeof(buf));
+        int r = kern_fs_create("plugins.lst", (const unsigned char*)buf, n);
+        if (r >= 0) { term.write("Plugin catalogue written to plugins.lst ("); term_write_int(n); term.write(" bytes)\n"); }
+        else term.write("Failed to write plugins.lst\n");
+    } else if (!strcmp_(sub, "toggle") || !strcmp_(sub, "load") || !strcmp_(sub, "unload")) {
+        if (!*args) { term.write("Usage: plugin toggle <id>\n"); return; }
+        int want = !strcmp_(sub, "unload") ? 0 : 1;
+        int s = (!strcmp_(sub, "toggle")) ? ai_plugin_toggle(args) : ai_plugin_set(args, want);
+        if (s < 0) { term.write("plugin not found: "); term.write(args); term.put_char('\n'); return; }
+        char buf[3072]; int n = ai_plugin_serialize(buf, sizeof(buf));
+        kern_fs_create("plugins.lst", (const unsigned char*)buf, n);
+        term.write(args); term.write(s ? " -> loaded\n" : " -> unloaded\n");
+    } else if (!strcmp_(sub, "info")) {
+        if (!*args) { term.write("Usage: plugin info <id>\n"); return; }
+        int i = ai_plugin_find(args);
+        if (i < 0) { term.write("plugin not found: "); term.write(args); term.put_char('\n'); return; }
+        AiPlugin* pl = &g_plugins[i];
+        term.write("Plugin: "); term.write(pl->id); term.put_char('\n');
+        term.write("  Name : "); term.write(pl->name); term.put_char('\n');
+        term.write("  Deps : "); term.write(pl->deps); term.put_char('\n');
+        term.write("  Mem  : "); term_write_int(pl->mem_kb); term.write(" KB\n");
+        term.write("  State: "); term_write_int(pl->state); term.write(" (0 planned,1 basic,2 available)\n");
+        term.write("  Load : "); term_write_int(pl->loaded); term.put_char('\n');
+    } else if (!strcmp_(sub, "run")) {
+        if (!*args) { term.write("Usage: plugin run <id>\n"); return; }
+        if (!strcmp_(args, "nexos.ai.inference")) {
+            term.write("Loading core AI inference plugin...\n");
+            int ret = ai_init("/boot/model.gguf");
+            if (ret == 0) { g_ai_initialized = true; term.write("AI inference engine loaded.\n"); }
+            else term.write("AI init failed (no model?).\n");
+        } else {
+            term.write("Plugin '"); term.write(args); term.write("' is not runnable in this build.\n");
+        }
+    } else {
+        term.write("Usage: plugin [list|persist|toggle|load|unload|info|run] [<id>]\n");
+    }
+}
+
+// P4 bridge: create/overwrite a file on the writable MKFS volume, used by the
+// skill system (skill.cpp) so skills can call system FS APIs without reaching
+// into kernel internals. Returns >=0 bytes written, <0 on error.
+int kern_fs_create(const char* name, const unsigned char* data, int len){
+    if (!mkfs.mounted) return -2;
+    return mkfs.create(name, (const uint8_t*)data, len);
+}
+
 static void cmd_agent(const char* args){
     if(!*args){
         char status[256];
@@ -4867,7 +5614,15 @@ static void cmd_agent(const char* args){
 
     if(!strcmp_(sub,"init")){
         if(!g_ai_initialized){
-            ai_init("/boot/model.gguf");
+            // Respect the return code: ai_init can fail to reserve the 4 MB
+            // Markov table or the GPT weights.  It used to be ignored, so the
+            // flag was set anyway and the next `agent run` walked NULL model
+            // pointers.
+            if(ai_init("/boot/model.gguf") != 0){
+                term.write("AI engine init FAILED (out of kernel heap).\n");
+                term.write("  Agent framework not started.\n");
+                return;
+            }
             g_ai_initialized = true;
         }
         agent_init();
@@ -4879,10 +5634,25 @@ static void cmd_agent(const char* args){
             term.write("Usage: agent run <goal>\n");
             return;
         }
-        term.write("Running agent pipeline...\n\n");
-        term.write(ai_env_is_vm()
-                   ? "  [env: VM -> built-in engine drives the pipeline]\n\n"
-                   : "  [env: bare metal -> real transformer inference]\n\n");
+        // P4: try the skill registry first (natural-language intent -> system API).
+        char skill_out[256];
+        if(agent_skill_dispatch(args, skill_out, (int)sizeof(skill_out))){
+            term.write("[Skill] "); term.write(skill_out); term.put_char('\n');
+            return;
+        }
+        // No verbose pipeline text here: while the pipeline runs, the caller
+        // shows a status element (the AI desktop's "思考中…" indicator) instead
+        // of textual progress, and agent_run() returns ONLY the final answer.
+        //
+        // First try to REALLY answer the question: ask the host's local LLM
+        // (LM Studio / Ollama) through the QEMU user-network bridge.  The
+        // built-in Markov engine is only a fallback for offline/VM use.
+        char remote[4096];
+        if (net_ask_host(args, remote, (int)sizeof(remote)) > 0){
+            term.write(remote);
+            term.put_char('\n');
+            return;
+        }
         char output[4096];
         int n = agent_run(args, output, sizeof(output));
         if(n > 0){
@@ -4894,8 +5664,20 @@ static void cmd_agent(const char* args){
         char status[256];
         agent_get_status(status, sizeof(status));
         term.write(status);
+    } else if(!strcmp_(sub,"skills")){
+        term.write("Registered skills:\n");
+        char buf[512];
+        agent_skill_list(buf, (int)sizeof(buf));
+        term.write(buf);
+    } else if(!strcmp_(sub,"abort")){
+        agent_abort();
+        term.write("Agent abort requested.\n");
+    } else if(!strcmp_(sub,"confirm")){
+        // `agent confirm on|off` toggles the dangerous-task gate.
+        if(!strcmp_(args,"off")){ agent_set_confirm(0); term.write("Confirm mode OFF.\n"); }
+        else { agent_set_confirm(1); term.write("Confirm mode ON (dangerous tasks blocked).\n"); }
     } else {
-        term.write("Usage: agent [init|run|status]\n");
+        term.write("Usage: agent [init|run|status|skills|abort|confirm]\n");
     }
 }
 
@@ -5382,6 +6164,71 @@ static void cmd_netstart(){
     term.set_color(make_color(WHITE, BLACK));
 }
 
+// Unified `net` command: up / info / wifi / time / http.  Parses the first
+// token as a subcommand and dispatches to the network stack in net.cpp.
+static void cmd_net(const char* args){
+    const char* a = args ? args : "";
+    while (*a == ' ' || *a == '\t') a++;
+    char sub[32]; int si = 0;
+    while (*a && *a != ' ' && si < 31) sub[si++] = *a++;
+    sub[si] = 0;
+    const char* rest = a; while (*rest == ' ') rest++;
+    char buf[2048];
+    if (!strcmp_(sub, "") || !strcmp_(sub, "up") || !strcmp_(sub, "start")){
+        if (!g_net_initialized){ int r = net_init(); if (r == 0) g_net_initialized = true; }
+        int n = net_status(buf, sizeof(buf));
+        term.write(n > 0 ? buf : "Network status unavailable.\n");
+    } else if (!strcmp_(sub, "info") || !strcmp_(sub, "status")){
+        int n = net_status(buf, sizeof(buf));
+        term.write(n > 0 ? buf : "Network status unavailable.\n");
+    } else if (!strcmp_(sub, "wifi")){
+        char wsub[32]; int wi = 0;
+        while (*rest && *rest != ' ' && wi < 31) wsub[wi++] = *rest++;
+        wsub[wi] = 0;
+        const char* wr = rest; while (*wr == ' ') wr++;
+        if (!strcmp_(wsub, "scan")){ net_wifi_scan(buf, sizeof(buf)); term.write(buf); }
+        else if (!strcmp_(wsub, "connect")){ net_wifi_connect(wr, buf, sizeof(buf)); term.write(buf); }
+        else if (!strcmp_(wsub, "disconnect")){ net_wifi_disconnect(buf, sizeof(buf)); term.write(buf); }
+        else if (!strcmp_(wsub, "status")){ net_wifi_status(buf, sizeof(buf)); term.write(buf); }
+        else term.write("Usage: net wifi <scan|connect <ssid> [pass]|disconnect|status>\n");
+    } else if (!strcmp_(sub, "time")){
+        net_time(buf, sizeof(buf)); term.write(buf);
+    } else if (!strcmp_(sub, "http")){
+        int got = net_http_get(rest, buf, (int)sizeof(buf) - 1);
+        if (got > 0) term.write(buf); else term.write("HTTP GET failed (no network or unreachable).\n");
+    } else {
+        term.write("Usage: net <up|info|wifi scan|wifi connect <ssid> [pass]|wifi status|time|http <url>>\n");
+    }
+}
+
+// Set the guest's IPv4 address at runtime (host order, see net.cpp IPV4()).
+// Used to give two distnet peers distinct addresses on a shared L2 link.
+static void cmd_setip(const char* args){
+    const char* p = args ? args : "";
+    while(*p==' '||*p=='\t') p++;
+    int parts[4]; int n=0; int cur=0; bool ok=true;
+    for(int i=0;p[i];i++){
+        char c=p[i];
+        if(c=='.'){ if(n>=4){ok=false;break;} parts[n++]=cur; cur=0; }
+        else if(c>='0'&&c<='9') cur=cur*10+(c-'0');
+        else { ok=false; break; }
+    }
+    if(ok && n==3){ parts[n++]=cur; } else ok=false;
+    if(!ok || n!=4){ term.write("setip: bad IP, expect a.b.c.d\n"); return; }
+    uint32_t ip = ((uint32_t)parts[0]<<24)|((uint32_t)parts[1]<<16)|
+                  ((uint32_t)parts[2]<<8) |(uint32_t)parts[3];
+    net_set_ip(ip);
+    char buf[40]; int bi=0;
+    for(int o=0;o<4;o++){
+        int v=parts[o]; char t[8]; int tn=0;
+        if(v==0) t[tn++]='0'; else { while(v){ t[tn++]='0'+(v%10); v/=10; } }
+        for(int j=tn-1;j>=0;j--) buf[bi++]=t[j];
+        if(o<3) buf[bi++]='.';
+    }
+    buf[bi]=0;
+    term.write("IP set to "); term.write(buf); term.write("\n");
+}
+
 // =====================================================================
 //  GUI mode - enter graphical desktop environment
 // =====================================================================
@@ -5482,7 +6329,113 @@ extern "C" void switch_to_64bit(uint32_t stage_phys);
 
 #define KERNEL64_LBA_DISK   2048
 #define KERNEL64_ADDR       0x100000
-#define KERNEL64_SECTORS    1024    // 1024*512 = 512 KiB; kernel64.bin is ~416 KiB / 814 sectors
+// 1320*512 = 660 KiB.  Raised from 1280 because net.cpp grew (POST client +
+// OpenAI-compatible remote agent + CORS + /agent web UI): kernel64.bin is now
+// ~717584 bytes (vector font rasterizer added).  kernel occupies LBA 2048..3488;
+// SFS_ALT_LBA / SFS_LBA = 3488.
+#define KERNEL64_SECTORS    1448    // 2048+1448 = 3496 = SFS start (no overlap)
+
+// Load kernel64.bin from the disk into a staging buffer and jump to long
+// mode.  Shared by `switch` and `ask64`; never returns on success.
+// EFI handoff struct written by BOOTX64.EFI at physical 0x7000.  Must
+// match struct k64_handoff in uefi/bootuefi.c.
+struct __attribute__((packed)) k64_handoff {
+    uint32_t magic;   // 0x4B36344E ("K64N")
+    uint32_t phys;    // physical address of preloaded 64-bit kernel
+    uint32_t size;    // size in bytes
+};
+
+static void do_switch64(void){
+    // The 32-bit kernel's own ATA driver reads garbage (all zeros) under
+    // UEFI, so BOOTX64.EFI preloads the 64-bit image and leaves a handoff
+    // struct at 0x7000.  Prefer that; fall back to the disk read only when
+    // booting via the legacy BIOS path (no handoff present).
+    volatile struct k64_handoff* h = (volatile struct k64_handoff*)0x7000;
+    int use_handoff = (h->magic == 0x4B36344EUL);
+
+    void* stage = nullptr;
+    uint32_t stage_phys = 0;
+
+    if (use_handoff) {
+        stage_phys = h->phys;
+        stage = (void*)(uintptr_t)stage_phys;
+        serial_puts("[K32] using EFI-preloaded K64 @");
+        serial_hex(stage_phys);
+        serial_puts(" size=");
+        serial_hex(h->size);
+        serial_puts("\n");
+    } else {
+        // Staging buffer: heap lives at 3-19 MiB, well clear of both the
+        // destination window (1-1.5 MiB) and our own .bss.
+        stage = kmalloc(KERNEL64_SECTORS * 512);
+        if (!stage) {
+            term.set_color(make_color(RED, BLACK));
+            term.write("ERROR: cannot allocate 512 KiB staging buffer.\n");
+            serial_puts("[K32] ERROR: kmalloc(512K) failed\n");
+            term.set_color(make_color(WHITE, BLACK));
+            return;
+        }
+        stage_phys = (uint32_t)(uintptr_t)stage;
+        const uint32_t stage_end = stage_phys + KERNEL64_SECTORS * 512;
+        // The staged image must not sit on live kernel globals (.bss) or on the
+        // boot stacks / long-mode page tables (.lmboot).  This is a range test:
+        // .lmboot is at 24 MiB, ABOVE the heap kmalloc draws from, so the old
+        // "stage_phys < __lmboot_end" form rejected every valid buffer and
+        // silently disabled the whole 64-bit transition.
+        if (ranges_overlap(stage_phys, stage_end,
+                           (uint32_t)(uintptr_t)__bss_start,
+                           (uint32_t)(uintptr_t)__bss_end) ||
+            ranges_overlap(stage_phys, stage_end,
+                           (uint32_t)(uintptr_t)__lmboot_start,
+                           (uint32_t)(uintptr_t)__lmboot_end)) {
+            term.set_color(make_color(RED, BLACK));
+            term.write("ERROR: staging buffer overlaps .bss/.lmboot -- raise HEAP_START.\n");
+            serial_puts("[K32] ERROR: stage ");
+            serial_hex(stage_phys);
+            serial_puts("..");
+            serial_hex(stage_end);
+            serial_puts(" hits .bss/.lmboot\n");
+            term.set_color(make_color(WHITE, BLACK));
+            kfree(stage);
+            return;
+        }
+        if (stage_phys < 0x00200000u || stage_phys + KERNEL64_SECTORS * 512 > 0x02000000u) {
+            // Must be outside the destination window and inside the identity map.
+            term.set_color(make_color(RED, BLACK));
+            term.write("ERROR: staging buffer at a bad address.\n");
+            serial_puts("[K32] ERROR: bad stage addr\n");
+            term.set_color(make_color(WHITE, BLACK));
+            kfree(stage);
+            return;
+        }
+
+        serial_puts("[K32] staging at ");
+        serial_hex(stage_phys);
+        serial_puts(", sectors=");
+        serial_hex(KERNEL64_SECTORS);
+        serial_puts("\n");
+
+        uint16_t* dst = (uint16_t*)stage;
+        for(int i=0; i<KERNEL64_SECTORS; i++){
+            ata_read_sector(KERNEL64_LBA_DISK + i, dst);
+            dst += 256;  // 512 bytes = 256 words
+        }
+    }
+
+    serial_puts("[K32] stage[0..3]=");
+    serial_hex(*(volatile uint32_t*)stage);
+    serial_puts(" (expect 03F8BA66 = '66 BA F8 03' entry64)\n");
+
+    serial_puts("[K32] K64 image staged; entering long mode\n");
+
+    switch_to_64bit(stage_phys);
+
+    // Should never reach here
+    term.set_color(make_color(RED, BLACK));
+    term.write("ERROR: switch_to_64bit() returned!\n");
+    serial_puts("[K32] ERROR: switch_to_64bit returned!\n");
+    term.set_color(make_color(WHITE, BLACK));
+}
 
 static void cmd_switch64(){
     term.set_color(make_color(CYAN, BLACK));
@@ -5493,46 +6446,31 @@ static void cmd_switch64(){
     term.write_dec(KERNEL64_LBA_DISK);
     term.write("...\n");
 
-    // Staging buffer: heap lives at 3-19 MiB, well clear of both the
-    // destination window (1-1.5 MiB) and our own .bss.
-    void* stage = kmalloc(KERNEL64_SECTORS * 512);
-    if (!stage) {
-        term.set_color(make_color(RED, BLACK));
-        term.write("ERROR: cannot allocate 512 KiB staging buffer.\n");
-        serial_puts("[K32] ERROR: kmalloc(512K) failed\n");
-        term.set_color(make_color(WHITE, BLACK));
+    do_switch64();
+}
+
+// `ask64 <question>`: stage the question in shared memory for the 64-bit
+// kernel's auto-answer backdoor (NEXQ magic at 0x5100, UTF-8 text at 0x5104),
+// then enter long mode.  kernel64 loads the embedded GGUF and answers with
+// the real transformer engine, streaming the reply to serial/terminal.
+static void cmd_ask64(const char* args){
+    if(!*args){
+        term.write("Usage: ask64 <question>\n");
+        term.write("  Answers with the built-in GGUF engine in 64-bit mode.\n");
         return;
     }
-    uint32_t stage_phys = (uint32_t)(uintptr_t)stage;
-    if (stage_phys < 0x00200000u || stage_phys + KERNEL64_SECTORS * 512 > 0x02000000u) {
-        // Must be outside the destination window and inside the identity map.
-        term.set_color(make_color(RED, BLACK));
-        term.write("ERROR: staging buffer at a bad address.\n");
-        serial_puts("[K32] ERROR: bad stage addr\n");
-        term.set_color(make_color(WHITE, BLACK));
-        kfree(stage);
-        return;
-    }
-
-    serial_puts("[K32] staging at ");
-    serial_hex(stage_phys);
-    serial_puts(", sectors=");
-    serial_hex(KERNEL64_SECTORS);
-    serial_puts("\n");
-
-    uint16_t* dst = (uint16_t*)stage;
-    for(int i=0; i<KERNEL64_SECTORS; i++){
-        ata_read_sector(KERNEL64_LBA_DISK + i, dst);
-        dst += 256;  // 512 bytes = 256 words
-    }
-    serial_puts("[K32] K64 image staged; entering long mode\n");
-
-    switch_to_64bit(stage_phys);
-
-    // Should never reach here
-    term.set_color(make_color(RED, BLACK));
-    term.write("ERROR: switch_to_64bit() returned!\n");
-    serial_puts("[K32] ERROR: switch_to_64bit returned!\n");
+    volatile char* dst = (volatile char*)0x5104;
+    int i = 0;
+    while (args[i] && i < 120){ dst[i] = args[i]; i++; }
+    dst[i] = 0;
+    *(volatile uint32_t*)0x5100 = 0x5145584Eu;   // 'NEXQ'
+    term.set_color(make_color(CYAN, BLACK));
+    term.write("\nask64: switching to 64-bit for real GGUF inference...\n");
+    serial_puts("[K32] ask64 staged; switching\n");
+    term.write("Loading kernel64.bin from LBA ");
+    term.write_dec(KERNEL64_LBA_DISK);
+    term.write("...\n");
+    do_switch64();
     term.set_color(make_color(WHITE, BLACK));
 }
 
@@ -5573,7 +6511,7 @@ static const char* g_cmd_table[] = {
     "help", "echo", "clear", "cls", "about", "history", "save", "load",
     "mkfs", "ls", "dir", "cat", "type", "touch", "rm", "del",
     "copy", "write", "mkdir", "md", "cd", "pwd",
-    "lsfs", "catfs", "part", "mount", "lsfat", "fatinfo",
+    "lsfs", "catfs", "part", "mount", "lsfat", "fatinfo", "disk",
     "run", "runfs", "ai", "generate", "agent", "ask",
     "winapp", "start", "reg", "regedit", "winver", "winenv",
     "netinfo", "netstat", "netstart", "ping", "download", "dl",
@@ -5741,10 +6679,33 @@ static bool do_tab_complete(char* inbuf, int* inlen){
 // =====================================================================
 
 // Run a Linux ELF32 image from the SFS volume (Wine-on-NexOS shim).
+// `linux <file> [args...]` -- argv is forwarded to the guest.
 static void cmd_linux(const char* args){
-    if (!args[0]){ term.write("Usage: linux <file.elf>\n"); return; }
-    term.write("Launching Linux ELF: "); term.write(args); term.write("\n");
-    linux_run(args);
+    if (!args[0]){ term.write("Usage: linux <file.elf> [args...]\n"); return; }
+    while (*args == ' ') args++;
+
+    // argv words must be NUL-terminated copies: the shell line buffer has
+    // spaces (not NULs) between words, and the guest reads argv strings up
+    // to their terminator.
+    char words[33][64];
+    int  nwords = 0;
+    const char* p = args;
+    while (*p && nwords < 32){
+        while (*p == ' ') p++;
+        if (!*p) break;
+        int w = 0;
+        while (*p && *p != ' ' && w < 63) words[nwords][w++] = *p++;
+        words[nwords][w] = 0;
+        nwords++;
+    }
+    if (nwords == 0){ term.write("Usage: linux <file.elf> [args...]\n"); return; }
+
+    const char* av[33];
+    int ac = nwords;
+    for (int i = 0; i < nwords; i++) av[i] = words[i];
+
+    term.write("Launching Linux ELF: "); term.write(av[0]); term.write("\n");
+    linux_run(av[0], ac, av);
 }
 
 // ---------------------------------------------------------------------
@@ -5806,6 +6767,54 @@ static void cmd_clr(const char* args){
     } else {
         term.set_color(make_color(GREEN, BLACK));
         term.write("[OK] managed execution finished.\n");
+        term.set_color(make_color(LIGHT_GREY, BLACK));
+    }
+}
+
+// Launch a standalone per-application .mex as the resident managed context.
+// The .mex's Program::Main opens exactly one app window via Host.OpenApp,
+// and the kernel's native GUI loop then paints and drives it.  This is how
+// the 12 packaged app images (Calc.mex, Terminal.mex, ...) run standalone.
+static void cmd_clrapp(const char* args){
+    clr_ensure_init();
+
+    while (*args == ' ') args++;
+    if (!args[0]){
+        term.write("Usage: clrapp <app.mex>\n");
+        term.write("       loads the .mex as the resident GUI context and runs\n");
+        term.write("       its Program::Main (opens that one managed app).\n");
+        return;
+    }
+
+    char file[64]; int fi = 0;
+    while (args[fi] && args[fi] != ' ' && fi < 63){ file[fi] = args[fi]; fi++; }
+    file[fi] = 0;
+
+    term.set_color(make_color(CYAN, BLACK));
+    term.write("=== NexOS .NET app (MiniCLR) ===\n");
+    term.set_color(make_color(LIGHT_GREY, BLACK));
+    term.write("Assembly: "); term.write(file); term.put_char('\n');
+
+    int rc = clr_run_resident(file);
+
+    const char* rep = clr_last_report();
+    if (rep && rep[0]) term.write(rep);
+
+    if (rc != 0){
+        term.set_color(make_color(RED, BLACK));
+        term.write("[X] ");
+        switch (rc){
+            case -1: term.write("File not found in SFS/MKFS.\n"); break;
+            case -2: term.write("Not a valid .mex image.\n"); break;
+            case -3: term.write("Out of managed heap.\n"); break;
+            case -4: term.write("Unbound internal call.\n"); break;
+            case -5: term.write("Execution fault.\n"); break;
+            default: term.write("CLR error.\n"); break;
+        }
+        term.set_color(make_color(LIGHT_GREY, BLACK));
+    } else {
+        term.set_color(make_color(GREEN, BLACK));
+        term.write("[OK] app launched (resident).\n");
         term.set_color(make_color(LIGHT_GREY, BLACK));
     }
 }
@@ -6081,6 +7090,7 @@ static void run_command(const char* line){
     else if(!strcmp_(cmd,"mount")) cmd_mount(args);
     else if(!strcmp_(cmd,"lsfat")) cmd_lsfat();
     else if(!strcmp_(cmd,"fatinfo"))cmd_fatinfo();
+    else if(!strcmp_(cmd,"disk"))  cmd_disk(args);
     // Script execution
     else if(!strcmp_(cmd,"run"))   cmd_run(args);
     else if(!strcmp_(cmd,"runfs")) cmd_runfs(args);
@@ -6092,26 +7102,39 @@ static void run_command(const char* line){
     // Linux binary-compat (Wine-on-NexOS): run an ELF32 image from SFS
     else if(!strcmp_(cmd,"linux"))                         cmd_linux(args);
     else if(!strcmp_(cmd,"clr")||!strcmp_(cmd,"dotnet"))   cmd_clr(args);
+    else if(!strcmp_(cmd,"clrapp"))                          cmd_clrapp(args);
     // Foundation 0: ring-3 user-mode demo (proves isolation + syscall ABI)
     else if(!strcmp_(cmd,"user"))                          cmd_user(args);
     else if(!strcmp_(cmd,"vfs"))                           cmd_vfs(args);
     else if(!strcmp_(cmd,"perm"))                          cmd_perm(args);
     // AI engine commands
     else if(!strcmp_(cmd,"ai"))         cmd_ai(args);
+    else if(!strcmp_(cmd,"kb"))         cmd_kb(args);
     else if(!strcmp_(cmd,"generate")||!strcmp_(cmd,"gen")) cmd_generate(args);
     else if(!strcmp_(cmd,"agent"))      cmd_agent(args);
     else if(!strcmp_(cmd,"model"))       cmd_model(args);
     else if(!strcmp_(cmd,"ask"))        cmd_ask(args);
+    else if(!strcmp_(cmd,"plugin"))     cmd_plugin(args);
     else if(!strcmp_(cmd,"webapi"))     cmd_webapi(args);
     // Network commands
     else if(!strcmp_(cmd,"ping"))        cmd_ping(args);
     else if(!strcmp_(cmd,"download")||!strcmp_(cmd,"dl")) cmd_download(args);
     else if(!strcmp_(cmd,"netinfo")||!strcmp_(cmd,"netstat")) cmd_netinfo();
-    else if(!strcmp_(cmd,"netstart")||!strcmp_(cmd,"net"))   cmd_netstart();
+    else if(!strcmp_(cmd,"netstart"))                        cmd_netstart();
+    else if(!strcmp_(cmd,"net"))                            cmd_net(args);
+    else if(!strcmp_(cmd,"setip"))       cmd_setip(args);
+    else if(!strcmp_(cmd,"distnet"))     cmd_distnet(args);
     // GUI
     else if(!strcmp_(cmd,"gui"))  cmd_gui(args);
     else if(!strcmp_(cmd,"nogui")) cmd_nogui(args);
+    else if(!strcmp_(cmd,"serialecho")){
+        if(!strcmp_(args,"off"))      g_term_serial = false;
+        else if(!strcmp_(args,"on"))  g_term_serial = true;
+        term.write("serialecho: ");
+        term.write(g_term_serial ? "on\n" : "off\n");
+    }
     else if(!strcmp_(cmd,"switch")||!strcmp_(cmd,"switch64")) cmd_switch64();
+    else if(!strcmp_(cmd,"ask64")) cmd_ask64(args);
     // Memory management
     else if(!strcmp_(cmd,"meminfo"))  cmd_meminfo();
     else if(!strcmp_(cmd,"memtest"))  cmd_memtest();
@@ -6138,6 +7161,40 @@ static void run_command(const char* line){
     else { term.write("Unknown command: "); term.write(cmd);
            term.write("  (Type 'help' for available commands)\n"); }
 }
+
+// ---- SSH server hooks (called from net.cpp) ----
+// Validate a username/password pair against the kernel user table.
+// Returns 1 on success, 0 otherwise.
+extern "C" int nexos_auth(const char* user, const char* pw){
+    for(int i = 0; i < g_user_count; i++){
+        if(!g_users[i].exists) continue;
+        if(strcmp_(g_users[i].name, user) != 0) continue;
+        char hash[17];
+        hash_password(g_users[i].name, pw, hash);
+        if(strcmp_(hash, g_users[i].hash) == 0){
+            // establish the session identity for commands run over SSH
+            g_login_idx = i;
+            g_euid = g_users[i].uid;
+            g_sudo_active = false;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Run a command line through the normal shell dispatcher.  Used by the SSH
+// server's channel-data / exec handlers so remote sessions share the same
+// command surface as the local console.  The SSH layer is responsible for
+// arming g_ssh_out_fn (via term_set_ssh_sink) so command output is forwarded
+// over the encrypted channel; kernel_exec_line itself does not touch the sink.
+extern "C" void kernel_exec_line(const char* line){
+    run_command(line);
+}
+
+// SSH output sink setters (called from net.cpp).  When fn is non-null, every
+// terminal character emitted by the shell is forwarded to the SSH channel.
+extern "C" void term_set_ssh_sink(ssh_out_fn_t fn){ g_ssh_out_fn = fn; }
+extern "C" void term_clear_ssh_sink(void){ g_ssh_out_fn = 0; }
 
 // =====================================================================
 //  Terminal::render (defined after the class, uses its members)
@@ -6290,7 +7347,7 @@ static void seed_desktop_shortcuts(void) {
         {"This PC.lnk", "1"}, {"Terminal.lnk", "3"}, {"Calculator.lnk", "4"},
         {"Task Mgr.lnk", "2"}, {"Settings.lnk", "0"}, {"Optimizer.lnk", "6"},
         {"Notepad.lnk", "7"}, {"About.lnk", "5"}, {"Browser.lnk", "8"},
-        {"AI Setup.lnk", "9"},
+        {"AI Setup.lnk", "9"}, {"AI Agent.lnk", "10"}, {"Demo.lnk", "11"},
     };
     for (unsigned i = 0; i < sizeof(seed)/sizeof(seed[0]); i++) {
         if (mkfs.find(seed[i].name) < 0)
@@ -6446,6 +7503,15 @@ static int gui_cb_read_file(int fs_type, const char* name, uint8_t* buf, int buf
     return -1;
 }
 
+// ---- File write callback (MKFS data disk) ----
+// fs_type: 0=MKFS only for now.  Returns bytes written, or -1 on error.
+static int gui_cb_write_file(int fs_type, const char* name, const uint8_t* buf, int size) {
+    while (*name == ' ') name++;
+    if (fs_type != 0) return -1;          // MKFS only
+    if (!mkfs.mounted) return -1;
+    return mkfs.create(name, buf, size);
+}
+
 // ---- Session persistence callbacks (MKFS data disk) ----
 // Store the running-app list so a reboot can reopen the GUI session.
 static int gui_cb_session_save(const char* name, const void* data, int size) {
@@ -6514,17 +7580,20 @@ static int gui_cb_mkdir(int fs, const char* name) {
 static int gui_cb_remove(int fs, const char* name) {
     while (name && *name == ' ') name++;
     if (!name || !name[0]) return -1;
+    int r = -1;
     if (fs == 3) {
         if (!mkfs.mounted) return -1;
         int di = desktop_dir_index();
         if (di < 0) return -1;
         uint16_t saved = g_cwd; g_cwd = (uint16_t)di;
-        int r = mkfs.remove(name);
+        r = mkfs.remove(name);
         g_cwd = saved;
-        return r;
+    } else if (fs == 0 && mkfs.mounted) {
+        r = mkfs.remove(name);
+    } else {
+        return -1;
     }
-    if (fs != 0 || !mkfs.mounted) return -1;
-    return mkfs.remove(name);
+    return r;
 }
 static int gui_cb_rename(int fs, const char* old_name, const char* new_name) {
     while (old_name && *old_name == ' ') old_name++;
@@ -6678,6 +7747,7 @@ static void register_gui_callbacks(void) {
     cb.optimize_memory     = gui_cb_optimize_memory;
     cb.list_files          = gui_cb_list_files;
     cb.read_file           = gui_cb_read_file;
+    cb.write_file          = gui_cb_write_file;
     cb.get_time            = gui_cb_get_time;
     cb.mkdir               = gui_cb_mkdir;
     cb.remove              = gui_cb_remove;
@@ -6723,10 +7793,19 @@ static void register_gui_callbacks(void) {
 // exceptions (0-31) that prints the vector/error code and halts, plus a
 // dummy handler for hardware IRQs so stray PIC interrupts don't crash us.
 
+// In IA-32e long mode every IDT gate is 16 bytes (8-byte gates are
+// ILLEGAL and are decoded as 16 bytes, yielding a non-canonical 64-bit
+// 32-bit protected-mode IDT gate (8 bytes).  The CPU parses each gate at
+// 8-byte strides in 32-bit mode; using a 64-bit (16-byte) gate struct here
+// misaligns every odd vector (they read back as not-present -> #GP) and,
+// worse, maps even vectors onto the *previous* gate's low half -- e.g. the
+// int 0x80 syscall gate silently pointed at isr_dummy.  Fixed to the true
+// 32-bit layout: offset_low(16) + selector(16) + zero(8) + type_attr(8) +
+// offset_high(16).  Handlers are <4GB so offset_high only needs 16 bits.
 struct IdtEntry {
     uint16_t offset_low;
     uint16_t selector;
-    uint8_t  zero;
+    uint8_t  zero;        // must be 0 for 32-bit gates (no IST in 32-bit)
     uint8_t  type_attr;
     uint16_t offset_high;
 } __attribute__((packed));
@@ -6791,7 +7870,7 @@ static void idt_set_gate(uint8_t num, uint32_t offset, uint16_t selector, uint8_
     g_idt[num].offset_low  = (uint16_t)(offset & 0xFFFF);
     g_idt[num].selector    = selector;
     g_idt[num].zero        = 0;
-    g_idt[num].type_attr   = flags;
+    g_idt[num].type_attr   = flags;           // 0x8E = present,DPL0,32-bit intr gate
     g_idt[num].offset_high = (uint16_t)((offset >> 16) & 0xFFFF);
 }
 
@@ -6806,6 +7885,17 @@ static const char* const g_exc_name[32] = {
     "reserved",              "reserved",             "reserved",             "reserved",
     "reserved",              "reserved",             "#SX security",         "reserved"
 };
+
+// Forward declaration so the fault handler below can paint a screen beacon.
+// (The canonical definition/declaration of boot_beacon lives in gui.cpp and
+// is also declared near kmain, but isr_common_c precedes that.)
+extern "C" void boot_beacon(uint8_t, uint8_t, uint8_t);
+
+// 32-bit kernel: diag_step is a no-op.  The 32-bit kernel has its own ISR
+// framework (isr_common_c) and does not use the 64-bit IDT / disk-record
+// diagnostic path.  gui.cpp / mforms.cpp call diag_step on both kernels, so
+// we provide a linkable stub here.
+extern "C" void diag_step(uint32_t, const char*) {}
 
 extern "C" void isr_common_c(uint32_t* esp){
     // Layout on stack after our stub:
@@ -6848,6 +7938,20 @@ extern "C" void isr_common_c(uint32_t* esp){
     }
     serial_puts("\nHALT\n");
 
+    // Visible-on-real-hardware fault indicator.  No serial console is
+    // available on bare metal, so paint the WHOLE framebuffer GRAY and drop a
+    // fault marker at 0x5100.  Gray is format-independent and distinct from
+    // every boot-stage beacon colour (red/blue/yellow/magenta/green/orange/
+    // white), so a GRAY screen unambiguously means "a CPU exception (e.g.
+    // #PF/#GP) was caught and the machine halted here" rather than a clean
+    // hang at a particular milestone.  If the screen instead REBOOTS, the
+    // fault came from a broken page table (the repaint itself #PF'd ->
+    // double fault -> triple fault).  boot_beacon() safely no-ops if VbeInfo
+    // width/height are still zero.
+    *(volatile uint8_t*)0x5100 = 0xFA;   // 'z' fault marker (NEXQ area)
+    boot_beacon(128, 128, 128);          // GRAY: caught CPU exception
+
+
     // Try to print to VGA text buffer as well for visibility.
     volatile uint16_t* vga = (volatile uint16_t*)0xB8000;
     const char* msg = "EXCEPTION - see serial";
@@ -6861,7 +7965,7 @@ static void idt_init(){
     // Exceptions 0-31 -> useful handlers.
     for (int i = 0; i < 32; i++){
         uint32_t handler = (uint32_t)&isr_dummy;
-        if (i == 8)  handler = (uint32_t)&isr_err_8;
+        if (i == 8)  handler = (uint32_t)&isr_err_8;   // #DF
         if (i == 10) handler = (uint32_t)&isr_err_10;
         if (i == 11) handler = (uint32_t)&isr_err_11;
         if (i == 12) handler = (uint32_t)&isr_err_12;
@@ -6905,7 +8009,16 @@ static void pic_init(){
 // =====================================================================
 //  kmain
 // =====================================================================
+// Boot progress beacon helpers (screen-visible, no serial needed).
+// boot_beacon() fills the framebuffer with a solid colour; boot_stage()
+// records the current milestone in low RAM (0x5101) so a captured serial
+// log or a fault marker can pin down where the kernel died.
+extern "C" void boot_beacon(uint8_t, uint8_t, uint8_t);
+static void boot_stage(uint8_t s){ *(volatile uint8_t*)0x5101 = s; }
+
 extern "C" void kmain(){
+    // RAW early marker: proves kmain entry is reached (bypasses C++ serial_puts)
+    __asm__ __volatile__("movb $0x5A, %%al\n\tmovw $0x3F8, %%dx\n\toutb %%al, %%dx" ::: "eax","edx");
     // ---- Mask all 8259 PIC interrupts ----
     // We have no protected-mode IDT yet. If a hardware IRQ (e.g. PIT timer
     // IRQ0) fires, the CPU reads a garbage IDT gate (IDT base=0 inherited
@@ -6915,94 +8028,54 @@ extern "C" void kmain(){
     outb(0x21, 0xFF);   // mask all IRQ0-7  (PIT=IRQ0, keyboard=IRQ1)
     outb(0xA1, 0xFF);   // mask all IRQ8-15
     __asm__ __volatile__("cli");
+    serial_puts("[K0] kmain entered, PIC masked\n");
+    boot_stage(1);          // milestone: 32-bit kmain entered
 
     gdt_init();          // Foundation 0: ring-0 + ring-3 GDT/TSS
+    serial_puts("[K-g] gdt_init done\n");
     idt_init();
+    serial_puts("[K-i] idt_init done\n");
     pic_init();
+    serial_puts("[K-p] pic_init done\n");
+    boot_stage(2);          // milestone: GDT/IDT/PIC up
+
+    // ---- Map the >4 GiB framebuffer into the 0xF0000000 window EARLY ----
+    // On real hardware the GOP LFB lives above 4 GiB, which the 32-bit
+    // compat-mode kernel cannot address until paging maps it.  Doing this
+    // first makes every later framebuffer write actually visible; otherwise
+    // they target an unreachable address and the screen stays on the EFI
+    // loader's last colour.  On <4 GiB setups (e.g. QEMU) this branch is a
+    // no-op.
+    vmm_init();
+    boot_stage(5);          // milestone: paging/MMU reconfigured (high FB mapped)
 
     serial_puts("[K1] kmain entered\n");
-    g_auto_gui = 1;   // default: boot straight into the Win11 desktop (graphical lock screen)
+#ifdef TEXT_BOOT
+    // Text-boot variant (built by `make textboot`): stay at the textual
+    // shell so headless security tests can drive the command line and still
+    // screendump the VBE framebuffer.  GUI is entered only on demand, e.g.
+    // by `winapp <file.exe>`.  The normal build defaults to 1 (auto GUI).
+    g_auto_gui = 0;
+#else
+    // Demo build: stay at the textual shell so `switch64` can drop into the
+    // 64-bit kernel (real GGUF LLM + distnet) without the desktop stealing
+    // the console.  Enter the GUI on demand with `gui`.
+    g_auto_gui = 1;  // TEMP: auto-enter GUI for headless verification
+#endif
 
-    /* P1 self-test: exercise PMM/VMM/ATA/PS2/PCI minimal checks */
-    serial_puts("[P1] Starting self-test\n");
-    /* PMM init: assume physical memory region available starting 0x100000, size 16MB */
-    extern void pmm_init(uint32_t, uint32_t);
-    extern uint32_t pmm_alloc_page(void);
-    extern void pmm_free_page(uint32_t);
-    pmm_init(0x100000, 16 * 1024 * 1024);
-    uint32_t p = pmm_alloc_page();
-    if (p) {
-        serial_puts("[P1] PMM alloc OK: 0x");
-        /* print hex (simple) */
-        char bufp[9];
-        for (int i = 0; i < 8; i++) bufp[7-i] = "0123456789ABCDEF"[(p >> (i*4)) & 0xF];
-        bufp[8] = '\0';
-        serial_puts(bufp);
-        serial_puts("\n");
-        pmm_free_page(p);
-    } else {
-        serial_puts("[P1] PMM alloc FAIL\n");
-    }
-
-    /* PCI scan stub */
-    extern int pci_scan(void*, int);
-    struct { uint8_t b,d,f; uint16_t vid,did; } devs[8];
-    int ndev = pci_scan(devs, 8);
-    serial_puts("[P1] PCI devices: ");
-    {
-        char num[4]; int nn = 0; int t = ndev;
-        if (t==0) { serial_puts("0\n"); }
-        else {
-            while (t>0 && nn<3){ num[nn++]= '0' + (t%10); t/=10; }
-            for (int i=nn-1;i>=0;i--) serial_putc(num[i]);
-            serial_puts("\n");
-        }
-    }
-
-    /* PS2 check: read scancode if present (non-blocking) */
-    extern void ps2_init(void);
-    extern int ps2_has_scancode(void);
-    extern uint8_t ps2_read_scancode(void);
-    ps2_init();
-    if (ps2_has_scancode()){
-        uint8_t sc = ps2_read_scancode();
-        serial_puts("[P1] PS2 sc=0x");
-        char scb[3]; scb[0]= "0123456789ABCDEF"[(sc>>4)&0xF]; scb[1]= "0123456789ABCDEF"[sc&0xF]; scb[2]='\0';
-        serial_puts(scb); serial_puts("\n");
-    } else {
-        serial_puts("[P1] PS2 no sc\n");
-    }
-
-    /* ATA read test: attempt to read LBA0 (may fail on some VMs) */
-    extern int ata_pio_read_lba28(uint32_t lba, uint8_t count, void* buf);
-    uint8_t ata_buf[512];
-    int ata_rc = ata_pio_read_lba28(0, 1, ata_buf);
-    if (ata_rc == 0) {
-        serial_puts("[P1] ATA LBA0 OK: ");
-        /* print first 16 bytes as hex */
-        for (int i = 0; i < 16; i++){
-            uint8_t b = ata_buf[i];
-            char hex[3]; hex[0] = "0123456789ABCDEF"[(b>>4)&0xF]; hex[1] = "0123456789ABCDEF"[b&0xF]; hex[2]='\0';
-            serial_puts(hex);
-            if (i%8==7) serial_puts(" ");
-        }
-        serial_puts("\n");
-    } else {
-        serial_puts("[P1] ATA read fail or not present\n");
-    }
-    serial_puts("[P1] Self-test done\n");
-
-    /* Ensure VMM identity maps kernel physical region (if VMM prepared) */
-    extern void vmm_init(void);
-    extern int vmm_identity_map_range(uint32_t, uint32_t);
-    vmm_init();
-    if (vmm_identity_map_range(0x100000, 16 * 1024 * 1024) == 0) {
-        serial_puts("[P1] VMM identity map OK\n");
-    } else {
-        serial_puts("[P1] VMM identity map skipped/FAIL\n");
-    }
+    // Headless / server mode flag, set by QEMU:
+    //   -device loader,addr=0x501E,data=1,data-len=1
+    // When present we still boot the 64-bit kernel (so the 64-bit agent /
+    // HTTP stack runs) but stay in the text shell instead of the GUI, which
+    // would otherwise triple-fault headlessly.  `make play` never sets this
+    // flag, so the desktop keeps coming up there.  The flag lives in the
+    // VbeInfo reserved area (0x501C is the existing GUI-request byte), so it
+    // survives the 32->64 handoff untouched.
+    uint8_t boot_no_gui = *(volatile uint8_t*)0x501E;
+    if (boot_no_gui) g_auto_gui = 0;
 
     // ---- Hardware detection (adapt to all devices) ----
+    boot_stage(3);          // milestone: about to probe hardware
     detect_hardware();
 
     // ---- Display mode selection ----
@@ -7036,6 +8109,7 @@ extern "C" void kmain(){
             VGA_SHADOW[i] = make_entry(' ', make_color(LIGHT_GREY, BLACK));
         // Initialize framebuffer console (renders VGA text buffer to VBE LFB)
         fb_console_init();
+        boot_stage(4);          // milestone: framebuffer console up
     } else {
         // Standard VGA text mode (BIOS boot without VBE mode set)
         vga_set_text_mode();
@@ -7074,18 +8148,64 @@ extern "C" void kmain(){
 
     term.init();
     serial_puts("[K3] terminal init done\n");
+#ifdef BOOT_LOGO_TEST
+    if (g_vbe_active) {
+        // Earliest possible "kernel loaded" signal: clear the framebuffer
+        // and draw a NexOS boot logo via the framebuffer console.  This path
+        // writes the LFB directly (no backbuffer/present()), so a GUI
+        // compositor white-line bug cannot mask it.  Built by `make boot-logo`
+        // to triage real-hardware boots: if the logo shows, the kernel loaded
+        // and the framebuffer is writable; if the screen stays black/garbled
+        // with no logo, the kernel never reached graphics mode.
+        term.clear_screen();
+        term.write("\n\n");
+        term.write("   NexOS\n");
+        term.write("   kernel loaded - framebuffer writable\n");
+        term.write("   [K1] kmain entered, VBE/GOP active\n");
+        for (volatile uint32_t i = 0; i < 500000000U; i++) { /* hold for inspection */ }
+        __asm__ __volatile__("hlt");
+        for (;;) { __asm__ __volatile__("hlt"); }
+    }
+#endif
     kbd  = Keyboard();
     mouse.init();
     serial_puts("[K4] mouse init done\n");
 
     mkfs.init();
+    // On a CD/ISO boot the SFS image was streamed into RAM by the bootloader
+    // and flagged at 0x0900 (no ATA disk exists to hold it).  Mount from RAM
+    // when the flag is present; otherwise fall back to the disk probe.
+    {
+        const uint32_t* cdf = (const uint32_t*)0x0900;
+        if (cdf[0] == SFS_RAM_MAGIC) {
+            serial_puts("[K] CD-boot RAM-SFS handoff flag present\n");
+            sfs.set_ram(cdf[1], cdf[2]);
+        }
+    }
     sfs.init();
     fat32.init();
+    // Independent Linux user-space partition (SFS volume at SFS_LINUX_LBA).
+    // Separate from the main SFS volume so `linux <file>` resolves ELF
+    // binaries from a dedicated on-disk region.
+    if (linux_fs.mount_at(SFS_LINUX_LBA)) {
+        serial_puts("[K6] Linux partition mounted at LBA ");
+        serial_puts_dec(SFS_LINUX_LBA);
+        serial_puts("\n");
+    } else {
+        serial_puts("[K6] WARN: no Linux partition at LBA ");
+        serial_puts_dec(SFS_LINUX_LBA);
+        serial_puts(" (linux <file> falls back to main SFS)\n");
+    }
     serial_puts("[K6] filesystem init done\n");
 
     // Register the SFS reader with the Linux-compat shim so `linux <file>`
-    // can load ELF images packed into the SFS volume.
+    // can load ELF images.  The dedicated Linux partition wins; fall back to
+    // the main SFS volume so the feature works even without the partition.
     linux_compat_init([](const char* name, unsigned char* buf, int sz) -> int {
+        if (linux_fs.mounted) {
+            int r = linux_fs.read(name, buf, sz);
+            if (r >= 0) return r;
+        }
         if (!sfs.mounted) return -1;
         return sfs.read(name, buf, sz);
     });
@@ -7107,9 +8227,10 @@ extern "C" void kmain(){
     perm_init(perm_ui_console);
 
     // ---- Memory management ----
-    /* initialize PMM for physical region starting at 0x100000, size 16MB */
-    pmm_init(0x100000, 16 * 1024 * 1024);
-    vmm_init();
+    pmm_init();
+    // NOTE: vmm_init() (high-FB window mapping) now runs right after the
+    // GDT/IDT/PIC come up, so the framebuffer is reachable before any
+    // framebuffer console / beacon write.
     heap_init();
     serial_puts("[K7] memory management init done\n");
     serial_puts("[K] Command-line shell (GUI starts on demand via 'run <winfile>')\n");
@@ -7175,7 +8296,9 @@ extern "C" void kmain(){
     // Network status
     if(g_net_initialized){
         term.set_color(make_color(GREEN,BLACK));
-        term.write("NET:  UP  HTTP server on http://10.0.2.15:8080\n");
+        term.write("NET:  UP  HTTP server on http://");
+        term.write(net_ip_str());
+        term.write(":8080\n");
     } else {
         term.set_color(make_color(BROWN,BLACK));
         term.write("NET:  not detected (use 'netstart' to retry)\n");
@@ -7186,7 +8309,7 @@ extern "C" void kmain(){
         term.set_color(make_color(GREEN,BLACK));
         term.write("GUI:  VBE "); term.write_dec(gui_get_width());
         term.write("x"); term.write_dec(gui_get_height());
-        term.write(" (auto-starts on boot; 'nogui' to disable)\n");
+        term.write(" (text shell by default; 'gui' to enter desktop)\n");
     } else {
         term.set_color(make_color(BROWN,BLACK));
         term.write("GUI:  not available (text mode)\n");
@@ -7197,6 +8320,12 @@ extern "C" void kmain(){
     userdb_load();
     if(g_user_count == 0) seed_default_users();
     permdb_load();
+
+    // Drain any PS/2 bytes left over from power-on (keyboard BAT / ACK /
+    // identify responses) and clear stuck modifier / extended-key state
+    // so the very first keystroke typed is not silently dropped.
+    kbd.drain();
+    kbd.reset();
 
     // ---- Sign-in ----
     // On a machine with a framebuffer the desktop comes up automatically
@@ -7214,15 +8343,57 @@ extern "C" void kmain(){
 
     term.set_color(make_color(CYAN,BLACK));
     term.write("\nShell ready. Type 'help' for commands.\n");
-    term.write("Tab=autocomplete, Arrows=cursor/history, PgUp/PgDn=scroll, Home/End, Ctrl+C/V/L/Z/A.\n\n");
+    term.write("Tab=autocomplete, Arrows=cursor/history, PgUp/PgDn=scroll, Home/End, Ctrl+C/V/L/Z/A.\n");
+    term.write("In the GUI: Ctrl+Left/Right/Up switch virtual desktops (default / AI / toggle).\n\n");
 
     // ---- Default-enable GUI ----
     // Automatically enter the Win11 desktop after boot when a graphics
     // framebuffer is available.  `cmd_gui` self-guards on g_vbe_active, so
     // text-only boots (no VBE/BGA) safely fall through to the shell.  The
     // `nogui` command flips g_auto_gui off for subsequent boots.
+    //
+    // The desktop itself now runs on the 64-bit kernel: that is where the
+    // real GGUF LLM lives, so the AI desktop answers with the built-in
+    // model.  Ask for the GUI via byte 0x501C and switch to long mode.
+    //
+    // 0x501C, NOT 0x5010: 0x5010 is the FIRST BYTE of VbeInfo.framebuffer_phys64,
+    // so the old flag silently ORed 1 into the framebuffer address.  With a
+    // <4GB framebuffer nobody noticed (the 64-bit kernel used the 32-bit
+    // framebuffer_phys field), but on real hardware -- where GOP reports the
+    // LFB at 0x4000000000 -- it turned into 0x4000000001 and every pixel write
+    // landed one byte off, i.e. a permanently garbled/black display.
+    // 0x501C is VbeInfo.reserved[0] and is unused by both kernels.
+    // ---- Default boot policy (anti-crash) ----
+    // The 64-bit Win11 desktop (C# mforms shell) triple-faults under QEMU
+    // inside mforms_paint_desktop -- the last serial line before the hang is
+    // "[DIAG] step=200 mforms_paint_desktop enter" (see build/boot_crash.log).
+    // So os.img boots to a STABLE shell by default and only reaches the 64-bit
+    // kernel when explicitly asked:
+    //   * default (g_auto_gui==0, no flag)  -> stay in the 32-bit shell.
+    //         Proven to serve the HTTP agent API (same stack as os_textboot).
+    //   * g_auto_gui==1  -> set 0x501C=1 and switch to 64-bit GUI (opt-in;
+    //         still crashes under QEMU for now -- use `gui` to try it).
+    //   * boot_no_gui (0x501E, set by QEMU -device loader) -> switch to the
+    //         64-bit kernel in TEXT mode (real GGUF LLM + agent/HTTP stack),
+    //         stable.  Used for headless/server scenarios.
     if (g_auto_gui && g_vbe_active) {
-        cmd_gui(nullptr);
+        // Default: boot straight into the 32-bit Win11 GUI desktop (the
+        // managed C# NexOS.Forms shell).  This path is stable under both
+        // QEMU and real hardware, so it is the default desktop.  The 64-bit
+        // kernel (native GGUF LLM) is reached on demand via the `switch64`
+        // command -- not automatically, since the 64-bit mforms desktop
+        // used to triple-fault headlessly under QEMU.
+        serial_puts("[K] boot: auto-launch Win11 GUI desktop (32-bit)\n");
+        boot_stage(6);
+        cmd_gui("");
+    } else if (boot_no_gui && g_vbe_active) {
+        // Headless / server mode: 64-bit kernel, text only (no crashing GUI).
+        serial_puts("[K] boot: 64-bit kernel, text shell (server mode)\n");
+        boot_stage(6);
+        cmd_switch64();
+    } else {
+        // Default: stable 32-bit shell.  Network + HTTP agent API work here.
+        serial_puts("[K] boot: 32-bit shell (stable default)\n");
     }
 
     char inbuf[HIST_LEN];
@@ -7283,11 +8454,29 @@ extern "C" void kmain(){
                             gui_handle_key('\t');
                         } else if(e.type == K_SHIFT){
                             gui_toggle_ime();   // Shift toggles 中文/EN
-                        } else if(e.type == K_CTRL_C){ serial_puts("[kbd] K_CTRL_C\n"); gui_handle_ctrl(1); }
-                        else if(e.type == K_CTRL_V){ serial_puts("[kbd] K_CTRL_V\n"); gui_handle_ctrl(2); }
-                        else if(e.type == K_CTRL_Z){ serial_puts("[kbd] K_CTRL_Z\n"); gui_handle_ctrl(3); }
-                        else if(e.type == K_CTRL_A){ serial_puts("[kbd] K_CTRL_A\n"); gui_handle_ctrl(4); }
+                        }                         else if(e.type == K_CTRL_C){ gui_handle_ctrl(1); }
+                        else if(e.type == K_CTRL_V){ gui_handle_ctrl(2); }
+                        else if(e.type == K_CTRL_Z){ gui_handle_ctrl(3); }
+                        else if(e.type == K_CTRL_A){ gui_handle_ctrl(4); }
+                        else if(e.type == K_CTRL_S){ gui_handle_ctrl(8); }
+                        else if(e.type == K_DESK_L){ serial_puts("[desk] switch -> default (desktop 1)\n"); gui_handle_ctrl(5); }
+                        else if(e.type == K_DESK_R){ serial_puts("[desk] switch -> AI (desktop 2)\n"); gui_handle_ctrl(6); }
+                        else if(e.type == K_DESK_TGL){ serial_puts("[desk] toggle virtual desktop\n"); gui_handle_ctrl(7); }
                     }
+                }
+                // Idle poll throttle: when no keyboard/mouse data is pending the
+                // inner branch above does nothing, so without this the guest
+                // spins the vCPU at 100% polling port 0x64.  That starves
+                // QEMU's device emulation (LFB flush, disk, net) and the GUI
+                // compositor, which is what makes the desktop feel sluggish on
+                // a 512 MB VM.  Busy-wait ~1.5 ms on the TSC between idle polls
+                // so the host gets time slices.  (PIT timer IRQs are masked, so
+                // we cannot use msleep/hlt.)
+                if (st == 0) {
+                    uint32_t _t0, _t1;
+                    __asm__ __volatile__("rdtsc" : "=a"(_t0) : : "edx");
+                    do { __asm__ __volatile__("rdtsc" : "=a"(_t1) : : "edx"); }
+                    while ((uint32_t)(_t1 - _t0) < 3000000u);
                 }
             }
             // The desktop was torn down (Start menu -> Terminal, or a

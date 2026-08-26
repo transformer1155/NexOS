@@ -8,11 +8,11 @@ The disk layout (128 MB total):
   LBA 2-33:     GPT partition entry array
   LBA 34-2047:  Unused (gap before kernel64 LBA)
   LBA 2048:     kernel64.bin (raw; matches KERNEL64_LBA in kernel.cpp)
-  LBA 3328:     SFS image  (raw; matches SFS_LBA probed by Sfs::init)
+  LBA 3368:     SFS image  (raw; matches SFS_LBA probed by Sfs::init)
   LBA 8192+:    ESP partition (FAT16, contains BOOTX64.EFI)
 
 The raw LBAs deliberately mirror the BIOS image (kernel.cpp:750 KERNEL64_LBA
-2048, Sfs::init probes LBA 3328) so `switch64` and the SFS mount behave the
+2048, Sfs::init probes LBA 3368) so `switch64` and the SFS mount behave the
 same no matter which firmware booted us.
 
 HISTORY: kernel64.bin used to be written at LBA 400 with the ESP at LBA 1024.
@@ -26,7 +26,7 @@ Usage:
       <esp_img>  - FAT16 image containing BOOTX64.EFI at /EFI/BOOT/BOOTX64.EFI
       <output>   - Output GPT disk image
       <kernel64> - Optional: kernel64.bin to write at LBA 2048
-      <sfs>      - Optional: SFS image to write at LBA 3328
+      <sfs>      - Optional: SFS image to write at LBA 3368
 """
 
 import struct
@@ -43,7 +43,7 @@ PART_GUID = b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' 
 # Disk layout
 DISK_SECTORS = 262144  # 128 MB
 KERNEL64_LBA = 2048    # same LBA the 32-bit kernel's `switch64` reads from
-SFS_LBA = 3328         # same LBA Sfs::init probes
+SFS_LBA = 3368         # same LBA Sfs::init probes
 ESP_LBA_START = 8192   # ESP starts well past kernel64 + SFS (see HISTORY above)
 
 

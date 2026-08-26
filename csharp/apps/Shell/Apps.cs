@@ -247,11 +247,12 @@ namespace NexOS.Forms
         int editMode;  // 0 none, 1 rename, 2 new folder
         string editBuf;// current text in the inline editor
         string editOld;// original name (rename source)
+        bool editDirty;// true once the user has started editing the buffer
         int dblT;      // TickMs() of the last row click (double-click detect)
         int dblIdx;    // row index of that click
         static string clip;   // last "copied" path
 
-        public FileExplorerApp() { fs = 0; sel = -1; scroll = 0; editMode = 0; editBuf = ""; editOld = ""; dblT = -100000; dblIdx = -1; }
+        public FileExplorerApp() { fs = 0; sel = -1; scroll = 0; editMode = 0; editBuf = ""; editOld = ""; editDirty = false; dblT = -100000; dblIdx = -1; }
 
         public override string GetTitle() { return "File Explorer"; }
 
@@ -305,6 +306,9 @@ namespace NexOS.Forms
                 string shown = editBuf;
                 if ((Host.Ticks() / 30) % 2 == 0) shown = U.Cat(shown, "|");
                 Gfx.Text(bx + 6, inputY + 6, shown, C.Text);
+                // Explicit finish/cancel hint so the mode is never a mystery.
+                Gfx.Text(ax + 4, inputY + W.RowH - 4,
+                         editMode == 1 ? "Enter 确认 · Esc 取消" : "", C.TextSub);
             }
         }
 
@@ -333,7 +337,10 @@ namespace NexOS.Forms
 
         public override void OnClick(int mx, int my)
         {
-            // While editing, a click outside the box commits the change.
+            // While editing, a click inside the inline box is ignored (the
+            // editor handles key input). A click outside commits the edit and
+            // then keeps processing, so nav buttons still work while a rename
+            // is pending.
             if (editMode != 0)
             {
                 int enavW = 150, epad = 12;
@@ -346,8 +353,8 @@ namespace NexOS.Forms
                     int ri = sel - scroll;
                     if (ri >= 0 && ri < erows) inputY = ely + ri * W.RowH;
                 }
-                if (!U.In(mx, my, eax + 4, inputY, eaw - 8, W.RowH - 2)) CommitEdit();
-                return;
+                if (U.In(mx, my, eax + 4, inputY, eaw - 8, W.RowH - 2)) return;
+                CommitEdit();
             }
             int navW2 = 150, pad2 = 12;
             if (U.In(mx, my, 10, 14 + 40, navW2 - 20, 30)) { fs = 0; sel = -1; scroll = 0; Host.FileRefresh(); return; }
@@ -384,11 +391,15 @@ namespace NexOS.Forms
                 if (ch == 27) { CancelEdit(); return; }                 // Esc
                 if (ch == 10 || ch == 13) { CommitEdit(); return; }     // Enter
                 if (ch == 8) {                                           // Backspace
+                    if (!editDirty) { editBuf = ""; editDirty = true; return; }
                     int m = editBuf.Length;
                     if (m > 0) { string r = ""; for (int i = 0; i < m - 1; i++) r = U.Cat(r, Host.CharStr((int)editBuf[i])); editBuf = r; }
                     return;
                 }
-                if ((ch >= 0x20 && ch < 0x7F) || (ch >= 0x80 && ch <= 0xFFFF)) { editBuf = U.Cat(editBuf, Host.CharStr(ch)); return; }
+                if ((ch >= 0x20 && ch < 0x7F) || (ch >= 0x80 && ch <= 0xFFFF)) {
+                    if (!editDirty) { editBuf = Host.CharStr(ch); editDirty = true; return; }
+                    editBuf = U.Cat(editBuf, Host.CharStr(ch)); return;
+                }
                 return;
             }
             int n = Host.FileCount(fs);
@@ -426,6 +437,12 @@ namespace NexOS.Forms
             else if (code == Desktop.A_F_RENAME) BeginRename();
             else if (code == Desktop.A_F_PROPS)  ShowProps();
             else if (code == Desktop.A_F_MKDIR)  BeginNewFolder();
+            else if (code == Desktop.A_F_NEWFILE) BeginNewFile();
+            // Win11 cluster: Cut copies (no clipboard-move in the shell),
+            // Paste / Share are acknowledged but inert for now.
+            else if (code == Desktop.A_F_CUT)   CopySelected();
+            else if (code == Desktop.A_F_PASTE) Host.Log("[FILE] paste (no-op)");
+            else if (code == Desktop.A_F_SHARE) Host.Log("[FILE] share (no-op)");
         }
 
         // Default action for a double-click / "Open".  Windows Explorer
@@ -489,19 +506,102 @@ namespace NexOS.Forms
             if (sel < 0 || sel >= Host.FileCount(fs)) return;
             editOld = Host.FileName(fs, sel);
             editBuf = editOld;
-            editMode = 1;
+            editMode = 1; editDirty = false;
         }
-        void BeginNewFolder() { editBuf = ""; editMode = 2; }
+        // Create a new folder IMMEDIATELY with an auto-unique name, then
+        // drop into the inline rename editor so the user can rename it on
+        // the spot (Enter confirms / Esc keeps the auto name).  The editor
+        // follows the new folder's row instead of overlaying the first
+        // file, and a hint line spells out how to finish editing.
+        void BeginNewFolder()
+        {
+            string baseName = "New Folder";
+            string name = baseName;
+            int n = Host.FileCount(fs);
+            int k = 1;
+            while (true)
+            {
+                bool clash = false;
+                for (int i = 0; i < n; i++)
+                    if (Host.FileName(fs, i) == name) { clash = true; break; }
+                if (!clash) break;
+                name = U.Cat(baseName, " (", U.I(k), ")");
+                k++;
+                n = Host.FileCount(fs);
+            }
+            Host.FileMkDir(fs, name);
+            Host.FileRefresh();
+            // Locate the new folder so the rename editor tracks its row
+            // (and scrolls it into view) instead of sitting on row 0.
+            int nn = Host.FileCount(fs);
+            sel = -1;
+            for (int i = 0; i < nn; i++)
+                if (Host.FileName(fs, i) == name) { sel = i; break; }
+            if (sel >= 0)
+            {
+                int rows = (Gfx.Height() - 60) / W.RowH;
+                if (sel >= scroll + rows) scroll = sel - rows + 1;
+                if (sel < scroll) scroll = sel;
+            }
+            editOld = name;
+            editBuf = name;
+            editMode = 1; editDirty = false;   // rename mode
+        }
+        // Create a new EMPTY TEXT FILE immediately with an auto-unique name,
+        // then drop into the same inline rename editor so the user can name
+        // it on the spot (Enter confirms / Esc keeps the auto name).  Mirrors
+        // BeginNewFolder() but writes a file body ("" => empty file) via the
+        // writable MKFS volume (fs==0) -- SFS is read-only and never offers
+        // this action.
+        void BeginNewFile()
+        {
+            string baseName = "New File.txt";
+            string name = baseName;
+            int n = Host.FileCount(fs);
+            int k = 1;
+            while (true)
+            {
+                bool clash = false;
+                for (int i = 0; i < n; i++)
+                    if (Host.FileName(fs, i) == name) { clash = true; break; }
+                if (!clash) break;
+                name = U.Cat("New File (", U.I(k), ").txt");
+                k++;
+                n = Host.FileCount(fs);
+            }
+            // WriteText with an empty body creates the file on MKFS (fs==0).
+            Host.WriteText(fs, name, "");
+            Host.Log(U.Cat("[FILES] new file created: ", name));
+            Host.FileRefresh();
+            // Locate the new file so the rename editor tracks its row
+            // (and scrolls it into view) instead of sitting on row 0.
+            int nn = Host.FileCount(fs);
+            sel = -1;
+            for (int i = 0; i < nn; i++)
+                if (Host.FileName(fs, i) == name) { sel = i; break; }
+            if (sel >= 0)
+            {
+                int rows = (Gfx.Height() - 60) / W.RowH;
+                if (sel >= scroll + rows) scroll = sel - rows + 1;
+                if (sel < scroll) scroll = sel;
+            }
+            editOld = name;
+            editBuf = name;
+            editMode = 1; editDirty = false;   // rename mode
+        }
         void CommitEdit()
         {
             if (editMode == 1 && editBuf.Length > 0 && editBuf != editOld)
+            {
                 Host.FileRename(fs, editOld, editBuf);
+                Host.Log("[FILES] rename ok");
+            }
             else if (editMode == 2 && editBuf.Length > 0)
                 Host.FileMkDir(fs, editBuf);
             if (editMode != 0) Host.FileRefresh();
-            editMode = 0; editBuf = "";
+            editMode = 0; editBuf = ""; editDirty = false;
         }
-        void CancelEdit() { editMode = 0; editBuf = ""; }
+        void CancelEdit() { editMode = 0; editBuf = ""; editDirty = false; }
 
         void ShowProps()
         {
@@ -511,10 +611,10 @@ namespace NexOS.Forms
             string loc = fs == 0 ? "Local Disk (MKFS)" : "System (SFS)";
             string[] labs = new string[4];
             int[]    acts = new int[4];
-            labs[0] = U.Cat("Name:    ", nm); acts[0] = Desktop.A_F_PROPS;
-            labs[1] = U.Cat("Type:    ", ty); acts[1] = Desktop.A_F_PROPS;
-            labs[2] = U.Cat("Location:", loc); acts[2] = Desktop.A_F_PROPS;
-            labs[3] = "Close";                  acts[3] = Desktop.A_F_PROPS;
+            labs[0] = U.Cat("Name:    ", nm); acts[0] = -3;
+            labs[1] = U.Cat("Type:    ", ty); acts[1] = -3;
+            labs[2] = U.Cat("Location:", loc); acts[2] = -3;
+            labs[3] = "Close";                  acts[3] = -3;   // -3 = dismiss
             // Screen centre so the dialog is easy to find.
             Popup.Open(Desktop.OWNER_FILE, Gfx.Width() / 2 - 90, Gfx.Height() / 2 - 70, labs, acts, 4);
         }
@@ -533,7 +633,7 @@ namespace NexOS.Forms
     public class ControlPanelApp : App
     {
         int page;   // -1 tiles, 0 System, 1 Power, 2 Display, 3 Network,
-                    // 4 Storage, 5 Devices, 6 Personalize, 7 Taskbar
+                    // 4 Storage, 5 Devices, 6 Personalize, 7 Taskbar, 8 Plugins
         const int SW = 92, SGap = 12, SCols = 6;   // swatch grid
 
         public ControlPanelApp()
@@ -561,13 +661,15 @@ namespace NexOS.Forms
             if (page == 5) { Devices(pad, w); return; }
             if (page == 6) { Personalize(pad, w); return; }
             if (page == 7) { TaskbarPage(pad, w); return; }
+            if (page == 8) { Plugins(pad, w); return; }
+            if (page == 9) { AppsPage(pad, w); return; }
 
             W.Header(pad, pad, "All Control Panel Items");
             int gy = pad + 36, gx = pad;
             int cols = 3;
             int cw = (w - 2 * pad - (cols - 1) * 12) / cols;
             int chh = 84;
-            for (int i = 0; i < 6; i++)
+            for (int i = 0; i < 8; i++)
             {
                 int r = i / cols, c = i % cols;
                 int x = gx + c * (cw + 12);
@@ -580,17 +682,20 @@ namespace NexOS.Forms
         {
             if (i == 0) return "System"; if (i == 1) return "Display";
             if (i == 2) return "Network"; if (i == 3) return "Storage";
-            if (i == 4) return "Devices"; return "Power";
+            if (i == 4) return "Devices"; if (i == 5) return "Power";
+            if (i == 6) return "Plugins"; return "Apps";
         }
         static int TileLetter(int i)
         {
             if (i == 0) return 'S'; if (i == 1) return 'D'; if (i == 2) return 'N';
-            if (i == 3) return 'H'; if (i == 4) return 'V'; return 'P';
+            if (i == 3) return 'H'; if (i == 4) return 'V'; if (i == 5) return 'P';
+            if (i == 6) return 'G'; return 'A';
         }
         static uint TileColor(int i)
         {
             if (i == 0) return 0x0078D4; if (i == 1) return 0x8B5CF6; if (i == 2) return 0x10B981;
-            if (i == 3) return 0xF59E0B; if (i == 4) return 0x06B6D4; return 0xEF4444;
+            if (i == 3) return 0xF59E0B; if (i == 4) return 0x06B6D4; if (i == 5) return 0xEF4444;
+            if (i == 6) return 0x6D28D9; return 0x0EA5E9;
         }
 
         static void Tile(int x, int y, int w, int h, int letter, string name, uint col)
@@ -626,8 +731,8 @@ namespace NexOS.Forms
 
         void ApplyTheme()
         {
-            if (Theme.Dark != 0) { Theme.WallTop = 0x0B0B12u; Theme.WallBot = 0x1B1B2Au; }
-            else { Theme.WallTop = 0x05162Cu; Theme.WallBot = 0x0B4A83u; }
+            if (Theme.Dark != 0) { Theme.WallTop = 0x218FD9u; Theme.WallBot = 0x05216Bu; }
+            else { Theme.WallTop = 0x5B86C4u; Theme.WallBot = 0xCFE3FFu; }
         }
 
         // ---- Display ---------------------------------------------------
@@ -638,7 +743,7 @@ namespace NexOS.Forms
             int cy = pad + 60;
             W.Card(pad, cy, w - 2 * pad, 120);
             int lx = pad + 20, rx = w - pad - 20, y = cy + 18;
-            Kv(lx, rx, y, "Resolution", "1280 x 720"); y += 26;
+            Kv(lx, rx, y, "Resolution", U.Cat(U.I(Gfx.Width()), " x ", U.I(Gfx.Height()))); y += 26;
             Kv(lx, rx, y, "Scaling", "100%"); y += 26;
             Kv(lx, rx, y, "Theme", Theme.Dark != 0 ? "Dark" : "Light"); y += 26;
             Kv(lx, rx, y, "Refresh rate", "60 Hz");
@@ -647,7 +752,11 @@ namespace NexOS.Forms
             W.Button(pad, by, 200, 38, Theme.Dark != 0 ? "Dark mode: On" : "Dark mode: Off");
             W.Button(pad + 216, by, 220, 38, "Apply wallpaper preset");
 
-            int sy = by + 60;
+            int ly2 = by + 48;
+            W.Button(pad, ly2, 200, 38, Theme.DesktopMode == 0 ? "Layout: Clean" : "Layout: Rich");
+            Gfx.Text(pad + 216, ly2 + 12, Theme.DesktopMode == 0 ? "Win11 desktop" : "Portal launcher", C.TextSub);
+
+            int sy = by + 96;
             Gfx.Text(pad, sy, "Accent colour", C.Text);
             uint[] acc = Theme.Accents();
             for (int i = 0; i < 6; i++)
@@ -660,6 +769,21 @@ namespace NexOS.Forms
                 if (Theme.Accent == acc[i])
                     Gfx.DrawRound(x + 4, y2 + 4, SW - 8, 36, 6, C.Accent);
             }
+
+            int py = sy + 96;
+            Gfx.Text(pad, py, "Pixel / CRT monitor", C.Text);
+            W.Toggle(pad + 200, py + 16, 56, 30, Theme.PixelMode != 0 ? 1 : 0, 0x10);
+            W.Toggle(pad + 430, py + 16, 56, 30, Theme.PixelScan != 0 ? 1 : 0, 0x11);
+            int qy = py + 70;
+            Gfx.Text(pad, qy, "Pixel size", C.Text);
+            int pct = ((Theme.PixelScale - 1) * 100) / 3;   // 1..4 -> 0..100
+            W.Slider(pad + 200, qy + 14, 220, 16, pct, 0x12);
+            Gfx.Text(pad + 430, qy + 14, U.Cat(U.I(Theme.PixelScale), "x"), C.TextSub);
+
+            int ty = qy + 70;
+            Gfx.Text(pad, ty, "Terminal", C.Text);
+            W.Button(pad,      ty + 22, 200, 38, U.Cat("Font: ", U.I(Theme.TermCellH)));
+            W.Button(pad + 236, ty + 22, 220, 38, Theme.TermBgMode != 0 ? "Background: Tint" : "Background: Solid");
         }
 
         // ---- Network & Internet ---------------------------------------
@@ -668,11 +792,11 @@ namespace NexOS.Forms
             Gfx.Text(pad, pad, "< Back", C.Accent);
             W.Header(pad, pad + 26, "Network & Internet");
             int cy = pad + 60;
-            NetCard(pad, cy, w - 2 * pad, "Ethernet", Theme.ActiveNet == 0);
-            NetCard(pad, cy + 86, w - 2 * pad, "Wi-Fi", Theme.ActiveNet == 1);
+            NetCard(pad, cy, w - 2 * pad, "Ethernet", Theme.ActiveNet == 0, 0x20);
+            NetCard(pad, cy + 86, w - 2 * pad, "Wi-Fi", Theme.ActiveNet == 1, 0x21);
         }
 
-        void NetCard(int x, int y, int w, string name, bool active)
+        void NetCard(int x, int y, int w, string name, bool active, int id)
         {
             uint bg = W.Hot(x, y, w, 72) ? C.Hover : C.Card;
             Gfx.FillRound(x, y, w, 72, 8, bg);
@@ -681,9 +805,7 @@ namespace NexOS.Forms
             Gfx.Text(x + 60, y + 16, name, C.Text);
             Gfx.Text(x + 60, y + 40, active ? "Connected" : "Not connected",
                      active ? C.Good : C.TextSub);
-            if (active) Gfx.FillRound(x + w - 92, y + 22, 72, 28, 14, C.Accent);
-            else        Gfx.FillRound(x + w - 92, y + 22, 72, 28, 14, C.Border);
-            Gfx.TextCenter(x + w - 92, y + 28, 72, active ? "On" : "Off", C.Text);
+            W.Toggle(x + w - 92 + 8, y + 22, 56, 28, active ? 1 : 0, id);
         }
 
         // ---- Storage ---------------------------------------------------
@@ -783,7 +905,72 @@ namespace NexOS.Forms
 
             int sy = cy + 90;
             Gfx.Text(pad, sy, "Show labels", C.Text);
-            W.Button(pad, sy + 26, 170, 36, Theme.ShowLabels != 0 ? "On" : "Off");
+            W.Toggle(pad + 190, sy + 26, 56, 30, Theme.ShowLabels != 0 ? 1 : 0, 0x13);
+        }
+
+        // ---- Plugins (page 8) -------------------------------------------
+        // Reads the catalogue the kernel serialises to plugins.lst.  Each
+        // line is "id|name|state|loaded".  Clicking a row toggles load via
+        // the `plugin toggle <id>` shell command (which re-persists).
+        void Plugins(int pad, int w)
+        {
+            Gfx.Text(pad, pad, "< Back", C.Accent);
+            W.Header(pad, pad + 26, "Plugins");
+            Gfx.Text(pad, pad + 58, "Click a row to load / unload. Green = loaded.", C.TextSub);
+            int top = pad + 84, rowH = 30, gap = 4;
+            string data = Host.ReadText(0, "plugins.lst");
+            if (data == null || NexOS.Sys.StrLen(data) == 0) {
+                Gfx.Text(pad, top, "(no plugin data - run 'plugin persist')", C.TextSub);
+                return;
+            }
+            int n = NexOS.Sys.StrLen(data), i = 0, y = top;
+            while (i < n && y < Gfx.Height() - 10)
+            {
+                int start = i;
+                while (i < n && NexOS.Sys.StrCharAt(data, i) != '\n') i++;
+                string line = NexOS.Sys.StrSub(data, start, i - start);
+                i++; // consume newline
+                int ln = NexOS.Sys.StrLen(line);
+                int[] seps = new int[3]; int sc = 0;
+                for (int k = 0; k < ln; k++) if (NexOS.Sys.StrCharAt(line, k) == '|') seps[sc++] = k;
+                if (sc < 3) continue;
+                string name = NexOS.Sys.StrSub(line, seps[0] + 1, seps[1] - seps[0] - 1);
+                string stStr = NexOS.Sys.StrSub(line, seps[1] + 1, seps[2] - seps[1] - 1);
+                string ldStr = NexOS.Sys.StrSub(line, seps[2] + 1, ln - seps[2] - 1);
+                bool loaded = NexOS.Sys.StrEq(ldStr, "1");
+                uint col = loaded ? 0x107C10u : 0x6B7280u;
+                uint bg = U.In(Gfx.MouseX(), Gfx.MouseY(), pad, y, w - 2 * pad, rowH) ? C.Hover : C.Card;
+                Gfx.FillRound(pad, y, w - 2 * pad, rowH, 6, bg);
+                Gfx.Text(pad + 10, y + 8, name, C.Text);
+                string status = loaded ? "Loaded" : (NexOS.Sys.StrEq(stStr, "0") ? "Planned" : "Available");
+                Gfx.Text(pad + 10 + Gfx.Measure(name) + 12, y + 8, status, col);
+                Gfx.Text(w - pad - 230, y + 8, NexOS.Sys.StrSub(line, 0, seps[0]), C.TextSub);
+                y += rowH + gap;
+            }
+        }
+
+        // Return the plugin id of catalogue row `idx` (0-based), or "".
+        string PluginIdAt(int idx)
+        {
+            string data = Host.ReadText(0, "plugins.lst");
+            if (data == null || NexOS.Sys.StrLen(data) == 0) return "";
+            int n = NexOS.Sys.StrLen(data), i = 0, cur = 0;
+            while (i < n)
+            {
+                int start = i;
+                while (i < n && NexOS.Sys.StrCharAt(data, i) != '\n') i++;
+                string line = NexOS.Sys.StrSub(data, start, i - start);
+                i++;
+                if (cur == idx)
+                {
+                    int ln = NexOS.Sys.StrLen(line);
+                    int sep = 0;
+                    while (sep < ln && NexOS.Sys.StrCharAt(line, sep) != '|') sep++;
+                    return NexOS.Sys.StrSub(line, 0, sep);
+                }
+                cur++;
+            }
+            return "";
         }
 
         static void Kv(int lx, int rx, int y, string k, string v)
@@ -809,21 +996,41 @@ namespace NexOS.Forms
                 {
                     int cy = pad + 60, by = cy + 140;
                     if (U.In(mx, my, pad, by, 200, 38))
-                    { Theme.Dark = Theme.Dark != 0 ? 0 : 1; ApplyTheme(); return; }
-                    if (U.In(mx, my, pad + 216, by, 220, 38)) { ApplyTheme(); return; }
+                    { Theme.Dark = Theme.Dark != 0 ? 0 : 1; ApplyTheme(); Theme.Save(); return; }
+                    if (U.In(mx, my, pad + 216, by, 220, 38)) { ApplyTheme(); Theme.Save(); return; }
+                    if (U.In(mx, my, pad, by + 48, 200, 38))
+                    { Theme.DesktopMode = Theme.DesktopMode != 0 ? 0 : 1; Theme.Save(); return; }
                     uint[] acc = Theme.Accents();
                     for (int i = 0; i < 6; i++)
                     {
-                        int x = SwX(pad, i), y2 = by + 60 + 22;
-                        if (U.In(mx, my, x, y2, SW, 44)) { Theme.Accent = acc[i]; return; }
+                        int x = SwX(pad, i), y2 = by + 96 + 22;
+                        if (U.In(mx, my, x, y2, SW, 44)) { Theme.Accent = acc[i]; Theme.Save(); return; }
                     }
+                    int sy = by + 96, py = sy + 96;
+                    if (U.In(mx, my, pad + 200, py + 16, 56, 30))
+                    { Theme.PixelMode = Theme.PixelMode != 0 ? 0 : 1; Theme.ApplyPixel(); Theme.Save(); return; }
+                    if (U.In(mx, my, pad + 430, py + 16, 56, 30))
+                    { Theme.PixelScan = Theme.PixelScan != 0 ? 0 : 1; Theme.ApplyPixel(); Theme.Save(); return; }
+                    int qy = py + 70;
+                    if (U.In(mx, my, pad + 200, qy + 14, 220, 16))
+                    {
+                        int r = mx - (pad + 200);
+                        int p = (r * 100) / 220;
+                        Theme.PixelScale = 1 + (p * 3) / 100; if (Theme.PixelScale > 4) Theme.PixelScale = 4;
+                        Theme.ApplyPixel(); Theme.Save(); return;
+                    }
+                    int ty = qy + 70;
+                    if (U.In(mx, my, pad, ty + 22, 200, 38))
+                    { Theme.TermCellH = TerminalApp.ZoomStep(Theme.TermCellH, 1); Theme.Save(); return; }
+                    if (U.In(mx, my, pad + 236, ty + 22, 220, 38))
+                    { Theme.TermBgMode = Theme.TermBgMode != 0 ? 0 : 1; Theme.Save(); return; }
                     return;
                 }
                 else if (page == 3)   // Network
                 {
                     int cy = pad + 60;
-                    if (U.In(mx, my, pad, cy, w - 2 * pad, 72)) { Theme.ActiveNet = 0; return; }
-                    if (U.In(mx, my, pad, cy + 86, w - 2 * pad, 72)) { Theme.ActiveNet = 1; return; }
+                    if (U.In(mx, my, pad, cy, w - 2 * pad, 72)) { Theme.ActiveNet = 0; Theme.Save(); return; }
+                    if (U.In(mx, my, pad, cy + 86, w - 2 * pad, 72)) { Theme.ActiveNet = 1; Theme.Save(); return; }
                     return;
                 }
                 else if (page == 6)   // Personalize
@@ -833,33 +1040,61 @@ namespace NexOS.Forms
                     for (int i = 0; i < 6; i++)
                     {
                         int x = SwX(pad, i), y2 = cy + 22;
-                        if (U.In(mx, my, x, y2, SW, 52)) { Theme.WallTop = wt[i]; Theme.WallBot = wb[i]; return; }
+                        if (U.In(mx, my, x, y2, SW, 52)) { Theme.WallTop = wt[i]; Theme.WallBot = wb[i]; Theme.Save(); return; }
                     }
                     int ay = cy + 96;
                     uint[] acc = Theme.Accents();
                     for (int i = 0; i < 6; i++)
                     {
                         int x = SwX(pad, i), y2 = ay + 22;
-                        if (U.In(mx, my, x, y2, SW, 44)) { Theme.Accent = acc[i]; return; }
+                        if (U.In(mx, my, x, y2, SW, 44)) { Theme.Accent = acc[i]; Theme.Save(); return; }
                     }
                     return;
                 }
                 else if (page == 7)   // Taskbar
                 {
                     int cy = pad + 60;
-                    if (U.In(mx, my, pad, cy + 26, 170, 36)) { Theme.TaskbarLeft = Theme.TaskbarLeft != 0 ? 0 : 1; return; }
+                    if (U.In(mx, my, pad, cy + 26, 170, 36)) { Theme.TaskbarLeft = Theme.TaskbarLeft != 0 ? 0 : 1; Theme.Save(); return; }
                     int sy = cy + 90;
-                    if (U.In(mx, my, pad, sy + 26, 170, 36)) { Theme.ShowLabels = Theme.ShowLabels != 0 ? 0 : 1; return; }
+                    if (U.In(mx, my, pad + 190, sy + 26, 56, 30)) { Theme.ShowLabels = Theme.ShowLabels != 0 ? 0 : 1; Theme.Save(); return; }
+                    return;
+                }
+                else if (page == 8)   // Plugins
+                {
+                    if (U.In(mx, my, pad, pad, 80, 20)) { page = -1; return; }
+                    int top = pad + 84, rowH = 30, gap = 4;
+                    if (my < top) return;
+                    int idx = (my - top) / (rowH + gap);
+                    string id = PluginIdAt(idx);
+                    if (NexOS.Sys.StrLen(id) > 0) Host.Exec(U.Cat("plugin toggle ", id));
                     return;
                 }
                 return;   // System / Storage / Devices are display-only
+            }
+
+            // "Apps & features" page: install / uninstall each of the 12 apps.
+            if (page == 9)
+            {
+                int top = pad + 60, rowH = 44, btnW = 110, btnH = 30;
+                int btnX = w - pad - btnW;
+                for (int i = 0; i < 12; i++)
+                {
+                    int ry = top + i * rowH;
+                    if (U.In(mx, my, btnX, ry + (rowH - btnH) / 2, btnW, btnH))
+                    {
+                        int cur = Desktop.IsInstalled(i);
+                        Desktop.SetInstalled(i, cur == 0 ? 1 : 0);
+                        return;
+                    }
+                }
+                return;
             }
 
             // Tile grid.
             int gy = pad + 36, gx = pad, cols = 3;
             int cw = (w - 2 * pad - (cols - 1) * 12) / cols;
             int chh = 84;
-            for (int i = 0; i < 6; i++)
+            for (int i = 0; i < 7; i++)
             {
                 int r = i / cols, c = i % cols;
                 int x = gx + c * (cw + 12), y = gy + r * (chh + 12);
@@ -871,8 +1106,38 @@ namespace NexOS.Forms
                     else if (i == 3) page = 4;
                     else if (i == 4) page = 5;
                     else if (i == 5) page = 1;
+                    else if (i == 6) { Host.Exec("plugin persist"); page = 8; }
+                    else if (i == 7) page = 9;
                     return;
                 }
+            }
+        }
+
+        // ---- "Apps & features" page (page 9) ---------------------------
+        static void AppsPage(int pad, int w)
+        {
+            int top = pad + 60, rowH = 44, btnW = 110, btnH = 30;
+            int btnX = w - pad - btnW;
+            int listW = w - 2 * pad;
+            Gfx.Text(pad, top - 36, "Apps & features", C.Text);
+            Gfx.Text(pad, top - 16, "Install or uninstall the built-in applications.", C.TextSub);
+            for (int i = 0; i < 12; i++)
+            {
+                int ry = top + i * rowH;
+                if (i > 0) Gfx.DrawLine(pad, ry, pad + listW, ry, C.Border);
+                uint col = Desktop.AppColor(i); int let = Desktop.AppLetter(i);
+                if (Gfx.HasImage(Tex.Icon + i) != 0)
+                    Gfx.Image(Tex.Icon + i, pad, ry + (rowH - 18) / 2, 18, 18);
+                else
+                    Gfx.Icon(pad, ry + (rowH - 18) / 2, 18, (uint)col, let, 0xFFFFFF);
+                Gfx.Text(pad + 26, ry + 4, Desktop.KindName(i), C.Text);
+                Gfx.Text(pad + 26, ry + 22, U.Cat("v", Desktop.AppVersion(i), "  ", Desktop.AppDesc(i)), C.TextSub);
+                int by = ry + (rowH - btnH) / 2;
+                int inst = Desktop.IsInstalled(i);
+                uint bcol = inst != 0 ? 0xB04848u : C.Accent;
+                string label = inst != 0 ? "Uninstall" : "Install";
+                Gfx.FillRound(btnX, by, btnW, btnH, 6, bcol);
+                Gfx.Text(btnX + (btnW - Gfx.Measure(label)) / 2, by + 7, label, 0xFFFFFF);
             }
         }
     }
@@ -880,98 +1145,790 @@ namespace NexOS.Forms
     // =================================================================
     //  Terminal
     // =================================================================
+    // =================================================================
+    //  Terminal  --  GNOME Terminal compatible emulator.
+    //  One TerminalApp window hosts N tabs; each tab (Term) owns its own
+    //  scrollback, input line, history and selection.
+    // =================================================================
     public class TerminalApp : App
     {
-        TBox t;           // command line editor (caret + selection + undo)
-        string lastCmd;   // last command echoed
-        string output;    // last command's output (replaced, never grown)
+        const int SCROLL_MAX = 2000, HIST_MAX = 200, TAB_MAX = 8;
+        const int GRIDCAP = 65536;   // cell grid cap (MiniCLR heap-safe: 256KB/array)
+        const int TAB_H = 26, PAD = 8, ROWCAP = 16000;
+        const int BG = 0x300A24, FG = 0xFFFFFF, SEL = 0x4A2E5A;
+        const int URLC = 0x55AAFF;   // link-blue for URL hover highlight
+        const int ESC = 27;
+
+        // One session == one tab.
+        public class Term
+        {
+            public string[] lines = new string[SCROLL_MAX];
+            public int head = 0, count = 0;   // ring buffer of logical lines
+            public int view = 0;               // scrollback offset from bottom
+            public string input = "";
+            public int caret = 0;
+            public bool hasSel = false;
+            public int selLineA = -1, selCharA = -1, selLineB = -1, selCharB = -1;
+            public string[] hist = new string[HIST_MAX];
+            public int histN = 0, histPos = 0;
+            public bool search = false;
+            public string sbuf = "";
+            public string title = "root@nexos";
+            public bool dragging = false;
+        }
+
+        // Parsed line: displayed chars (ANSI stripped) + per-char fg/bg
+        // (0xRRGGBB, -1 = default).  Stored as a char[] so OnPaint can
+        // render without building a string per frame (the O(n^2) Cat loop
+        // warned about in U.Sub would fault the MiniCLR bump heap).
+        public class PR
+        {
+            public char[] ch;
+            public int len;
+            public int[] fg;
+            public int[] bg;
+            public int[] url;   // per-char URL flag (0/1), for hover highlight
+        }
+
+        int[] PAL;                  // 16-colour Ubuntu GNOME palette
+        int active = 0;
+        Term[] tabs;
+        int tabN = 1;
+
+        // Layout caches (recomputed every frame for the active tab).
+        int cols, rows, cellW, cellH, contentX, contentY, contentW, contentH;
+        int[] gLine, gChar; int gN;
+        int[] rowLine, rowStart, rowEnd; int rowN;
+        PR[] prs; int firstAbsRow, visRows, lastTotalRows;
+
+        int hoverX = -1, hoverY = -1;
+        int hoverLine = -1, hoverChar = -1;
+        int lastDownMs = 0, lastDownCell = -1, clickCount = 0;
+        string user = "root", host = "nexos", cwd = "~";
 
         public TerminalApp()
         {
-            t = new TBox();
-            lastCmd = "";
-            output = "NexOS terminal. Type a command and press Enter.\nTry: help, ver, mem, ls";
+            PAL = new int[] { 0x2E3436,0xCC0000,0x4E9A06,0xC4A000,0x3465A4,0x75507B,
+                              0x06989A,0xD3D7CF,0x555753,0xEF2929,0x8AE234,0xFCE94F,
+                              0x729FCF,0xAD7FA8,0x34E2E2,0xEEEEEC };
+            tabs = new Term[TAB_MAX];
+            tabs[0] = new Term();
+            tabN = 1; active = 0;
+            gLine = new int[GRIDCAP]; gChar = new int[GRIDCAP];
+            AppendLine(tabs[0],
+                U.Cat("NexOS Terminal - GNOME Terminal compatible.\n",
+                      "Type `help`.  Ctrl+Shift+T new tab, Ctrl+Shift+C copy,\n",
+                      "Ctrl+Shift+V paste, middle-click paste, wheel = scrollback."));
         }
 
-        public override string GetTitle() { return "Terminal"; }
+        Term T() { return tabs[active]; }
 
-        public override void OnPaint()
+        // Test / introspection helpers (used by the WinHost --termtest
+        // harness).  They expose otherwise-private per-tab state without
+        // changing any runtime behaviour.
+        public Term ActiveTerm() { return T(); }
+        public string SelText() { return GetSelText(T()); }
+        public int TabCount() { return tabN; }
+        public string UserHost() { return U.Cat(user, "@", host); }
+        // Test-only helpers (WinHost --termtest harness): inject a logical
+        // line (e.g. ANSI-coloured) and read the most recently appended one.
+        public void TestAppend(string s) { AppendLine(T(), s); }
+        public string LastLine()
         {
-            int w = Gfx.Width(), h = Gfx.Height();
-            Gfx.FillRect(0, 0, w, h, 0x0C0C0C);
-            int pad = 12, y = pad;
-
-            if (lastCmd != "")
-            {
-                Gfx.Text(pad, y, U.Cat("C:\\> ", lastCmd), 0x4EC9B0);
-                y += 22;
-            }
-            // Output, wrapped crudely per source newline by the host font.
-            DrawLines(pad, y, output, 0xD4D4D4, h - 40);
-
-            // Prompt line pinned to the bottom.
-            int py = h - 26;
-            Gfx.FillRect(0, py - 4, w, 30, 0x161616);
-            string prompt = "C:\\> ";
-            string before = Slice(t.text, 0, t.cursor);
-            Gfx.Text(pad, py, U.Cat(prompt, t.text), 0xFFFFFF);
-            if ((Host.Ticks() / 30) % 2 == 0) {
-                int cx = pad + Gfx.Measure(U.Cat(prompt, before));
-                Gfx.FillRect(cx, py, 2, 18, 0xFFFFFF);
-            }
+            Term t = T(); int b = t.head - 1; if (b < 0) b += SCROLL_MAX;
+            return t.lines[b];
         }
 
-        // Draw a string, breaking at '\n', clipped to maxY.
-        static void DrawLines(int x, int y, string s, uint col, int maxY)
+        public override string GetTitle() { return U.Cat(user, "@", host, ":", cwd, "$", ""); }
+
+        // ---- scrollback ----------------------------------------------
+        string RingAt(Term t, int idx)
         {
-            int n = s.Length;
-            int start = 0;
+            int b = t.head - t.count; if (b < 0) b += SCROLL_MAX;
+            return t.lines[(b + idx) % SCROLL_MAX];
+        }
+        void AppendLine(Term t, string s)
+        {
+            if (s == null) return;
+            int n = s.Length, start = 0;
             for (int i = 0; i <= n; i++)
             {
                 if (i == n || s[i] == '\n')
                 {
-                    string line = Slice(s, start, i);
-                    if (y < maxY) Gfx.Text(x, y, line, col);
-                    y += 20;
+                    t.lines[t.head] = U.Sub(s, start, i - start);
+                    t.head = (t.head + 1) % SCROLL_MAX;
+                    if (t.count < SCROLL_MAX) t.count++;
                     start = i + 1;
                 }
             }
+            if (t.view > 0) t.view = 0;   // stick to bottom on new output
+        }
+        void ClearScreen(Term t) { t.count = 0; t.head = 0; t.view = 0; }
+
+        // ---- prompt / title ------------------------------------------
+        string Pad2(int v) { string s = U.I(v); if (s.Length < 2) s = U.Cat("0", s); return s; }
+        string PS1()
+        {
+            string ts = U.Cat("[", U.I(Host.Hour()), ":", Pad2(Host.Minute()), ":",
+                              Pad2(Host.Second()), "] ");
+            return U.Cat(ts, user, "@", host, ":", cwd, "$ ");
         }
 
-        // Substring is missing from the mini BCL; build one glyph by glyph.
-        static string Slice(string s, int a, int b)
+        // ---- ANSI / SGR colour ---------------------------------------
+        int Cube(int n)
+        {
+            int v = n - 16, r = v / 36, g = (v / 6) % 6, b = v % 6;
+            return (CubeC(r) << 16) | (CubeC(g) << 8) | CubeC(b);
+        }
+        int CubeC(int x) { return x == 0 ? 0 : 55 + x * 40; }
+        int Gray(int n) { int v = 8 + (n - 232) * 10; return (v << 16) | (v << 8) | v; }
+
+        PR ParseLine(string s)
+        {
+            PR pr = new PR();
+            int n = (s == null) ? 0 : s.Length;
+            char[] ch = new char[n + 1];
+            int[] fg = new int[n + 1], bg = new int[n + 1];
+            int[] url = new int[n + 1];
+            int curFg = -1, curBg = -1, k = 0, i = 0;
+            bool inUrl = false;
+            while (i < n)
+            {
+                char c = s[i];
+                if (c == (char)ESC && i + 1 < n && s[i + 1] == '[')
+                {
+                    int j = i + 2;
+                    int[] p = new int[16]; int pn = 0, cur = 0; bool any = false;
+                    while (j < n && s[j] != 'm' && s[j] != (char)ESC)
+                    {
+                        if (s[j] >= '0' && s[j] <= '9') { cur = cur * 10 + (s[j] - '0'); any = true; }
+                        else if (s[j] == ';') { if (pn < 16) p[pn] = any ? cur : 0; pn++; cur = 0; any = false; }
+                        j++;
+                    }
+                    if (pn < 16 && any) p[pn++] = cur;
+                    else if (!any && pn == 0) { p[0] = 0; pn = 1; }
+                    int kk = 0;
+                    while (kk < pn)
+                    {
+                        int code = p[kk];
+                        if (code == 0) { curFg = -1; curBg = -1; }
+                        else if (code >= 30 && code <= 37) curFg = PAL[code - 30];
+                        else if (code >= 90 && code <= 97) curFg = PAL[code - 90 + 8];
+                        else if (code >= 40 && code <= 47) curBg = PAL[code - 40];
+                        else if (code >= 100 && code <= 107) curBg = PAL[code - 100 + 8];
+                        else if (code == 38 || code == 48)
+                        {
+                            int isFg = (code == 38) ? 1 : 0;
+                            if (kk + 2 < pn && p[kk + 1] == 5)
+                            {
+                                int v = p[kk + 2];
+                                int col = (v < 16) ? PAL[v] : (v < 232 ? Cube(v) : Gray(v));
+                                if (isFg != 0) curFg = col; else curBg = col; kk += 2;
+                            }
+                            else if (kk + 4 < pn && p[kk + 1] == 2)
+                            {
+                                int r = p[kk + 2], g = p[kk + 3], b = p[kk + 4];
+                                int col = (r << 16) | (g << 8) | b;
+                                if (isFg != 0) curFg = col; else curBg = col; kk += 4;
+                            }
+                        }
+                        kk++;
+                    }
+                    i = (j < n && s[j] == 'm') ? j + 1 : j;
+                }
+                else if (c == '\r' || c == '\n') i++;
+                else
+                {
+                    bool isU = IsUrlChar(c);
+                    if (inUrl)
+                    {
+                        if (isU) { ch[k] = c; fg[k] = curFg; bg[k] = curBg; url[k] = 1; k++; }
+                        else { inUrl = false; ch[k] = c; fg[k] = curFg; bg[k] = curBg; k++; }
+                    }
+                    else
+                    {
+                        int sl = UrlSchemeLen(s, i, n);
+                        if (sl > 0) { inUrl = true; ch[k] = c; fg[k] = curFg; bg[k] = curBg; url[k] = 1; k++; }
+                        else { ch[k] = c; fg[k] = curFg; bg[k] = curBg; k++; }
+                    }
+                    i++;
+                }
+            }
+            pr.ch = ch; pr.fg = fg; pr.bg = bg; pr.url = url; pr.len = k;
+            return pr;
+        }
+
+        // ---- mini-BCL string helpers (MiniCLR has no Substring/IndexOf/etc) ----
+        static bool IsWordChar(char c)
+        {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '_' || c == '-' ||
+                   c == '/' || c == '.' || c == ':';
+        }
+        // ---- URL detection (MiniCLR-safe: no Substring/IndexOf) ----------
+        static bool IsUrlChar(char c)
+        {
+            if (c >= 'a' && c <= 'z') return true;
+            if (c >= 'A' && c <= 'Z') return true;
+            if (c >= '0' && c <= '9') return true;
+            if (c == '.' || c == '-' || c == '_' || c == ':' || c == '/' ||
+                c == '?' || c == '#' || c == '&' || c == '=' || c == '+' ||
+                c == '%' || c == '@' || c == '~') return true;
+            return false;
+        }
+        // Returns the length of a URL scheme prefix at s[i..] (http(s)://,
+        // ftp://, www.), else 0.  Bounds-checked so it is safe to call with
+        // any i.
+        static int UrlSchemeLen(string s, int i, int n)
+        {
+            if (i + 6 < n &&
+                s[i] == 'h' && s[i + 1] == 't' && s[i + 2] == 't' && s[i + 3] == 'p' &&
+                s[i + 4] == ':' && s[i + 5] == '/' && s[i + 6] == '/') return 7;
+            if (i + 7 < n &&
+                s[i] == 'h' && s[i + 1] == 't' && s[i + 2] == 't' && s[i + 3] == 'p' &&
+                s[i + 4] == 's' && s[i + 5] == ':' && s[i + 6] == '/' && s[i + 7] == '/') return 8;
+            if (i + 5 < n &&
+                s[i] == 'f' && s[i + 1] == 't' && s[i + 2] == 'p' &&
+                s[i + 3] == ':' && s[i + 4] == '/' && s[i + 5] == '/') return 6;
+            if (i + 3 < n &&
+                s[i] == 'w' && s[i + 1] == 'w' && s[i + 2] == 'w' && s[i + 3] == '.') return 4;
+            return 0;
+        }
+        static string Trim(string s)
+        {
+            int a = 0, b = s.Length;
+            while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n')) a++;
+            while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n')) b--;
+            if (b < a) b = a;
+            return U.Sub(s, a, b - a);
+        }
+        static string Lower(string s)
         {
             string r = "";
-            for (int i = a; i < b; i++) r = U.Cat(r, Host.CharStr(s[i]));
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+                r = U.Cat(r, Host.CharStr((int)c));
+            }
             return r;
         }
-
-        public override void OnKey(int ch)
+        static int IndexOf(string s, string sub)
         {
-            if (ch == -2) { Run(); return; }   // enter
-            t.Key(ch);                          // backspace / ctrl combos / typing
+            int n = s.Length, m = sub.Length;
+            if (m == 0) return 0;
+            for (int i = 0; i + m <= n; i++)
+            {
+                bool ok = true;
+                for (int j = 0; j < m; j++) { if (s[i + j] != sub[j]) { ok = false; break; } }
+                if (ok) return i;
+            }
+            return -1;
+        }
+        static bool StartsWith(string s, string p)
+        {
+            int m = p.Length;
+            if (s.Length < m) return false;
+            for (int i = 0; i < m; i++) if (s[i] != p[i]) return false;
+            return true;
+        }
+        // Insert / delete on a string (used for the input line editing).
+        static string InsStr(string s, int pos, string ins)
+        {
+            return U.Cat(U.Sub(s, 0, pos), U.Cat(ins, U.Sub(s, pos, s.Length - pos)));
+        }
+        static string DelStr(string s, int pos, int len)
+        {
+            return U.Cat(U.Sub(s, 0, pos), U.Sub(s, pos + len, s.Length - pos - len));
         }
 
-        static string Chop(string s)
+        // ---- layout --------------------------------------------------
+        void ComputeColsRows()
         {
-            int n = s.Length;
-            if (n <= 0) return "";
+            int W = Gfx.Width(), H = Gfx.Height();
+            contentX = PAD; contentY = TAB_H + PAD;
+            contentW = W - contentX * 2 - 8;
+            contentH = H - contentY - PAD;
+            if (contentW < 40) contentW = 40;
+            if (contentH < 40) contentH = 40;
+            int ch2 = Theme.TermCellH; if (ch2 < 12) ch2 = 12; if (ch2 > 28) ch2 = 28;
+            cellH = ch2;
+            int w0 = Gfx.Measure("0"); if (w0 < 4) w0 = 8; if (w0 > 20) w0 = 10;
+            cellW = (w0 * ch2) / 18; if (cellW < 4) cellW = 4;
+            rows = contentH / cellH; cols = contentW / cellW;
+            if (rows < 1) rows = 1; if (cols < 1) cols = 1;
+        }
+        void ComputeLayout(Term t)
+        {
+            int ndoc = t.count + 1;
+            prs = new PR[ndoc];
+            rowLine = new int[ROWCAP]; rowStart = new int[ROWCAP]; rowEnd = new int[ROWCAP]; rowN = 0;
+            for (int idx = 0; idx < ndoc; idx++)
+            {
+                string s = (idx < t.count) ? RingAt(t, idx) : U.Cat(PS1(), t.input);
+                PR pr = ParseLine(s); prs[idx] = pr;
+                int L = pr.len, pos = 0;
+                while (pos < L && rowN < ROWCAP - 1)
+                {
+                    int take = (L - pos < cols) ? (L - pos) : cols;
+                    rowLine[rowN] = idx; rowStart[rowN] = pos; rowEnd[rowN] = pos + take; rowN++;
+                    pos += take;
+                }
+            }
+            lastTotalRows = rowN;
+            visRows = rows;
+            firstAbsRow = rowN - visRows - t.view;
+            if (firstAbsRow < 0) firstAbsRow = 0;
+            for (int vr = 0; vr < rows; vr++)
+            {
+                int absRow = firstAbsRow + vr, b = vr * cols;
+                if (absRow < 0 || absRow >= rowN) { for (int c = 0; c < cols && b + c < GRIDCAP; c++) gLine[b + c] = -1; continue; }
+                for (int c = 0; c < cols && b + c < GRIDCAP; c++)
+                {
+                    int ca = rowStart[absRow] + c;
+                    if (ca < rowEnd[absRow]) { gLine[b + c] = rowLine[absRow]; gChar[b + c] = ca; }
+                    else gLine[b + c] = -1;
+                }
+            }
+            gN = rows * cols; if (gN > GRIDCAP) gN = GRIDCAP;
+        }
+        int[] CellAt(int mx, int my)
+        {
+            if (my < contentY || my >= contentY + contentH || mx < contentX || mx >= contentX + contentW)
+                return new int[] { -1, -1 };
+            int col = (mx - contentX) / cellW, vr = (my - contentY) / cellH;
+            if (vr < 0 || vr >= rows) return new int[] { -1, -1 };
+            int idx = vr * cols + col; if (idx >= gN) return new int[] { -1, -1 };
+            int line = gLine[idx]; if (line < 0) return new int[] { -1, -1 };
+            return new int[] { line, gChar[idx] };
+        }
+        bool CellSelected(Term t, int line, int chr)
+        {
+            if (!t.hasSel) return false;
+            long ka = (long)line * 1000000L + (long)chr;
+            long a = (long)t.selLineA * 1000000L + (long)t.selCharA;
+            long b = (long)t.selLineB * 1000000L + (long)t.selCharB;
+            if (a > b) { long tmp = a; a = b; b = tmp; }
+            return ka >= a && ka <= b;
+        }
+        int LineLen(Term t, int line)
+        {
+            string s = (line < t.count) ? RingAt(t, line) : U.Cat(PS1(), t.input);
+            return ParseLine(s).len;
+        }
+        int[] WordBounds(Term t, int line, int chr)
+        {
+            string s = (line < t.count) ? RingAt(t, line) : U.Cat(PS1(), t.input);
+            PR pr = ParseLine(s);
+            int start = WordStartC(pr.ch, pr.len, chr), end = WordEndC(pr.ch, pr.len, chr);
+            return new int[] { start, end };
+        }
+        bool IsWord(char c) { return IsWordChar(c); }
+        int WordStart(string s, int pos)
+        {
+            int i = pos; while (i > 0 && !IsWord(s[i - 1])) i--;
+            while (i > 0 && IsWord(s[i - 1])) i--; return i;
+        }
+        int WordEnd(string s, int pos)
+        {
+            int i = pos, n = s.Length;
+            while (i < n && !IsWord(s[i])) i++;
+            while (i < n && IsWord(s[i])) i++; return i;
+        }
+        int WordStartC(char[] s, int n, int pos)
+        {
+            int i = pos; while (i > 0 && !IsWordChar(s[i - 1])) i--;
+            while (i > 0 && IsWordChar(s[i - 1])) i--; return i;
+        }
+        int WordEndC(char[] s, int n, int pos)
+        {
+            int i = pos;
+            while (i < n && !IsWordChar(s[i])) i++;
+            while (i < n && IsWordChar(s[i])) i++; return i;
+        }
+        string GetSelText(Term t)
+        {
+            if (!t.hasSel) return "";
+            if (t.selLineA > t.selLineB || (t.selLineA == t.selLineB && t.selCharA > t.selCharB))
+            {
+                int tl = t.selLineA; t.selLineA = t.selLineB; t.selLineB = tl;
+                int tc = t.selCharA; t.selCharA = t.selCharB; t.selCharB = tc;
+            }
             string r = "";
-            for (int i = 0; i < n - 1; i++) r = U.Cat(r, Host.CharStr(s[i]));
+            for (int L = t.selLineA; L <= t.selLineB; L++)
+            {
+                PR pr = (L < t.count) ? ParseLine(RingAt(t, L)) : ParseLine(U.Cat(PS1(), t.input));
+                int s0 = (L == t.selLineA) ? t.selCharA : 0;
+                int e0 = (L == t.selLineB) ? t.selCharB : pr.len;
+                if (e0 > s0) { for (int k2 = s0; k2 < e0; k2++) r = U.Cat(r, Host.CharStr((int)pr.ch[k2])); }
+                if (L < t.selLineB) r = U.Cat(r, "\n");
+            }
             return r;
         }
+        int MaxView(Term t) { return (lastTotalRows > rows) ? (lastTotalRows - rows) : 0; }
 
+        // Wallpaper hue at a given *screen* Y, blended 55% toward the Ubuntu
+        // terminal purple.  Used when TermBgMode == 1 to make the terminal
+        // background echo the live desktop behind it (pure-C# transparency
+        // approximation -- the framebuffer has no alpha channel).
+        int WallColorAt(int sy)
+        {
+            int H = Gfx.ScreenH(); if (H < 1) H = 1;
+            int t = (sy * 100) / H; if (t < 0) t = 0; if (t > 100) t = 100;
+            int a = (int)Theme.WallTop, b = (int)Theme.WallBot;
+            int ar = (a >> 16) & 0xFF, ag = (a >> 8) & 0xFF, ab = a & 0xFF;
+            int br = (b >> 16) & 0xFF, bg2 = (b >> 8) & 0xFF, bb = b & 0xFF;
+            int r = (ar * (100 - t) + br * t) / 100;
+            int g = (ag * (100 - t) + bg2 * t) / 100;
+            int bl = (ab * (100 - t) + bb * t) / 100;
+            int ur = (BG >> 16) & 0xFF, ug = (BG >> 8) & 0xFF, ub = BG & 0xFF;
+            r = (r * 45 + ur * 55) / 100;
+            g = (g * 45 + ug * 55) / 100;
+            bl = (bl * 45 + ub * 55) / 100;
+            return (r << 16) | (g << 8) | bl;
+        }
+
+        // Cycle the terminal cell size through a discrete set.  dir +1 = zoom
+        // in, -1 = zoom out.  Pure int math (no BCL arrays-of-literals needed).
+        public static int ZoomStep(int cur, int dir)
+        {
+            int[] steps = new int[6];
+            steps[0] = 14; steps[1] = 16; steps[2] = 18; steps[3] = 20; steps[4] = 22; steps[5] = 24;
+            int idx = 2;
+            for (int i = 0; i < 6; i++) if (steps[i] == cur) { idx = i; break; }
+            idx += dir; if (idx < 0) idx = 0; if (idx > 5) idx = 5;
+            return steps[idx];
+        }
+
+        // ---- tabs ----------------------------------------------------
+        void NewTab()
+        {
+            if (tabN >= TAB_MAX) return;
+            tabs[tabN] = new Term(); tabN++; active = tabN - 1;
+        }
+        void CloseTab()
+        {
+            if (tabN <= 1) { Shell.Close(this.id); return; }
+            for (int i = active; i < tabN - 1; i++) tabs[i] = tabs[i + 1];
+            tabN--; if (active >= tabN) active = tabN - 1;
+        }
+
+        // ---- commands -------------------------------------------------
         void Run()
         {
-            lastCmd = t.text;
-            string cmd = t.text;
-            t.text = ""; t.cursor = 0; t.selA = t.selB = 0;
-            if (cmd == "") { return; }
-            if (cmd == "cls" || cmd == "clear") { output = ""; return; }
-            output = Host.Exec(cmd);
+            Term t = T();
+            string cmd = t.input;
+            t.input = ""; t.caret = 0; t.hasSel = false; t.search = false; t.sbuf = "";
+            t.histPos = t.histN;
+            AppendLine(t, U.Cat(PS1(), cmd));
+            if (Trim(cmd).Length == 0) return;
+            if (t.histN == 0 || t.hist[t.histN - 1] != cmd)
+            {
+                if (t.histN < HIST_MAX) { t.hist[t.histN] = cmd; t.histN++; }
+            }
+            t.histPos = t.histN;
+            if (cmd == "exit" || cmd == "logout") { CloseTab(); return; }
+            if (cmd == "clear" || cmd == "cls") { ClearScreen(t); return; }
+            string outp = RunBuiltin(t, cmd);
+            if (outp == null) outp = Host.Exec(cmd);
+            if (outp != null && outp.Length > 0) AppendLine(t, outp);
+        }
+        string RunBuiltin(Term t, string cmd)
+        {
+            string c = Trim(cmd), low = Lower(c);
+            if (low == "help") return "NexOS shell - builtins: help ver mem date time ls cat echo clear pwd whoami history uname exit";
+            if (low == "ver") return "NexOS 1.0 / .NET";
+            if (low == "mem") return U.Cat("total ", U.I(Host.MemTotalKb() / 1024), " MB");
+            if (low == "date" || low == "time") return U.Cat(U.I(Host.Hour()), ":", Pad2(Host.Minute()), ":", Pad2(Host.Second()));
+            if (low == "whoami") return user;
+            if (low == "pwd") return U.Cat("/home/", user);
+            if (low == "uname") return "NexOS";
+            if (low == "history")
+            {
+                string r = "";
+                for (int i = 0; i < t.histN; i++) r = U.Cat(r, U.I(i + 1), "  ", t.hist[i], "\n");
+                return r;
+            }
+            if (low == "ls")
+            {
+                string r = "";
+                for (int fs = 0; fs < 2; fs++)
+                {
+                    int n = Host.FileCount(fs);
+                    for (int i = 0; i < n && i < 40; i++) r = U.Cat(r, Host.FileName(fs, i), " ");
+                }
+                return r.Length > 0 ? r : "(empty)";
+            }
+            if (StartsWith(low, "cat "))
+            {
+                string f = Trim(U.Sub(c, 4, c.Length - 4));
+                string b = Host.ReadText(1, f); if (b == null || b.Length == 0) b = Host.ReadText(0, f);
+                if (b == null || b.Length == 0) return U.Cat("cat: ", f, ": No such file");
+                return b;
+            }
+            if (StartsWith(low, "echo ")) return U.Sub(c, 5, c.Length - 5);
+            return null;
         }
 
+        // ---- keyboard ------------------------------------------------
+        public override void OnKey(int ch)
+        {
+            Term t = T();
+            if (t.search) { KeySearch(t, ch); return; }
+            if (ch >= 32) { t.input = InsStr(t.input, t.caret, Host.CharStr((char)ch)); t.caret++; t.hasSel = false; return; }
+            switch (ch)
+            {
+                case VK.Enter: Run(); break;
+                case VK.Back: if (t.caret > 0) { t.input = DelStr(t.input, t.caret - 1, 1); t.caret--; } break;
+                case VK.Delete: if (t.caret < t.input.Length) t.input = DelStr(t.input, t.caret, 1); break;
+                case VK.CtrlC:
+                    if (t.hasSel) Host.SetClipboard(GetSelText(t));
+                    else { AppendLine(t, U.Cat(PS1(), "^C")); t.input = ""; t.caret = 0; t.hasSel = false; }
+                    break;
+                case VK.CtrlV:
+                case VK.CsV:
+                    { string cb = Host.GetClipboard(); if (cb != null && cb.Length > 0) { t.input = InsStr(t.input, t.caret, cb); t.caret += cb.Length; } }
+                    break;
+                case VK.CsC: if (t.hasSel) Host.SetClipboard(GetSelText(t)); break;
+                case VK.CsT: NewTab(); break;          // Ctrl+Shift+T new tab
+                case VK.CsW: CloseTab(); break;        // Ctrl+Shift+W close tab
+                case VK.CtrlA: case VK.HomeK: t.caret = 0; break;
+                case VK.CtrlE: case VK.EndK: t.caret = t.input.Length; break;
+                case VK.CtrlU: t.input = U.Sub(t.input, t.caret, t.input.Length - t.caret); t.caret = 0; break;
+                case VK.CtrlK: t.input = U.Sub(t.input, 0, t.caret); break;
+                case VK.CtrlW: { int s = WordStart(t.input, t.caret); t.input = DelStr(t.input, s, t.caret - s); t.caret = s; } break;
+                case VK.CtrlL: ClearScreen(t); break;
+                case VK.CtrlD: if (t.input.Length == 0) CloseTab(); break;
+                case VK.CtrlZ: AppendLine(t, "[1]+  Stopped"); break;
+                case VK.CtrlR: t.search = true; t.sbuf = ""; break;
+                case VK.AltF: t.caret = WordEnd(t.input, t.caret); break;
+                case VK.AltB: t.caret = WordStart(t.input, t.caret); break;
+                case VK.Tab: Complete(t); break;
+                case VK.Up: HistUp(t); break;
+                case VK.Down: HistDown(t); break;
+                case VK.Left: if (t.caret > 0) t.caret--; break;
+                case VK.Right: if (t.caret < t.input.Length) t.caret++; break;
+                case VK.PageUp: t.view += rows; if (t.view > MaxView(t)) t.view = MaxView(t); break;
+                case VK.PageDown: t.view -= rows; if (t.view < 0) t.view = 0; break;
+                case VK.Esc: t.hasSel = false; break;
+                case VK.CtrlPlus:  Theme.TermCellH = ZoomStep(Theme.TermCellH, 1);  Theme.Save(); break;
+                case VK.CtrlMinus: Theme.TermCellH = ZoomStep(Theme.TermCellH, -1); Theme.Save(); break;
+                case VK.Ctrl0:     Theme.TermCellH = 18; Theme.Save(); break;
+                default:
+                    if (ch <= -40 && ch >= -51) AppendLine(t, U.Cat("F", U.I(-ch - 39), " pressed"));
+                    break;
+            }
+        }
+        void KeySearch(Term t, int ch)
+        {
+            if (ch == VK.Enter) { t.search = false; t.sbuf = ""; return; }
+            if (ch == VK.Esc) { t.search = false; t.sbuf = ""; t.input = ""; t.caret = 0; return; }
+            if (ch == VK.Back) { if (t.sbuf.Length > 0) t.sbuf = U.Sub(t.sbuf, 0, t.sbuf.Length - 1); }
+            else if (ch >= 32) t.sbuf = U.Cat(t.sbuf, Host.CharStr((char)ch));
+            else return;
+            string low = Lower(t.sbuf);
+            for (int i = t.histN - 1; i >= 0; i--)
+                if (IndexOf(Lower(t.hist[i]), low) >= 0) { t.input = t.hist[i]; t.caret = t.input.Length; break; }
+        }
+        void HistUp(Term t)
+        {
+            if (t.histN == 0) return;
+            if (t.histPos > 0) t.histPos--;
+            t.input = (t.histPos < t.histN) ? t.hist[t.histPos] : "";
+            t.caret = t.input.Length;
+        }
+        void HistDown(Term t)
+        {
+            if (t.histPos < t.histN) t.histPos++;
+            t.input = (t.histPos >= t.histN) ? "" : t.hist[t.histPos];
+            t.caret = t.input.Length;
+        }
+        void Complete(Term t)
+        {
+            string[] cmds = { "help","ver","mem","date","time","ls","cat","echo",
+                              "clear","pwd","whoami","history","uname","exit","net" };
+            string tok = t.input; int m = 0; string first = "";
+            for (int i = 0; i < cmds.Length; i++)
+                if (StartsWith(cmds[i], tok)) { m++; if (m == 1) first = cmds[i]; }
+            if (m == 1) { t.input = first; t.caret = first.Length; }
+            else if (m > 1)
+            {
+                string r = "";
+                for (int i = 0; i < cmds.Length; i++) if (StartsWith(cmds[i], tok)) r = U.Cat(r, cmds[i], " ");
+                AppendLine(t, r);
+            }
+        }
+
+        // ---- mouse ---------------------------------------------------
+        public override void OnMouseDown(int btn, int mx, int my)
+        {
+            if (my < TAB_H)   // tab bar: switch
+            {
+                int tw = 140;
+                for (int i = 0; i < tabN; i++)
+                {
+                    int tx = contentX + i * (tw + 4);
+                    if (mx >= tx && mx < tx + tw) { active = i; break; }
+                }
+                return;
+            }
+            Term t = T();
+            if (btn == 1)   // middle-click paste
+            {
+                string cb = Host.GetClipboard();
+                if (cb != null && cb.Length > 0) { t.input = InsStr(t.input, t.caret, cb); t.caret += cb.Length; }
+                return;
+            }
+            int[] cell = CellAt(mx, my); if (cell[0] < 0) return;
+            int line = cell[0], chr = cell[1];
+            int now = Host.TickMs(), cellKey = line * 100000 + chr;
+            if (now - lastDownMs < 400 && cellKey == lastDownCell) clickCount++; else clickCount = 1;
+            if (clickCount > 3) clickCount = 3;
+            lastDownMs = now; lastDownCell = cellKey;
+            if (clickCount >= 3)
+            {
+                int L = LineLen(t, line);
+                t.selLineA = line; t.selCharA = 0; t.selLineB = line; t.selCharB = L; t.hasSel = true; t.dragging = false;
+            }
+            else if (clickCount == 2)
+            {
+                int[] wb = WordBounds(t, line, chr);
+                t.selLineA = line; t.selCharA = wb[0]; t.selLineB = line; t.selCharB = wb[1]; t.hasSel = true; t.dragging = false;
+            }
+            else
+            {
+                t.dragging = true;
+                t.selLineA = line; t.selCharA = chr; t.selLineB = line; t.selCharB = chr; t.hasSel = false;
+            }
+        }
+        public override void OnMouseMove(int mx, int my)
+        {
+            hoverX = mx; hoverY = my;
+            Term t = T();
+            if (my < TAB_H) { hoverLine = -1; hoverChar = -1; }
+            else if (gN > 0)
+            {
+                int[] cell = CellAt(mx, my);
+                if (cell[0] >= 0) { hoverLine = cell[0]; hoverChar = cell[1]; }
+                else { hoverLine = -1; hoverChar = -1; }
+            }
+            if (!t.dragging) return;
+            if (my < TAB_H) return;
+            int[] c2 = CellAt(mx, my); if (c2[0] < 0) return;
+            t.selLineB = c2[0]; t.selCharB = c2[1]; t.hasSel = true;
+        }
+        public override void OnMouseUp(int btn, int mx, int my)
+        {
+            Term t = T();
+            if (t.dragging) t.dragging = false;
+            // GNOME Terminal copies to the PRIMARY selection the moment a
+            // selection is finalised -- by drag-release OR by double / triple
+            // click.  Mirror that: any active selection lands on the clipboard.
+            if (t.hasSel) Host.SetClipboard(GetSelText(t));
+        }
+        public override void OnWheel(int dy)
+        {
+            Term t = T();
+            if (dy > 0) { t.view++; if (t.view > MaxView(t)) t.view = MaxView(t); }
+            else if (dy < 0) { t.view--; if (t.view < 0) t.view = 0; }
+        }
         public override void OnClick(int mx, int my) { }
+
+        // ---- paint ---------------------------------------------------
+        void DrawTabBar()
+        {
+            Gfx.FillRect(0, 0, Gfx.Width(), TAB_H, 0x1A0820);
+            int tw = 140;
+            for (int i = 0; i < tabN; i++)
+            {
+                int tx = contentX + i * (tw + 4), ty = 4, th = TAB_H - 8;
+                bool act = (i == active);
+                Gfx.FillRound(tx, ty, tw, th, 4, (uint)(act ? 0x3465A4 : 0x2A1030));
+                Gfx.Text(tx + 10, ty + (th - 16) / 2, tabs[i].title, (uint)(act ? 0xFFFFFF : 0xC0C0C0));
+                if (act) Gfx.Text(tx + tw - 16, ty + (th - 16) / 2, "x", 0xDDDDDD);
+            }
+        }
+        void DrawScrollbar(Term t)
+        {
+            int x = contentX + contentW + 2, y = contentY, w = 6, h = contentH;
+            Gfx.FillRect(x, y, w, h, 0x1A0820);
+            int total = lastTotalRows; if (total < 1) total = 1;
+            int thumbH = h, ty = y;
+            if (total > rows)
+            {
+                thumbH = (h * rows) / total; if (thumbH < 10) thumbH = 10;
+                int maxOff = h - thumbH;
+                int off = (total <= rows) ? 0 : (maxOff * (total - rows - t.view) / (total - rows));
+                ty = y + off;
+            }
+            Gfx.FillRect(x, ty, w, thumbH, 0x555555);
+        }
+        public override void OnPaint()
+        {
+            int W = Gfx.Width(), H = Gfx.Height();
+            Term t = T();
+            ComputeColsRows();
+            ComputeLayout(t);
+            DrawTabBar();
+            uint baseBg = (Theme.TermBgMode != 0)
+                ? (uint)WallColorAt(Gfx.OriginY() + contentY)
+                : (uint)BG;
+            Gfx.FillRect(0, 0, W, H, baseBg);
+            for (int vr = 0; vr < rows; vr++)
+            {
+                int y = contentY + vr * cellH;
+                int absRow = firstAbsRow + vr;
+                if (absRow < 0 || absRow >= rowN) continue;
+                PR pr = prs[rowLine[absRow]];
+                int start = rowStart[absRow], end = rowEnd[absRow];
+                int isInput = (rowLine[absRow] == t.count) ? 1 : 0;
+                uint rowBg = (Theme.TermBgMode != 0)
+                    ? (uint)WallColorAt(Gfx.OriginY() + y)
+                    : (uint)BG;
+                Gfx.FillRect(0, y, W, cellH, rowBg);   // band covers full width + margins
+                int defBg = (int)rowBg;
+                for (int i = start; i < end; i++)
+                {
+                    int xc = contentX + (i - start) * cellW;
+                    int ch = (int)pr.ch[i];
+                    int fg = pr.fg[i]; if (fg < 0) fg = FG;
+                    int bg = pr.bg[i]; if (bg < 0) bg = defBg;
+                    bool sel = CellSelected(t, rowLine[absRow], i);
+                    if (sel) Gfx.FillRect(xc, y, cellW, cellH, SEL);
+                    // URL hover highlight: expand from hoverChar to the URL span
+                    bool hot = false;
+                    if (hoverLine == rowLine[absRow] && pr.url != null && pr.url[i] != 0)
+                    {
+                        int s = i, e = i;
+                        while (s - 1 >= start && pr.url[s - 1] != 0) s--;
+                        while (e + 1 < end && pr.url[e + 1] != 0) e++;
+                        if (hoverChar >= s && hoverChar <= e) hot = true;
+                    }
+                    if (ch != ' ' && ch != '\t')
+                    {
+                        string s2 = Host.CharStr((char)ch);
+                        if (hot) fg = URLC;
+                        if (bg == defBg)
+                        {
+                            if (hot) Gfx.TextBg(xc, y, s2, (uint)fg, rowBg);
+                            else Gfx.Text(xc, y, s2, (uint)fg);
+                        }
+                        else Gfx.TextBg(xc, y, s2, (uint)fg, (uint)bg);
+                    }
+                    if (hot) Gfx.FillRect(xc, y + cellH - 2, cellW, 2, URLC);
+                    if (isInput != 0 && i == t.caret)
+                    {
+                        if (t.hasSel) Gfx.FillRect(xc, y, 2, cellH, 0xFFFFFF);          // I-beam
+                        else
+                        {
+                            Gfx.FillRect(xc, y, cellW, cellH, 0xFFFFFF);                 // block
+                            if (ch != ' ' && ch != '\t') Gfx.Text(xc, y, Host.CharStr((char)ch), (uint)defBg);
+                        }
+                    }
+                }
+            }
+            DrawScrollbar(t);
+        }
     }
 
     // =================================================================
@@ -1040,6 +1997,7 @@ namespace NexOS.Forms
         TBox t;        // editor model (caret + selection + undo)
         string name;   // currently loaded file
         bool picking;   // showing the open list
+        bool saved;    // last action was a successful Ctrl+S (title hint)
 
         public NotepadApp()
         {
@@ -1058,6 +2016,17 @@ namespace NexOS.Forms
                 name = "Untitled";
             }
             picking = false;
+            saved = false;
+        }
+
+        // Ctrl+S save: persist the document body to the MKFS data disk.
+        // Mirrors the ReadText(0, name) fallback used when a file is opened,
+        // so a re-open lands on the saved copy.  Silent on purpose -- the
+        // title shows a "(saved)" hint until the next edit.
+        void Save()
+        {
+            Host.WriteText(0, name, t.text);
+            saved = true;
         }
 
         public override string GetTitle() { return U.Cat("Notepad - ", name); }
@@ -1074,6 +2043,7 @@ namespace NexOS.Forms
             W.Button(pad, 6, 70, 28, "Open");
             W.Button(pad + 80, 6, 70, 28, "New");
             Gfx.Text(pad + 170, 12, name, C.TextSub);
+            if (saved) { int sw = Gfx.Measure(name); Gfx.Text(pad + 178 + sw, 12, "(saved)", 0x107C10); }
 
             if (picking) { DrawPicker(w, h); return; }
 
@@ -1155,8 +2125,10 @@ namespace NexOS.Forms
         public override void OnKey(int ch)
         {
             if (picking) { return; }
-            if (ch == -2) { t.Insert("\n"); return; }
+            if (ch == -10) { Save(); return; }          // Ctrl+S -> save
+            if (ch == -2) { t.Insert("\n"); saved = false; return; }
             t.Key(ch);
+            saved = false;
         }
     }
 }

@@ -31,6 +31,7 @@ struct W32DrawCmd {
     int16_t  x, y, w, h;
     uint32_t color;         // 0x00RRGGBB
     uint32_t bkcolor;       // 0x00RRGGBB (text background, 0xFFFFFFFF = transparent)
+    uint16_t id;            // child-control id (control's menu/resource id)
     char     text[48];
 };
 
@@ -86,6 +87,9 @@ int  win32_window_info(int idx, W32WinInfo* out);   // 1 = live window, 0 = empt
 int  win32_window_cmds(int idx, const W32DrawCmd** out);   // returns count
 void win32_window_repaint(int idx);                        // re-run WM_PAINT
 int  win32_window_dispatch(int idx, uint32_t msg, uint32_t wp, uint32_t lp);
+// Hit-test a click (client-local coords lx,ly) against this window's BUTTON
+// controls.  Returns the control id, or 0 if nothing was hit.
+int  win32_window_button_hit(int idx, int lx, int ly);
 void win32_window_close(int idx);
 void win32_reset(void);          // free all images / windows
 

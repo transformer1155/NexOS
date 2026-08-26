@@ -1,59 +1,48 @@
-# NexOS bootloader — 长期项目记忆（精简版）
+# NexOS bootloader — 长期项目记忆
 
-## 构建环境 (强制)
-- 所有 Linux 构建在 WSL: `wsl -e bash -lc 'cd /mnt/d/MyOS/bootloader && make <target>'`
-- 工具链: nasm / g++ -m32 -ffreestanding / ld / objcopy / qemu-system-x86_64 / xorriso / mtools
-- 镜像: `build/os.img`(BIOS raw, LBA33=kernel.bin) 无头测试; `build/os.iso` CD 布局(2026-08-05 起默认 make); UEFI 见下。看 C# GUI 用 `make play`(GTK)/`make bios-run`。
-- Windows `rm` 被 safe-delete 拦 → 清旧产物在 WSL 内 `rm -f`。WSL/Windows 时钟偏移会让 make 跳过重编 → 改完先删再到 make。
+## 构建与测试环境（纯 Windows，不用 WSL，2026-08-14 起）
+- 构建统一走 `tools/build_win.sh <target>`（MSYS2 make/nasm + i686/x86_64-elf GCC 13.2.0 @ `C:\Users\trans\elf_tools\bin` + dotnet.ps1 + 托管 python）；测试 `D:\qemu\qemu-system-x86_64.exe`。
+- **构建必须用真实 MSYS2 bash 调用**：`C:\msys64\usr\bin\bash.exe -lc 'cd /d/MyOS/bootloader && tools/build_win.sh <target>'`。WorkBuddy 自带 Git Bash 把 `/msys64` 解析成 `E:\Program Files\Git\msys64`（不存在），导致 `make: not found`；真实 MSYS2 的 `/msys64/usr/bin` 才含 make/nasm。交叉编译器由 build_win.sh 的 PATH(`/c/Users/trans/elf_tools/bin`)补上。
+- 本机 WHPX 不可用 → 所有 QEMU 验证一律 `-accel tcg`；内存紧用 `-m 256 -accel tcg,tb-size=128`（默认 1GB JIT 触发 cannot set up guest memory）。
+- **本机无原生 C 编译器**（MSYS2 各工具链目录下均无 gcc/clang，elf_tools 只有交叉编译器产出 ELF 不能直接执行）。要对 C 逻辑做确定性实测时，把逻辑 1:1 移植成 Python，用托管 python `C:\Users\trans\.workbuddy\binaries\python\versions\3.13.12\python.exe` 跑断言（例：`tools/test_hfilename.py` 验证 `h_file_name` 空格截断修复）。
+- **后台代理 WIP 可能打断构建**：工作树里 net.cpp/linux_compat.cpp 等常有未提交半成品改动，会出现 `net_init` 缺声明、`case` 号撞车等编译错误。临时修复（加前向声明 / 临时改系统调用号）拿到可启动镜像验证后**务必回滚**，保留代理的 WIP 原状，撞车/重排决定留给对应代理。
+- 默认 `os.img` BIOS raw（7.4MiB）；Linux 用户分区 `LINUX_SFS_LBA=12288`（Makefile+kernel.cpp 同步）；UEFI 诊断盘 `os_uefi_diag.img`。
 
-## 架构 (双架构 32+64 位)
-- 32 位 `kernel.bin`(LBA33, 链接 0x10000) 与 64 位 `kernel64.bin`(LBA2048, 链接 0x100000) 同存 `build/os.img`，SFS 在 LBA3328。
-- 32→64: `switch64`(kernel.cpp:5019) 从 LBA2048 读 1024 扇区到 0x100000; 64→32: `switch32`(kernel64.cpp:2715) 从 LBA33 读 1024 扇区到 0x10000。**两方向 SECTORS 均=1024，勿改回 800/256**。
-- VMM: 4MiB PSE 身份映射前 32MiB + VBE LFB; VGA 空洞 0xA0000–0xBFFFF; `USER_BASE=0x04000000..USER_END=0x08000000`; 统一 `-m 128M`。
-- 已修复根因(勿踩): ① page_directory 与 .bss 重叠→三重故障, 现 `g_page_directory_store[1024](alignas 4096)`; ② .bss 尾落 VGA 空洞→已 relocate 到 1MiB+。
+## 构建/测试纪律（用户强制）
+- 改动后必须实测：构建 + 无头 QEMU serial 抓内核标记/截图，不能只编译过。
+- 完成先发"验证问答"，用户 OK 才收工。渐进式推进，不擅自跳阶段。
 
-## GUI 纪律 (C# 优先, 2026-08-09 用户强制)
-- 「要改的图形界面」尽量只改 C#(`csharp/`): 桌面/窗口/菜单/图标/托盘/右键菜单在 32 位 C# 托管壳(`NexOS.Forms` + `apps/Shell/*`)。
-- 品牌统一 NexOS (PascalCase)。新增 App 用 `NexOS.Forms`/`NexOS.Core`，勿用 MiniOS/miniOS/nexos。
-- C++ 内核层(gui.cpp/mforms.cpp/win32.cpp) 只留 host 回调注册、P/invoke 桥、ring-0 资源(fb/输入/窗口 surface)。
-- C# 约束: 无浮点/泛型/接口/try-catch, 数组4B槽, 静态初始化器不执行(需 Shell.Init() 显式赋值), 堆每帧回卷; 动画状态存 static。
+## GUI 改动纪律（C# 优先，2026-08-20）
+- 真实 VM 桌面由 C# 托管壳渲染（gui.cpp render_all 内 managed_desk=true）；桌面/任务栏/菜单改 NexOS.Forms/apps/Shell/*，烤进 shell.mex→sfs.img→镜像。窗口 chrome 仍是原生 gui.cpp::draw_window。
+- 渲染按需：gui_tick() 仅 g_mforms_anim 时 render_all()，空闲零渲染。改共享源后 shell.mex 与 csharp/winhost 都要重编。
 
-## 高频坑 (勿再踩)
-- `handle_mouse_move` 中 `cursor.move` 只能调一次(否则位移×2)。
-- fbcon 会清 LFB: gui_mode 下 `term.render()` 若调 `fb_console_render` 会抹 GUI → 已加 `if(g_wm.gui_mode) return;`。
-- 退出 GUI 用 `gui_exit()` 保持 BGA+fbcon, 别 disable_vbe; 并 `fb_console_force_redraw()`。
-- 16bpp 掩码: `((color>>19)&0x1F)<<11 | ((color>>10)&0x3F)<<5 | (color>>3)&0x1F`。
-- 32 位内核须 `register_gui_callbacks()`(kernel.cpp cmd_gui), 否则 g_cb 全零。
-- C# 控制键负向虚拟键: `0x08→-1`(Backspace)、`\n`/`\r`→`-2`(Enter); C# 的 OnKey 须同时接受负向与原始 ASCII。BrowserApp 曾只查 8/10/13 致 64 位退格回车失效(2026-08-10 已修)。
-- CLR 字符串字面量上限: `clr.cpp` `CLR_MAX_STRINGS` 原 256→512; 加 App 报 `[CLR] fault: too many string literals` 时继续上调(同扩 `g_strobj[]`)。
+## 真 VM 登录与桌面验证
+- 账号 root/admin(uid0)、guest/guest(uid1000)，启动进 Win11 锁屏；无头登录 sendkey `admin`+ret。验证脚本 capture_desk.py / qemu_uefi_verify_diag.py。
 
-## 测试工作流
-- 安全套件 `make test-sec`(Foundation0/弹窗/Win32 GUI)。无头: `tools/test_ie_pe.py`/`test_ie_click.py`/`test_desktop_ui.py`/`test_kb_input.py`/`test_linux_compat.py`(4451); 跑完 `pkill -f "[q]emu-system"`。
-- 验证: `term.write` 不写串口 → 屏幕靠 screendump, 内核逻辑靠 `serial_puts`。
-- VirtualBox 真机式引导: BIOS 用 `MyOSTest`(32-bit,128MB,PIIX3,VBoxVGA,COM1→文件), `convertfromraw build/os.img build/os_vbox.vdi`; UEFI 用 `MyOSUefi`(64-bit,EFI64,128MB,PIIX4)。UEFI 启动链: `ST`→`[GOP]`→`[4]`→`[5]`→`EGI3SFB`→`[K1]`→`[K32] Entering Win11 GUI mode`。
+## 高频坑（内核/编译/链接）
+- gfx 半透明用 blend_rect/blend_rounded_rect；16bpp 掩码 `((c>>19)&0x1F)<<11|((c>>10)&0x3F)<<5|(c>>3)&0x1F`。
+- CLR 字符串字面量上限 clr.cpp CLR_MAX_STRINGS（256→512，报 too many 继续上调+扩 g_strobj）。
+- 无宿主 C 库 freestanding 源（net.cpp、.attic64/kernel64.cpp 等）用 NULL 前须 `#ifndef NULL #define NULL 0 #endif`。
+- 32 位内核须 register_gui_callbacks()；64 位 IDT gate 按加载 delta 重定位（BIOS 实测 delta=0x7）。
 
-## Win32 PE 加载器
-- `run <file>`→`cmd_run`→winloader.cpp 仅 PE 检测(只报不跑)。`winapp <file>`→真正执行器: 32 位 `win32_run`(machine==0x014C && magic==0x010B, 否则 -3); 64 位 `win64_run`(MAXPE=192KiB 截断)。`win32_ensure_init()` 必在 PE 启动前调。
-- 浏览器: 32 位 `iexplore.exe`(winpe/iexplore.c, 真实 PE32 i386); 64 位 = C# 托管 `BrowserApp`(默认 `https://www.bing.com/`)。验证地址栏编辑靠串口 `[browser] addr=`/`[iexplore] addr=` 长度序列, 不靠像素。
+## UEFI / 高帧缓冲黑屏（根因已修，备查）
+- 真机 GOP LFB 常 >4GB；.compat_path 须先装 0x90000 新页表切 CR3 再 blit（否则拷贝覆盖在用页表→triple fault）。长模式页表 512 项×8B（非1024）。vmm_init() 须提前到 GDT/IDT/PIC 后。
+- boot_beacon() RGBX/BGRX 打包：RGBX `(b<<16)|(g<<8)|r`、BGRX `(r<<16)|(g<<8)|b`（真机/QEMU 均 BGRX32）。
 
-## 浏览器 IE: agent 桥 (2026-08-09)
-- 私有消息 `WM_MINIOS_API=0x8000`: kernel `webapi` 命令(口令鉴权)向 IE 投递(verb=wParam, arg=lParam)。agent verbs: PING=1/GET_URL=2/NAVIGATE=3/GET_TEXT=4/ASK=5/CLICK=6/LINKS=7/STATUS=8。
-- AI 桥: iexplore 惰性绑定 `MiniAiReady/MiniAiInit/MiniAiAsk`(→ kernel `kern_ai_*`→`ai_engine.cpp`, 无需外部模型, `ai_init` 恒成功)。口令 24 字节 XOR 混淆 `WEBAPI_PW`, `webapi auth <pw>` 解锁, ≥3 次失败锁死。
+## 64 位诊断与落盘 / CD 早期崩溃（悬挂未修，备查）
+- 诊断落盘扇区 LBA1500（原 LBA34 落在 kernel.bin 内会污染）；kmain64 早调 ata_write_sector 会硬冻结，diag_step 落盘仅步号≥100。
+- os.iso 真机引导后内核标记从不出现（BIOS raw 路径正常）；嫌疑 boot_cd.asm 保护模式远跳转 16:16 vs 16:32。修前先清残留调试探针。
 
-## 锁屏 + 默认 GUI + 取消 ESC (2026-08-10)
-- 默认进图形: `kmain`/`kmain64` 在 `g_auto_gui && g_vbe_active` 时 `cmd_gui` 自动进桌面。`g_auto_gui` 默认 1, **勿被 TEMP-DIAG 改回 0**。
-- ESC 不退终端: GUI 事件循环 0x1B 只交 `gui_handle_key`; `Login.Key` 遇 27 return。串口标记 `[GUI] ESC ignored`。
-- 图形登录: `csharp/apps/Shell/Login.cs` 提交 `Host.LoginCheck`; 内核 `gui_cb_login_check` 比对哈希, `[K32-LOGIN] OK user=root`; 哈希不出内核。默认账户 root/admin、guest/guest。
-- 文本终端已被 GUI「Terminal」窗口取代(桌面/开始菜单图标); 切 64 位: 登录后点 Terminal 图标输 `switch64`。
+## distnet 分布式算力网络（2026-08-21 起，2026-08-26 打通真推理）
+- 任务 sum/echo/compute + ai（派发原生 AI 引擎）。协议 UDP 换行 ASCII：QUERY/BEACON(5455) TASK(5456) RESULT(5457)。**端口原 5355 是 IANA LLMNR 被 svchost 独占，已迁 5455/5456/5457**，改须同步 distnet.h+distnet.cpp+tools/distnet_host_peer.py。
+- 新增 `distnet ask "<question>"`：发现所有 compute 节点 → 同问题派发给多台 VM → 收集并合并答案（演示多机算力合并）。RESULT/answer 缓冲已放宽到 400B 容纳真推理答案。
+- **真推理打通（2026-08-26）**：`.attic64/kernel64.cpp` 的 `kern_ai_ask` 改为优先走 64 位 `qwen_generate`（读 LBA16384 的 GGUF blob + 真实 transformer 前向），绕过 VM 检测的 Markov 离线引擎；`distnet compute` 收到 `ai` 任务即触发真推理。模型用 **Qwen2-0.5B-Instruct Q4_K_M**（因 gguf_infer.cpp 仅支持 qwen2/llama，不支持 Phi-3；2GB VM 也跑得动 0.5B）。
+- **演示镜像**：`make build/os.img MODEL_GGUF=build/qwen2-0_5b-instruct-q4_k_m.gguf`（须先 `rm -f build/os.img` 强制重建，否则 make 认为 up-to-date 不跑 embed 步）。产物 `build/os.img` ≈387MB（含 397MB 模型 blob @LBA16384/描述符 LBA16383）。
+- **演示运行必须用 Windows 端 QEMU**：`D:\qemu\qemu-system-x86_64.exe`（当前 WSL 环境**无 qemu 且 apt 源不可达无法安装**）。3 VM（1 scheduler+2 compute，各 `-m 2G -accel tcg`）走真实 L2 UDP 隧道组网，脚本 `tools/test_distnet_ask.py`。本机 WHPX 不可用 → 一律 `-accel tcg`。
 
-## 中文位图字体 (2026-08-11)
-- 字库 `zfont_data.h`(GB2312 16×16, 387 字), `zfont_find_unicode()` 按 Unicode 码点二分。
-- 根因: `gen_zfont.py` 原按区位码排序, 与运行时二分不一致 → 常用字命中错索引成方框。修复: 生成 `zfont_unicode[]` 按 Unicode 严格升序。扩充字库必须保证该表升序。
-
-## UEFI 32 位兼容模式 + >4GB 帧缓冲 (2026-08-11 修复)
-- `enter_kernel.S` 不退出 long mode, 切 IA-32e 32 位兼容模式沿用 UEFI 4 级页表。`>4GB` fb 必须在长模式内建 4 级页表。
-- `bootuefi.c`: 已删无效 shadow(空壳导致黑屏), 保留真实 64 位 fb 地址交给内核映射。
-- 内核 `vmm_init()` long-mode 分支: `framebuffer_phys64>4GB && shadow_buffer==0` 时自建 PML4(低 4GB 身份映射 + `0xF0000000` 虚拟窗口映射真实高 fb), 重写 `VbeInfo.framebuffer_phys=0xF0000000`、`shadow_buffer=1`。gui.cpp 凭 `shadow_buffer=1` 不 abort。
-- VirtualBox Bochs VBE fb 恒 `<4GB`(通常 `0xE0000000`), 不触发该分支; 真机 Iris Xe 须 COM1 确认 `[VMM] high FB ... mapped to VA 0xF0000000`。
-- **真机白线修复**: `present()` 全屏翻页原忽略 LFB `pitch`(Intel GOP `PixelsPerScanLine>HorizontalResolution` 时把图压进前几行); 已改四格式分支均按 `lfb + ry*pitch` 逐行写。`present_rect()` 本已正确。`[DGOP]` 串口诊断打印 fb_base/fb64/w/h/bpp/pitch/nominal 与 MATCH/MISMATCH。虚拟机 pitch==width*bpp 无法复现, 真机须看 `[DGOP]` 是否 `MISMATCH(pitch>width)`。
-- **诊断构建**: `make uefi-diag [FB_TEST=1|2|3]` 产 `build/os_uefi_diag.img`(独立产物链 gui_diag.o/bootuefi_diag.o/kernel_diag.bin，不污染正常 `uefi`)。`[GOPF]` 打真实 GOP `PixelFormat` 枚举/`PixelsPerScanLine`/`PixelBitMask` 的 R/G/B 掩码；`gui_fb_diag()` 在 `gui_enter()` 入口画竖条/红块(FB_TEST=1)/全屏蓝(FB_TEST=2)/竖条用 width*4 pitch(FB_TEST=3) 后 `hlt` 停机。真机烧录抓 COM1 定性(竖条均匀=OK；红块不可见=>高fb映射失败；蓝屏仍白条=>pitch 偏差；`[GOPF]` 非标 BitMask=>扩格式分支)。QEMU/OVMF 跑不到 GUI(32位UEFI内核早期分页环境性不兼容, 复位在 GUI 前), 仅验证 bootloader+[GOPF] 启动。
+## Linux 兼容层路线（当前主线，2026-08 起，远期目标跑真·MC Java 版）
+- freestanding ELF32 guest 跑 RING0；int 0x80 真实入口 sys_enter(syscall.cpp:178)。32 位非 PAE 分页，4MiB PSE identity-map **0–32MiB 给内核**(含内核栈 0x1800000–0x1810000、RAM-SFS 0x1400000–0x1800000、.bss 0x120000–0x200000) + **64–256MiB 为 PG_USER 空闲区**；**无 NX→用户页天然可执行**（W^X 软约束）。
+- 构建 guest：NEX_CC=i686-elf-g++ `-x c -m32 -ffreestanding -nostdlib -fno-stack-protector`；链接 `-m elf_i386 -nostdlib -Ttext=$(NEX_TEXT) -e _start`，**NEX_TEXT=0x08048000**（落在 64–256MiB PG_USER 区，与 `linux_run` 既有布局注释 ELF@0x08048000/栈@0xC000000/mmap@0xC100000–0x0FFFF000 一致）。**严禁改回 0x01800000**——那会覆盖内核启动栈（linker.ld 2026-08-19 把栈从 0x90000 迁到 0x1800000 后，旧基址 0x01800000 与之冲突，加载客户机时清零 bss 把内核栈帧 i/phnum/返回地址清零→PH 循环洪泛、静默卡死）。
+- g_reader 从 linux_fs(挂载于 LBA 12288, SFS_LINUX_LBA) 读文件，未挂载则回退主 sfs；cmd_linux 解析内核命令行 argv 传 linux_run(name,ac,av)；execve(case 11) 真·加载 ELF + 透传 argv + 透传 envp(r->edx)（envp 解析在 linux_compat.cpp sys_execve 分支，落盘前先剥离前导 `/`）。
+- 阶段进度：S1 基础加载/hello；S2 信号(handler sig_slot GAP=88、clone 拷贝 sa[]/blocked、worker yield)；S3 mmap/mprotect/munmap+扩大竞技场(PASS 10/10)；**S4 DONE(PASS) — argv 从 `linux` 命令行到达 main()；execve 的 envp(r->edx) 解析并透传新映像（自举 `linux linux_argv spawn` 验证 STAGE4=ENV_PASSED/FOO=BAR）**。
+- 验证：tools/verify_linux_argv.py 无头 QEMU(`-m 256 -accel tcg,tb-size=128`)，从 shell 输入 `linux <prog> [args]`，抓 serial `LXARG:` 标记判定（8 项全 PASS）。**偶发毛刺**：shell-ready 后立即首访 reader 偶发首次 `linux` 命令 file not found、二次成功；干净复跑可 8/8 PASS，与 NEX_TEXT 改动无关，待查（疑 g_fsbuf 共享/ATA 首读时序）。

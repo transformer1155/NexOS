@@ -21,7 +21,10 @@
 KERNEL_LOAD_SEG    equ 0x1000      ; load kernel at linear 0x1000:0x0000 = 0x10000
 KERNEL_LOAD_OFF    equ 0x0000
 KERNEL_LBA         equ 33          ; 1 (boot) + 32 (stage2) = 33
-KERNEL_SECTORS     equ 1024        ; 512 KiB max (0x10000..0x90000, stays below 0xA0000 VGA)
+KERNEL_SECTORS     equ 1152        ; 576 KiB.  Kernel loads at 0x10000, so the load
+                                   ; window ends at 0x10000 + 0x90000 = 0xA0000, the
+                                   ; VGA MMIO hole.  .bss is NOLOAD at 0x120000, so the
+                                   ; flat binary holds only .text/.rodata/.data.
 KERNEL_CHUNK       equ 16          ; sectors per INT 13h call (state kept in memory)
 KERNEL_ENTRY       equ 0x10000     ; kernel entry (linked at this address)
 

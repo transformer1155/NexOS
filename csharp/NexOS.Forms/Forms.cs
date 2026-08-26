@@ -57,6 +57,13 @@ namespace NexOS.Forms
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int  ScreenH();
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int  MouseX();
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int  MouseY();
+        // Origin of the current client context (window offset), so controls
+        // can translate their local coordinates to screen space.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int  OriginX();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int  OriginY();
+        // Synthetically position the pointer (used by voice / automation
+        // clicks so controls that hit-test via Gfx.MouseX/Y still fire).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void SetMouse(int x, int y);
     }
 
     // -----------------------------------------------------------------
@@ -87,6 +94,10 @@ namespace NexOS.Forms
         // Monotonic milliseconds (host-calibrated); used for double-click
         // detection.  Wraps after ~49 days.
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int TickMs();
+        // Request the host to keep repainting so managed animations
+        // (AI desktop thinking dots / typewriter reveal) can progress.
+        // The GUI loop throttles render_all() to ~30 fps while set.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void SetAnim(int on);
         // Bit i is set when a window of Kind i is open; drives the
         // running-app indicators under the taskbar buttons.
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int RunningMask();
@@ -95,6 +106,11 @@ namespace NexOS.Forms
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int FileIsDir(int fs, int idx);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int FileRefresh();
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern string ReadText(int fs, string name);
+        // Persist a UTF-8 text body to stable storage.  Returns bytes written
+        // (>=0) or -1 on error.  Used by the shell to save personalization
+        // settings ("nexos.cfg") and Notepad documents.  fs selects the
+        // volume (0=mkfs).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int WriteText(int fs, string name, string text);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern string Exec(string cmd);
         // Execute a native Windows PE image (.exe) through the kernel's
         // win32 / win64 PE loader and surface the windows it creates on the
@@ -128,6 +144,11 @@ namespace NexOS.Forms
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void CloseApp(int kind);
         // Ask the kernel to leave GUI mode and return to the text terminal.
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void ExitGui();
+        // Window-geometry action from the Alt+Space / title-bar menu
+        // (Restore / Minimize / Maximize).  The kernel owns the window rect
+        // in both the VM (gui.cpp) and the WinForms harness, so it performs
+        // the minimise / maximise / restore here.  code is a WAct.* value.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void WinAction(int id, int code);
         // Synchronous HTTP GET for the Browser control.  Returns the
         // response body, or "" on error / when offline.
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern string HttpGet(string url);
@@ -142,8 +163,49 @@ namespace NexOS.Forms
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int    LoginUid();
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int    UserCount();
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern string UserName(int idx);
+        // Push the retro "pixel / CRT monitor" settings down to the kernel
+        // framebuffer post-process: mode (on/off), scale (block size), scan (scanlines).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void   SetPixel(int mode, int scale, int scan);
     }
 #endif // !WINHOST
+
+    // =================================================================
+    //  Btn - global "press" animation state for every button control.
+    // -----------------------------------------------------------------
+    //  A left click (routed by the host / kernel bridge through
+    //  PressScreen with SCREEN coordinates) arms a timed press.  Each
+    //  button control asks ScaleAt() whether the last press landed on it
+    //  and, if so, gets a scale% that shrinks it to half in 100 ms, holds
+    //  it there for 500 ms and springs it back in 150 ms.  All phases are
+    //  millisecond-driven (Host.TickMs), so the animation is identical on
+    //  the VM and the WinForms host regardless of frame rate.
+    // =================================================================
+    public static class Btn
+    {
+        static int pressX, pressY, pressMs;   // last left click, screen space
+
+        public static void PressScreen(int sx, int sy)
+        { pressX = sx; pressY = sy; pressMs = Host.TickMs(); }
+
+        public static bool Pressing()
+        {
+            int e = Host.TickMs() - pressMs;
+            return pressMs > 0 && e >= 0 && e < 750;
+        }
+
+        // sx,sy = button origin in SCREEN space; w,h = button size.
+        // Returns the scale% to draw at (100 = full, 50 = half).
+        public static int ScaleAt(int sx, int sy, int w, int h)
+        {
+            int e = Host.TickMs() - pressMs;
+            if (pressMs <= 0 || e < 0 || e >= 750) return 100;
+            if (sx > pressX || pressX >= sx + w || sy > pressY || pressY >= sy + h)
+                return 100;
+            if (e < 100) return 100 - 50 * e / 100;   // press: -> 50
+            if (e < 600) return 50;                   // hold 500 ms
+            return 50 + 50 * (e - 600) / 150;         // restore: -> 100
+        }
+    }
 
     // =================================================================
     //  TBox - a tiny single/multi-line text editor model shared by every
@@ -251,25 +313,29 @@ namespace NexOS.Forms
     // -----------------------------------------------------------------
     //  Theme.  const so Roslyn inlines the value: no .cctor required.
     // -----------------------------------------------------------------
+    // WinUI 3 standard colour palette (Windows App SDK / Fluent).  Values are
+    // aligned to win11-ui/winui3-tokens.json (extracted from WinUIonWeb's
+    // theme.css) so every NexOS surface renders standard WinUI 3.
     public static class C
     {
-        public const uint WinBg     = 0xF3F3F3;   // window client background (mica-ish grey)
+    public const uint WinBg     = 0xF3F3F3;   // window client background (mica-ish grey)
         public const uint Card      = 0xFFFFFF;   // raised surface
         public const uint CardAlt   = 0xFAFAFA;   // subtle alternate row
-        public const uint Border    = 0xE1E1E1;   // hairline separators
+        public const uint Border    = 0xE6E6E6;   // hairline (WinUI3 ControlStroke 0.06 alpha)
         public const uint BorderMid = 0xCFCFCF;
-        public const uint Accent    = 0x0078D4;   // Windows accent blue
-        public const uint AccentHi  = 0x1A86D9;   // hovered accent
-        public const uint AccentLo  = 0x005FB0;   // pressed accent
-        public const uint Text      = 0x1B1B1B;   // primary text
-        public const uint TextSub   = 0x606060;   // secondary text
-        public const uint TextFaint = 0x909090;
+        public const uint Accent    = 0x0067C0;   // standard WinUI 3 accent blue
+        public const uint AccentHi  = 0x0B6FB8;   // hovered accent (accent @0.90)
+        public const uint AccentLo  = 0x0A639F;   // pressed accent (accent @0.80)
+        public const uint AccentText= 0x0067C0;   // WinUI3 AccentTextFill
+        public const uint Text      = 0x171717;   // primary text (rgba(0,0,0,0.89))
+        public const uint TextSub   = 0x5E5E5E;   // secondary text (rgba(0,0,0,0.62))
+        public const uint TextFaint = 0x737373;   // tertiary/disabled (rgba(0,0,0,0.45))
         public const uint White     = 0xFFFFFF;
-        public const uint Hover     = 0xEEF3FA;   // control hover fill
-        public const uint Sel       = 0xE1EDFB;   // selected row fill
-        public const uint Good      = 0x107C10;   // green (success)
-        public const uint Warn      = 0xC29A00;   // amber
-        public const uint Danger    = 0xC42B1C;   // red (destructive / stop)
+        public const uint Hover     = 0xF5F5F5;   // control hover (WinUI3 SubtleFill 0.04)
+        public const uint Sel       = 0xE5EFF8;   // selected row (accent @0.10)
+        public const uint Good      = 0x0F7B0F;   // green (WinUI3 system success)
+        public const uint Warn      = 0x9D5A00;   // amber (WinUI3 system caution)
+        public const uint Danger    = 0xC42B1C;   // red (WinUI3 system critical)
     }
 
     // -----------------------------------------------------------------
@@ -281,22 +347,160 @@ namespace NexOS.Forms
     // -----------------------------------------------------------------
     public static class Theme
     {
-        public static uint  WallTop   = 0x05162C;   // wallpaper gradient top
-        public static uint  WallBot   = 0x0B4A83;   // wallpaper gradient base
-        public static uint  Accent    = 0x0078D4;   // primary accent (Fluent blue)
-        public static int    Dark      = 0;         // 0 light, 1 dark
+        public static uint  WallTop   = 0x218FD9;   // wallpaper gradient top (Win11 blue)
+        public static uint  WallBot   = 0x05216B;   // wallpaper gradient base (Win11 deep blue)
+        public static uint  Accent    = 0x0067C0;   // primary accent (standard WinUI 3 blue)
+        public static int    Dark      = 1;         // 0 light, 1 dark (default dark)
         public static int    TaskbarLeft = 0;       // 0 centred, 1 left-aligned
         public static int    ShowLabels = 1;        // taskbar labels (reserved)
         public static int    ActiveNet = 0;         // 0 Ethernet, 1 Wi-Fi
         public static int    VoiceOn   = 0;         // microphone listening
+        // Desktop layout: 0 = Simple (classic left-aligned icon grid, the
+        // earlier Win11 desktop), 1 = Busy (the current Portal surface:
+        // search bar + wordmark + tiles + nav tabs + live cards).
+        public static int    DesktopMode = 0;       // 0 = clean Win11 desktop, 1 = Portal launcher
+
+        // Retro "pixel / CRT monitor" render mode.  Pushed to the kernel via
+        // Host.SetPixel so the single framebuffer post-process applies to every
+        // UI surface (managed desktop, native window chrome, cursor).
+        //   PixelMode  : 0 off, 1 on (default ON -- the user wants the look)
+        //   PixelScale : block size in pixels (1 = full spatial detail)
+        //   PixelScan  : 0 off, 1 on (CRT scanline darkening)
+        public static int    PixelMode  = 1;
+        public static int    PixelScale = 1;
+        public static int    PixelScan  = 0;
+
+        // Terminal (GNOME-Terminal-style) presentation, persisted so it
+        // survives reboot.  NOTE: the kernel bitmap font is fixed-size, so
+        // TermCellH is a *layout zoom* of the terminal grid (cell spacing
+        // scales), not a true glyph-size change.  TermBgMode 1 blends the
+        // Ubuntu purple with the live wallpaper hue behind the window, a
+        // pure-C# approximation of a transparent terminal background.
+        public static int    TermCellH  = 18;   // 12..28, default 18
+        public static int    TermBgMode = 0;    // 0 solid, 1 wallpaper-tint
 
         // A small Fluent accent ramp, indexed by the Settings swatches.
         public static uint[] Accents()
         {
             uint[] a = new uint[6];
-            a[0] = 0x0078D4; a[1] = 0x8B5CF6; a[2] = 0x0EA5E9;
+            a[0] = 0x0067C0; a[1] = 0x8B5CF6; a[2] = 0x0EA5E9;
             a[3] = 0x107C10; a[4] = 0xE11D8A; a[5] = 0xF59E0B;
             return a;
+        }
+
+        // -----------------------------------------------------------------
+        //  Persistence.  Personalization is serialized to a tiny "nexos.cfg"
+        //  text file on the MKFS data disk so it survives reboot.  The
+        //  format is one "key=value" line per field; values are plain
+        //  decimal integers (colours fit in a signed int: max 0xFFFFFF).
+        // -----------------------------------------------------------------
+        public static string CfgName = "nexos.cfg";
+
+        public static void Save()
+        {
+            string cfg = "";
+            cfg = NexOS.Sys.StrConcat(cfg, "walltop=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr((int)WallTop));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "wallbot=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr((int)WallBot));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "accent=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr((int)Accent));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "dark=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(Dark));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "taskbarleft=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(TaskbarLeft));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "showlabels=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(ShowLabels));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "activenet=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(ActiveNet));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "voiceon=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(VoiceOn));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "desktopmode=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(DesktopMode));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "pixelmode=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(PixelMode));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "pixelscale=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(PixelScale));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "pixelscan=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(PixelScan));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "termcellh=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(TermCellH));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "termbgmode=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(TermBgMode));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            Host.WriteText(0, CfgName, cfg);
+        }
+
+        public static void Load()
+        {
+            string s = Host.ReadText(0, CfgName);
+            if (s == null) return;
+            if (NexOS.Sys.StrLen(s) == 0) return;
+            int n = NexOS.Sys.StrLen(s), i = 0;
+            while (i < n) {
+                int start = i;
+                while (i < n && NexOS.Sys.StrCharAt(s, i) != '\n') i++;
+                string line = NexOS.Sys.StrSub(s, start, i - start);
+                i++; // consume '\n'
+                int ln = NexOS.Sys.StrLen(line), eq = 0;
+                while (eq < ln && NexOS.Sys.StrCharAt(line, eq) != '=') eq++;
+                if (eq >= ln) continue;
+                string key = NexOS.Sys.StrSub(line, 0, eq);
+                string val = NexOS.Sys.StrSub(line, eq + 1, ln - eq - 1);
+                int v = ParseInt(val);
+                if      (NexOS.Sys.StrEq(key, "walltop"))     WallTop     = (uint)v;
+                else if (NexOS.Sys.StrEq(key, "wallbot"))     WallBot     = (uint)v;
+                else if (NexOS.Sys.StrEq(key, "accent"))      Accent      = (uint)v;
+                else if (NexOS.Sys.StrEq(key, "dark"))        Dark        = v;
+                else if (NexOS.Sys.StrEq(key, "taskbarleft")) TaskbarLeft = v;
+                else if (NexOS.Sys.StrEq(key, "showlabels"))  ShowLabels  = v;
+                else if (NexOS.Sys.StrEq(key, "activenet"))   ActiveNet   = v;
+                else if (NexOS.Sys.StrEq(key, "voiceon"))     VoiceOn     = v;
+                else if (NexOS.Sys.StrEq(key, "desktopmode")) DesktopMode = v;
+                else if (NexOS.Sys.StrEq(key, "pixelmode"))   PixelMode  = v;
+                else if (NexOS.Sys.StrEq(key, "pixelscale"))  PixelScale = (v > 1) ? v : 1;
+                else if (NexOS.Sys.StrEq(key, "pixelscan"))   PixelScan  = v;
+                else if (NexOS.Sys.StrEq(key, "termcellh"))   { TermCellH = v; if (TermCellH < 12) TermCellH = 12; if (TermCellH > 28) TermCellH = 28; }
+                else if (NexOS.Sys.StrEq(key, "termbgmode"))  TermBgMode = v;
+            }
+        }
+
+        // Push the current pixel-mode settings to the kernel framebuffer
+        // post-process.  Call after Load() and after any Settings change.
+        public static void ApplyPixel()
+        {
+            Host.SetPixel(PixelMode, PixelScale, PixelScan);
+        }
+
+        // Decimal (optionally signed) integer parse.  No BCL int.Parse in
+        // MiniCLR, so this is a hand-rolled scanner over the managed string
+        // API.  Stops at the first non-digit.
+        private static int ParseInt(string s)
+        {
+            int n = NexOS.Sys.StrLen(s), i = 0, v = 0, sign = 1;
+            while (i < n && (NexOS.Sys.StrCharAt(s, i) == ' ' ||
+                             NexOS.Sys.StrCharAt(s, i) == '\t')) i++;
+            if (i < n && NexOS.Sys.StrCharAt(s, i) == '-') { sign = -1; i++; }
+            while (i < n) {
+                char c = NexOS.Sys.StrCharAt(s, i);
+                if (c < '0' || c > '9') break;
+                v = v * 10 + (c - '0');
+                i++;
+            }
+            return v * sign;
         }
     }
 
@@ -323,6 +527,37 @@ namespace NexOS.Forms
     {
         public static string I(int v) { return NexOS.Sys.IntToStr(v); }
 
+        // Linearly interpolate a packed 0xRRGGBB colour.  t is 0..1000.
+        public static uint LerpColor(uint c0, uint c1, int t)
+        {
+            if (t <= 0) return c0;
+            if (t >= 1000) return c1;
+            int r0 = (int)((c0 >> 16) & 0xFF), g0 = (int)((c0 >> 8) & 0xFF), b0 = (int)(c0 & 0xFF);
+            int r1 = (int)((c1 >> 16) & 0xFF), g1 = (int)((c1 >> 8) & 0xFF), b1 = (int)(c1 & 0xFF);
+            int r = r0 + ((r1 - r0) * t) / 1000;
+            int g = g0 + ((g1 - g0) * t) / 1000;
+            int b = b0 + ((b1 - b0) * t) / 1000;
+            return (uint)((r << 16) | (g << 8) | b);
+        }
+
+        // Re-pack a colour with an explicit alpha byte (0..255).
+        public static uint Alpha(uint c, int a)
+        {
+            if (a < 0) a = 0; if (a > 255) a = 255;
+            return (uint)((a << 24) | (c & 0x00FFFFFF));
+        }
+
+        // Fade a colour by `t` (0..1000) from fully transparent -> opaque,
+        // preserving its original alpha at t=1000.
+        public static uint Fade(uint c, int t)
+        {
+            if (t <= 0) return (c & 0x00FFFFFF);          // alpha 0
+            if (t >= 1000) return c;
+            int a = (int)((c >> 24) & 0xFF);
+            int na = (a * t) / 1000;
+            return (uint)((na << 24) | (c & 0x00FFFFFF));
+        }
+
         public static string Cat(string a, string b) { return NexOS.Sys.StrConcat(a, b); }
         public static string Cat(string a, string b, string c)
         { return NexOS.Sys.StrConcat(NexOS.Sys.StrConcat(a, b), c); }
@@ -330,8 +565,18 @@ namespace NexOS.Forms
         { return NexOS.Sys.StrConcat(NexOS.Sys.StrConcat(a, b), NexOS.Sys.StrConcat(c, d)); }
         public static string Cat(string a, string b, string c, string d, string e)
         { return NexOS.Sys.StrConcat(Cat(a, b, c, d), e); }
+        public static string Cat(string a, string b, string c, string d, string e, string f)
+        { return NexOS.Sys.StrConcat(Cat(a, b, c, d, e), f); }
         public static string Cat(string a, string b, string c, string d, string e, string f, string g)
         { return NexOS.Sys.StrConcat(Cat(a, b, c, d, e), NexOS.Sys.StrConcat(f, g)); }
+
+        // Single-allocation substring / newline flattening.  ALWAYS prefer
+        // these over a `for (...) r = Cat(r, CharStr(s[i]))` loop: that
+        // pattern is O(n^2) BYTES on the CLR bump heap and exhausting the
+        // heap faults the managed shell.
+        public static string Sub(string s, int start, int len)
+        { return NexOS.Sys.StrSub(s, start, len); }
+        public static string Flat(string s) { return NexOS.Sys.StrFlat(s); }
 
         // Point-in-rect test used by every click handler.
         public static bool In(int mx, int my, int x, int y, int w, int h)
@@ -411,23 +656,37 @@ namespace NexOS.Forms
             Gfx.Text(x + 12, y, s, C.Text);
         }
 
-        // Primary (filled) button.  hover/press recolour the fill.
+        // Primary (filled) button.  hover/press recolour the fill; a press
+        // plays the Btn shrink-to-half-and-restore animation.
         public static void Primary(int x, int y, int w, int h, string label)
         {
-            uint fill = C.Accent;
-            if (Hot(x, y, w, h)) fill = C.AccentHi;
-            Gfx.FillRound(x, y, w, h, 6, fill);
-            Gfx.TextCenter(x, y + (h - 16) / 2, w, label, C.White);
+            int sx = x, sy = y, sw = w, sh = h;
+            int sc = Btn.ScaleAt(x + Gfx.OriginX(), y + Gfx.OriginY(), w, h);
+            if (sc != 100)
+            {
+                sw = w * sc / 100; sh = h * sc / 100;
+                sx = x + (w - sw) / 2; sy = y + (h - sh) / 2;
+            }
+            uint fill = U.LerpColor(C.Accent, C.AccentHi, Hover(x, y, w, h));
+            Gfx.FillRound(sx, sy, sw, sh, 6, fill);
+            Gfx.TextCenter(sx, sy + (sh - 16) / 2, sw, label, C.White);
             if (App.Current != null) App.Current.RegisterHit(0, x, y, w, h);
         }
 
         // Secondary (outlined) button.
         public static void Button(int x, int y, int w, int h, string label)
         {
-            uint fill = Hot(x, y, w, h) ? C.Hover : C.Card;
-            Gfx.FillRound(x, y, w, h, 6, fill);
-            Gfx.DrawRound(x, y, w, h, 6, C.BorderMid);
-            Gfx.TextCenter(x, y + (h - 16) / 2, w, label, C.Text);
+            int sx = x, sy = y, sw = w, sh = h;
+            int sc = Btn.ScaleAt(x + Gfx.OriginX(), y + Gfx.OriginY(), w, h);
+            if (sc != 100)
+            {
+                sw = w * sc / 100; sh = h * sc / 100;
+                sx = x + (w - sw) / 2; sy = y + (h - sh) / 2;
+            }
+            uint fill = U.LerpColor(C.Card, C.Hover, Hover(x, y, w, h));
+            Gfx.FillRound(sx, sy, sw, sh, 6, fill);
+            Gfx.DrawRound(sx, sy, sw, sh, 6, C.BorderMid);
+            Gfx.TextCenter(sx, sy + (sh - 16) / 2, sw, label, C.Text);
             if (App.Current != null) App.Current.RegisterHit(0, x, y, w, h);
         }
 
@@ -435,12 +694,19 @@ namespace NexOS.Forms
         public static void Key(int x, int y, int w, int h, string label, bool accent)
         {
             uint fill;
-            if (accent) fill = Hot(x, y, w, h) ? C.AccentHi : C.Accent;
-            else        fill = Hot(x, y, w, h) ? C.Hover    : C.Card;
+            if (accent) fill = U.LerpColor(C.Accent, C.AccentHi, Hover(x, y, w, h));
+            else        fill = U.LerpColor(C.Card, C.Hover, Hover(x, y, w, h));
             uint fg = accent ? C.White : C.Text;
-            Gfx.FillRound(x, y, w, h, 6, fill);
-            if (!accent) Gfx.DrawRound(x, y, w, h, 6, C.Border);
-            Gfx.TextCenter(x, y + (h - 16) / 2, w, label, fg);
+            int sx = x, sy = y, sw = w, sh = h;
+            int sc = Btn.ScaleAt(x + Gfx.OriginX(), y + Gfx.OriginY(), w, h);
+            if (sc != 100)
+            {
+                sw = w * sc / 100; sh = h * sc / 100;
+                sx = x + (w - sw) / 2; sy = y + (h - sh) / 2;
+            }
+            Gfx.FillRound(sx, sy, sw, sh, 6, fill);
+            if (!accent) Gfx.DrawRound(sx, sy, sw, sh, 6, C.Border);
+            Gfx.TextCenter(sx, sy + (sh - 16) / 2, sw, label, fg);
             if (App.Current != null) App.Current.RegisterHit(0, x, y, w, h);
         }
 
@@ -452,9 +718,10 @@ namespace NexOS.Forms
                 Gfx.FillRound(x, y, w, RowH - 2, 6, C.Sel);
                 Gfx.FillRound(x + 3, y + 6, 3, RowH - 14, 2, C.Accent);
             }
-            else if (Hot(x, y, w, RowH - 2))
+            else
             {
-                Gfx.FillRound(x, y, w, RowH - 2, 6, C.Hover);
+                uint fc = U.LerpColor(C.Card, C.Hover, Hover(x, y, w, RowH - 2));
+                Gfx.FillRound(x, y, w, RowH - 2, 6, fc);
             }
             Gfx.Text(x + 14, y + (RowH - 2 - 16) / 2, text, C.Text);
             if (App.Current != null) App.Current.RegisterHit(0, x, y, w, RowH - 2);
@@ -474,6 +741,165 @@ namespace NexOS.Forms
             int mx = Gfx.MouseX(), my = Gfx.MouseY();
             return mx >= x && mx < x + w && my >= y && my < y + h;
         }
+
+        // Animated hover amount 0..1000 (lerps over 150ms via Anim.Hover).
+        // Use this for colour/scale transitions instead of the hard Hot() bool.
+        public static int Hover(int x, int y, int w, int h)
+        {
+            int k = Anim.Key(x, y, w, h);
+            int hot = Hot(x, y, w, h) ? 1 : 0;
+            return Anim.Hover(k, hot);
+        }
+
+        // -----------------------------------------------------------------
+        //  Voice binding -- the ONLY way a control becomes voice-enabled.
+        //  Callers that pass a non-empty `cmd` opt this control in; every
+        //  other control stays silent (the default).  The rect is the same
+        //  one the control was drawn with, so the synthetic click lands
+        //  dead-centre on it.  The Voice engine decides window-local vs
+        //  screen coordinates from App.Current (null == desktop surface).
+        // -----------------------------------------------------------------
+        public static void Voice(string cmd, int x, int y, int w, int h)
+        {
+            if (cmd == null) return;
+            if (NexOS.Sys.StrLen(cmd) == 0) return;
+            NexOS.Forms.Voice.Register(cmd, x, y, w, h);
+        }
+
+        // -----------------------------------------------------------------
+        //  Animated state controls.  Each takes a stable `id` (use a unique
+        //  constant per control, or Anim.Key(x,y,w,h) for fixed layouts) and
+        //  interpolates its visual state via Anim so toggling is never a hard
+        //  cut.  Callers own the click handling (these only draw + hit-test).
+        // -----------------------------------------------------------------
+
+        // ToggleSwitch.  Knob slides with a Back-overshoot; track colour
+        // lerps from BorderMid (off) to Accent (on) over 200ms.
+        public static int Toggle(int x, int y, int w, int h, int on, int id)
+        {
+            int tgt = (on != 0) ? 1000 : 0;
+            Anim.Set(id, tgt, 200, 1);                 // 1 = Back easing
+            int t = Anim.Get(id);
+            if (t < 0) t = 0; if (t > 1000) t = 1000;
+            uint track = U.LerpColor(C.BorderMid, C.Accent, t);
+            int r = h / 2;
+            Gfx.FillRound(x, y, w, h, r, track);
+            int kx = x + r + ((w - h) * t) / 1000;     // knob centre x
+            int ky = y + r;
+            Gfx.FillCircle(kx, ky, r - 2, C.White);
+            return Hot(x, y, w, h) ? 1 : 0;
+        }
+
+        // CheckBox.  Box recolours to Accent when on; the check mark scales in
+        // with a Back overshoot.
+        public static int Check(int x, int y, int s, int on, int id)
+        {
+            int tgt = (on != 0) ? 1000 : 0;
+            Anim.Set(id, tgt, 120, 1);
+            int t = Anim.Get(id);
+            if (t < 0) t = 0; if (t > 1000) t = 1000;
+            uint box = U.LerpColor(C.BorderMid, C.Accent, t);
+            int r = s / 2;
+            Gfx.FillRound(x, y, s, s, 4, box);
+            // check mark: two segments meeting at the centre, scaled by t
+            int cx = x + r, cy = y + r;
+            int len = (s * t) / 1000;
+            if (len > 2)
+            {
+                int x1 = cx - s / 4, y1 = cy + s / 8;
+                int x2 = cx - s / 10, y2 = cy + s / 4;
+                int x3 = cx + s / 3, y3 = cy - s / 6;
+                Gfx.DrawLine(x1, y1, x2, y2, C.White);
+                Gfx.DrawLine(x2, y2, x3, y3, C.White);
+            }
+            return Hot(x, y, s, s) ? 1 : 0;
+        }
+
+        // RadioButton.  Outer ring; filled centre dot scales in when selected.
+        public static int Radio(int x, int y, int s, int on, int id)
+        {
+            int tgt = (on != 0) ? 1000 : 0;
+            Anim.Set(id, tgt, 120, 1);
+            int t = Anim.Get(id);
+            if (t < 0) t = 0; if (t > 1000) t = 1000;
+            int r = s / 2;
+            Gfx.DrawCircle(x + r, y + r, r - 1, C.BorderMid);
+            if (t > 0)
+            {
+                int dr = (r * t) / 1000;
+                Gfx.FillCircle(x + r, y + r, dr, C.Accent);
+            }
+            return Hot(x, y, s, s) ? 1 : 0;
+        }
+
+        // Slider.  Track + thumb; thumb grows on hover (1.0->1.15).  The value
+        // (`pct` 0..100) is supplied by the caller and tracked live (no easing,
+        // so dragging stays glued to the pointer).
+        public static int Slider(int x, int y, int w, int h, int pct, int id)
+        {
+            int r = h / 2;
+            Gfx.FillRound(x, y, w, h, r, C.BorderMid);
+            int filled = (w * pct) / 100;
+            Gfx.FillRound(x, y, filled < r ? r : filled, h, r, C.Accent);
+            int hv = Hover(x, y, w, h);
+            int tr = r - 2 + (r * 15 * hv) / 10000;   // up to +15% on hover
+            int tx = x + (w * pct) / 100;
+            Gfx.FillCircle(tx, y + r, tr, C.White);
+            Gfx.DrawCircle(tx, y + r, tr, C.BorderMid);
+            return Hot(x, y, w, h) ? 1 : 0;
+        }
+
+        // ProgressBar.  The displayed fill eases toward `pct` (0..100) over
+        // 300ms so value changes glide instead of snapping.
+        public static int Progress(int x, int y, int w, int h, int pct, uint c, int id)
+        {
+            if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+            Anim.Set(id, pct * 10, 300, 0);
+            int disp = Anim.Get(id) / 10;
+            if (disp < 0) disp = 0; if (disp > 100) disp = 100;
+            Gfx.Progress(x, y, w, h, disp, c);
+            return disp;
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  VK -- virtual-key codes the input layer routes to App.OnKey when a
+    //  key has no literal character (Ctrl/Alt combos, arrows, F-keys...).
+    //  Positive values are literal codepoints; these negatives are the
+    //  synthetic codes ShellForm (WinHost) and the kernel bridge emit.
+    //  Shared by TerminalApp and every other consumer.
+    // -----------------------------------------------------------------
+    public static class VK
+    {
+        public const int Back   = 8;
+        public const int Enter  = 13;
+        public const int Esc    = 27;
+        public const int Delete = -26;   // forward delete
+        public const int CtrlC  = -3;    // copy selection, else SIGINT
+        public const int CtrlV  = -4;    // paste
+        public const int CtrlZ  = -5;    // undo (TBox) / suspend (term)
+        public const int CtrlA  = -6;    // home (term) / select-all (TBox)
+        public const int CtrlE  = -7;    // end
+        public const int CtrlU  = -8;    // clear to line start
+        public const int CtrlK  = -9;    // clear to line end
+        public const int CtrlW  = -10;   // delete word back
+        public const int CtrlL  = -11;   // clear screen
+        public const int CtrlD  = -12;   // EOF / close if empty
+        public const int CtrlR  = -13;   // reverse-i-search
+        public const int AltF   = -15;   // word forward
+        public const int AltB   = -16;   // word back
+        public const int Tab    = -17;   // completion
+        public const int Up = -18, Down = -19, Left = -20, Right = -21;
+        public const int HomeK = -22, EndK = -23, PageUp = -24, PageDown = -25;
+        public const int CsC = -30, CsV = -31, CsT = -32, CsW = -33;
+        public const int F1 = -40, F2 = -41, F3 = -42, F4 = -43, F5 = -44,
+                         F6 = -45, F7 = -46, F8 = -47, F9 = -48, F10 = -49,
+                         F11 = -50, F12 = -51;
+        // Terminal zoom (Ctrl +/-/0).  Must not collide with the -3..-33 and
+        // -40..-51 ranges already used above.
+        public const int CtrlPlus  = -60;   // zoom in  (Ctrl '+')
+        public const int CtrlMinus = -61;   // zoom out (Ctrl '-')
+        public const int Ctrl0     = -62;   // zoom reset
     }
 
     // -----------------------------------------------------------------
@@ -483,10 +909,18 @@ namespace NexOS.Forms
     public class App
     {
         public int id;                         // window id, set by Shell.Open
+        public int KindId;                     // launch kind, set by Shell.Open
         public virtual void OnPaint() { }
         public virtual void OnClick(int mx, int my) { }
         public virtual void OnKey(int ch) { }
+        // New input surfaces the terminal emulator needs.  Default to
+        // no-ops so every existing app keeps compiling and behaving.
+        public virtual void OnMouseDown(int btn, int mx, int my) { }
+        public virtual void OnMouseUp(int btn, int mx, int my) { }
+        public virtual void OnMouseMove(int mx, int my) { }
+        public virtual void OnWheel(int dy) { }
         public virtual string GetTitle() { return "App"; }
+
         // Context-menu hooks: the selected file in a file-browser window.
         public virtual string SelectedFile() { return ""; }
         public virtual int    SelectedFs()   { return -1; }
@@ -503,11 +937,23 @@ namespace NexOS.Forms
         }
         // Perform a file-action code from the file context menu.
         public virtual void DoFileAction(int code) { }
-        // Perform a generic window-context action (Refresh / Close).
+        // Perform a generic window-context action (Alt+Space menu).
+        // Refresh / Close are handled directly; the geometry-bearing
+        // actions (Minimize / Maximize / Restore / Move / Size) are
+        // delegated to the host, which owns window position in both the
+        // VM (gui.cpp) and the WinForms harness (ShellForm.ToggleMax /
+        // WinRec.Minimized).  Move / Size are live drag gestures the
+        // immediate-mode shell cannot capture, so the host surfaces them
+        // as a no-op when unsupported - the menu still closes cleanly.
         public virtual void DoWinAction(int code)
         {
-            if (code == WAct.Refresh) OnCtxRefresh();
-            else if (code == WAct.Close) Shell.Close(id);
+            if (code == WAct.Refresh)      OnCtxRefresh();
+            else if (code == WAct.Close)   Shell.Close(id);
+            else if (code == WAct.Minimize) Host.WinAction(id, WAct.Minimize);
+            else if (code == WAct.Maximize) Host.WinAction(id, WAct.Maximize);
+            else if (code == WAct.Restore)  Host.WinAction(id, WAct.Restore);
+            else if (code == WAct.Move || code == WAct.Size)
+                Host.WinAction(id, code);
         }
         // Override to reload window content on "Refresh".
         public virtual void OnCtxRefresh() { }
@@ -540,10 +986,18 @@ namespace NexOS.Forms
         }
     }
 
-    // Action codes for the generic window context menu.
+    // Action codes for the generic window context menu (Alt+Space / title
+    // bar right-click).  Mirrors the Win11 window menu: Restore / Move /
+    // Size / Minimize / Maximize / Close - with the greyed states the OS
+    // shows for the current window state.
     public static class WAct
     {
-        public const int Refresh = 15;   // re-run OnCtxRefresh()
-        public const int Close   = 17;   // Shell.Close(id)
+        public const int Restore  = 10;   // un-maximise / un-minimise
+        public const int Move     = 11;   // enter drag-move (host gesture)
+        public const int Size     = 12;   // enter drag-resize (host gesture)
+        public const int Minimize = 13;   // minimise to taskbar
+        public const int Maximize = 14;   // maximise to fill
+        public const int Refresh  = 15;   // re-run OnCtxRefresh()
+        public const int Close    = 17;   // Shell.Close(id)
     }
 }
