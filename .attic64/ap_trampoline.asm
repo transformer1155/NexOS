@@ -116,16 +116,16 @@ ap_long_entry:
     mov gs, ax
     mov ss, ax
 
-    ; per-CPU stack inside the BSP-mapped kernel region (identity-mapped by
-    ; the PML4 we inherited): 0x180000 + cpu*0x4000, top of a 16KiB stack.
-    ; (CPU index patched by BSP.)
+    ; per-CPU stack in low memory.  Trampoline lives at 0x10000; place each
+    ; AP's 4KiB stack window above it: 0x20000 + (cpu+1)*0x1000 (top of page).
     mov eax, [tramp_cpu]
     and eax, 0xFF                ; 0..MAX_CPUS-1
     mov rax, 0
     mov eax, eax
-    shl rax, 14                  ; *0x4000
-    add rax, 0x180000
-    add rax, 0x4000             ; top of this AP's 16KiB stack
+    add rax, 1                   ; cpu+1
+    shl rax, 12                  ; *0x1000
+    add rax, 0x20000
+    add rax, 0x1000              ; top of this AP's 4KiB stack page
     mov rsp, rax
 
     ; Pass the logical cpu index to ap_main() in rdi (System V AMD64 ABI:

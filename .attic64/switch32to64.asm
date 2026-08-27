@@ -53,7 +53,7 @@ extern __lm_stack_top
 ; "msyh.ttf" string used by Sfs::find and font_vec's vec_init) live past the
 ; old 640 KiB window, so they read back as a zero page and strcmp() never
 ; matches -> vec_init fails (step 319).  Keep this == KERNEL64_SECTORS*512/4.
-%define KERNEL64_DWORDS (1440 * 512 / 4)   ; 1440 sectors = 737280 B, matches KERNEL64_SECTORS (kernel64.bin is ~707 KiB)
+%define KERNEL64_DWORDS (1452 * 512 / 4)   ; MUST cover the whole kernel64.bin (now 742672 B = ~1452 sectors incl. embedded trampoline). Keep in sync with KERNEL64_SECTORS in kernel.cpp.
 
 global switch_to_64bit
 
@@ -157,6 +157,14 @@ switch_to_64bit:
     add eax, 0x40000000           ; next 1GiB block
     add edi, 8
     loop .fill_pdpt
+
+    ; Mark the 3-4 GiB 1GiB page (PDPT[3], covering 0xC0000000-0xFFFFFFFF) as
+    ; cache-disabled (PCD bit 4).  This region holds the LAPIC MMIO at
+    ; 0xFEE00000 (and the VBE LFB); without PCD, reads of MMIO return stale
+    ; cache lines (BIOS ROM shadow) instead of live LAPIC state.
+    mov eax, [PDPT_ADDR + 24]
+    or  eax, 0x10                 ; PCD (cache disable)
+    mov [PDPT_ADDR + 24], eax
 
     popad
 

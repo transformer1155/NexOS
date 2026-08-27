@@ -46,7 +46,7 @@ ifeq ($(WSL),1)
 endif
 
 BUILD   := build
-IMG     := $(BUILD)/os.img
+IMG     := $(BUILD)/os_v2.img
 UEFI_IMG := $(BUILD)/os_uefi.img
 SFS_IMG := $(BUILD)/sfs.img
 SFS_DIR := sfs_files
@@ -114,7 +114,7 @@ EFI_LDFLAGS := -nostdlib -znocombreloc -T $(EFI_LDS) -shared -Bsymbolic \
 # entry64.asm, linker64.ld, switch32to64.asm, switch64to32.asm) and the
 # PE32+/amd64 browser were retired to .attic64/ -- nothing in the build,
 # the disk layout or the shell references them any more.
-SFS_LBA      := 3496
+SFS_LBA      := 3508
 SFS_BYTE_OFF := $(shell echo $$(( $(SFS_LBA) * 512 )))
 
 # Real GGUF weights bypass SFS entirely (768-sector cap) and are appended to
@@ -1178,6 +1178,9 @@ $(BUILD)/switch32to64.o: .attic64/switch32to64.asm | $(BUILD)
 $(BUILD)/kernel64.o: .attic64/kernel64.cpp | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c .attic64/kernel64.cpp -o $@
 
+$(BUILD)/smp64.o: .attic64/smp64.cpp .attic64/smp64.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c .attic64/smp64.cpp -o $@
+
 $(BUILD)/gui64.o: gui.cpp logo.h font_vec.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c gui.cpp -o $@
 
@@ -1245,14 +1248,14 @@ $(BUILD)/clr64.o: clr.cpp | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c clr.cpp -o $@
 
 $(BUILD)/mforms64.o: mforms.cpp | $(BUILD)
-	$(CC64) $(CXX64FLAGS) -fno-optimize-sibling-calls -c mforms.cpp -o $@
+$(BUILD)/kernel64.elf: $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/font_vec64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_mc.o $(BUILD)/ap_trampoline.o .attic64/linker64.ld | $(BUILD)
+	$(LD64) $(LDFLAGS64) -o $@ $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/font_vec64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_mc.o $(BUILD)/ap_trampoline.o
+$(BUILD)/ap_trampoline.o: .attic64/ap_trampoline.asm | $(BUILD)
+	$(AS) -f bin -o $(BUILD)/ap_trampoline.bin .attic64/ap_trampoline.asm
+	$(OBJCOPY64) -I binary -O elf64-x86-64 -B i386 $(BUILD)/ap_trampoline.bin $@
 
-# ----- Link 64-bit kernel ELF (entry64.o first => _start64 at 0x100000) -----
-$(BUILD)/kernel64.elf: $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/font_vec64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_bringup.o $(BUILD)/ap_trampoline.o .attic64/linker64.ld | $(BUILD)
-	$(LD64) $(LDFLAGS64) -o $@ $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/font_vec64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_bringup.o $(BUILD)/ap_trampoline.o
-
-$(BUILD)/smp_bringup.o: .attic64/smp_bringup.cpp .attic64/smp64.h | $(BUILD)
-	$(CC64) $(CXX64FLAGS) -c .attic64/smp_bringup.cpp -o $@
+$(BUILD)/smp_mc.o: .attic64/smp_mc.cpp .attic64/smp64.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c .attic64/smp_mc.cpp -o $@
 
 # ELF relocations are needed, then wrap it in an ELF64 object via objcopy
 # so it can be linked.  This exposes _binary_ap_trampoline_bin_start/end.

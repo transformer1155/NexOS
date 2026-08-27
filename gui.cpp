@@ -7077,6 +7077,38 @@ struct Win11Desktop {
 // =====================================================================
 static Win11Desktop g_wm;
 
+// Programmatic window geometry action (WAct.*).  Called from the managed
+// shell via Host.WinAction(id, code).  Mirrors the title-bar / taskbar
+// gestures that set the same window flags.
+extern "C" void gui_win_action(int id, int code) {
+    if (id < 0 || id >= g_wm.window_count) return;
+    Win11Window& w = g_wm.windows[id];
+    switch (code) {
+        case 13: // WAct.Minimize
+            if (!w.minimized) {
+                w.minimized = true;
+                if (g_wm.active_window == id) {
+                    g_wm.active_window = -1;
+                    for (int k = g_wm.window_count - 1; k >= 0; k--)
+                        if (g_wm.windows[k].visible && !g_wm.windows[k].minimized) {
+                            g_wm.windows[k].active = true; g_wm.active_window = k; break;
+                        }
+                }
+            }
+            break;
+        case 14: // WAct.Maximize
+            w.fullscreen = !w.fullscreen;
+            break;
+        case 10: // WAct.Restore
+            w.minimized = false;
+            break;
+        case 11: // WAct.Move   (host drag gesture; nothing to do headless)
+        case 12: // WAct.Size   (host drag gesture; nothing to do headless)
+        default:
+            break;
+    }
+}
+
 // =====================================================================
 //  NexOS.Forms host bridge
 // ---------------------------------------------------------------------

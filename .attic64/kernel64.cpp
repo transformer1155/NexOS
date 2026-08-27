@@ -47,8 +47,10 @@ void gguf_adapter_selftest(void);
 // =====================================================================
 static inline uint8_t  inb(uint16_t p){ uint8_t v; __asm__ __volatile__("inb %1,%0":"=a"(v):"Nd"(p)); return v; }
 static inline uint16_t inw(uint16_t p){ uint16_t v; __asm__ __volatile__("inw %1,%0":"=a"(v):"Nd"(p)); return v; }
+static inline uint32_t inl(uint16_t p){ uint32_t v; __asm__ __volatile__("inl %1,%0":"=a"(v):"Nd"(p)); return v; }
 static inline void outb(uint16_t p,uint8_t v){ __asm__ __volatile__("outb %0,%1"::"a"(v),"Nd"(p)); }
 static inline void outw(uint16_t p,uint16_t v){ __asm__ __volatile__("outw %0,%1"::"a"(v),"Nd"(p)); }
+static inline void outl(uint16_t p,uint32_t v){ __asm__ __volatile__("outl %0,%1"::"a"(v),"Nd"(p)); }
 
 // =====================================================================
 //  Serial debug output (port 0x3F8)  -  for UEFI boot tracing
@@ -178,13 +180,13 @@ static bool ata_drq(int to){
 static void ata_read_sector(uint32_t lba, uint16_t* buf){
     ata_last_err = 0;
     // 1) device must be idle before we touch any registers
-    if(!ata_nobsy(2000000)) { ata_last_status = inb(0x1F7); ata_last_err = 1; return; }
+    if(!ata_nobsy(50000)) { ata_last_status = inb(0x1F7); ata_last_err = 1; return; }
     // 2) select drive + LBA mode, THEN wait again: selecting a device can
     //    assert BSY, and any register write while BSY is set is dropped by the
     //    controller -- which is exactly why the old driver always read LBA0
     //    (the LBA registers never latched and the drive used its default CHS).
     outb(0x1F6, 0xE0 | ((lba>>24)&0x0F));
-    if(!ata_nobsy(2000000)) { ata_last_status = inb(0x1F7); ata_last_err = 2; return; }
+    if(!ata_nobsy(50000)) { ata_last_status = inb(0x1F7); ata_last_err = 2; return; }
     // 3) now the parameters will actually latch
     outb(0x1F1, 0x00);
     outb(0x1F2, 1);
@@ -194,14 +196,311 @@ static void ata_read_sector(uint32_t lba, uint16_t* buf){
     outb(0x1F7, 0x20);                 // READ SECTORS
     // 4) wait for the data to be ready (BSY clear + DRQ set)
     if(!ata_drq(2000000)) { ata_last_status = inb(0x1F7); ata_last_err = 3; return; }
-    for(int i=0;i<256;i++) buf[i]=inw(0x1F0);
+    __asm__ __volatile__("cld; rep insw" :: "d"((uint16_t)0x1F0), "D"(buf), "c"(256) : "memory");
     ata_last_status = inb(0x1F7);      // final status / clear IRQ
 }
 
-static void ata_write_sector(uint32_t lba, const uint16_t* buf){
-    if(!ata_nobsy(2000000)) return;
+// Multi-sector PIO read: issues ONE READ SECTORS command for `count` sectors
+// (count<=128).  Drastically cuts per-sector command overhead vs calling
+// ata_read_sector in a loop (776964 single-sector commands for the model).
+// Uses `rep insw` (string I/O) so QEMU can transfer the whole block in one
+// shot instead of one inw per word.
+static void ata_read_multi(uint32_t lba, uint8_t count, uint16_t* buf){
+    ata_last_err = 0;
+    if(!ata_nobsy(50000)) { ata_last_status = inb(0x1F7); ata_last_err = 1; return; }
     outb(0x1F6, 0xE0 | ((lba>>24)&0x0F));
-    if(!ata_nobsy(2000000)) return;
+    if(!ata_nobsy(50000)) { ata_last_status = inb(0x1F7); ata_last_err = 2; return; }
+    outb(0x1F1, 0x00);
+    outb(0x1F2, count);
+    outb(0x1F3, (uint8_t)(lba & 0xFF));
+    outb(0x1F4, (uint8_t)((lba>>8) & 0xFF));
+    outb(0x1F5, (uint8_t)((lba>>16) & 0xFF));
+    outb(0x1F7, 0x20);                 // READ SECTORS
+    if(!ata_drq(2000000)) { ata_last_status = inb(0x1F7); ata_last_err = 3; return; }
+    // One rep insw for the whole batch (count*256 words).
+    __asm__ __volatile__("cld; rep insw" :: "d"((uint16_t)0x1F0), "D"(buf), "c"((uint32_t)count*256u) : "memory");
+    ata_last_status = inb(0x1F7);
+}
+
+// =====================================================================
+//  IDE Bus Master DMA (BM-DMA) for bulk model loading.
+//  QEMU's PIIX3 (00:01.1) exposes a BM interface; DMA copies disk data
+//  straight into RAM with ~zero per-byte CPU cost, vs millions of PIO
+//  inw/insw that TCG emulates painfully slowly.
+// =====================================================================
+static uint32_t pci_cfg_read32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg){
+    uint32_t addr = 0x80000000u | ((uint32_t)bus<<16) | ((uint32_t)dev<<11) |
+                    ((uint32_t)fn<<8) | (reg & 0xFC);
+    outl(0xCF8, addr);
+    return inl(0xCFC);
+}
+static uint16_t pci_cfg_read16(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg){
+    uint32_t addr = 0x80000000u | ((uint32_t)bus<<16) | ((uint32_t)dev<<11) |
+                    ((uint32_t)fn<<8) | (reg & 0xFC);
+    outl(0xCF8, addr);
+    return (uint16_t)(inl(0xCFC) >> ((reg&3)*8));
+}
+
+// Returns the BM interface IO base (e.g. 0xC000), or 0 if not found.
+static uint16_t ata_bm_base(void){
+    // PIIX3 IDE is typically 00:01.1, class 0x0101 (IDE). Scan a few slots.
+    for (uint8_t dev=0; dev<4; dev++){
+        uint32_t id = pci_cfg_read32(0, dev, 1, 0);
+        if (id == 0xFFFFFFFFu) continue;
+        uint32_t cls = pci_cfg_read32(0, dev, 1, 8);
+        uint8_t class_base = (uint8_t)(cls >> 24);
+        uint8_t class_sub  = (uint8_t)(cls >> 16);
+        if (class_base == 0x01 && class_sub == 0x01){
+            // Enable PCI Bus Mastering so the BM-DMA controller is live.
+            uint16_t cmd = pci_cfg_read16(0, dev, 1, 0x04);
+            if (!(cmd & 0x04)){
+                cmd |= 0x04;
+                // write back via config dword (16-bit write at 0x04)
+                uint32_t cur = pci_cfg_read32(0, dev, 1, 0x04);
+                cur = (cur & 0xFFFF0000u) | (uint32_t)cmd | 0x04u;
+                // use 0xCF8/0xCFC dword write
+                uint32_t addr = 0x80000000u | ((uint32_t)0<<16) | ((uint32_t)dev<<11) | ((uint32_t)1<<8) | (0x04 & 0xFC);
+                outl(0xCF8, addr);
+                outl(0xCFC, cur);
+            }
+            uint16_t bm = pci_cfg_read16(0, dev, 1, 0x20);
+            if (bm & 1) return (uint16_t)(bm & 0xFFF0);
+        }
+    }
+    return 0;
+}
+
+// Single PRDT entry: 32-bit phys addr, 32-bit byte count (0 => 64KiB), flags.
+static uint32_t g_bm_base = 0;
+// PRDT is a static (identity-mapped) buffer so its phys==virt address is
+// always valid regardless of PMM init order.
+static uint32_t g_prdt[4] __attribute__((aligned(16)));
+static uint32_t g_prdt_phys = 0;
+
+// Read up to 64KiB (128 sectors) via BM-DMA into a physically-contiguous
+// buffer `buf_phys` (which, in identity-mapped long mode, is also the VA).
+static bool ata_read_dma_block(uint32_t lba, uint8_t* buf_phys){
+    if (!g_bm_base) return false;
+    uint16_t bm = (uint16_t)g_bm_base;
+    // Program PRDT: one entry, 64KiB, EOT (bit0).
+    volatile uint32_t* prdt = (volatile uint32_t*)(uintptr_t)g_prdt_phys;
+    prdt[0] = (uint32_t)(uintptr_t)buf_phys;
+    prdt[1] = 0x00010000u;   // 64KiB explicit (byte count; 0x10000 = 65536)
+    prdt[2] = 0x00000001u;   // EOT
+    outl(bm+4, g_prdt_phys); // PRD table address
+    outb(bm+2, 0x06);        // clear BM status (INTR|ERROR)
+    // Enable DMA transfer mode on the device (SET FEATURES, subcmd 0x03),
+    // once. Without this the drive answers READ DMA with a PIO DRQ and the
+    // bus master never sees data -> BM error.
+    static bool dma_enabled = false;
+    if (!dma_enabled){
+        if(ata_nobsy(50000)){
+            outb(0x1F6, 0xE0 | ((lba>>24)&0x0F));
+            if(ata_nobsy(50000)){
+                outb(0x1F1, 0x03);   // DMA mode
+                outb(0x1F2, 0x00);
+                outb(0x1F3, 0x00);
+                outb(0x1F4, 0x00);
+                outb(0x1F5, 0x00);
+                outb(0x1F7, 0xEF);   // SET FEATURES
+                // wait for completion
+                uint32_t w=0; while(!(inb(0x1F7)&0x40) && w<2000000u){w++;}
+                dma_enabled = true;
+            }
+        }
+    }
+    // Issue READ DMA (LBA28, 128 sectors = 64KiB).
+    if(!ata_nobsy(50000)) { ata_last_err = 11; return false; }
+    outb(0x1F6, 0xE0 | ((lba>>24)&0x0F));
+    if(!ata_nobsy(50000)) { ata_last_err = 12; return false; }
+    outb(0x1F1, 0x00);
+    outb(0x1F2, 128);
+    outb(0x1F3, (uint8_t)(lba & 0xFF));
+    outb(0x1F4, (uint8_t)((lba>>8) & 0xFF));
+    outb(0x1F5, (uint8_t)((lba>>16) & 0xFF));
+    outb(0x1F7, 0xC8);       // READ DMA
+    outb(bm+0, 0x01);        // start bus master read (bit0=start, bit3=0 => device->memory)
+    // One-time diagnostic on first call.
+    static bool dbg_done = false;
+    if (!dbg_done){
+        dbg_done = true;
+        serial_puts("[DMA-DBG] bmcmd="); serial_hex(inb(bm+0));
+        serial_puts(" bmstat="); serial_hex(inb(bm+2));
+        serial_puts(" ide="); serial_hex(inb(0x1F7));
+        serial_puts(" prdt0="); serial_hex(prdt[0]);
+        serial_puts("\n");
+    }
+    // Poll BM status (bit0 = active -> clears on completion) with timeout.
+    uint32_t t = 0;
+    while (inb(bm+2) & 0x01) { if (++t > 4000000u) { outb(bm+0, 0x00); ata_last_err = 13; if(!dbg_done){} serial_puts("[DMA-DBG] TIMEOUT bmstat="); serial_hex(inb(bm+2)); serial_puts("\n"); return false; } }
+    outb(bm+0, 0x00);        // stop BM
+    uint8_t st = inb(0x1F7);
+    ata_last_status = st;
+    if (inb(bm+2) & 0x02) { ata_last_err = 14; serial_puts("[DMA-DBG] BM-ERROR bmstat="); serial_hex(inb(bm+2)); serial_puts("\n"); return false; } // BM error
+    return true;
+}
+
+// =====================================================================
+//  virtio-blk (legacy) for fast bulk model loading.
+//  Unlike IDE PIO (TCG-emulated byte-by-byte, ~100KB/s), virtio moves
+//  data through an in-RAM descriptor ring: QEMU memcpy's the disk blocks
+//  straight into our buffer, so a single request can pull the whole 379MB
+//  model at memory speed.
+// =====================================================================
+extern "C" void* big_alloc(uint32_t size);
+extern "C" void big_free(void* p, uint32_t size);
+#define VIRTIO_BLK_T_IN 0u
+struct vblk_vq {
+    volatile uint8_t* desc;   // descriptor table (16 bytes/entry)
+    volatile uint8_t* avail;  // available ring
+    volatile uint8_t* used;   // used ring
+    uint16_t qsz;
+};
+static uint16_t g_vblk_io = 0;     // virtio-blk IO port base (BAR0)
+static uint8_t  g_vblk_irq = 0;    // unused (polled)
+static struct vblk_vq g_vq;
+static uint32_t g_vq_phys = 0;
+static bool g_vblk_tried = false;   // lazy init guard (after PMM is up)
+
+static uint16_t vpci_read16(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg){
+    uint32_t addr = 0x80000000u | ((uint32_t)bus<<16) | ((uint32_t)dev<<11) |
+                    ((uint32_t)fn<<8) | (reg & 0xFC);
+    outl(0xCF8, addr);
+    return (uint16_t)(inl(0xCFC) >> ((reg&3)*8));
+}
+static uint32_t vpci_read32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg){
+    uint32_t addr = 0x80000000u | ((uint32_t)bus<<16) | ((uint32_t)dev<<11) |
+                    ((uint32_t)fn<<8) | (reg & 0xFC);
+    outl(0xCF8, addr);
+    return inl(0xCFC);
+}
+static void vpci_write32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg, uint32_t val){
+    uint32_t addr = 0x80000000u | ((uint32_t)bus<<16) | ((uint32_t)dev<<11) |
+                    ((uint32_t)fn<<8) | (reg & 0xFC);
+    outl(0xCF8, addr);
+    outl(0xCFC, val);
+}
+
+static bool virtio_blk_init(void){
+    for (uint8_t dev=0; dev<32; dev++){
+        uint32_t id = vpci_read32(0, dev, 0, 0);
+        if ((id & 0xFFFF) != 0x1AF4) continue;
+        uint16_t did = (uint16_t)(id >> 16);
+        if (did != 0x1001) continue;   // virtio-blk
+        // Enable IO + Bus Master in command register (0x04).
+        uint32_t cmd = vpci_read32(0, dev, 0, 0x04);
+        cmd |= 0x01u | 0x04u;          // IO space + bus master
+        vpci_write32(0, dev, 0, 0x04, cmd);
+        uint32_t bar0 = vpci_read32(0, dev, 0, 0x10);
+        if (!(bar0 & 1)) { serial_puts("[VBLK] BAR0 not IO\n"); return false; }
+        uint16_t base = (uint16_t)(bar0 & 0xFFFC);
+        // Device status: reset -> acknowledge -> driver -> features_ok -> driver_ok
+        outb(base+0x12, 0);            // reset
+        outb(base+0x12, 0x01);         // ACKNOWLEDGE
+        outb(base+0x12, 0x01|0x02);    // DRIVER
+        uint32_t devfeat = inl(base+0x00);
+        // Negotiate NO features (virtio-blk legacy base I/O needs none). Writing
+        // back device features verbatim can include bits the device rejects.
+        outl(base+0x04, 0);
+        outb(base+0x12, 0x01|0x02|0x04); // FEATURES_OK
+        // Select queue 0 and read its size.
+        outw(base+0x0E, 0);
+        uint16_t qsz = inw(base+0x0C);
+        if (qsz == 0 || qsz > 8192) { serial_puts("[VBLK] bad qsz\n"); return false; }
+        g_vq.qsz = qsz;
+        // Allocate physically-contiguous virtqueue (identity-mapped).
+        // Legacy layout: descriptor table, then driver area (avail ring),
+        // then the device area (used ring) on its OWN 4K page (QEMU requires
+        // the used ring to be page-aligned).
+        uint32_t desc_sz = (uint32_t)qsz * 16u;
+        uint32_t avail_sz = 4u + (uint32_t)qsz * 2u + 2u;   // flags+idx+ring+used_event
+        uint32_t used_sz  = 4u + (uint32_t)qsz * 8u + 2u;   // flags+idx+elem(8B)+avail_event
+        uint32_t vq = (uint32_t)(uintptr_t)big_alloc( (desc_sz + avail_sz + 8192u + used_sz + 4095u) & ~4095u );
+        if (!vq) { serial_puts("[VBLK] no mem\n"); return false; }
+        g_vq_phys = vq;
+        uint32_t avail_off = vq + desc_sz;
+        uint32_t used_off  = (vq + desc_sz + avail_sz + 4095u) & ~4095u;
+        g_vq.desc = (volatile uint8_t*)(uintptr_t)vq;
+        g_vq.avail = (volatile uint8_t*)(uintptr_t)avail_off;
+        g_vq.used  = (volatile uint8_t*)(uintptr_t)used_off;
+        // Tell device the queue address (page frame number).
+        outl(base+0x08, vq >> 12);
+        // Zero the ring state.
+        uint32_t total = (used_off + used_sz + 4095u) & ~4095u;
+        for (uint32_t i=0; i<total; i++) *(volatile uint8_t*)(uintptr_t)(vq+i) = 0;
+        outb(base+0x12, 0x01|0x02|0x04|0x08); // DRIVER_OK
+        g_vblk_io = base;   // mark ready only after full setup
+        serial_puts("[VBLK] ready io="); serial_hex(base);
+        serial_puts(" qsz="); serial_hex(qsz); serial_puts("\n");
+        return true;
+    }
+    return false;
+}
+
+// Read `nsect` sectors from `lba` into physically-contiguous `buf` in ONE
+// virtio request (only 3 descriptors needed regardless of size).
+static bool virtio_blk_read(uint32_t lba, uint8_t* buf, uint32_t nsect){
+    if (!g_vblk_io) return false;
+    uint16_t base = g_vblk_io;
+    // Request header: type(4) + reserved(4) + sector(8) = 16 bytes.
+    static uint8_t hdr[16] __attribute__((aligned(16)));
+    static uint8_t status __attribute__((aligned(8)));
+    status = 0xFF;
+    *(volatile uint32_t*)(hdr+0) = VIRTIO_BLK_T_IN;
+    *(volatile uint32_t*)(hdr+4) = 0;
+    *(volatile uint64_t*)(hdr+8) = (uint64_t)lba;
+
+    volatile uint8_t* d = g_vq.desc;
+    uint32_t doff = 0;
+    // desc0: header (device reads it) -> NEXT -> 1
+    *(volatile uint64_t*)(d+doff+0) = (uint64_t)(uintptr_t)hdr;
+    *(volatile uint32_t*)(d+doff+8) = 16;
+    *(volatile uint16_t*)(d+doff+12) = 1;          // flags = NEXT
+    *(volatile uint16_t*)(d+doff+14) = 1;          // next = 1
+    // desc1: data (device writes) -> NEXT -> 2, WRITE flag
+    *(volatile uint64_t*)(d+doff+16) = (uint64_t)(uintptr_t)buf;
+    *(volatile uint32_t*)(d+doff+24) = nsect*512u;
+    *(volatile uint16_t*)(d+doff+28) = (1u<<1) | 1u; // WRITE | NEXT
+    *(volatile uint16_t*)(d+doff+30) = 2;          // next = 2
+    // desc2: status (device writes) -> no NEXT, WRITE flag
+    *(volatile uint64_t*)(d+doff+32) = (uint64_t)(uintptr_t)&status;
+    *(volatile uint32_t*)(d+doff+40) = 1;
+    *(volatile uint16_t*)(d+doff+44) = (1u<<1);    // WRITE
+    *(volatile uint16_t*)(d+doff+46) = 0;
+
+    // Available ring: place head index 0, bump idx.
+    volatile uint8_t* av = g_vq.avail;
+    uint16_t idx = *(volatile uint16_t*)(av+2);
+    *(volatile uint16_t*)(av+4) = 0;               // ring[0] = head desc
+    *(volatile uint16_t*)(av+2) = (uint16_t)(idx + 1); // idx++
+    outl(base+0x10, 0);                            // notify queue 0 (32-bit write)
+    // tiny delay so the device can pick up the notification
+    for (volatile uint32_t d=0; d<1000; d++){}
+
+    // Poll used ring idx until it advances past our submission.
+    volatile uint8_t* us = g_vq.used;
+    uint32_t t = 0;
+    while (*(volatile uint16_t*)(us+2) == idx){
+        if (++t > 20000000u){
+            serial_puts("[VBLK] TIMEOUT devstat="); serial_hex(inb(base+0x12));
+            serial_puts(" isr="); serial_hex(inb(base+0x14));
+            serial_puts(" usedidx="); serial_hex(*(volatile uint16_t*)(us+2));
+            serial_puts(" availidx="); serial_hex(*(volatile uint16_t*)(g_vq.avail+2));
+            // used ring elem[0]: id @ us+4 (4B), len @ us+8 (4B)
+            serial_puts(" used_e0_id="); serial_hex(*(volatile uint32_t*)(us+4));
+            serial_puts(" used_e0_len="); serial_hex(*(volatile uint32_t*)(us+8));
+            serial_puts(" desc0="); serial_hex64(*(volatile uint64_t*)d);
+            serial_puts("\n");
+            return false;
+        }
+    }
+    return status == 0;
+}
+
+static void ata_write_sector(uint32_t lba, const uint16_t* buf){
+    if(!ata_nobsy(50000)) return;
+    outb(0x1F6, 0xE0 | ((lba>>24)&0x0F));
+    if(!ata_nobsy(50000)) return;
     outb(0x1F2, 1);
     outb(0x1F3, (uint8_t)(lba & 0xFF));
     outb(0x1F4, (uint8_t)((lba>>8) & 0xFF));
@@ -210,7 +509,7 @@ static void ata_write_sector(uint32_t lba, const uint16_t* buf){
     if(!ata_drq(2000000)) return;
     for(int i=0;i<256;i++) outw(0x1F0, buf[i]);
     outb(0x1F7, 0xE7);                 // CACHE FLUSH
-    ata_nobsy(2000000);
+    ata_nobsy(50000);
 }
 
 // (ata_diag_probe removed — debug-only, no longer needed)
@@ -3373,22 +3672,51 @@ static uint64_t model_blob_probe(uint64_t* out_lba){
 static uint8_t* model_blob_read(uint64_t lba, uint64_t size){
     uint8_t* dst = (uint8_t*)big_alloc((uint32_t)size);
     if (!dst) return 0;
+    // Lazily bring up virtio-blk once PMM is available (i.e. now).
+    if (!g_vblk_io && !g_vblk_tried){
+        g_vblk_tried = true;
+        virtio_blk_init();
+    }
+    // Fast path: pull the entire model from a virtio-blk disk in ONE request.
+    if (g_vblk_io){
+        uint64_t sectors = (size + 511) / 512;
+        serial_puts("[VBLK] reading "); serial_dec((uint32_t)(size>>20)); serial_puts("MB in one DMA...\n");
+        if (virtio_blk_read(0, dst, (uint32_t)sectors)){
+            serial_puts("[VBLK] model read OK\n");
+            return dst;
+        }
+        serial_puts("[VBLK] read failed, falling back to IDE PIO\n");
+    }
     uint64_t sectors = (size + 511) / 512;
     uint64_t done = 0;
     uint8_t sec[512];
-    for (uint64_t i = 0; i < sectors; i++){
-        uint64_t chunk = size - done;
-        if (chunk >= 512){
-            // Whole sector: land it straight in the destination buffer.
-            ata_read_sector((uint32_t)(lba + i), (uint16_t*)(dst + done));
-            done += 512;
+    uint64_t i = 0;
+    bool use_dma = (g_bm_base != 0) && (g_prdt_phys != 0);
+    while (i < sectors){
+        uint64_t remaining = sectors - i;
+        uint8_t batch = (remaining > 255) ? 255 : (uint8_t)remaining;
+        if (use_dma && (done + (uint64_t)batch*512 <= size)){
+            // BM-DMA: 128 sectors = 64KiB straight into the (physically
+            // contiguous, identity-mapped) destination buffer.
+            if (!ata_read_dma_block((uint32_t)(lba + i), dst + done)){
+                // Fall back to PIO for the rest if DMA hiccups.
+                use_dma = false;
+                ata_read_multi((uint32_t)(lba + i), batch, (uint16_t*)(dst + done));
+            }
+            done += (uint64_t)batch*512;
+        } else if (done + (uint64_t)batch*512 <= size){
+            ata_read_multi((uint32_t)(lba + i), batch, (uint16_t*)(dst + done));
+            done += (uint64_t)batch*512;
         } else {
             ata_read_sector((uint32_t)(lba + i), (uint16_t*)sec);
+            uint64_t chunk = size - done;
             memcpy_(dst + done, sec, (int)chunk);
             done += chunk;
         }
-        // Progress dots keep long PIO transfers from looking like a hang.
+        i += batch;
+        // Progress dots keep long transfers from looking like a hang.
         if ((i & 1023u) == 0u) term.put_char('.');
+        if ((i & 32767u) == 0u) { serial_puts("[load "); serial_dec((uint32_t)(i>>17)); serial_puts("MB]\n"); }
     }
     return dst;
 }
@@ -5851,6 +6179,15 @@ extern "C" void kmain64(){
     smp_init();
     diag_step(1, "kmain64 post-smp_init");
 
+    // --- Init IDE Bus Master DMA (for fast bulk model loading) ---
+    g_bm_base = ata_bm_base();
+    g_prdt_phys = (uint32_t)(uintptr_t)g_prdt;
+    serial_puts("[ATA] BM-DMA base=");
+    serial_hex(g_bm_base);
+    serial_puts(" prdt=");
+    serial_hex(g_prdt_phys);
+    serial_puts("\n");
+
     // --- DIAG: report what the 64-bit side sees for the framebuffer ---
     {
         volatile uint8_t* dbg_vb = (volatile uint8_t*)0x5000;
@@ -6075,16 +6412,28 @@ extern "C" void kmain64(){
     term.write("\nShell ready. Type 'help' for commands.\n");
     term.write("Tab=autocomplete, Arrows=cursor/history, PgUp/PgDn=scroll, Home/End, Ctrl+C/V/L.\n\n");
 
-    // ---- AUTOTEST: load embedded GGUF and run one real inference (serial) ----
-    // Runs BEFORE the security/sign-in sequence so headless/VM boots print
-    // genuine transformer output even if a later prompt would block.
-    serial_puts("[AUTOTEST] loading embedded GGUF...\n");
-    if (model_try_load()) {
-        serial_puts("[AUTOTEST] model loaded; real inference (DeepSeek)...\n");
-        qwen_generate("DeepSeek is which company?", 96, 0.8f, ask_emit);
-        serial_puts("\n[AUTOTEST] inference done.\n");
-    } else {
-        serial_puts("[AUTOTEST] model load FAILED.\n");
+    // ---- AUTOTEST: probe embedded GGUF and run one real inference (serial) ----
+    serial_puts("[AUTOTEST] probing embedded GGUF...\n");
+    {
+        uint64_t plba = 0;
+        uint64_t psize = model_blob_probe(&plba);
+        if (psize) {
+            serial_puts("[AUTOTEST] model blob found at LBA ");
+            serial_dec((uint32_t)plba);
+            serial_puts(" size=");
+            serial_dec((uint32_t)(psize>>20));
+            serial_puts(" MB\n");
+            serial_puts("[AUTOTEST] loading model (this may take a while)...\n");
+            if (model_try_load()) {
+                serial_puts("[AUTOTEST] model loaded; real inference (DeepSeek)...\n");
+                qwen_generate("DeepSeek is which company?", 96, 0.8f, ask_emit);
+                serial_puts("\n[AUTOTEST] inference done.\n");
+            } else {
+                serial_puts("[AUTOTEST] model load or inference FAILED.\n");
+            }
+        } else {
+            serial_puts("[AUTOTEST] no model blob found.\n");
+        }
     }
 
     // ---- Security subsystem init (parity with 32-bit kernel.cpp kmain) ----

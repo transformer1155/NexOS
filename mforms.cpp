@@ -607,6 +607,14 @@ int32_t h_clip_get(int32_t*) {
 extern "C" { int g_mforms_anim = 0; }
 int32_t h_set_anim(int32_t* a) { g_mforms_anim = (a && a[0]) ? 1 : 0; return 0; }
 
+extern "C" void gui_win_action(int id, int code);
+int32_t h_win_action(int32_t* a) {
+    int id  = (a && a[0]) ? a[0] : -1;
+    int code = (a && a[1]) ? a[1] : 0;
+    gui_win_action(id, code);
+    return 0;
+}
+
 // Host.SetPixel(mode, scale, scan): the managed shell (Theme) pushes its
 // retro "pixel / CRT monitor" settings down to the kernel so the single
 // framebuffer post-process in gui.cpp::pixelate_framebuffer() can read them.
@@ -710,6 +718,7 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::LoginUid",     h_login_uid   },
     { "NexOS.Forms.Host::UserCount",    h_user_count  },
     { "NexOS.Forms.Host::UserName",     h_user_name   },
+    { "NexOS.Forms.Host::WinAction",     h_win_action  },
     { "NexOS.Forms.Host::SetPixel",     h_set_pixel   },
 };
 const int G_REG_COUNT = (int)(sizeof(g_regs) / sizeof(g_regs[0]));

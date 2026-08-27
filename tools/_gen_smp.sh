@@ -1,3 +1,10 @@
+#!/bin/bash
+set -e
+cd /mnt/d/MyOS/bootloader
+# NOTE: GGUF model loading + AUTOTEST must run on BSP only. Waking APs under
+# QEMU TCG hangs smp_init forever, blocking the demo. We emit a single-core
+# (BSP-only) smp_init on purpose.
+cat > .attic64/smp_bringup.cpp <<'NEXEOF'
 #include "smp64.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -21,3 +28,5 @@ void smp_init(void){
 }
 
 int cpu_index(void){ return g_my_cpu; }
+NEXEOF
+echo "WROTE .attic64/smp_bringup.cpp (single-core)"

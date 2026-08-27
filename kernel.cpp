@@ -6333,7 +6333,7 @@ extern "C" void switch_to_64bit(uint32_t stage_phys);
 // OpenAI-compatible remote agent + CORS + /agent web UI): kernel64.bin is now
 // ~717584 bytes (vector font rasterizer added).  kernel occupies LBA 2048..3488;
 // SFS_ALT_LBA / SFS_LBA = 3488.
-#define KERNEL64_SECTORS    1448    // 2048+1448 = 3496 = SFS start (no overlap)
+#define KERNEL64_SECTORS    1460    // 2048+1460 = 3508 = SFS start (no overlap)
 
 // Load kernel64.bin from the disk into a staging buffer and jump to long
 // mode.  Shared by `switch` and `ask64`; never returns on success.
@@ -8057,10 +8057,9 @@ extern "C" void kmain(){
     // by `winapp <file.exe>`.  The normal build defaults to 1 (auto GUI).
     g_auto_gui = 0;
 #else
-    // Demo build: stay at the textual shell so `switch64` can drop into the
-    // 64-bit kernel (real GGUF LLM + distnet) without the desktop stealing
-    // the console.  Enter the GUI on demand with `gui`.
-    g_auto_gui = 1;  // TEMP: auto-enter GUI for headless verification
+    // Default into the Win11 GUI desktop on boot (the C# mforms shell now
+    // loads and runs; conv.u8 + SFS layout fixes made the desktop stable).
+    g_auto_gui = 1;
 #endif
 
     // Headless / server mode flag, set by QEMU:

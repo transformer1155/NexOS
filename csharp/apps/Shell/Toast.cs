@@ -25,16 +25,23 @@ namespace NexOS.Forms
 
         const int TOAST_KEY = 0x70A57EAF;   // base Anim key (slot i -> +i)
 
-        static string[] title = new string[CAP];
-        static string[] body  = new string[CAP];
-        static int[]    t0    = new int[CAP];   // show start ms
-        static int[]    life  = new int[CAP];   // total lifetime ms (>1 => occupied)
-        static int[]    hasBody = new int[CAP]; // 1 => body text present
+        // NOTE: static field initialisers do NOT run on this minimal CLR, so
+        // the arrays are allocated lazily in Init() (mirrors Anim.Ensure()).
+        static string[] title;
+        static string[] body;
+        static int[]    t0;    // show start ms
+        static int[]    life;  // total lifetime ms (>1 => occupied)
+        static int[]    hasBody; // 1 => body text present
         static int      inited = 0;
 
         public static void Init()
         {
             if (inited == 1) return;
+            title   = new string[CAP];
+            body    = new string[CAP];
+            t0      = new int[CAP];
+            life    = new int[CAP];
+            hasBody = new int[CAP];
             for (int i = 0; i < CAP; i++) { title[i] = ""; body[i] = ""; life[i] = 1; hasBody[i] = 0; }
             inited = 1;
         }

@@ -11,6 +11,20 @@ IMG  = r"d:\MyOS\bootloader\build\os.img"
 SER  = r"d:\MyOS\bootloader\build\smoke_serial.log"
 MON  = 4441
 
+def open_mon():
+    time.sleep(2)
+    return socket.create_connection(("127.0.0.1", MON), timeout=10)
+
+def type_line(mon, s, delay=0.6):
+    keymap = {' ': 'spc', '.': 'dot', '/': 'slash', '\\': 'backslash',
+              '-': 'minus', '_': 'shift-minus', '?': 'shift-slash'}
+    for ch in s:
+        key = "shift-%s" % ch.lower() if 'A' <= ch <= 'Z' else keymap.get(ch, ch)
+        mon.sendall(("sendkey %s\n" % key).encode())
+        time.sleep(0.08)
+    mon.sendall(b"sendkey ret\n")
+    time.sleep(delay)
+
 def main():
     if os.path.exists(SER):
         os.remove(SER)
@@ -27,8 +41,16 @@ def main():
     print("launch:", " ".join(cmd))
     p = subprocess.Popen(cmd)
     try:
-        print("loader 0x501E set; waiting for 64-bit AUTO switch64 + AUTOTEST...")
-        for i in range(48):
+        mon = open_mon()
+        time.sleep(10)
+        type_line(mon, "root", 2.0)
+        time.sleep(2)
+        type_line(mon, "admin", 2.0)
+        time.sleep(2)
+        type_line(mon, "switch64", 2.0)
+        mon.close()
+        print("switch64 sent; waiting for 64-bit AUTOTEST real inference...")
+        for i in range(60):
             time.sleep(5)
             if os.path.exists(SER):
                 t = open(SER, encoding="latin-1", errors="replace").read()

@@ -735,7 +735,14 @@ static int exec_method(uint32_t midx, int depth) {
         } break;
         case 0x9C: case 0x9D: case 0x9E: case 0xA2: {       // stelem.*
             int32_t v = POP(); int32_t i = POP(); uint32_t a = (uint32_t)POP();
-            if (!a) { fault("null reference in stelem"); return -1; }
+            if (!a) {
+                char buf[160];
+                scpy_(buf, "null reference in stelem (", sizeof(buf));
+                scat_(buf, mex_name(m->name_off), sizeof(buf));
+                scat_(buf, ")", sizeof(buf));
+                fault(buf);
+                return -1;
+            }
             if (i < 0 || (uint32_t)i >= *(uint32_t*)(a + 4)) {
                 fault("array index out of range"); return -1;
             }

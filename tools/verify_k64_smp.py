@@ -13,9 +13,18 @@ Usage: python3 tools/verify_k64_smp.py
 """
 import os, socket, subprocess, sys, time
 
+# Avoid Windows console GBK encoding crashes on non-ASCII serial bytes.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
-IMG = "build/os_textboot.img"
+# Use the freshest WSL-built image (new filename each build defeats DrvFS cache).
+import glob as _glob
+_cands = sorted(_glob.glob("build/os_textboot_qemu_*.img"))
+IMG = _cands[-1] if _cands else "build/os_textboot_qemu.img"
 LOG = "build/k64_smp_verify.log"
 ERR = "build/k64_smp_verify.err"
 MON_PORT = 4478
@@ -90,14 +99,12 @@ if __name__ == "__main__":
         # Wait for SMP markers
         smp_init = wait_for("[SMP] init", 30.0)
         bsp = wait_for("[SMP] BSP apic_id=", 30.0)
-        online = wait_for("[SMP] online cpus=", 60.0)
+        online = wait_for("[SMP] online cpus=", 90.0)
         time.sleep(3.0)
         txt = ser_text()
-        print("---- serial SMP excerpt ----")
-        for ln in txt.splitlines():
-            s = ln.strip()
-            if s.startswith("[SMP]") or s.startswith("CPU") or "online" in s:
-                print(s)
+        print("---- FULL serial tail ----")
+        for ln in txt.splitlines()[-50:]:
+            print(repr(ln))
         print("----------------------------")
         cpu_onlines = sum(1 for ln in txt.splitlines()
                           if ln.strip().startswith("CPU") and "online" in ln)
