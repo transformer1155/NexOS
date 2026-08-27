@@ -1,3 +1,54 @@
+# NexOS — Two-Stage Bootloader C++ Kernel
+
+A full-featured x86 educational operating system with dual BIOS/UEFI boot paths.
+Boot flow: Stage1 boot sector → Stage2 loader → switch to 32-bit protected mode → jump to C++ kernel.
+
+## Features
+
+- Scrollback terminal + clipboard (mouse select / middle-click paste / Ctrl+C/V)
+- PS/2 keyboard (Set 1) + mouse (Intellimouse w/ scroll wheel) drivers
+- PowerShell-style shell (`PS user@minios /path>`), 48+ commands
+- **User system**: login / multi-user / password hashing (shadow file persistence)
+- **Permission system**: 9-bit rwxrwxrwx, `chmod`/`stat`, automatic permission checks on file commands
+- **sudo**: temporary privilege elevation with password verification
+- Dual file systems: MKFS (writable, with **dedicated data disk persistence**) + SFS (pre-built read-only)
+- `.sh` script execution (`run`/`runfs`)
+- **GUI desktop** (Win11 Portal style, on-demand launch, BGA fallback for any GPU)
+- **Chinese support**: GB2312 16×16 bitmap font (387 glyphs), mixed Chinese/English rendering in GUI
+- **Pinyin IME**: type pinyin in GUI Terminal → select by number → UTF-8 Chinese characters
+- Networking: NE2000 driver + HTTP server
+- AI engine (Markov + GPT-style text generation)
+- 32↔64 bit kernel switching
+
+## Directory Structure
+
+| File | Description |
+|------|-------------|
+| `boot.asm` | Stage1, 512-byte boot sector, INT 13h extended read to load Stage2 |
+| `stage2.asm` | Stage2, loads kernel, enables A20, sets up GDT, enters 32-bit protected mode |
+| `entry.asm` | Kernel entry stub (32-bit), sets up stack and calls `kmain` |
+| `kernel.cpp` | 32-bit kernel: terminal + input + ATA + shell + file systems + user/perm/sudo |
+| `entry64.asm` | 64-bit kernel entry stub (long mode) |
+| `kernel64.cpp` | 64-bit kernel (long mode variant) |
+| `switch32to64.asm` | 32 → 64 bit mode switch (`switch64` command) |
+| `switch64to32.asm` | 64 → 32 bit mode switch (return to command line) |
+| `gui.cpp` | GUI desktop + Chinese rendering + Pinyin IME |
+| `winloader.cpp` | Windows executable loader (`run xxx.exe/.bat/.ps1`) |
+| `net.cpp` | NE2000 NIC driver + HTTP server |
+| `ai_engine.cpp` | AI text generation engine (Markov + GPT) |
+| `linker.ld` / `linker64.ld` | 32/64-bit kernel linker scripts, entry `_start` @ `0x10000` / `0x100000` |
+| `uefi/bootuefi.c` | UEFI bootloader (x86_64, gnu-efi): loads kernel.bin, exits Boot Services |
+| `uefi/enter_kernel.S` | UEFI mode switch: long mode → 32-bit compatibility mode → jump to kernel |
+| `tools/sfs_gen.py` | SFS image generator: packs `sfs_files/` |
+| `tools/gen_zfont.py` | Chinese font generator: SimSun → GB2312 16×16 bitmap (`zfont_data.h`) |
+| `tools/gen_ime_dict.py` | Pinyin dictionary generator: pypinyin → `ime_dict.h` |
+| `tools/make_data_vhd.py` | User data disk generator: pre-formatted MKFS 8MB VHD |
+| `sfs_files/` | SFS source files (`.sh` scripts, `.txt` text files) |
+| `Makefile` | Build: BIOS + UEFI + ISO + SFS + data disk |
+| `test.sh` / `test_uefi.sh` | Headless automated tests for BIOS/UEFI (serial + screenshot checks) |
+
+## Memory & Disk Layout
+
 # NexOS — 二阶引导加载 C++ 内核
 
 一个功能完整的 x86 教学操作系统,支持 **BIOS** 和 **UEFI** 双引导路径。
