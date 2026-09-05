@@ -65,6 +65,30 @@ extern void     net_udp_broadcast(uint16_t src_port, uint16_t dst_port,
 #define DN_WGHT_PORT    5459   // node -> scheduler:  "WGHT <idx> <ntotal> <bytes...>"
 #define DN_WDONE_PORT   5460   // node -> scheduler:  "WDONE <seed> <nbytes> <crc>"
 
+// Sharded inference (model sharding) -- kernel-side orchestrator.
+// Wire protocol MUST match tools/distnet_shard_node.py and
+// tools/distnet_shard_orchestrator.py:
+//   QUERY                                -> BEACON compute <weight>
+//   SHARD <job> <s> <e> <nh> <np> <last>
+//   AACT  <job> <seq> <floats...>        (activations between nodes)
+//   CKPT  <job> <seq> <end> <floats...>  (node -> orchestrator checkpoint)
+//   OUT   <job> <seq> <floats...>        (last node -> orchestrator)
+//   PING  <job>                          -> PONG <job> <end> idle
+// NOTE: under SLIRP the host cannot initiate UDP to the guest, so the
+// orchestrator must run in the guest (it dials out to host shard nodes).
+#define DN_SHARD_MAX_NODES 3
+#define DN_SHARD_PORT      5461   // orchestrator's own UDP port
+
+void distnet_shard_run(int layers, int dim, uint32_t node_ip);
+void distnet_shard_probe(uint32_t node_ip);
+
+// Self-managing agent.  dn_agent_tick() is called from net.cpp's net_poll()
+// (see the extern declaration there), so it MUST have C linkage -- declare it
+// inside this extern "C" block, otherwise the C++ name mangling makes the
+// net.cpp reference unresolved at link time.
+void dn_agent_tick(void);
+extern int g_agent_running;
+
 void distnet_compute(void);
 // Discover a compute node (broadcast if target_ip==NULL), dispatch one task,
 // and log the RESULT.  `type`+`args` build the wire line "TASK 1 <type> <args>"

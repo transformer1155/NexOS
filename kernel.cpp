@@ -68,6 +68,15 @@ static void serial_hex(uint32_t v){
     buf[8] = 0;
     serial_puts(buf);
 }
+// Non-blocking serial read: returns char if data ready, else -1.
+static int serial_try_getc(void){
+    if (inb(0x3FD) & 0x01) return (int)(unsigned char)inb(0x3F8);
+    return -1;
+}
+// Remote console buffer: commands arriving over COM1 (frontend ops terminal /
+// bridge) are accumulated here and dispatched to run_command() on newline.
+static char g_serial_inbuf[256];
+static int  g_serial_inlen = 0;
 
 // =====================================================================
 //  Hardware Detection Module
@@ -1025,7 +1034,7 @@ struct Line { int len; char data[VGA_WIDTH]; };
 // ---- GUI terminal command output capture ----
 // When g_capturing is true, terminal output is also captured into g_exec_output
 // so the GUI terminal can display command results.
-static char g_exec_output[2048];
+static char g_exec_output[1024];
 static int  g_exec_output_len;
 static bool g_capturing;
 
@@ -1727,8 +1736,8 @@ static bool g_fb_console_mode = false;
 #define SFS_DATA_LBA      817
 // The BIOS os.img build places the same SFS image further out on the disk so
 // it does not collide with the 64-bit kernel payload.  Probe both locations.
-#define SFS_ALT_LBA       3496   // must match Makefile SFS_LBA (kernel64 payload ends at 2048+1448=3496)
-#define SFS_LINUX_LBA     3800   // independent Linux user-space partition (after main SFS vol; kept < 4 MiB so QEMU IDE (CHS-limited) can reach it)
+#define SFS_ALT_LBA       3664   // must match Makefile SFS_LBA (kernel64 payload ends at 2048+1600=3648, SFS at 3664)
+#define SFS_LINUX_LBA     3932   // independent Linux user-space partition (after main SFS vol; matches Makefile LINUX_SFS_LBA)
 
 // CD/ISO-boot RAM-SFS handoff.  boot_cd.asm streams the (texture-free) SFS
 // image off the CD into high RAM and leaves a flag at 0x0900 so the kernel
@@ -2279,7 +2288,8 @@ public:
             }
             return;
         }
-        static const uint32_t cand[] = { SFS_SUPER_LBA, SFS_ALT_LBA };
+        // Makefile places the SFS at LBA 3508 (2048 + KERNEL64_SECTORS=1460).
+        static const uint32_t cand[] = { SFS_SUPER_LBA, SFS_ALT_LBA, 3536 };
         for (unsigned i = 0; i < sizeof(cand)/sizeof(cand[0]); i++) {
             rd(cand[i], (uint16_t*)g_fsbuf);
             if (g_fsbuf[0]=='S' && g_fsbuf[1]=='F' && g_fsbuf[2]=='S' && g_fsbuf[3]==0) {
@@ -3946,6 +3956,23 @@ static void cmd_cd(const char* name){
 static void cmd_pwd(){
     mkfs.pwd();
 }
+// ----- process management (ps / kill) -----
+extern "C" int  proc_list(char* buf, int bufsz);
+extern "C" int  proc_kill(uint32_t pid);
+static void cmd_ps(){
+    char buf[512];
+    proc_list(buf, (int)sizeof(buf));
+    term.write(buf);
+    if (buf[0]) term.write("\n");
+}
+static void cmd_kill(const char* arg){
+    if (!*arg){ term.write("usage: kill <pid>\n"); return; }
+    uint32_t pid = 0;
+    for (const char* c = arg; *c >= '0' && *c <= '9'; c++) pid = pid * 10 + (uint32_t)(*c - '0');
+    if (pid == 0){ term.write("cannot kill the kernel (pid 0)\n"); return; }
+    if (proc_kill(pid) == 0){ term.write("killed pid "); term.write_dec((int)pid); term.write("\n"); }
+    else { term.write("no such pid: "); term.write_dec((int)pid); term.write("\n"); }
+}
 
 // ----- SFS commands -----
 static void cmd_lsfs(){
@@ -4776,7 +4803,17 @@ static void seed_default_users(){
     while(gg[i] && i < USER_GROUP_LEN - 1){ g_users[1].group[i] = gg[i]; i++; }
     g_users[1].group[i] = 0;
     hash_password("guest", "guest", g_users[1].hash);
-    g_user_count = 2;
+    // nexos / nexos (uid 1000, gid 1000, group users) -- the default ops account
+    g_users[2].exists = true;
+    i = 0; const char* nn = "nexos";
+    while(nn[i] && i < USER_NAME_LEN - 1){ g_users[2].name[i] = nn[i]; i++; }
+    g_users[2].name[i] = 0;
+    g_users[2].uid = 1000; g_users[2].gid = 1000;
+    i = 0; const char* ng = "users";
+    while(ng[i] && i < USER_GROUP_LEN - 1){ g_users[2].group[i] = ng[i]; i++; }
+    g_users[2].group[i] = 0;
+    hash_password("nexos", "nexos", g_users[2].hash);
+    g_user_count = 3;
     userdb_save();
 }
 
@@ -5009,22 +5046,36 @@ static void cmd_users(){
     }
 }
 
-static void cmd_login(const char* name){
-    if(!name[0]){ term.write("Usage: login <username>\n"); return; }
+static void cmd_login(const char* arg){
+    // Accept "login <user>" (interactive password) or "login <user> <password>"
+    // (one-shot, used by the web ops console / bridge).
+    char name[32]; int i = 0;
+    while(*arg && *arg != ' ' && i < 31){ name[i++] = *arg++; }
+    name[i] = 0;
+    const char* pw = (*arg == ' ') ? arg + 1 : "";
+    if(!name[0]){ term.write("Usage: login <username> [password]\n"); return; }
     int idx = -1;
     for(int i = 0; i < g_user_count; i++){
         if(g_users[i].exists && strcmp_(g_users[i].name, name) == 0){ idx = i; break; }
     }
     if(idx < 0){ term.write("User not found: "); term.write(name); term.put_char('\n'); return; }
-    term.write("Password: ");
-    term.render();
-    char pw[64]; int plen = 0;
-    read_line_quiet(pw, &plen, true);
     char hash[17];
-    hash_password(g_users[idx].name, pw, hash);
-    if(strcmp_(hash, g_users[idx].hash) != 0){
-        term.write("Incorrect password.\n");
-        return;
+    if(pw[0]){
+        hash_password(g_users[idx].name, pw, hash);
+        if(strcmp_(hash, g_users[idx].hash) != 0){
+            term.write("Incorrect password.\n");
+            return;
+        }
+    } else {
+        term.write("Password: ");
+        term.render();
+        char buf[64]; int plen = 0;
+        read_line_quiet(buf, &plen, true);
+        hash_password(g_users[idx].name, buf, hash);
+        if(strcmp_(hash, g_users[idx].hash) != 0){
+            term.write("Incorrect password.\n");
+            return;
+        }
     }
     g_login_idx = idx;
     g_euid = g_users[idx].uid;
@@ -6331,9 +6382,14 @@ extern "C" void switch_to_64bit(uint32_t stage_phys);
 #define KERNEL64_ADDR       0x100000
 // 1320*512 = 660 KiB.  Raised from 1280 because net.cpp grew (POST client +
 // OpenAI-compatible remote agent + CORS + /agent web UI): kernel64.bin is now
-// ~717584 bytes (vector font rasterizer added).  kernel occupies LBA 2048..3488;
-// SFS_ALT_LBA / SFS_LBA = 3488.
-#define KERNEL64_SECTORS    1460    // 2048+1460 = 3508 = SFS start (no overlap)
+// ~717584 bytes (vector font rasterizer added).  Raised again to 1461 because
+// the GUI ghosting fix + mouse-move refactor pushed kernel64.bin to ~747744
+// bytes; SFS_LBA (Makefile) was moved 3508 -> 3520 to keep the gap large
+// enough.  The rounded-rect clipping pipeline (Graphics::push_round_clip /
+// fill_rect / blend_rect honour the clip mask) pushed it to ~754912 bytes,
+// so SFS_LBA moved 3520 -> 3536 (gap = (3536-2048)*512 = 762368 and
+// KERNEL64_SECTORS=1475 => 755200 bytes still fits with margin).
+#define KERNEL64_SECTORS    1600    // raised for ps/kill
 
 // Load kernel64.bin from the disk into a staging buffer and jump to long
 // mode.  Shared by `switch` and `ask64`; never returns on success.
@@ -7082,6 +7138,8 @@ static void run_command(const char* line){
     else if(!strcmp_(cmd,"mkdir")||!strcmp_(cmd,"md")) cmd_mkdir(args);
     else if(!strcmp_(cmd,"cd")||!strcmp_(cmd,"sl"))    cmd_cd(args);
     else if(!strcmp_(cmd,"pwd")||!strcmp_(cmd,"gl"))   cmd_pwd();
+    else if(!strcmp_(cmd,"ps"))                         cmd_ps();
+    else if(!strcmp_(cmd,"kill"))                        cmd_kill(args);
     // SFS commands
     else if(!strcmp_(cmd,"lsfs"))  cmd_lsfs();
     else if(!strcmp_(cmd,"catfs")) cmd_catfs(args);
@@ -8386,10 +8444,17 @@ extern "C" void kmain(){
         boot_stage(6);
         cmd_gui("");
     } else if (boot_no_gui && g_vbe_active) {
-        // Headless / server mode: 64-bit kernel, text only (no crashing GUI).
-        serial_puts("[K] boot: 64-bit kernel, text shell (server mode)\n");
+        // Headless / server mode: stay in the 32-bit text shell (no crashing
+        // GUI, and no automatic 64-bit switch).  The 64-bit GGUF kernel is
+        // reached on demand via `ask64` / `switch64`, which is the path that
+        // actually answers with the embedded transformer.  This matches the
+        // 0x501E flag's own comment ("stay in the text shell instead of the
+        // GUI") and lets a headless session stage a question and run real
+        // inference.  (The old behaviour auto-switched here, which left no
+        // chance to type `ask64` before the handoff.)
+        serial_puts("[K] boot: 32-bit text shell (headless, no auto-switch)\n");
         boot_stage(6);
-        cmd_switch64();
+        // (no cmd_switch64 -- user drives 64-bit inference via `ask64`)
     } else {
         // Default: stable 32-bit shell.  Network + HTTP agent API work here.
         serial_puts("[K] boot: 32-bit shell (stable default)\n");
@@ -8406,6 +8471,28 @@ extern "C" void kmain(){
             int gui_tick_counter = 0;
             while(gui_is_active()){
                 if(g_net_initialized) net_poll();
+
+                // Remote console over COM1 (frontend ops terminal / bridge).
+                // Characters arriving on the serial port are accumulated and
+                // dispatched to the shell dispatcher on newline, so the web
+                // ops console can drive NexOS directly. Output is mirrored
+                // back to COM1 by Terminal::put_char (g_term_serial).
+                {
+                    int ch;
+                    while ((ch = serial_try_getc()) >= 0) {
+                        if (ch == '\r' || ch == '\n') {
+                            if (g_serial_inlen > 0) {
+                                g_serial_inbuf[g_serial_inlen] = 0;
+                                run_command(g_serial_inbuf);
+                                g_serial_inlen = 0;
+                            }
+                        } else if (ch == 0x7F || ch == '\b') {
+                            if (g_serial_inlen > 0) g_serial_inlen--;
+                        } else if (g_serial_inlen < (int)sizeof(g_serial_inbuf) - 1) {
+                            g_serial_inbuf[g_serial_inlen++] = (char)ch;
+                        }
+                    }
+                }
 
                 // Update clock every ~50 iterations
                 if(++gui_tick_counter > 50){

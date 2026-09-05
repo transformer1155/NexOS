@@ -1,5 +1,9 @@
 # NexOS — 二阶引导加载 C++ 内核
 
+> ⚠️ **协作规则：见 [RULES.md](RULES.md)。**
+> 任何更改（含 AI 助手完成的）都**必须提交 git 并推送 GitHub**（remote `origin`，分支 `master`）。
+> 改动大文件前请先备份并做锚点校验——本项目曾因未提交的工作被误删而无法恢复。
+
 一个功能完整的 x86 教学操作系统,支持 **BIOS** 和 **UEFI** 双引导路径。
 Stage1 引导扇区 → Stage2 二阶引导 → 切换到 32 位保护模式 → 跳转到 C++ 内核。
 
@@ -18,7 +22,15 @@ Stage1 引导扇区 → Stage2 二阶引导 → 切换到 32 位保护模式 →
 - **拼音输入法(IME)**:GUI Terminal 内输入拼音 → 数字选字 → UTF-8 汉字
 - 网络:NE2000 驱动 + HTTP 服务器
 - AI 引擎(Markov + GPT 风格文本生成)
+- **64 位 GGUF 推理引擎**:内置 Qwen2-0.5B(Q4_K_M)Transformer,从镜像嵌入的
+  GGUF 直接加载,`ask64` 命令切换 64 位内核流式推理
 - 32↔64 位内核切换
+- **分布式算力网络**(`distnet.cpp`):UDP 广播发现计算节点 + 任务调度 +
+  结果回收,可把计算/推理任务真实分发到计算节点(宿主 peer 或第二台 VM)
+- **Web 控制台 + 串口桥**:浏览器 UI 经 WebSocket 桥(`tools/nexos_bridge.py`)
+  直连**真 QEMU 虚拟机内核**,登录、shell 命令、算力网络全部真实执行(无本地模拟)
+- **Visual Agent Forge**:浏览器里拖拽节点连线编排 Agent,图会被翻译成真实
+  内核命令序列下发执行(见 `win11-ui/nexos-desktop.html`)
 
 ## 目录结构
 
@@ -30,19 +42,30 @@ Stage1 引导扇区 → Stage2 二阶引导 → 切换到 32 位保护模式 →
 | `kernel.cpp`            | 32 位内核:终端 + 输入 + ATA + shell + 文件系统 + 用户/权限/sudo |
 | `entry64.asm`           | 64 位内核入口桩(长模式)                                       |
 | `kernel64.cpp`          | 64 位内核(长模式变体)                                         |
+| `smp_impl64.cpp`        | 64 位内核 SMP 初始化(VM 下自动单核)                          |
+| `gguf_infer.cpp`        | 64 位 GGUF(Qwen2)Transformer 推理引擎                         |
 | `switch32to64.asm`      | 32 → 64 位模式切换(`switch64` 命令)                           |
 | `switch64to32.asm`      | 64 → 32 位模式切换(返回命令行)                                |
 | `gui.cpp`               | GUI 桌面 + 中文渲染 + 拼音 IME                                |
 | `winloader.cpp`         | Windows 可执行文件加载器(`run xxx.exe/.bat/.ps1`)             |
 | `net.cpp`               | NE2000 网卡驱动 + HTTP 服务器                                 |
+| `distnet.cpp`           | 分布式算力网络:UDP 发现 + 任务调度 + 计算节点 / Agent          |
 | `ai_engine.cpp`         | AI 文本生成引擎(Markov + GPT)                                |
 | `linker.ld` / `linker64.ld` | 32/64 位内核链接脚本,入口 `_start` @ `0x10000` / `0x100000` |
 | `uefi/bootuefi.c`       | UEFI 引导程序(x86_64,gnu-efi):加载 kernel.bin、退出 Boot Services |
 | `uefi/enter_kernel.S`   | UEFI 模式切换:长模式 → 32 位兼容模式 → 跳转内核              |
 | `tools/sfs_gen.py`      | SFS 镜像生成器:打包 `sfs_files/`                              |
+| `tools/embed_model.py`  | 把 GGUF 模型嵌入镜像(写 MINIMDL1 描述符到 LBA 16383/16384)   |
+| `build/run_ai_qemu.py`  | QEMU 自动启动(headless + monitor/Serial TCP),注入 ask64 验证 |
 | `tools/gen_zfont.py`    | 中文字库生成器:SimSun → GB2312 16×16 点阵(`zfont_data.h`)    |
 | `tools/gen_ime_dict.py` | 拼音字典生成器:pypinyin → `ime_dict.h`                        |
 | `tools/make_data_vhd.py`| 用户数据盘生成器:预格式化 MKFS 的 8MB VHD                     |
+| `tools/nexos_bridge.py` | WebSocket ↔ VM 串口桥:浏览器控制台与真内核之间的通道           |
+| `tools/nexos_l2hub.py`  | L2 交换 hub:让多台 VM 共享广播域(`distnet` 广播发现的前提)    |
+| `tools/distnet_host_peer.py` | 宿主侧**真实计算节点**,接收并执行 distnet 下发的任务      |
+| `tools/distnet_compute_driver.py` | 计算节点 VM 的串口驱动(登录 → setip → distnet compute) |
+| `tools/check_k64_fit.sh`| 构建前自检:64 位内核是否溢出内核区、各分区是否重叠             |
+| `win11-ui/nexos-desktop.html` | Web 控制台:Win11 桌面 + 分布式网络面板 + Agent Forge    |
 | `sfs_files/`            | SFS 源文件(`.sh` 脚本、`.txt` 文本)                           |
 | `Makefile`              | 构建:BIOS + UEFI + ISO + SFS + 数据盘                         |
 | `test.sh` / `test_uefi.sh` | BIOS/UEFI 无头自动化测试(串口 + 截图校验)                  |
@@ -62,6 +85,8 @@ BIOS 磁盘 (LBA, 扇区=512B):
        LBA 33..544   kernel.bin   (内核, 最多 256KiB)
        LBA 300..303  命令历史文件  (save/load, 2KiB)
        LBA 2048..     kernel64.bin (64 位内核)
+       LBA 16383     GGUF 描述符 (魔数 "MINIMDL1": size + data_lba)
+       LBA 16384..    GGUF 模型数据 (如 Qwen2-0.5B Q4_K_M, ~397MB)
        LBA 512       MKFS 超级块   (魔数 "MKFS")
        LBA 513..528  MKFS 文件表   (16 扇区, 256 条目)
        LBA 529..799  MKFS 数据区   (启动盘: 271 扇区 / 135KB)
@@ -82,6 +107,42 @@ Stage2 固定 16KiB,内核起始 LBA(33)确定。**MKFS 数据区默认写在独
 
 UEFI 路径下,`BOOTX64.EFI` 从 ESP 读取 `kernel.bin` 复制到 `0x10000`,
 退出 Boot Services 后切到 32 位兼容模式跳转——与 BIOS 路径汇合。
+
+### 镜像分区与容量告警(改内核前必读)
+
+`build/os_v2.img` 的实际分区(由 Makefile 变量决定):
+
+| 区域 | LBA | 说明 |
+|------|-----|------|
+| boot + stage2 + kernel.bin | 0 .. ~1200 | 32 位部分 |
+| `kernel64.bin` | 2048 .. 2048+`KERNEL64_SECTORS` | 64 位内核;32 位 loader 只搬 `KERNEL64_SECTORS` 个扇区 |
+| 主 SFS | `SFS_LBA`(3568) | 只读文件系统 |
+| Linux 用户态 FS | `LINUX_SFS_LBA`(3836) | 独立分区 |
+| GGUF 描述符 / 数据 | 16383 / 16384 | 仅指定 `MODEL_GGUF` 时写入 |
+
+**64 位内核的容量非常紧张**:它必须落在 LBA 2048 与 SFS 之间的“缝隙”里。
+一旦内核涨出这个缝隙,`dd` 会**静默覆盖文件系统**,或把截断的镜像交给
+`switch_to_64bit()` 导致 triple fault —— 属于“镜像长到硬编码偏移里”的经典故障。
+Makefile 的 `$(IMG)` 规则有守卫会直接报错,但**改内核前先自检更快**:
+
+```bash
+bash tools/check_k64_fit.sh
+```
+
+当前状态:`KERNEL64_SECTORS=1500`、`SFS_LBA=3568`,kernel64 约 765KB,
+**仅剩个位数扇区(约 2~3KB)余量**。继续往 64 位内核加功能时,必须同步:
+
+1. 调大 `kernel.cpp` 的 `KERNEL64_SECTORS`
+2. 把 `Makefile` 的 `SFS_LBA` 与 `kernel.cpp` 的 `SFS_ALT_LBA` **一起后移**(两者必须一致)
+3. 相应后移 `LINUX_SFS_LBA`
+
+> ⚠️ **已知既有问题**:`LINUX_SFS_LBA(3836)` 落在主 SFS 区间(3568..13390)
+> **内部**,写 Linux FS 时会覆盖主 SFS 的一部分。目前没被触发是因为被覆盖区域
+> 尚无实际文件数据;在扩展 SFS 之前,应先把 `LINUX_SFS_LBA` 移到主 SFS 之后。
+
+> 💡 **WSL 构建提示**:WSL2 的 DrvFs 偶发“大文件写不进去 / 构建产物消失”。
+> 若遇到,把产物目录指到 WSL 本地盘再拷回即可:
+> `make BUILD=/home/<user>/nb && cp ~/nb/os_v2.img build/os_v2.img`
 
 ## 依赖
 
@@ -121,13 +182,29 @@ sudo apt install gnu-efi ovmf mtools xorriso
 ## 构建
 
 ```bash
-make                 # 生成 BIOS 镜像 build/os.img (含 SFS)
+make                 # 生成 BIOS 镜像 build/os_v2.img (含 SFS)
 make iso             # 生成 CD-ROM 镜像 build/os.iso (BIOS+UEFI 混合)
 make uefi            # 生成 UEFI 镜像 build/os_uefi.img
 make sfs             # 仅生成 SFS 镜像 build/sfs.img
 make data-vhd        # 生成用户数据盘 build/data.vhd (8MB, 预格式化 MKFS)
 make disasm          # 查看内核入口与反汇编,确认 _start 在 0x10000
 ```
+
+### 嵌入 GGUF 模型(64 位 Qwen2 推理)
+
+默认镜像不含模型权重。`make` 时传 `MODEL_GGUF` 会把 GGUF 写入镜像
+(LBA 16383 描述符 + LBA 16384 数据,镜像自动扩容到 ~400MB+):
+
+```bash
+# 下载/准备 Qwen2-0.5B Q4_K_M GGUF(约 397MB)到 build/
+make MODEL_GGUF=build/qwen2-0_5b-instruct-q4_k_m.gguf
+# 或事后单独嵌入到任意已存在镜像:
+python3 tools/embed_model.py build/os_v2.img build/qwen2-0_5b-instruct-q4_k_m.gguf 16383 16384
+```
+
+> 注意:`build/os.img` 默认是 auto-GUI 构建;验证 GGUF 推理请用
+> `build/os_v2.img`(默认 IMG),并通过 QEMU `-device loader,addr=0x501E`
+> 进入 headless 文本 shell(见下)。
 
 SFS 镜像由 `tools/sfs_gen.py` 从 `sfs_files/` 打包;中文与拼音字典由
 `gen_zfont.py` / `gen_ime_dict.py` 在 `gui.cpp` 编译前自动生成到项目根
@@ -230,9 +307,247 @@ OVMF 退出后 monitor 读 VGA 返回 `0xFFFFFFFF`,改用 `screendump` 截图
 | `switch` / `switch64` | 切换到 64 位内核(长模式)               |
 | `netinfo` / `netstart` | 网络状态 / 启动 NE2000 + HTTP 服务器    |
 | `ai` / `generate` / `agent` | AI 文本生成(初始模型 / 生成 / Agent) |
+| `ask64 <q>`    | 切 64 位内核用内嵌 GGUF 做真实 Qwen2 推理(流式输出) |
+| `ps` / `kill <pid>` | 进程列表 / 结束进程                                    |
 | `meminfo` / `memtest` / `pagetest` | 内存 / 页表诊断            |
 | `run xxx.bat/.exe/.ps1` | 通过 winloader 在 GUI 中打开并执行       |
 | `shutdown` / `reboot` | 关机 / 重启                               |
+
+## AI 推理(GGUF / Qwen2)
+
+系统有两层 AI:
+
+1. **32 位内置引擎**(`ai_engine.cpp`):Markov + GPT 风格文本生成,不需要
+   模型文件,`ai` / `generate` / `agent` 命令直接可用(见 `test_ai.sh`)。
+2. **64 位 GGUF 推理引擎**(`gguf_infer.cpp` + `kernel64.cpp`):从镜像嵌入的
+   GGUF 加载真实 Transformer(Qwen2-0.5B Q4_K_M),做高质量生成。
+
+### 触发真实 GGUF 推理
+
+64 位内核的 `ask` 命令在 `qwen_ready()` 时才跑真实权重;而 64 位文本
+shell 本身不接收 PS/2 键盘输入,所以推理由 **32 位 `ask64` 命令**触发:
+
+```
+ask64 <问题>
+  └─ 32 位内核把问题写入共享内存 0x5104,魔法字 NEXQ 写入 0x5100
+  └─ do_switch64() 切换到 64 位内核 (LBA 2048 的 kernel64.bin)
+  └─ jump_to_64bit_and_infer() 检测到 NEXQ → 加载内嵌 GGUF → qwen_generate()
+  └─ 流式输出到串口 / 终端,完成后返回 32 位 shell
+```
+
+### Headless 启动(windows 端 QEMU,TCG)
+
+64 位内核在检测到 hypervisor(VM)时默认进文本 shell(不进 GUI)。用
+`-device loader,addr=0x501E,data=1,data-len=1` 让 32 位内核停在文本
+shell(不自动切换、不进 GUI),登录后即可输入 `ask64`。示例
+(`build/run_ai_qemu.py` 已封装 monitor/Serial TCP 注入):
+
+```bash
+qemu-system-x86_64 -m 256 \
+  -drive file=build/os_v2.img,format=raw,if=ide -boot c \
+  -display none -monitor tcp:127.0.0.1:4460,server,nowait \
+  -serial tcp:127.0.0.1:4461,server,nowait \
+  -accel tcg -smp 4 \
+  -device loader,addr=0x501E,data=1,data-len=1
+```
+
+登录 `root` / `admin` 后,通过 monitor `sendkey` 注入 `ask64 What is 2+2?`,
+即可看到 64 位内核加载 GGUF 并推理。无模型时内核打印
+`[AUTOTEST] no model blob found.`(管线本身已打通)。
+
+### 已知修复 / 注意
+
+- **64 位 SMP 在 QEMU/TCG 下卡死**:原 `smp_impl64.cpp` 的 `smp_init()`
+  会对 APIC 1..3 广播 INIT/SIPI,而 QEMU TCG xAPIC 返回 Send Accept Error
+  且 IPI 投递位常驻,导致 `smp_lapic_ipi()` 每次跑满超时、整体数分钟卡住。
+  已在 `smp_init()` 开头加 **VM 检测**(cpuid leaf 1 bit 31):检测到
+  hypervisor 时直接 `g_ncpus=1` 单核返回,GPUF 推理路径完全 BSP 本地,
+  无需 AP。重编 `kernel64.bin` 后该问题消失。
+- **headless 标志语义**:`0x501E` 原会让 32 位内核登录后自动 `cmd_switch64()`
+  切到 64 位,导致没机会输入 `ask64`。已改为停在 32 位文本 shell,由用户
+  显式 `ask64` / `switch64` 驱动 64 位推理(符合标志"文本 shell"本意)。
+- 模型文件较大(~397MB),镜像需相应扩容;`make MODEL_GGUF=...` 会自动处理。
+- **未嵌模型时的表现**:内核打印 `[AUTOTEST] no model blob found.`,管线本身
+  已打通(详见下方「Web 控制台」里 Agent Forge 对思考节点的说明)。
+
+## 分布式算力网络(distnet)
+
+`distnet.cpp` 实现了一个真实的极简分布式计算网络:调度器用 **UDP 广播**发现
+计算节点,把任务下发给节点执行并回收结果。
+
+| 命令 | 作用 |
+|------|------|
+| `distnet nodes [ip]` | 发现计算节点(不带 IP = 广播;带 IP = 单播) |
+| `distnet discover` | 广播发现(需要节点与调度器在同一 L2 广播域) |
+| `distnet scheduler <type> <n>` | 广播下发任务并回收结果 |
+| `distnet scheduler <ip> <type> <n>` | 单播下发到指定节点 |
+| `distnet compute` | 本机作为计算节点上线(若干次 BEACON 后 idle-exit) |
+| `distnet ai "<prompt>"` | 把推理任务分发到 ai 节点并合并答案 |
+| `distnet agent status/start/stop/add/set/del/ai` | Agent 状态与节点管理 |
+| `setip <ip>` | 配置 IP(SLIRP 下内核会自动 DHCP,一般无需手动) |
+
+任务类型 `<type>` 支持 `fib` / `sum` / `echo`。已验证链路:
+
+```
+login nexos nexos
+distnet nodes 10.0.2.2              -> discovered 10.0.2.2, total 1
+distnet scheduler 10.0.2.2 fib 30   -> RESULT: RESULT 1 ok 832040
+```
+
+### 分布式推理(模型分片)
+
+`tools/distnet_shard_orchestrator.py` + `tools/distnet_shard_node.py` 实现
+**多节点协同推理同一个模型**,对应五项能力:
+
+| 能力 | 实现 |
+|------|------|
+| 模型分片 | 按层切成连续区间,每个节点持有一段(`SHARD <job> <s> <e> ...`) |
+| 分布式推理 | 激活值沿节点链逐段前传,末节点产出结果 |
+| 动态负载均衡 | 分片边界按各节点算力权重 `weight` 比例划分(算力大的多分层) |
+| 中间结果传输 | `AACT` 在节点间传激活值;`CKPT` 回传检查点给调度器 |
+| 推理容错 | 心跳探测;节点掉线则剔除 → 重新分片 → 从最近检查点续跑 |
+
+线协议(文本 UDP):`QUERY/BEACON`、`SHARD/SHARDOK`、`AACT`、`CKPT`、`OUT`、`PING/PONG`。
+
+```bash
+# 起 3 个分片节点(算力权重 1 / 2 / 4)
+python tools/distnet_shard_node.py --port 5501 --weight 1 --dim 16 &
+python tools/distnet_shard_node.py --port 5502 --weight 2 --dim 16 &
+python tools/distnet_shard_node.py --port 5503 --weight 4 --dim 16 &
+# 编排器:12 层模型切给这 3 个节点
+python tools/distnet_shard_orchestrator.py --port 5500 --layers 12 --dim 16 \
+       --nodes 127.0.0.1:5501,127.0.0.1:5502,127.0.0.1:5503
+```
+
+分片结果按算力 1:2:4 划分,节点掉线时自动恢复:
+
+```
+[orch] discovered: 5501(w=1), 5502(w=2), 5503(w=4)
+[orch] job job1 shards: 5501:L0-0 | 5502:L1-3 | 5503:L4-11
+[orch] !! node 5503 (L4-11) dead -> reshard
+[orch] resume from checkpoint layer 3
+[orch] job job1 shards: 5501:L4-5 | 5502:L6-11
+[orch] job job1 done (2 shards)
+```
+
+验证:`python tools/_shard_demo.py`(自动起 3 节点 + 编排器,中途 kill 掉正在
+计算的节点,验证重新分片与检查点续跑;恢复后的结果与无故障基线**逐位一致**)。
+
+#### 在 Agent Forge 里使用(桥做协议路由)
+
+Forge 的**分布式推理**节点发出 `forge shard <层数> <维度>`。`nexos_bridge.py`
+识别 `forge ` 前缀后**不下发内核**,而是路由到宿主侧分片编排器 —— 桥在此充当
+协议翻译/路由层(内核区已无空间放分片引擎):
+
+```
+Forge 节点 ──ws://8765──▶ nexos_bridge.py ──▶ distnet_shard_orchestrator
+                                                   └─▶ 5501/5502/5503 分片节点
+```
+
+开箱即用:桥会自动拉起 3 个分片节点(算力权重 1/2/4),无需手工启动。
+另有 `forge shard-nodes` 查看各节点存活状态。
+
+```powershell
+# 演示容错:让每层慢一点，好在推理途中 kill 节点
+$env:SHARD_DELAY="0.5"
+python tools\nexos_bridge.py
+# 浏览器 Agent Forge → 示例 →「分布式推理」→ ▶ Run
+```
+
+> ⚠️ 已修复的两处同类陷阱(改动时勿回退):节点冷启动比固定 sleep 慢,编排器会
+> 抢跑导致 `no shard nodes discovered`(改为轮询确认就绪);以及上面的
+> `WSAECONNRESET` —— 分片节点也会因给已死下一跳发包而退出,表现为**一个节点掉线
+> “传染”整条链**,节点与编排器两侧都必须捕获后 `continue`。
+
+> **层算子说明**:当前是**确定性合成层**(`act = tanh(W_i·act + b_i)`,权重由
+> `(seed, layer)` 生成),用于在无 GGUF 权重时验证分片/激活路由/容错这套机制。
+> 嵌入真实模型后,只需把 `distnet_shard_node.py` 的 `apply_layers()` 换成真实层
+> 算子,其余(分片、负载均衡、检查点、容错)完全复用。
+
+> ⚠️ **Windows UDP 陷阱**(已修复,改动时勿回退):给已挂掉的节点发过 UDP 后,
+> 对端回 ICMP 端口不可达,**下一次 `recvfrom()` 会抛 `WSAECONNRESET`**。若在收包
+> 循环里 `break`,编排器会在节点挂掉的瞬间“失聪”——能检测故障却收不到恢复结果。
+> 必须捕获后 `continue`。
+
+### 计算节点从哪来
+
+- **宿主 peer(推荐,单 VM 即可)**:`python tools/distnet_host_peer.py`
+  在宿主起一个真实计算节点(UDP 5455/5456)。SLIRP 下宿主地址是 `10.0.2.2`。
+- **第二台 VM(`-Fabric`)**:`.\run_nexos.ps1 -Ops -Fabric` 会启动
+  `tools/nexos_l2hub.py`(L2 交换 hub)+ 两台 VM(调度器 + 计算节点),
+  计算节点由 `tools/distnet_compute_driver.py` 自动登录并保持 `distnet compute` 在线。
+
+### 关键约束:广播与网卡
+
+- **内核只实现了 NE2000 ISA 驱动**(I/O 0x300 轮询),**不支持 virtio-net**。
+  用 `-device virtio-net-pci` 启动时内核检测不到网卡(`netinfo` 的 MAC 会是全
+  `FF:FF:FF:FF:FF:FF`),所有网络功能形同虚设。必须用 `-device ne2k_isa`。
+- QEMU **点对点** `socket` netdev **不洪泛 L2 广播帧**,SLIRP(`-netdev user`)
+  也不把 guest 广播转发到宿主。因此在 SLIRP 下要用**单播**(`distnet nodes <ip>`);
+  多 VM 广播发现需要 `nexos_l2hub.py` 在宿主做帧洪泛。
+
+## Web 控制台与串口桥(真 VM 后端)
+
+浏览器 UI 不是模拟器,它通过 WebSocket 桥直连真实 QEMU 虚拟机内核:
+
+```
+浏览器(nexos-desktop.html)
+   │  WebSocket  ws://127.0.0.1:8765
+   ▼
+tools/nexos_bridge.py       ← 桥:WebSocket 帧 ↔ 串口字节流
+   │  TCP  127.0.0.1:4321
+   ▼
+QEMU 虚拟机串口 → NexOS 内核(kmain / kmain64)
+```
+
+启动:
+
+```powershell
+cd bootloader
+.\run_nexos.ps1 -Ops                  # 启动 VM(NE2000)+ 桥
+python tools\distnet_host_peer.py     # 可选:宿主计算节点
+# 浏览器打开 win11-ui/nexos-desktop.html
+#   → 右下角 conn → Connect → 用内核账号登录(nexos/nexos、root/admin、guest/guest)
+```
+
+- 登录是**真实校验**:前端不持有账号库,把 `login <user> <pass>` 发给内核,
+  由内核比对影子文件的密码哈希,失败则不允许进入桌面。
+- 面板里的命令(含 `distnet`)都经桥下发到真内核执行,输出原样回传。
+- 早期曾有一个替代内核的 Node 假后端(`win11-ui/nexos-server.js`),**已删除**;
+  现在只有“真 VM + 桥”一条链路,没有任何本地模拟回退。
+
+## Visual Agent Forge(可视化 Agent 工场)
+
+桌面 **Agent Forge** 图标打开后是一个节点图编辑器:**拖 → 连 → 运行**,不写代码。
+
+- 左侧点节点类型添加;点节点**绿点(输出)→ 目标节点蓝点(输入)**连线;
+  拖标题栏移动,标题栏 `✕` 删除。
+- **Compile** 把图翻译成内核命令序列并显示;**▶ Run** 逐条下发到真内核执行。
+- **示例**里的一键图(文件链 `mkfs → touch → ls`、算力链 `distnet scheduler … fib 30`)
+  使用的都是实测通过的真实命令。
+- 模板可 Save/Load(localStorage),图会自动保存。
+
+节点 → 内核命令映射:
+
+| 节点 | 生成的内核命令 |
+|------|----------------|
+| 思考 / AI | `ask64 "<提示词>"`(可切 `ai` / `ask`) |
+| 搜索 / Net | `net http <url>` |
+| 文件 / FS | `ls` / `cat <p>` / `touch <p>` / `rm <p>` / `mkfs` |
+| 执行 / ELF | `run <程序>` |
+| 算力 / Distnet | `distnet scheduler <ip> <job> <n>` |
+| 分布式推理 | `forge shard <层数> <维度>`(多节点协同推理同一模型) |
+| 判断 / If | 判断上一步输出是否包含文本,否则跳过下一个节点 |
+| 循环 / Loop | 把其后的节点重复 N 次 |
+| 输出 / Out | 把结果打到日志面板 |
+
+控制语义说明:内核 shell 没有“图解释器”,所以 **if / loop 由前端解释**,但下发的
+每一步仍是真实内核命令;线性链则直接等价于一段 `.sh`。
+
+> 已知限制:当前镜像**未嵌入 GGUF 模型**时,“思考”节点只能走通切换 64 位与加载
+> 管线,拿不到真实回答(需 `make MODEL_GGUF=<路径>` 重建)。文件节点在 SFS 未格式化
+> 时 `ls` 会报 `MKFS not formatted`,先加一个 `mkfs` 节点即可(这两点在节点参数区
+> 都有红字提示)。
 
 ## 用户系统
 

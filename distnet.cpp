@@ -345,7 +345,10 @@ static void scheduler_run(const char* task, const char* target_ip){
     //    that handshake latency instead of relying on a single shot.
     char q[16];
     my_strcpy(q, "QUERY");
-    const int QUERY_INTERVAL = 20000;   // polls to wait between QUERYs
+    // TCG/SLIRP 下 UDP 往返(guest -> host peer -> guest)真实耗时远大于 20000 次
+    // 空转,BEACON 会晚于等待窗口到达(表现为 "no compute nodes" 但节点随后
+    // 才被 discover)。放大等待窗口,让每次 QUERY 后有足够时间收到回程。
+    const int QUERY_INTERVAL = 400000;  // polls to wait between QUERYs
     const int QUERY_MAX = 15;           // give up after this many QUERYs
     int queries_sent = 0;
     while (!g_got_beacon && queries_sent < QUERY_MAX){
@@ -562,6 +565,391 @@ static int looks_like_ip(const char* s){
     return (dots == 3 && digits > 0);
 }
 
+// =====================================================================
+//  Self-managing agent (自管理 Agent)
+// ---------------------------------------------------------------------
+//  说明:本子系统曾在一次误删事故中丢失(从未提交 git),这里是**重写**实现,
+//  行为与对外输出格式按前端面板(win11-ui/nexos-desktop.html)已依赖的
+//  [AGENT] 输出协议重建,保证 UI 无需改动即可继续解析。
+//
+//  能力:自动发现节点 → 维护节点表(role/weight/busy) → 队列任务 →
+//       按角色与权重挑选空闲节点下发 → 支持身份移交(handoff)。
+//  运行:dn_agent_tick() 由 net.cpp 的 net_poll() 每轮调用(见 net.cpp 的
+//       g_agent_running / dn_agent_tick 外部声明)。
+// =====================================================================
+#define DN_AGENT_MAX_NODES  8
+#define DN_AGENT_MAX_QUEUE  8
+#define DN_AGENT_TASK_MAX   256
+#define DN_ROLE_COMPUTE     0
+#define DN_ROLE_AI          1
+#define DN_ROLE_STORAGE     2
+
+struct dn_agent_node { uint32_t ip; int role; int weight; int busy; };
+
+static struct dn_agent_node g_agent_nodes[DN_AGENT_MAX_NODES];
+static int      g_agent_node_count = 0;
+int             g_agent_running = 0;               // net.cpp 外部引用
+static char     g_agent_identity[32];
+static char     g_agent_qtype[DN_AGENT_MAX_QUEUE][DN_AGENT_TASK_MAX];
+static int      g_agent_qai[DN_AGENT_MAX_QUEUE];   // 1 = 需要 ai 角色节点
+static int      g_agent_qcount = 0;                // 队列中的任务数
+static uint32_t g_agent_handoff_ip = 0;
+static unsigned long g_agent_tick_n = 0;
+
+// 每 20000 轮 net_poll 做一次发现/推进(近似“心跳”,内核无定时器)
+#define DN_AGENT_TICK_DISCOVER 20000UL
+
+static const char* dn_role_name(int r){
+    return (r == DN_ROLE_AI) ? "ai" : ((r == DN_ROLE_STORAGE) ? "storage" : "compute");
+}
+static int dn_role_from_name(const char* s){
+    if (!s || !s[0]) return DN_ROLE_COMPUTE;
+    if (s[0]=='a' && s[1]=='i') return DN_ROLE_AI;
+    if (s[0]=='s') return DN_ROLE_STORAGE;
+    return DN_ROLE_COMPUTE;
+}
+
+// 按 IP 查找节点(未找到返回 -1)
+static int dn_agent_find(const char* ip){
+    uint32_t a = parse_ip(ip);
+    for (int i = 0; i < g_agent_node_count; i++)
+        if (g_agent_nodes[i].ip == a) return i;
+    return -1;
+}
+
+// 发现回包:登记/刷新节点
+static void agent_on_beacon(uint32_t src_ip, uint16_t src_port,
+                            const uint8_t* data, int len){
+    (void)src_port; (void)data; (void)len;
+    for (int i = 0; i < g_agent_node_count; i++){
+        if (g_agent_nodes[i].ip == src_ip){
+            net_log("[AGENT] node seen "); log_ip(src_ip); net_log("\n");
+            return;
+        }
+    }
+    if (g_agent_node_count >= DN_AGENT_MAX_NODES) return;
+    g_agent_nodes[g_agent_node_count].ip     = src_ip;
+    g_agent_nodes[g_agent_node_count].role   = DN_ROLE_COMPUTE;
+    g_agent_nodes[g_agent_node_count].weight = 1;
+    g_agent_nodes[g_agent_node_count].busy   = 0;
+    g_agent_node_count++;
+    net_log("[AGENT] added node "); log_ip(src_ip); net_log("\n");
+}
+
+// 结果回包:释放节点 busy 标志并打印结果
+static void agent_on_result(uint32_t src_ip, uint16_t src_port,
+                            const uint8_t* data, int len){
+    (void)src_port;
+    for (int i = 0; i < g_agent_node_count; i++)
+        if (g_agent_nodes[i].ip == src_ip) g_agent_nodes[i].busy = 0;
+    net_log("[AGENT] result from "); log_ip(src_ip); net_log(": ");
+    int c = len < 199 ? len : 199;
+    for (int i = 0; i < c; i++) { char t[2]; t[0] = (char)data[i]; t[1] = 0; net_log(t); }
+    net_log("\n");
+}
+
+// 入队:type=任务类型(如 fib / sum),args=参数,is_ai=1 表示需要 ai 角色
+static int dn_agent_enqueue(const char* type, const char* args, int is_ai){
+    if (g_agent_qcount >= DN_AGENT_MAX_QUEUE) return -1;
+    int slot = g_agent_qcount++;
+    int rp = 0;
+    rcat(g_agent_qtype[slot], &rp, type ? type : "sum");
+    if (args && args[0]){ rcat(g_agent_qtype[slot], &rp, " "); rcat(g_agent_qtype[slot], &rp, args); }
+    g_agent_qai[slot] = is_ai ? 1 : 0;
+    return slot;
+}
+
+// 把队首任务下发给一个合适的空闲节点;成功返回 1
+static int dn_agent_dispatch_head(void){
+    if (g_agent_qcount <= 0) return 0;
+    int need_ai = g_agent_qai[0];
+    for (int i = 0; i < g_agent_node_count; i++){
+        struct dn_agent_node* n = &g_agent_nodes[i];
+        if (n->busy) continue;
+        if (need_ai && n->role != DN_ROLE_AI) continue;
+        // 取任务并下发(复用 scheduler_run 的 TASK 线格式)
+        char task[DN_AGENT_TASK_MAX];
+        int rp = 0;
+        rcat(task, &rp, "TASK 1 ");
+        rcat(task, &rp, g_agent_qtype[0]);
+        // 出队(前移)
+        for (int k = 1; k < g_agent_qcount; k++){
+            int w = 0;
+            g_agent_qtype[k-1][w = 0] = 0;
+            for (int j = 0; g_agent_qtype[k][j]; j++) g_agent_qtype[k-1][j] = g_agent_qtype[k][j];
+            g_agent_qtype[k-1][my_strlen(g_agent_qtype[k])] = 0;
+            g_agent_qai[k-1] = g_agent_qai[k];
+            (void)w;
+        }
+        g_agent_qcount--;
+        n->busy = 1;
+        net_udp_send(n->ip, DN_TASK_PORT, DN_TASK_PORT,
+                     (const uint8_t*)task, my_strlen(task));
+        net_log("[AGENT] dispatch "); net_log(task);
+        net_log(" -> "); log_ip(n->ip); net_log("\n");
+        return 1;
+    }
+    return 0;
+}
+
+// 广播一次 QUERY 以发现节点
+static void dn_agent_discover_once(void){
+    const char* q = "QUERY";
+    net_udp_bind(DN_BEACON_PORT, agent_on_beacon);
+    net_udp_bind(DN_RESULT_PORT, agent_on_result);
+    net_udp_broadcast(DN_BEACON_PORT, DN_BEACON_PORT, (const uint8_t*)q, 5);
+}
+
+// 推进队列
+static void dn_agent_progress(void){
+    while (dn_agent_dispatch_head()) { /* 尽量把队列排空 */ }
+}
+
+// net_poll() 每轮调用
+void dn_agent_tick(void){
+    if (!g_agent_running) return;
+    if (++g_agent_tick_n % DN_AGENT_TICK_DISCOVER == 0){
+        dn_agent_discover_once();
+        dn_agent_progress();
+    }
+}
+
+// ---- 命令实现 ----
+static void dn_agent_start(const char* identity){
+    g_agent_running = 1;
+    g_agent_tick_n = 0;
+    my_strcpy(g_agent_identity, identity && identity[0] ? identity : "nexos-agent");
+    net_log("[AGENT] started as "); net_log(g_agent_identity); net_log("\n");
+    dn_agent_discover_once();
+}
+static void dn_agent_stop(void){
+    g_agent_running = 0;
+    net_log("[AGENT] stopped\n");
+}
+static void dn_agent_add(const char* ip, const char* role, const char* w){
+    if (!ip || !ip[0]){ net_log("[AGENT] usage: add <ip> [role] [weight]\n"); return; }
+    int idx = dn_agent_find(ip);
+    if (idx < 0){
+        if (g_agent_node_count >= DN_AGENT_MAX_NODES){ net_log("[AGENT] node table full\n"); return; }
+        idx = g_agent_node_count++;
+        g_agent_nodes[idx].ip = parse_ip(ip);
+        g_agent_nodes[idx].busy = 0;
+        g_agent_nodes[idx].role = DN_ROLE_COMPUTE;
+        g_agent_nodes[idx].weight = 1;
+    }
+    if (role && role[0]) g_agent_nodes[idx].role = dn_role_from_name(role);
+    if (w && w[0]){
+        int v = 0; const char* s = w;
+        while (*s >= '0' && *s <= '9'){ v = v * 10 + (*s - '0'); s++; }
+        if (v > 0) g_agent_nodes[idx].weight = v;
+    }
+    net_log("[AGENT] node "); log_ip(g_agent_nodes[idx].ip);
+    net_log(" role="); net_log(dn_role_name(g_agent_nodes[idx].role));
+    net_log(" weight="); { char nb[16]; int rp=0; ucat(nb,&rp,(unsigned)g_agent_nodes[idx].weight); nb[rp]=0; net_log(nb); }
+    net_log("\n");
+}
+static void dn_agent_del(const char* ip){
+    int idx = dn_agent_find(ip);
+    if (idx < 0){ net_log("[AGENT] node not found\n"); return; }
+    for (int i = idx; i < g_agent_node_count - 1; i++) g_agent_nodes[i] = g_agent_nodes[i+1];
+    g_agent_node_count--;
+    net_log("[AGENT] removed "); net_log(ip); net_log("\n");
+}
+static void dn_agent_status(void){
+    net_log("[AGENT] identity: "); net_log(g_agent_identity[0] ? g_agent_identity : "(unnamed)"); net_log("\n");
+    net_log("[AGENT] running: "); net_log(g_agent_running ? "yes" : "no"); net_log("\n");
+    net_log("[AGENT] nodes ("); { char nb[16]; int rp=0; ucat(nb,&rp,(unsigned)g_agent_node_count); nb[rp]=0; net_log(nb); } net_log("):\n");
+    for (int i = 0; i < g_agent_node_count; i++){
+        struct dn_agent_node* n = &g_agent_nodes[i];
+        net_log("  "); log_ip(n->ip);
+        net_log(" role="); net_log(dn_role_name(n->role));
+        net_log(" weight="); { char nb[16]; int rp=0; ucat(nb,&rp,(unsigned)n->weight); nb[rp]=0; net_log(nb); }
+        net_log(" busy="); net_log(n->busy ? "1" : "0"); net_log("\n");
+    }
+    net_log("[AGENT] queue ("); { char nb[16]; int rp=0; ucat(nb,&rp,(unsigned)g_agent_qcount); nb[rp]=0; net_log(nb); } net_log(")\n");
+    if (g_agent_handoff_ip){
+        net_log("[AGENT] pending handoff -> "); log_ip(g_agent_handoff_ip); net_log("\n");
+    }
+}
+
+//  Sharded inference - orchestrator role (model sharding)
+// =====================================================================
+static const uint16_t dn_shard_ports[DN_SHARD_MAX_NODES] = { 5501, 5502, 5503 };
+
+struct dn_shnode { uint32_t ip; uint16_t port; int weight; int start; int end; int last; };
+static struct dn_shnode g_shn[DN_SHARD_MAX_NODES];
+static int      g_shn_found = 0;
+static int      g_sh_layers = 0, g_sh_dim = 0;
+static char     g_sh_job[16];
+static int      g_sh_got_out = 0;
+static char     g_sh_out[600];
+
+static int dn_atoi(const char* s){
+    int v = 0, neg = 0;
+    if (*s == '-'){ neg = 1; s++; }
+    while (*s >= '0' && *s <= '9'){ v = v * 10 + (*s - '0'); s++; }
+    return neg ? -v : v;
+}
+
+// 把 0.1*tenths 格式化成 "d.dddddd"(整数运算,不依赖 %f)
+static void dn_put_tenths(char* out, int* rp, int tenths){
+    char t[24]; int k = 0;
+    int ip = tenths / 10;
+    int fp = (tenths % 10) * 100000;
+    if (ip == 0) { t[k++] = '0'; }
+    else { char tmp[8]; int m = 0; while (ip){ tmp[m++] = (char)('0' + (ip % 10)); ip /= 10; } while (m) t[k++] = tmp[--m]; }
+    t[k++] = '.';
+    for (int p = 100000; p >= 1; p /= 10) t[k++] = (char)('0' + ((fp / p) % 10));
+    t[k] = 0;
+    rcat(out, rp, t);
+}
+
+static struct dn_shnode* dn_shnode_by(uint32_t ip, uint16_t port){
+    for (int i = 0; i < DN_SHARD_MAX_NODES; i++)
+        if (g_shn[i].ip == ip && g_shn[i].port == port) return &g_shn[i];
+    return 0;
+}
+
+// 统一收包:按前缀分发 BEACON / OUT / CKPT
+static void dn_shard_recv(uint32_t src_ip, uint16_t src_port,
+                          const uint8_t* data, int len){
+    char buf[620];
+    int n = len < 619 ? len : 619;
+    for (int i = 0; i < n; i++) buf[i] = (char)data[i];
+    buf[n] = 0;
+    (void)src_port;
+
+    if (buf[0]=='B' && buf[1]=='E' && buf[2]=='A' && buf[3]=='C' && buf[4]=='O' && buf[5]=='N'){
+        // "BEACON compute <weight>"
+        char* tok[8]; int tl[8];
+        int nt = tokenize(buf, tok, tl, 8);
+        int w = (nt >= 3) ? dn_atoi(tok[2]) : 1;
+        if (w <= 0) w = 1;
+        struct dn_shnode* n2 = dn_shnode_by(src_ip, src_port);
+        if (!n2){
+            for (int i = 0; i < DN_SHARD_MAX_NODES; i++){
+                if (g_shn[i].weight == 0){
+                    g_shn[i].ip = src_ip; g_shn[i].port = src_port;
+                    g_shn[i].weight = w; g_shn_found++; n2 = &g_shn[i]; break;
+                }
+            }
+        }
+        if (n2) n2->weight = w;
+        net_log("[DISTNET] shard: BEACON "); log_ip(src_ip);
+        net_log(" w="); { char nb[16]; int rp=0; ucat(nb,&rp,(unsigned)w); nb[rp]=0; net_log(nb); net_log("\n"); }
+        return;
+    }
+    if (buf[0]=='O' && buf[1]=='U' && buf[2]=='T'){
+        if (!g_sh_got_out){
+            int k = 0;
+            while (k < n && k < 599){ g_sh_out[k] = buf[k]; k++; }
+            g_sh_out[k] = 0;
+            g_sh_got_out = 1;
+        }
+        return;
+    }
+    // CKPT: 记录检查点可用于后续容错续跑,这里先忽略(层计算在节点侧)
+}
+
+static void dn_shard_plan(void){
+    int tot = 0;
+    for (int i = 0; i < DN_SHARD_MAX_NODES; i++) if (g_shn[i].weight > 0) tot += g_shn[i].weight;
+    if (tot <= 0) tot = 1;
+    int cur = 0, used = 0;
+    for (int i = 0; i < DN_SHARD_MAX_NODES; i++){
+        if (g_shn[i].weight <= 0) continue;
+        int n = (g_sh_layers * g_shn[i].weight) / tot;
+        if (used == g_shn_found - 1) n = g_sh_layers - cur;   // 末段吃下余数
+        if (n <= 0) n = 1;
+        g_shn[i].start = cur; g_shn[i].end = cur + n - 1;
+        g_shn[i].last = (used == g_shn_found - 1);
+        cur += n; used++;
+    }
+}
+
+// 发现节点(QUERY/BEACON)
+static int dn_shard_discover(uint32_t ip){
+    g_shn_found = 0;
+    for (int i = 0; i < DN_SHARD_MAX_NODES; i++){
+        g_shn[i].ip = 0; g_shn[i].port = 0; g_shn[i].weight = 0;
+        g_shn[i].start = 0; g_shn[i].end = -1; g_shn[i].last = 0;
+    }
+    net_udp_bind(DN_SHARD_PORT, dn_shard_recv);
+    const char* q = "QUERY";
+    for (int i = 0; i < DN_SHARD_MAX_NODES; i++)
+        net_udp_send(ip, DN_SHARD_PORT, dn_shard_ports[i], (const uint8_t*)q, 5);
+    // 等待回包(内核无定时器,用有界轮询;SLIRP 往返较慢故给足窗口)
+    unsigned long guard = 0;
+    while (g_shn_found < DN_SHARD_MAX_NODES && guard++ < 1500000UL) net_poll();
+    return g_shn_found;
+}
+
+void distnet_shard_probe(uint32_t node_ip){
+    int n = dn_shard_discover(node_ip);
+    net_log("[DISTNET] shard nodes found: ");
+    { char nb[16]; int rp=0; ucat(nb,&rp,(unsigned)n); nb[rp]=0; net_log(nb); net_log("\n"); }
+    for (int i = 0; i < DN_SHARD_MAX_NODES; i++){
+        if (g_shn[i].weight <= 0) continue;
+        net_log("  "); log_ip(g_shn[i].ip);
+        net_log(":"); { char nb[16]; int rp=0; ucat(nb,&rp,(unsigned)g_shn[i].port); nb[rp]=0; net_log(nb); }
+        net_log(" w="); { char nb[16]; int rp=0; ucat(nb,&rp,(unsigned)g_shn[i].weight); nb[rp]=0; net_log(nb); net_log("\n"); }
+    }
+}
+
+// 跑一次分片推理:layers 层模型切给发现的节点协同推理
+void distnet_shard_run(int layers, int dim, uint32_t node_ip){
+    if (layers <= 0) layers = 12;
+    if (dim <= 0) dim = 16;
+    g_sh_layers = layers; g_sh_dim = dim;
+    g_sh_got_out = 0; g_sh_out[0] = 0;
+    my_strcpy(g_sh_job, "k1");
+
+    int n = dn_shard_discover(node_ip);
+    if (n <= 0){ net_log("[DISTNET] shard: no shard nodes discovered\n"); return; }
+    net_log("[DISTNET] shard: ");
+    { char nb[16]; int rp=0; ucat(nb,&rp,(unsigned)n); nb[rp]=0; net_log(nb); }
+    net_log(" nodes, layers=");
+    { char nb[16]; int rp=0; ucat(nb,&rp,(unsigned)layers); nb[rp]=0; net_log(nb); net_log("\n"); }
+
+    dn_shard_plan();
+
+    // 下发分片:SHARD <job> <s> <e> <next_ip> <next_port> <last>
+    for (int i = 0; i < DN_SHARD_MAX_NODES; i++){
+        if (g_shn[i].weight <= 0) continue;
+        struct dn_shnode* nx = 0;
+        for (int j = i + 1; j < DN_SHARD_MAX_NODES; j++) if (g_shn[j].weight > 0){ nx = &g_shn[j]; break; }
+        char msg[96]; int rp = 0;
+        rcat(msg, &rp, "SHARD "); rcat(msg, &rp, g_sh_job); rcat(msg, &rp, " ");
+        { char nb[16]; int q=0; ucat(nb,&q,(unsigned)g_shn[i].start); nb[q]=0; rcat(msg,&rp,nb); }
+        rcat(msg, &rp, " ");
+        { char nb[16]; int q=0; ucat(nb,&q,(unsigned)g_shn[i].end); nb[q]=0; rcat(msg,&rp,nb); }
+        rcat(msg, &rp, " ");
+        if (g_shn[i].last){ rcat(msg, &rp, "127.0.0.1 "); { char nb[16]; int q=0; ucat(nb,&q,(unsigned)DN_SHARD_PORT); nb[q]=0; rcat(msg,&rp,nb); } rcat(msg,&rp," 1"); }
+        else if (nx){ rcat(msg, &rp, "127.0.0.1 "); { char nb[16]; int q=0; ucat(nb,&q,(unsigned)nx->port); nb[q]=0; rcat(msg,&rp,nb); } rcat(msg,&rp," 0"); }
+        else { rcat(msg, &rp, "127.0.0.1 0 1"); }
+        msg[rp] = 0;
+        net_udp_send(g_shn[i].ip, DN_SHARD_PORT, g_shn[i].port, (const uint8_t*)msg, rp);
+        net_log("[DISTNET] shard: -> "); log_ip(g_shn[i].ip);
+        net_log(" L"); { char nb[16]; int q=0; ucat(nb,&q,(unsigned)g_shn[i].start); nb[q]=0; net_log(nb); }
+        net_log("-");   { char nb[16]; int q=0; ucat(nb,&q,(unsigned)g_shn[i].end); nb[q]=0; net_log(nb); net_log("\n"); }
+    }
+
+    // 注入初始激活值:与宿主实现一致 vec[i] = 0.1*(i+1)
+    char act[512]; int ap = 0;
+    rcat(act, &ap, "AACT "); rcat(act, &ap, g_sh_job); rcat(act, &ap, " 0");
+    for (int i = 0; i < g_sh_dim; i++){ rcat(act, &ap, " "); dn_put_tenths(act, &ap, i + 1); }
+    act[ap] = 0;
+    int first = -1;
+    for (int i = 0; i < DN_SHARD_MAX_NODES; i++) if (g_shn[i].weight > 0){ first = i; break; }
+    if (first < 0) return;
+    net_udp_send(g_shn[first].ip, DN_SHARD_PORT, g_shn[first].port, (const uint8_t*)act, ap);
+
+    // 等待最终结果(层计算在节点侧,内核只等 OUT)
+    unsigned long guard = 0;
+    while (!g_sh_got_out && guard++ < 6000000UL) net_poll();
+    if (g_sh_got_out){ net_log("[DISTNET] shard inference OK: "); net_log(g_sh_out); net_log("\n"); }
+    else net_log("[DISTNET] shard inference: timeout waiting for OUT\n");
+}
 void cmd_distnet(const char* args){
     // args points just past "distnet" (may be NULL or empty)
     const char* p = args ? args : "";
@@ -577,6 +965,86 @@ void cmd_distnet(const char* args){
         net_log("  distnet scheduler <ip> [<type> <args>]  unicast to <ip>\n");
         net_log("  distnet ai \"<prompt>\"              dispatch an AI inference task\n");
         net_log("  distnet ask \"<question>\"           ask ALL nodes, merge their answers\n");
+        net_log("  distnet agent start [identity]     start self-managing agent\n");
+        net_log("  distnet agent stop                 stop the agent\n");
+        net_log("  distnet agent status               show identity/nodes/queue\n");
+        net_log("  distnet agent add <ip> [role] [w]  register node (compute|ai|storage)\n");
+        net_log("  distnet agent del <ip>             remove node\n");
+        net_log("  distnet agent set <ip> weight|role <v>  reconfigure\n");
+        net_log("  distnet agent run <type> <args>    queue a task\n");
+        net_log("  distnet agent ai \"<prompt>\"        queue an AI task\n");
+        net_log("  distnet agent handoff <ip>         transfer identity to a node\n");
+        return;
+    }
+    // ---- distnet agent ... ----
+    if (p[0]=='a' && p[1]=='g' && p[2]=='e' && p[3]=='n' && p[4]=='t'){
+        const char* q = p + 5;
+        while (*q==' '||*q=='\t') q++;
+        // 取子命令
+        char sub[16] = {0}; int sl = 0;
+        while (*q && *q!=' ' && *q!='\t' && sl < 15) sub[sl++] = *q++;
+        while (*q==' '||*q=='\t') q++;
+        // 取后续参数(最多 3 个)
+        char* tok[3]; int tl2[3];
+        int nt = tokenize((char*)q, tok, tl2, 3);
+
+        if (sub[0]=='s' && sub[1]=='t' && sub[2]=='a' && sub[3]=='r'){       // start [identity]
+            dn_agent_start(nt > 0 ? tok[0] : NULL);
+            return;
+        }
+        if (sub[0]=='s' && sub[1]=='t' && sub[2]=='o' && sub[3]=='p'){       // stop
+            dn_agent_stop();
+            return;
+        }
+        if (sub[0]=='s' && sub[1]=='t' && sub[2]=='a' && sub[3]=='t'){       // status
+            dn_agent_status();
+            return;
+        }
+        if (sub[0]=='a' && sub[1]=='d' && sub[2]=='d'){                      // add <ip> [role] [w]
+            dn_agent_add(nt > 0 ? tok[0] : NULL,
+                         nt > 1 ? tok[1] : NULL,
+                         nt > 2 ? tok[2] : NULL);
+            return;
+        }
+        if (sub[0]=='d' && sub[1]=='e' && sub[2]=='l'){                      // del <ip>
+            dn_agent_del(nt > 0 ? tok[0] : NULL);
+            return;
+        }
+        if (sub[0]=='s' && sub[1]=='e' && sub[2]=='t'){                      // set <ip> weight|role <v>
+            if (nt < 3){ net_log("[AGENT] usage: set <ip> weight|role <v>\n"); return; }
+            int idx = dn_agent_find(tok[0]);
+            if (idx < 0){ net_log("[AGENT] node not found\n"); return; }
+            if (tok[1][0]=='w'){
+                int v = 0; const char* s = tok[2];
+                while (*s >= '0' && *s <= '9'){ v = v * 10 + (*s - '0'); s++; }
+                if (v > 0) g_agent_nodes[idx].weight = v;
+            } else {
+                g_agent_nodes[idx].role = dn_role_from_name(tok[2]);
+            }
+            dn_agent_status();
+            return;
+        }
+        if (sub[0]=='r' && sub[1]=='u' && sub[2]=='n'){                      // run <type> <args>
+            if (nt < 1){ net_log("[AGENT] usage: run <type> <args>\n"); return; }
+            int id = dn_agent_enqueue(tok[0], nt > 1 ? tok[1] : NULL, 0);
+            net_log(id >= 0 ? "[AGENT] queued\n" : "[AGENT] queue full\n");
+            dn_agent_progress();
+            return;
+        }
+        if (sub[0]=='a' && sub[1]=='i'){                                     // ai "<prompt>"
+            if (nt < 1){ net_log("[AGENT] usage: ai \"<prompt>\"\n"); return; }
+            int id = dn_agent_enqueue("ai", tok[0], 1);
+            net_log(id >= 0 ? "[AGENT] queued ai task\n" : "[AGENT] queue full\n");
+            dn_agent_progress();
+            return;
+        }
+        if (sub[0]=='h' && sub[1]=='a' && sub[2]=='n'){                      // handoff <ip>
+            if (nt < 1){ net_log("[AGENT] usage: handoff <ip>\n"); return; }
+            g_agent_handoff_ip = parse_ip(tok[0]);
+            net_log("[AGENT] pending handoff -> "); log_ip(g_agent_handoff_ip); net_log("\n");
+            return;
+        }
+        net_log("[AGENT] unknown subcommand: "); net_log(sub); net_log("\n");
         return;
     }
     if (p[0]=='c' && p[1]=='o' && p[2]=='m' && p[3]=='p'){
@@ -597,8 +1065,13 @@ void cmd_distnet(const char* args){
         while (*q==' '||*q=='\t') q++;
         const char* target = NULL;
         if (looks_like_ip(q)){
-            target = q;
-            while (*q && *q!=' ' && *q!='\t') q++;
+            // 拷贝目标 IP 到局部缓冲:原 q 指向的命令行缓冲在 net_poll 循环
+            // 期间可能被覆盖,留指针会把 IP 读坏(如 10.0.2.2 变成 10.0.2.230)。
+            static char targetbuf[16] = {0};
+            int tl = 0;
+            while (*q && *q!=' ' && *q!='\t' && tl < 15) targetbuf[tl++] = *q++;
+            targetbuf[tl] = 0;
+            target = targetbuf;
             while (*q==' '||*q=='\t') q++;
         }
         // Now q points at the first task-type token (or empty).

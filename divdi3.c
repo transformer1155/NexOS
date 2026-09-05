@@ -31,6 +31,15 @@ u64 __udivdi3(u64 num, u64 den) {
     return quot;
 }
 
+// __udivmoddi4: GCC may lower a combined "quotient and remainder" 64-bit
+// division to this libgcc routine (seen with -Os).  It returns the quotient
+// and stores the remainder through `rem`, and is trivially expressed with
+// the helpers above (no new division logic, so nothing to get wrong).
+u64 __udivmoddi4(u64 num, u64 den, u64* rem) {
+    if (rem) *rem = num - __udivdi3(num, den) * den;
+    return __udivdi3(num, den);
+}
+
 u64 __umoddi3(u64 num, u64 den) {
     u64 rem = 0;
     for (int i = 63; i >= 0; i--) {
