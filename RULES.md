@@ -49,6 +49,28 @@
    - 约束：`2048 + KERNEL64_SECTORS <= SFS_LBA`，且 32 位镜像
      `kernel.bin <= 588800` 字节（EBDA 上限 `0x9FC00`）。
 
+## 三之二、仓库体积与第三方依赖
+
+1. **生成物禁止入库**（`.gitignore` 已配置，勿回退）：
+   - 镜像/光盘/文件系统：`*.img` `*.iso` `*.vhd` `*.vhdx` `*.qcow2` `*.sfs`
+   - 编译产物：`build/` `*.o` `*.a` `*.elf` `*.bin` `*.map`
+   - npm 依赖：`node_modules/`
+2. **第三方依赖用 `git submodule` 引用**，不要把源码/压缩包塞进本仓库：
+   ```bash
+   git submodule add <外部仓库URL> vendor/<名称>
+   git submodule update --init --recursive
+   ```
+   当前已从历史清除的第三方大包：`vendor/mono.tar.gz`（如需 mono，请改为 submodule）。
+3. **若历史里混入大文件，GitHub 会直接拒绝推送**（`GH001` / 超过 100MB）。
+   处理办法（`filter-repo` 会改写提交哈希，操作前先打备份标签）：
+   ```bash
+   git tag backup-before-purge
+   git filter-repo --invert-paths --path build/ --path vendor/mono.tar.gz --force
+   git remote add origin https://github.com/transformer1155/NexOS.git   # filter-repo 会移除 remote
+   git push origin master:master
+   ```
+   2026-09-05 实绩：pack **514 MB → 61.8 MB**，推送随即成功。
+
 ## 四、架构约束（易踩坑）
 
 1. **内核只实现 NE2000 ISA 网卡驱动**，不支持 virtio-net。
