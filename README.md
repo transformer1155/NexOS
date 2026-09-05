@@ -1,137 +1,67 @@
-<<<<<<< HEAD
-# NexOS — 二阶引导加载 C++ 内核
+# NexOS — 自研 x86 操作系统（内核 · C# 桌面壳 · Web 控制台 · AI · 分布式算力）
 
 > ⚠️ **协作规则：见 [RULES.md](RULES.md)。**
 > 任何更改（含 AI 助手完成的）都**必须提交 git 并推送 GitHub**（remote `origin`，分支 `master`）。
 > 改动大文件前请先备份并做锚点校验——本项目曾因未提交的工作被误删而无法恢复。
-=======
-
-
----
-<!-- ============================================================ -->
-<!-- 语言切换导航栏（纯HTML + 锚点，无需JavaScript，100%兼容）    -->
-<!-- ============================================================ -->
 
 <div align="center">
 
-# NexOS — 二阶引导加载 C++ 内核
-
-[![Language](https://img.shields.io/badge/中文-简体-red)](#中文版本)
-[![Language](https://img.shields.io/badge/English-README-blue)](#english-version)
+[![中文](https://img.shields.io/badge/中文-简体-red)](#中文版本)
+[![English](https://img.shields.io/badge/English-README-blue)](#english-version)
+[![Roadmap](https://img.shields.io/badge/架构-NEXOS_ROADMAP-blue)](NEXOS_ROADMAP.md)
 
 </div>
 
----
-
-<!-- ============================================================ -->
-<!--                        中文版本                                -->
-<!-- ============================================================ -->
-
 ## <a id="中文版本"></a> 🇨🇳 中文版本
 
-# NexOS — 二阶引导加载 C++ 内核
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
+## 项目定位
 
-一个功能完整的 x86 教学操作系统,支持 **BIOS** 和 **UEFI** 双引导路径。
-Stage1 引导扇区 → Stage2 二阶引导 → 切换到 32 位保护模式 → 跳转到 C++ 内核。
+NexOS 是一个从零自研的 **x86 操作系统**：起点是一个支持 BIOS + UEFI 双引导、可切换 32/64 位保护模式的 C++ 内核与二阶引导加载器，如今已演进为**融合图形桌面、本地大模型推理、分布式算力网络与 Windows/Linux 兼容能力的全栈系统**：
 
-<<<<<<< HEAD
-内核特性:
-=======
-## 内核特性
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
+- **内核与引导**：Stage1→Stage2 二阶引导，32 位保护模式内核 `kernel.cpp` + 64 位长模式内核 `kernel64.cpp`，UEFI/BIOS 双路径汇合到同一 C++ 入口。
+- **图形桌面（GUI）**：`gui.cpp` 在帧缓冲上自绘 Win11 风格桌面；其上叠加 **C# 托管壳**（`csharp/NexOS.Forms` / `NexOS.Core`，`csharp/apps/Shell` 以 `Desktop.cs`/`Browser.cs`/`Login.cs`/`Shell.cs`/`AiAgent.cs` 实现窗口管理器、菜单、托盘、登录与 AI Agent）。
+- **Web 控制台**：`win11-ui/` 提供浏览器端 Win11 桌面 + 分布式网络面板 + Visual Agent Forge，经 WebSocket 桥（`tools/nexos_bridge.py`）通过串口直连**真 QEMU 虚拟机内核**，登录/命令/算力任务全部真实执行（无本地模拟）。
+- **AI 能力**：Markov + GPT 风格文本引擎（`ai_engine.cpp`）+ 内置 **Qwen2-0.5B (Q4_K_M) GGUF Transformer 推理引擎**（`gguf_infer.cpp`，`ask64` 切换 64 位流式推理）；`agent/` 智能体与 Agent Forge 可视化编排。
+- **分布式算力网络**：内核内 `distnet.cpp`（UDP 广播发现 + 任务调度 + 结果回收）+ 独立运行时 `dcn/`（crypto/discovery/sched/transport/wifi），可将推理/计算任务**分片下发到多 VM / 宿主节点合并推理**。
+- **兼容层**：自研 **PE/Win32 子系统**（`winloader.cpp` + `win32.cpp`，已能跑自研 IE 浏览器）；**Linux 二进制兼容**（`linux_compat.cpp` + `linux_root/`，运行 ELF/动态链接程序）；**Mono 运行时移植**（`mono_port/`，在 NexOS 上跑 .NET 托管代码）。
+- **系统设施**：双文件系统 MKFS（可写、独立数据盘持久化）+ SFS（只读）、用户/权限/sudo、网络栈（NE2000 + HTTP）、中文点阵字库 + 拼音 IME。
 
-- 滚动回看终端 + 剪贴板(鼠标选择/中键粘贴/Ctrl+C/V)
-- PS/2 键盘(Set 1)+ 鼠标(Intellimouse 滚轮)驱动
-- PowerShell 风格 shell(`PS user@minios /path>`),48+ 命令
-- **用户系统**:登录/多用户/密码哈希(影子文件持久化)
-- **权限系统**:9 位 rwxrwxrwx,`chmod`/`stat`,文件命令自动鉴权
-- **sudo**:验证密码后临时提权执行
-- 双文件系统:MKFS(自制可写,支持**独立数据盘持久化**) + SFS(预构建只读)
-- `.sh` 脚本执行(`run`/`runfs`)
-- **GUI 桌面**(Win11 Portal 风格,按需启动,BGA fallback 兼容任意显卡)
-- **中文支持**:GB2312 16×16 点阵字库(387 字),GUI 中英文混排渲染
-- **拼音输入法(IME)**:GUI Terminal 内输入拼音 → 数字选字 → UTF-8 汉字
-- 网络:NE2000 驱动 + HTTP 服务器
-- AI 引擎(Markov + GPT 风格文本生成)
-<<<<<<< HEAD
-- **64 位 GGUF 推理引擎**:内置 Qwen2-0.5B(Q4_K_M)Transformer,从镜像嵌入的
-  GGUF 直接加载,`ask64` 命令切换 64 位内核流式推理
-- 32↔64 位内核切换
-- **分布式算力网络**(`distnet.cpp`):UDP 广播发现计算节点 + 任务调度 +
-  结果回收,可把计算/推理任务真实分发到计算节点(宿主 peer 或第二台 VM)
-- **Web 控制台 + 串口桥**:浏览器 UI 经 WebSocket 桥(`tools/nexos_bridge.py`)
-  直连**真 QEMU 虚拟机内核**,登录、shell 命令、算力网络全部真实执行(无本地模拟)
-- **Visual Agent Forge**:浏览器里拖拽节点连线编排 Agent,图会被翻译成真实
-  内核命令序列下发执行(见 `win11-ui/nexos-desktop.html`)
+> **一句话定位**：以自研 C++ 内核为底座，融合 C# 托管桌面壳、浏览器 Web 控制台、本地大模型推理与分布式算力网络的**教学级全栈操作系统**。
 
-## 目录结构
+## 核心特性
 
-| 文件                    | 说明                                                          |
-|-------------------------|---------------------------------------------------------------|
-| `boot.asm`              | Stage1,512 字节引导扇区,INT 13h 扩展读加载 Stage2             |
-| `stage2.asm`            | Stage2,加载内核、开 A20、建 GDT、切入 32 位保护模式           |
-| `entry.asm`             | 内核入口桩(32 位),设栈后调用 `kmain`                        |
-| `kernel.cpp`            | 32 位内核:终端 + 输入 + ATA + shell + 文件系统 + 用户/权限/sudo |
-| `entry64.asm`           | 64 位内核入口桩(长模式)                                       |
-| `kernel64.cpp`          | 64 位内核(长模式变体)                                         |
-| `smp_impl64.cpp`        | 64 位内核 SMP 初始化(VM 下自动单核)                          |
-| `gguf_infer.cpp`        | 64 位 GGUF(Qwen2)Transformer 推理引擎                         |
-| `switch32to64.asm`      | 32 → 64 位模式切换(`switch64` 命令)                           |
-| `switch64to32.asm`      | 64 → 32 位模式切换(返回命令行)                                |
-| `gui.cpp`               | GUI 桌面 + 中文渲染 + 拼音 IME                                |
-| `winloader.cpp`         | Windows 可执行文件加载器(`run xxx.exe/.bat/.ps1`)             |
-| `net.cpp`               | NE2000 网卡驱动 + HTTP 服务器                                 |
-| `distnet.cpp`           | 分布式算力网络:UDP 发现 + 任务调度 + 计算节点 / Agent          |
-| `ai_engine.cpp`         | AI 文本生成引擎(Markov + GPT)                                |
-| `linker.ld` / `linker64.ld` | 32/64 位内核链接脚本,入口 `_start` @ `0x10000` / `0x100000` |
-| `uefi/bootuefi.c`       | UEFI 引导程序(x86_64,gnu-efi):加载 kernel.bin、退出 Boot Services |
-| `uefi/enter_kernel.S`   | UEFI 模式切换:长模式 → 32 位兼容模式 → 跳转内核              |
-| `tools/sfs_gen.py`      | SFS 镜像生成器:打包 `sfs_files/`                              |
-| `tools/embed_model.py`  | 把 GGUF 模型嵌入镜像(写 MINIMDL1 描述符到 LBA 16383/16384)   |
-| `build/run_ai_qemu.py`  | QEMU 自动启动(headless + monitor/Serial TCP),注入 ask64 验证 |
-| `tools/gen_zfont.py`    | 中文字库生成器:SimSun → GB2312 16×16 点阵(`zfont_data.h`)    |
-| `tools/gen_ime_dict.py` | 拼音字典生成器:pypinyin → `ime_dict.h`                        |
-| `tools/make_data_vhd.py`| 用户数据盘生成器:预格式化 MKFS 的 8MB VHD                     |
-| `tools/nexos_bridge.py` | WebSocket ↔ VM 串口桥:浏览器控制台与真内核之间的通道           |
-| `tools/nexos_l2hub.py`  | L2 交换 hub:让多台 VM 共享广播域(`distnet` 广播发现的前提)    |
-| `tools/distnet_host_peer.py` | 宿主侧**真实计算节点**,接收并执行 distnet 下发的任务      |
-| `tools/distnet_compute_driver.py` | 计算节点 VM 的串口驱动(登录 → setip → distnet compute) |
-| `tools/check_k64_fit.sh`| 构建前自检:64 位内核是否溢出内核区、各分区是否重叠             |
-| `win11-ui/nexos-desktop.html` | Web 控制台:Win11 桌面 + 分布式网络面板 + Agent Forge    |
-| `sfs_files/`            | SFS 源文件(`.sh` 脚本、`.txt` 文本)                           |
-| `Makefile`              | 构建:BIOS + UEFI + ISO + SFS + 数据盘                         |
-| `test.sh` / `test_uefi.sh` | BIOS/UEFI 无头自动化测试(串口 + 截图校验)                  |
-=======
-- 32↔64 位内核切换
+- **引导与内核**：BIOS + UEFI 双引导；32 位 `kernel.cpp` 与 64 位 `kernel64.cpp`（长模式）双内核；`switch64`/`switch32` 互切。
+- **终端与 shell**：滚动回看终端 + 剪贴板（鼠标选择/中键粘贴/Ctrl+C/V）；PS/2 键鼠驱动；PowerShell 风格 shell，48+ 命令。
+- **用户与权限**：登录/多用户/密码哈希（影子文件持久化）；9 位 `rwxrwxrwx` 权限；`sudo` 提权。
+- **文件系统**：MKFS（自制可写，独立数据盘持久化）+ SFS（只读）+ VFS；NTFS 只读浏览；`.sh` 脚本执行。
+- **GUI 桌面**：`gui.cpp` 帧缓冲自绘 Win11 风格桌面 + **C# 托管壳**（`NexOS.Forms`/`NexOS.Core`）窗口管理器；按需启动，BGA fallback 兼容任意显卡。
+- **中文与 IME**：GB2312 16×16 点阵字库（387 字）+ 拼音输入法（GUI Terminal 内拼音→选字→UTF-8）。
+- **Web 控制台**：`win11-ui/` 浏览器 Win11 桌面 + 分布式网络面板 + Agent Forge，经 WebSocket 桥连真内核。
+- **AI 推理**：`ai_engine.cpp`（Markov+GPT）文本生成；`gguf_infer.cpp` 内置 Qwen2-0.5B GGUF Transformer，`ask64` 流式推理；`agent/` 智能体。
+- **分布式算力**：`distnet.cpp` UDP 发现/调度 + `dcn/` 运行时（crypto/sched/transport），任务分片到多节点合并推理。
+- **兼容层**：自研 PE/Win32 子系统（`winloader.cpp`+`win32.cpp`，可跑自研 IE）；Linux 二进制兼容（`linux_compat.cpp`+`linux_root/`）；Mono 运行时移植（`mono_port/`）。
+- **网络**：NE2000 驱动 + TCP/IP + HTTP 服务器（`netstart` 后浏览器可访问）。
 
-## 目录结构
+## 顶层目录与子模块
 
-| 文件 | 说明 |
-|------|------|
-| `boot.asm` | Stage1,512 字节引导扇区,INT 13h 扩展读加载 Stage2 |
-| `stage2.asm` | Stage2,加载内核、开 A20、建 GDT、切入 32 位保护模式 |
-| `entry.asm` | 内核入口桩(32 位),设栈后调用 `kmain` |
-| `kernel.cpp` | 32 位内核:终端 + 输入 + ATA + shell + 文件系统 + 用户/权限/sudo |
-| `entry64.asm` | 64 位内核入口桩(长模式) |
-| `kernel64.cpp` | 64 位内核(长模式变体) |
-| `switch32to64.asm` | 32 → 64 位模式切换(`switch64` 命令) |
-| `switch64to32.asm` | 64 → 32 位模式切换(返回命令行) |
-| `gui.cpp` | GUI 桌面 + 中文渲染 + 拼音 IME |
-| `winloader.cpp` | Windows 可执行文件加载器(`run xxx.exe/.bat/.ps1`) |
-| `net.cpp` | NE2000 网卡驱动 + HTTP 服务器 |
-| `ai_engine.cpp` | AI 文本生成引擎(Markov + GPT) |
-| `linker.ld` / `linker64.ld` | 32/64 位内核链接脚本,入口 `_start` @ `0x10000` / `0x100000` |
-| `uefi/bootuefi.c` | UEFI 引导程序(x86_64,gnu-efi):加载 kernel.bin、退出 Boot Services |
-| `uefi/enter_kernel.S` | UEFI 模式切换:长模式 → 32 位兼容模式 → 跳转内核 |
-| `tools/sfs_gen.py` | SFS 镜像生成器:打包 `sfs_files/` |
-| `tools/gen_zfont.py` | 中文字库生成器:SimSun → GB2312 16×16 点阵(`zfont_data.h`) |
-| `tools/gen_ime_dict.py` | 拼音字典生成器:pypinyin → `ime_dict.h` |
-| `tools/make_data_vhd.py` | 用户数据盘生成器:预格式化 MKFS 的 8MB VHD |
-| `sfs_files/` | SFS 源文件(`.sh` 脚本、`.txt` 文本) |
-| `Makefile` | 构建:BIOS + UEFI + ISO + SFS + 数据盘 |
-| `test.sh` / `test_uefi.sh` | BIOS/UEFI 无头自动化测试(串口 + 截图校验) |
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
+| 目录 / 文件                | 角色                                                          |
+|----------------------------|---------------------------------------------------------------|
+| `boot.asm` `stage2.asm` `entry.asm` `entry64.asm` | Stage1/Stage2 二阶引导、32/64 位内核入口桩          |
+| `kernel.cpp` `kernel64.cpp` `switch32to64.asm` `switch64to32.asm` `smp_impl64.cpp` | 32/64 位内核与模式切换、SMP        |
+| `gui.cpp`                  | 帧缓冲 GUI 桌面 + 中文渲染 + 拼音 IME                          |
+| `winloader.cpp` `win32.cpp` | 自研 PE/Win32 子系统（加载并运行 Windows exe）               |
+| `net.cpp`                  | NE2000 网卡驱动 + TCP/IP + HTTP 服务器                         |
+| `ai_engine.cpp` `gguf_infer.cpp` `gguf*.{c,h}` `ai_*` | AI 文本生成 + Qwen2 GGUF 64 位推理引擎           |
+| `distnet.cpp` `distnet.h`  | 内核内分布式算力网络：UDP 发现 + 任务调度 + 计算节点/Agent      |
+| `linux_compat.cpp` `linux_compat.h` `linux_root/` | Linux 二进制（ELF/动态链接）兼容层                  |
+| `uefi/bootuefi.c` `uefi/enter_kernel.S` `linker.ld` `linker64.ld` | UEFI 引导与 32/64 位链接脚本              |
+| `csharp/`                  | **C# 托管壳**：`NexOS.Core`/`NexOS.Forms` API + `apps/Shell`（桌面/窗口/浏览器/登录/AI Agent）+ `winhost` 宿主 |
+| `win11-ui/`               | **Web 控制台**：浏览器 Win11 桌面 + 分布式网络面板 + Agent Forge（`nexos-desktop.html`）+ WinUI 3 标准控件/令牌 |
+| `dcn/`                    | **分布式算力运行时**：`dcn_*`(crypto/discovery/sched/transport/wifi/kernel) + `rt/`(运行时) + `build_qemu/` |
+| `mono_port/`              | **Mono 运行时移植**：`pal/`(平台抽象层) + 构建产物，在 NexOS 上跑 .NET 托管代码 |
+| `agent/`                  | AI 智能体实现（与 `ai_engine`/`gguf_infer`/`distnet` 协作）     |
+| `tools/`                  | 构建与运维脚本：`sfs_gen.py`、`embed_model.py`、`gen_zfont.py`、`gen_ime_dict.py`、`nexos_bridge.py`、`nexos_l2hub.py`、`distnet_host_peer.py`、`check_k64_fit.sh`、`analyze_login.py`/`analyze_ppms.py` 等 |
+| `sfs_files/` `docs/` `Makefile` `test.sh` `test_uefi.sh` | SFS 源文件、规划文档、构建与无头测试         |
 
 ## 内存与磁盘布局
 
@@ -148,11 +78,8 @@ BIOS 磁盘 (LBA, 扇区=512B):
        LBA 33..544   kernel.bin   (内核, 最多 256KiB)
        LBA 300..303  命令历史文件  (save/load, 2KiB)
        LBA 2048..     kernel64.bin (64 位内核)
-<<<<<<< HEAD
        LBA 16383     GGUF 描述符 (魔数 "MINIMDL1": size + data_lba)
        LBA 16384..    GGUF 模型数据 (如 Qwen2-0.5B Q4_K_M, ~397MB)
-=======
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
        LBA 512       MKFS 超级块   (魔数 "MKFS")
        LBA 513..528  MKFS 文件表   (16 扇区, 256 条目)
        LBA 529..799  MKFS 数据区   (启动盘: 271 扇区 / 135KB)
@@ -166,7 +93,6 @@ BIOS 磁盘 (LBA, 扇区=512B):
        LBA 529..     MKFS 数据区   (15200 扇区 ≈ 7.5MB)
 ```
 
-<<<<<<< HEAD
 Stage2 固定 16KiB,内核起始 LBA(33)确定。**MKFS 数据区默认写在独立的
 用户数据盘**(Secondary/Primary 上第一个 ATA 硬盘),启动介质(ISO/CD)可
 保持只读;没有数据盘时回退到启动盘(兼容旧镜像)。用户文件(含 `shadow`
@@ -240,25 +166,6 @@ sudo apt install gnu-efi ovmf mtools xorriso
 > Windows 侧的跨编译工具(如 `/d/nexos-tc/...`)。UEFI 固件用系统 OVMF,
 > QEMU 用原生 `qemu-system-x86_64`(WSLg 下自动走 X11 后端)。
 > 若不希望自动探测 WSL,可用 `make WSL=0 ...` 强制按原生 Linux 行为。
-=======
-Stage2 固定 16KiB,内核起始 LBA(33)确定。**MKFS 数据区默认写在独立的用户数据盘**(Secondary/Primary 上第一个 ATA 硬盘),启动介质(ISO/CD)可保持只读;没有数据盘时回退到启动盘(兼容旧镜像)。用户文件(含 `shadow` 用户库与 `permdb` 权限表)因此**跨重启持久化**。
-
-UEFI 路径下,`BOOTX64.EFI` 从 ESP 读取 `kernel.bin` 复制到 `0x10000`,退出 Boot Services 后切到 32 位兼容模式跳转——与 BIOS 路径汇合。
-
-## 依赖
-
-### BIOS 构建
-
-```bash
-sudo apt install nasm g++ gcc-multilib make qemu-system-x86 python3
-```
-
-### UEFI 构建
-
-```bash
-sudo apt install gnu-efi ovmf mtools
-```
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
 
 ### 中文字库 / 拼音字典(可选,构建时自动)
 
@@ -268,11 +175,7 @@ sudo apt install gnu-efi ovmf mtools
 ## 构建
 
 ```bash
-<<<<<<< HEAD
 make                 # 生成 BIOS 镜像 build/os_v2.img (含 SFS)
-=======
-make                 # 生成 BIOS 镜像 build/os.img (含 SFS)
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
 make iso             # 生成 CD-ROM 镜像 build/os.iso (BIOS+UEFI 混合)
 make uefi            # 生成 UEFI 镜像 build/os_uefi.img
 make sfs             # 仅生成 SFS 镜像 build/sfs.img
@@ -280,7 +183,6 @@ make data-vhd        # 生成用户数据盘 build/data.vhd (8MB, 预格式化 M
 make disasm          # 查看内核入口与反汇编,确认 _start 在 0x10000
 ```
 
-<<<<<<< HEAD
 ### 嵌入 GGUF 模型(64 位 Qwen2 推理)
 
 默认镜像不含模型权重。`make` 时传 `MODEL_GGUF` 会把 GGUF 写入镜像
@@ -300,9 +202,6 @@ python3 tools/embed_model.py build/os_v2.img build/qwen2-0_5b-instruct-q4_k_m.gg
 SFS 镜像由 `tools/sfs_gen.py` 从 `sfs_files/` 打包;中文与拼音字典由
 `gen_zfont.py` / `gen_ime_dict.py` 在 `gui.cpp` 编译前自动生成到项目根
 (`zfont_data.h` / `ime_dict.h`)。
-=======
-SFS 镜像由 `tools/sfs_gen.py` 从 `sfs_files/` 打包;中文与拼音字典由 `gen_zfont.py` / `gen_ime_dict.py` 在 `gui.cpp` 编译前自动生成到项目根 (`zfont_data.h` / `ime_dict.h`)。
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
 
 ## 运行 / 测试
 
@@ -326,7 +225,6 @@ make uefi-run         # QEMU 窗口(OVMF 固件)
 make uefi-test        # 无头测试:串口 + 截图校验
 ```
 
-<<<<<<< HEAD
 `make test` 通过 monitor `sendkey` 模拟输入,分 6 阶段导出 `0xB8000`
 校验:help/echo 回显、方向键翻页、save/load 历史持久化、MKFS 增删改查、
 SFS 列目录/读文件/跑脚本。当前还含登录步骤(`root`/`admin`)。
@@ -376,56 +274,10 @@ OVMF 退出后 monitor 读 VGA 返回 `0xFFFFFFFF`,改用 `screendump` 截图
 | `catfs <f>`     | 打印 SFS 文件内容                      |
 | `run <f>`       | 执行 MKFS 上的 `.sh` 脚本              |
 | `runfs <f>`     | 执行 SFS 上的 `.sh` 脚本               |
-=======
-`make test` 通过 monitor `sendkey` 模拟输入,分 6 阶段导出 `0xB8000` 校验:help/echo 回显、方向键翻页、save/load 历史持久化、MKFS 增删改查、SFS 列目录/读文件/跑脚本。当前还含登录步骤(`root`/`admin`)。
-
-`make uefi-test` 捕获串口验证:UEFI bootloader 加载内核 → 退出 Boot Services → x64→32 位兼容模式 → kmain → VGA 文本模式 → Hello world。OVMF 退出后 monitor 读 VGA 返回 `0xFFFFFFFF`,改用 `screendump` 截图统计非黑像素验证屏幕有内容。
-
-## 命令行 shell
-
-启动后进入**登录提示**,输入用户名/密码(预置 `root`/`admin`、`guest`/`guest`),成功后进入 shell,提示符 `PS user@minios /path>`。
-
-### 基础命令
-
-| 命令 | 作用 |
-|------|------|
-| `help` | 列出所有命令 |
-| `echo <text>` | 打印文本 |
-| `clear` / `cls` | 清屏并清空回看历史 |
-| `about` | 系统信息 |
-| `history` / `h` | 显示本次(及从磁盘载入的)命令历史 |
-| `save` | 把命令历史写入磁盘(LBA 300) |
-| `load` | 从磁盘读回命令历史 |
-
-### MKFS 命令(自制可写文件系统)
-
-| 命令 | 作用 |
-|------|------|
-| `mkfs` | 格式化 MKFS(数据盘或启动盘) |
-| `ls` / `dir` | 列出 MKFS 上的文件 |
-| `cat` / `type` | 打印 MKFS 文件内容 |
-| `touch` / `ni` | 创建空文件 |
-| `write <f>` | 逐行写入文本(空行结束,最大 8KB) |
-| `rm` / `del` | 删除 MKFS 文件 |
-| `copy` / `cp` | 复制文件 |
-| `mkdir` / `md` | 创建目录 |
-| `cd` / `sl` | 切换目录 |
-| `pwd` / `gl` | 显示当前目录 |
-
-### SFS / 分区 / 脚本
-
-| 命令 | 作用 |
-|------|------|
-| `lsfs` | 列出 SFS 上的文件 |
-| `catfs <f>` | 打印 SFS 文件内容 |
-| `run <f>` | 执行 MKFS 上的 `.sh` 脚本 |
-| `runfs <f>` | 执行 SFS 上的 `.sh` 脚本 |
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
 | `part` / `mount` / `lsfat` / `fatinfo` | FAT32 分区管理与浏览 |
 
 ### 用户 / 权限 / sudo 命令
 
-<<<<<<< HEAD
 | 命令            | 作用                                          |
 |-----------------|-----------------------------------------------|
 | `whoami` / `id` | 显示当前用户 / uid / gid                       |
@@ -707,44 +559,6 @@ python tools\distnet_host_peer.py     # 可选:宿主计算节点
   0644/0755,归属创建者。
 - `sudo <cmd>`:提示当前用户密码,验证通过后以 effective uid=0 执行,
   命令结束自动降权。
-=======
-| 命令 | 作用 |
-|------|------|
-| `whoami` / `id` | 显示当前用户 / uid / gid |
-| `users` | 列出所有用户 |
-| `login <user>` | 切换用户(输密码) |
-| `logout` | 退出登录,回到登录提示 |
-| `su <user>` | 切换用户(默认 root,输密码) |
-| `useradd <name> [pw]` | 添加用户(root only,默认密码 123456) |
-| `deluser <name>` | 删除用户(root only,不能删 root/当前用户) |
-| `passwd [user]` | 改密码(root 可改任何人;自己改需输旧密码) |
-| `chmod <mode> <file>` | 改文件权限(如 600/644/755,owner 或 root) |
-| `stat <file>` | 显示 owner / gid / mode(rwxrwxrwx + 八进制) |
-| `sudo <cmd>` | 输密码提权后以 root 执行单条命令 |
-
-### 内核 / GUI / 网络 / AI / 电源
-
-| 命令 | 作用 |
-|------|------|
-| `gui` | 进入 GUI 桌面(BGA fallback,任意显卡可用) |
-| `switch` / `switch64` | 切换到 64 位内核(长模式) |
-| `netinfo` / `netstart` | 网络状态 / 启动 NE2000 + HTTP 服务器 |
-| `ai` / `generate` / `agent` | AI 文本生成(初始模型 / 生成 / Agent) |
-| `meminfo` / `memtest` / `pagetest` | 内存 / 页表诊断 |
-| `run xxx.bat/.exe/.ps1` | 通过 winloader 在 GUI 中打开并执行 |
-| `shutdown` / `reboot` | 关机 / 重启 |
-
-## 用户系统
-
-用户数据库持久化在 MKFS 根目录的 `shadow` 文件 (`name:uid:gid:group:hash\n`),密码用 **FNV-1a 32 位哈希**(盐=用户名, 8 位 hex)存储,不存明文。首次启动若无用户自动播种 `root/admin`(uid 0) 与 `guest/guest`(uid 1000)。`useradd`/`deluser`/`passwd`/`login` 都会更新 `shadow` 并写回数据盘。
-
-## 权限系统
-
-- 9 位标准 `rwxrwxrwx`,权限表持久化在 MKFS 根目录 `permdb` (`name:uid:gid:mode3`);`FileEntry.reserved` 冗余存低 8 位。
-- 鉴权顺序:root(uid 0)放行 → owner 位 → group 位 → other 位。
-- `cat`(r)、`rm`/`write`/`touch`(w)自动检查;新建文件/目录默认 0644/0755,归属创建者。
-- `sudo <cmd>`:提示当前用户密码,验证通过后以 effective uid=0 执行,命令结束自动降权。
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
 
 ## 文件系统
 
@@ -759,15 +573,10 @@ LBA 529+:    数据区   启动盘 271 扇区 / 数据盘 15200 扇区, 顺序�
 文件条目(32 字节):`name[20] + size(4) + start_lba(4) + type(1) + parent(2) + reserved(1)`。
 
 - `mkfs` 格式化:写魔数、清表、重置 `free_lba`;数据盘用大数据区。
-<<<<<<< HEAD
 - `write` 逐行输入(`>>` 提示符),空行结束保存;`create` 顺序分配扇区,
   同名覆盖;`mkdir`/`cd` 支持目录层级。
 - **数据盘自动检测**:启动时扫描 ATA 硬盘(排除 ATAPI CD-ROM),
   找到即把 MKFS 写在那里 —— 重启后文件仍在,启动介质可只读。
-=======
-- `write` 逐行输入(`>>` 提示符),空行结束保存;`create` 顺序分配扇区,同名覆盖;`mkdir`/`cd` 支持目录层级。
-- **数据盘自动检测**:启动时扫描 ATA 硬盘(排除 ATAPI CD-ROM),找到即把 MKFS 写在那里 —— 重启后文件仍在,启动介质可只读。
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
 - `shadow` / `permdb`(用户库 / 权限表)也存这里,随用户操作实时更新。
 
 ### SFS — 兼容只读文件系统
@@ -778,24 +587,16 @@ LBA 801-816: 目录     16 扇区, 最多 256 文件条目
 LBA 817+:    数据区   按文件顺序排列, 每文件按扇区对齐
 ```
 
-<<<<<<< HEAD
 `sfs_files/` 中的文件在 `make` 时由 `tools/sfs_gen.py` 打包,格式与
 MKFS 文件条目兼容,支持任意类型(`.sh`/`.txt` 等),文件名最长 23 字符。
-=======
-`sfs_files/` 中的文件在 `make` 时由 `tools/sfs_gen.py` 打包,格式与 MKFS 文件条目兼容,支持任意类型(`.sh`/`.txt` 等),文件名最长 23 字符。
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
 
 当前包含:`hello.sh`(示例脚本)、`test.sh`(测试脚本)、`welcome.txt`。
 
 ### 脚本执行
 
-<<<<<<< HEAD
 `run`/`runfs` 逐行读取并执行 `.sh`:跳过空行与 `#` 注释,每条命令以
 黄色 `> ` 前缀回显后调用 `run_command`;脚本内命令不污染历史
 (`g_in_script` 标志)。
-=======
-`run`/`runfs` 逐行读取并执行 `.sh`:跳过空行与 `#` 注释,每条命令以黄色 `> ` 前缀回显后调用 `run_command`;脚本内命令不污染历史 (`g_in_script` 标志)。
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
 
 ```
 --- running SFS: hello.sh ---
@@ -812,7 +613,6 @@ MiniOS v2.0  -  C++ freestanding kernel
 输入 `gui` 进入 Win11 Portal 风格桌面(1024×768 32 位):
 
 - 黑色顶栏:Start 按钮 + 运行指示 + 中文欢迎语 + 时钟/内存指示
-<<<<<<< HEAD
 - Portal 桌面:搜索栏 + 8 个彩色应用图标(Control/Files/Tasks/Memory/
   Terminal/Browser/Calc/About)+ 三卡片 + Home/Apps/System/Tools
 - 可拖动窗口:Terminal(支持中文 + IME)/浏览器/计算器/任务管理器/
@@ -830,23 +630,10 @@ LFB 0xFD000000),因此任何 QEMU/VirtualBox 显卡都能进 GUI;UEFI 路径
   从 SimSun 渲染(22px → LANCZOS 缩放到 16×16 → 阈值二值化)嵌入内核。
 - `draw_text_utf8` / `draw_text_utf8_transparent`:UTF-8 3 字节 → Unicode
   → 二分查找字库 → 16×16 blit;ASCII 走原 8×16 字体,中英文混排。
-=======
-- Portal 桌面:搜索栏 + 8 个彩色应用图标(Control/Files/Tasks/Memory/Terminal/Browser/Calc/About)+ 三卡片 + Home/Apps/System/Tools
-- 可拖动窗口:Terminal(支持中文 + IME)/浏览器/计算器/任务管理器/控制面板/文件浏览器/About
-- `run xxx.bat/.exe/.ps1` 在 GUI 中打开并执行,输出显示在窗口内
-
-**VBE 适配**:BIOS 下 QEMU Cirrus/VMSVGA 没有经典 VBE BIOS 时,内核自动探测 **BGA ports(0x1CE/0x1CF)** 合成 VBE info(1024×768×32, LFB 0xFD000000),因此任何 QEMU/VirtualBox 显卡都能进 GUI;UEFI 路径走 GOP + shadow framebuffer。
-
-## 中文支持
-
-- GB2312 16×16 点阵字库(387 个 UI 常用字),由 `tools/gen_zfont.py` 从 SimSun 渲染(22px → LANCZOS 缩放到 16×16 → 阈值二值化)嵌入内核。
-- `draw_text_utf8` / `draw_text_utf8_transparent`:UTF-8 3 字节 → Unicode → 二分查找字库 → 16×16 blit;ASCII 走原 8×16 字体,中英文混排。
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
 - 顶栏 `欢迎使用`、Terminal 输出/输入均支持中文。
 
 ## 拼音输入法(IME)
 
-<<<<<<< HEAD
 - `tools/gen_ime_dict.py`:pypinyin 把 387 字转拼音,输出 `ime_dict.h`
   (按拼音排序,前缀匹配)。
 - GUI Terminal 内直接可用:
@@ -880,35 +667,10 @@ LFB 0xFD000000),因此任何 QEMU/VirtualBox 显卡都能进 GUI;UEFI 路径
 3. **内核**(`0x10000`,32 位 PM):`entry.asm` 设栈 → `kmain`:
    硬件探测 → VBE 探测(BGA fallback)→ 终端/键盘/鼠标/文件系统
    → 用户库加载 → 强制登录 → shell 循环。
-=======
-- `tools/gen_ime_dict.py`:pypinyin 把 387 字转拼音,输出 `ime_dict.h` (按拼音排序,前缀匹配)。
-- GUI Terminal 内直接可用:
-
-| 按键 | 行为 |
-|------|------|
-| `a-z` | 进入拼音状态,显示候选条(紫拼音+黄编号+白字) |
-| `1-9` | 选第 N 个候选,UTF-8 写入输入行 |
-| `空格` | 选第 1 个候选 |
-| `退格` | 删最后一个拼音字符 |
-| `ESC` | 取消 IME(不退出 GUI) |
-
-## 键盘 / 鼠标 / 终端
-
-- **键盘**:`0x64` 状态口,`0x60` 读 Set 1 扫描码;支持 Backspace/Enter/Tab/Shift/CapsLock/方向键/Home/End/PgUp/PgDn/Ctrl+C(复制或中止)/Ctrl+V(粘贴)/Ctrl+L(聚焦)/Ctrl+↑↓(剪贴板历史)。
-- **鼠标**:PS/2 Intellimouse(4 字节包,200/100/80 采样序列启用滚轮);左键拖选复制,右键聚焦输入,滚轮翻页。
-- **终端**:200 行环形回看缓冲,25 行窗口;`m_view` 视口 + `m_at_bottom` 贴底;翻页不破坏历史;光标用 0x3D4/0x3D5 定位,离开底部自动隐藏;任意输入自动 snap 回底部;支持 framebuffer console 模式(BGA/OVMF)。
-
-## BIOS 引导流程
-
-1. **Stage1**(`0x7C00`,16 位实模式):保存启动盘号,INT 13h AH=42h 从 LBA 1 读 32 扇区 Stage2 到 `0x8000`,远跳转。
-2. **Stage2**(`0x8000`,16 位实模式):从 LBA 33 读内核到 `0x10000`;端口 `0x92` 开 A20;加载 GDT;置 CR0.PE 切保护模式;远跳转 `CODE_SEG:init_pm` 刷流水线、装段寄存器,跳到 `0x10000`。
-3. **内核**(`0x10000`,32 位 PM):`entry.asm` 设栈 → `kmain`:硬件探测 → VBE 探测(BGA fallback)→ 终端/键盘/鼠标/文件系统 → 用户库加载 → 强制登录 → shell 循环。
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
 
 ## UEFI 引导流程
 
 1. **OVMF**:扫描 ESP 启动 `/EFI/BOOT/BOOTX64.EFI`(CPU 在长模式)。
-<<<<<<< HEAD
 2. **bootuefi.c**(64 位):LoadedImage 协议 → SimpleFileSystem 读
    `kernel.bin` → `AllocatePages(AllocateAddress, 0x10000)` 复制内核
    → 取内存映射 → `ExitBootServices`。
@@ -930,198 +692,93 @@ UEFI 启动后 CPU 在长模式,而内核是 32 位代码。**兼容模式方案
 `L=0, D=1` 段在长模式内执行 32 位指令,UEFI 页表保持有效,所有
 I/O/VGA/内存行为与 32 位保护模式一致,避免完整切换(关分页→关 PAE→
 关 LME)的三重错误风险。CR0/CR4/EFER 仍保持长模式配置,对内核透明。
-好的，以下是纯文本 Markdown 格式的完整协议，你可以直接复制粘贴到 `README.md` 中使用：
-=======
-2. **bootuefi.c**(64 位):LoadedImage 协议 → SimpleFileSystem 读 `kernel.bin` → `AllocatePages(AllocateAddress, 0x10000)` 复制内核 → 取内存映射 → `ExitBootServices`。
-3. **enter_kernel.S**:RIP 相对 LEA 建 GDTR → LGDT → LRETQ 远返回 32 位**兼容模式**段(长模式内执行 32 位指令,UEFI 恒等映射页表保持有效)→ 装平坦段、设栈 `0x90000` → 远跳 `0x10000`。
-4. **内核**(32 位兼容模式):与 BIOS 路径相同;额外调 `vga_set_text_mode()` 把 VGA 从 OVMF 图形模式切回文本模式 3。
+# 开源协议（MIT License）
 
-### UEFI 调试
+NexOS 采用 **MIT 许可证**——一款 OSI 认证的宽松开源协议，具有明确法律效力，且**允许商业使用**（已删除原自定义协议中的“禁止商业使用”与“最终解释权归项目方”等削弱法律确定性的条款）。权威英文文本见仓库根目录 `LICENSE`；以下为便于阅读的中文释文。
 
-串口(0x3F8)输出标记:`[UEFI]`(bootloader 各阶段)、`E`(enter_kernel 入口)、`G`(GDT 已加载)、`3`(进入 32 位兼容模式)、`S`(内核 `_start`)、`[K1]`~`[K6]`(kmain 各阶段)、`[K32]`(进入 GUI)。
+> 采用 MIT 许可证意味着：任何人都可自由使用、复制、修改、合并、发布、分发、再许可乃至**出售**本软件，只需在副本中保留版权声明与许可声明；软件按“现状”提供，作者不承担任何担保或责任。
 
-### 设计决策:兼容模式 vs 完整模式切换
+## MIT License（英文权威文本）
 
-UEFI 启动后 CPU 在长模式,而内核是 32 位代码。**兼容模式方案**用 `L=0, D=1` 段在长模式内执行 32 位指令,UEFI 页表保持有效,所有 I/O/VGA/内存行为与 32 位保护模式一致,避免完整切换(关分页→关 PAE→关 LME)的三重错误风险。CR0/CR4/EFER 仍保持长模式配置,对内核透明。
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
+Copyright (c) 2026 transformer1155
 
----
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-# NexOS 开源协议
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-**NexOS 开源协议（MiniOS Open Source License）**  
-<<<<<<< HEAD
-版权所有 (c) 2026 transformer1155
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
-贡献者许可：任何人向本仓库提交代码，即表示同意将其贡献
-按本协议授权给项目所有者。项目所有者保留对协议解释、
-商业授权和代码合并的最终决定权。
+## 中文释文
 
-允许并鼓励任何个人或组织出于学习、研究、教学、个人兴趣或非商业目的，使用、复制、修改、合并、发布、分发本软件及其衍生版本。
-
----
-
-=======
-版权所有 (c) 2026 MiniOS 项目开发者（以下简称“项目方”）
-
-允许并鼓励任何个人或组织出于学习、研究、教学、个人兴趣或非商业目的，使用、复制、修改、合并、发布、分发本软件及其衍生版本。
-
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
-## 一、定义
-
-1.1 “软件”指本协议所约束的源代码、二进制文件、文档及相关资源。
-
-1.2 “衍生版本”指在原始软件基础上进行修改、扩展、移植后形成的新版本。
-
-<<<<<<< HEAD
----
-
-=======
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
-## 二、允许的行为
-
-2.1 **学习与研究**  
-任何人有权查看、分析、运行本软件，用于学习操作系统原理、编程技术或进行科学研究。
-
-2.2 **修改与扩展**  
-任何人有权对本软件进行修改、优化、功能增强，并创建衍生版本。
-
-2.3 **分发衍生版本**  
-任何人有权在遵守本协议的前提下，分发其基于本软件创建的衍生版本。分发时须清晰标注衍生版本的修改范围，并保留本协议及版权声明。
-
-2.4 **内部使用**  
-企业或组织内部出于教育、培训或内部技术验证目的使用本软件，不受商业使用限制。
-
-<<<<<<< HEAD
----
-
-=======
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
-## 三、禁止的行为
-
-3.1 **商业使用**  
-未经项目方书面明确许可，任何人不得将本软件或其衍生版本用于任何商业目的，包括但不限于：
-
-a) 直接或间接通过本软件收费、盈利或获取商业利益；  
-b) 将本软件作为商品或服务的一部分进行销售；  
-c) 将本软件集成到用于出售或出租的软件产品中；  
-d) 使用本软件为商业客户提供技术服务、外包或咨询服务并以此获利。
-
-3.2 **盗用或剽窃**  
-任何人不得将本软件或其衍生版本声称为自己原创，不得移除或篡改版权声明、作者信息及本协议内容。
-
-3.3 **恶意使用**  
-任何人不得使用本软件从事任何违法、危害网络安全、侵犯他人权益的活动。
-
-<<<<<<< HEAD
----
-
-=======
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
-## 四、衍生版本要求
-
-4.1 任何衍生版本必须在显著位置保留本协议全文或提供明确的本协议引用链接。
-
-4.2 衍生版本的分发者须明确说明其对原始软件的修改内容，并确保衍生版本不误导他人认为其与原始项目方有直接关联。
-
-4.3 衍生版本同样适用本协议的条款，特别是禁止商业使用的限制。
-
-<<<<<<< HEAD
----
-
-=======
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
-## 五、免责声明
-
-本软件以“现状”（AS IS）提供，项目方不对其适销性、特定用途适用性、安全性或任何其他方面提供任何明示或暗示的保证。项目方不对因使用本软件而导致的任何直接、间接、特殊、偶然或结果性损失承担责任。
-
-<<<<<<< HEAD
----
-
-=======
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
-## 六、终止
-
-如违反本协议任何条款，本协议授予的权利将自动终止。违反者须立即停止使用并销毁所有副本。
-
-<<<<<<< HEAD
----
-
-=======
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
-## 七、最终解释权
-
-本协议最终解释权归项目方所有。项目方保留根据实际情况调整本协议条款的权利，调整后的条款将通过适当方式通知用户。
-
-<<<<<<< HEAD
----
-
-**版本：2.0**  
-**生效日期：2026-08-12**
-=======
-**版本：1.0**  
-**生效日期：2026-08-11**
-
----
-
-<p align="right"><a href="#nexos--二阶引导加载-c-内核">⬆ 返回顶部</a></p>
-
-<!-- ============================================================ -->
-<!--                        英文版本                                -->
-<!-- ============================================================ -->
+- **授予权利**：任何人可出于任何目的（含商业目的）使用、复制、修改、合并、发布、分发、再许可、销售本软件及其衍生版本。
+- **唯一条件**：在所有副本或实质性部分中保留上述版权声明与许可声明。
+- **免责**：本软件按“现状”提供，不提供任何明示或暗示担保；作者不对因使用本软件产生的任何损失承担责任。
+- **贡献者许可**：向本仓库提交代码即表示同意按本 MIT 许可证授权。
 
 ---
 
 ## <a id="english-version"></a> 🇬🇧 English Version
 
-# NexOS — Two-Stage Bootloader C++ Kernel
+# NexOS — Self-built x86 Operating System (Kernel · C# Desktop Shell · Web Console · AI · Distributed Compute)
 
-A full-featured x86 educational operating system with dual BIOS/UEFI boot paths.
-Boot flow: Stage1 boot sector → Stage2 loader → switch to 32-bit protected mode → jump to C++ kernel.
+NexOS is a from-scratch **x86 operating system**. It started as a C++ kernel + two-stage bootloader with dual BIOS/UEFI boot and 32/64-bit protected-mode switching, and has evolved into a **full-stack system fusing a graphical desktop, on-device LLM inference, a distributed compute network, and Windows/Linux compatibility**:
+
+- **Kernel & boot**: Stage1→Stage2 two-stage loader; 32-bit protected-mode kernel `kernel.cpp` + 64-bit long-mode kernel `kernel64.cpp`; UEFI/BIOS paths converge on the same C++ entry.
+- **GUI desktop**: `gui.cpp` draws a Win11-style desktop on the framebuffer; on top sits a **C# managed shell** (`csharp/NexOS.Forms` / `NexOS.Core`, `csharp/apps/Shell` implements the window manager, menus, tray, login and AI Agent via `Desktop.cs`/`Browser.cs`/`Login.cs`/`Shell.cs`/`AiAgent.cs`).
+- **Web console**: `win11-ui/` provides a browser-based Win11 desktop + distributed-network panel + Visual Agent Forge, talking to the **real QEMU kernel** over a WebSocket bridge (`tools/nexos_bridge.py`) through the serial port — login/commands/compute tasks execute for real (no local simulation).
+- **AI**: Markov + GPT-style text engine (`ai_engine.cpp`) + built-in **Qwen2-0.5B (Q4_K_M) GGUF Transformer inference engine** (`gguf_infer.cpp`, `ask64` switches to 64-bit streaming inference); `agent/` agents + Agent Forge visual orchestration.
+- **Distributed compute**: in-kernel `distnet.cpp` (UDP discovery + scheduling + result collection) + standalone runtime `dcn/` (crypto/discovery/sched/transport/wifi) can shard inference/compute tasks to multiple VMs / host nodes for merged inference.
+- **Compat layers**: self-built **PE/Win32 subsystem** (`winloader.cpp` + `win32.cpp`, already runs a self-built IE browser); **Linux binary compatibility** (`linux_compat.cpp` + `linux_root/`, runs ELF/dynamically-linked programs); **Mono runtime port** (`mono_port/`, runs .NET managed code on NexOS).
+- **System facilities**: dual file systems MKFS (writable, dedicated data-disk persistence) + SFS (read-only); user/permission/sudo; network stack (NE2000 + HTTP); Chinese bitmap font + pinyin IME.
+
+> **One-line positioning**: a teaching-grade **full-stack operating system** built on a self-built C++ kernel, fusing a C# managed desktop shell, a browser-based web console, on-device LLM inference, and a distributed compute network.
 
 ## Features
 
-- Scrollback terminal + clipboard (mouse select / middle-click paste / Ctrl+C/V)
-- PS/2 keyboard (Set 1) + mouse (Intellimouse w/ scroll wheel) drivers
-- PowerShell-style shell (`PS user@minios /path>`), 48+ commands
-- **User system**: login / multi-user / password hashing (shadow file persistence)
-- **Permission system**: 9-bit rwxrwxrwx, `chmod`/`stat`, automatic permission checks on file commands
-- **sudo**: temporary privilege elevation with password verification
-- Dual file systems: MKFS (writable, with **dedicated data disk persistence**) + SFS (pre-built read-only)
-- `.sh` script execution (`run`/`runfs`)
-- **GUI desktop** (Win11 Portal style, on-demand launch, BGA fallback for any GPU)
-- **Chinese support**: GB2312 16×16 bitmap font (387 glyphs), mixed Chinese/English rendering in GUI
-- **Pinyin IME**: type pinyin in GUI Terminal → select by number → UTF-8 Chinese characters
-- Networking: NE2000 driver + HTTP server
-- AI engine (Markov + GPT-style text generation)
-- 32↔64 bit kernel switching
+- **Boot & kernel**: dual BIOS/UEFI boot; 32-bit `kernel.cpp` and 64-bit `kernel64.cpp` (long mode) dual kernels; `switch64`/`switch32` switching.
+- **Terminal & shell**: scrollback terminal + clipboard (mouse select / middle-click paste / Ctrl+C/V); PS/2 keyboard/mouse drivers; PowerShell-style shell, 48+ commands.
+- **Users & permissions**: login / multi-user / password hashing (shadow file persistence); 9-bit `rwxrwxrwx` permissions; `sudo` elevation.
+- **File systems**: MKFS (writable, dedicated data-disk persistence) + SFS (read-only) + VFS; NTFS read-only browsing; `.sh` script execution.
+- **GUI desktop**: `gui.cpp` Win11-style framebuffer desktop + **C# managed shell** (`NexOS.Forms`/`NexOS.Core`) window manager; on-demand launch, BGA fallback for any GPU.
+- **Chinese & IME**: GB2312 16×16 bitmap font (387 glyphs) + pinyin IME (pinyin → pick → UTF-8 in GUI Terminal).
+- **Web console**: `win11-ui/` browser Win11 desktop + distributed-network panel + Agent Forge over WebSocket bridge to the real kernel.
+- **AI inference**: `ai_engine.cpp` (Markov+GPT) text generation; `gguf_infer.cpp` built-in Qwen2-0.5B GGUF Transformer, `ask64` streaming inference; `agent/` agents.
+- **Distributed compute**: `distnet.cpp` UDP discovery/scheduling + `dcn/` runtime (crypto/sched/transport), sharded tasks across nodes for merged inference.
+- **Compat layers**: self-built PE/Win32 subsystem (`winloader.cpp`+`win32.cpp`, runs self-built IE); Linux binary compatibility (`linux_compat.cpp`+`linux_root/`); Mono runtime port (`mono_port/`).
+- **Networking**: NE2000 driver + TCP/IP + HTTP server (reachable from a browser after `netstart`).
 
-## Directory Structure
+## Top-level Directories & Submodules
 
-| File | Description |
-|------|-------------|
-| `boot.asm` | Stage1, 512-byte boot sector, INT 13h extended read to load Stage2 |
-| `stage2.asm` | Stage2, loads kernel, enables A20, sets up GDT, enters 32-bit protected mode |
-| `entry.asm` | Kernel entry stub (32-bit), sets up stack and calls `kmain` |
-| `kernel.cpp` | 32-bit kernel: terminal + input + ATA + shell + file systems + user/perm/sudo |
-| `entry64.asm` | 64-bit kernel entry stub (long mode) |
-| `kernel64.cpp` | 64-bit kernel (long mode variant) |
-| `switch32to64.asm` | 32 → 64 bit mode switch (`switch64` command) |
-| `switch64to32.asm` | 64 → 32 bit mode switch (return to command line) |
-| `gui.cpp` | GUI desktop + Chinese rendering + Pinyin IME |
-| `winloader.cpp` | Windows executable loader (`run xxx.exe/.bat/.ps1`) |
-| `net.cpp` | NE2000 NIC driver + HTTP server |
-| `ai_engine.cpp` | AI text generation engine (Markov + GPT) |
-| `linker.ld` / `linker64.ld` | 32/64-bit kernel linker scripts, entry `_start` @ `0x10000` / `0x100000` |
-| `uefi/bootuefi.c` | UEFI bootloader (x86_64, gnu-efi): loads kernel.bin, exits Boot Services |
-| `uefi/enter_kernel.S` | UEFI mode switch: long mode → 32-bit compatibility mode → jump to kernel |
-| `tools/sfs_gen.py` | SFS image generator: packs `sfs_files/` |
-| `tools/gen_zfont.py` | Chinese font generator: SimSun → GB2312 16×16 bitmap (`zfont_data.h`) |
-| `tools/gen_ime_dict.py` | Pinyin dictionary generator: pypinyin → `ime_dict.h` |
-| `tools/make_data_vhd.py` | User data disk generator: pre-formatted MKFS 8MB VHD |
-| `sfs_files/` | SFS source files (`.sh` scripts, `.txt` text files) |
-| `Makefile` | Build: BIOS + UEFI + ISO + SFS + data disk |
-| `test.sh` / `test_uefi.sh` | Headless automated tests for BIOS/UEFI (serial + screenshot checks) |
+| Directory / File | Role |
+|------------------|------|
+| `boot.asm` `stage2.asm` `entry.asm` `entry64.asm` | Stage1/Stage2 loader, 32/64-bit kernel entry stubs |
+| `kernel.cpp` `kernel64.cpp` `switch32to64.asm` `switch64to32.asm` `smp_impl64.cpp` | 32/64-bit kernels, mode switching, SMP |
+| `gui.cpp` | Framebuffer GUI desktop + Chinese rendering + pinyin IME |
+| `winloader.cpp` `win32.cpp` | Self-built PE/Win32 subsystem (load & run Windows exe) |
+| `net.cpp` | NE2000 NIC driver + TCP/IP + HTTP server |
+| `ai_engine.cpp` `gguf_infer.cpp` `gguf*.{c,h}` `ai_*` | AI text generation + Qwen2 GGUF 64-bit inference engine |
+| `distnet.cpp` `distnet.h` | In-kernel distributed compute: UDP discovery + scheduling + compute nodes/Agent |
+| `linux_compat.cpp` `linux_compat.h` `linux_root/` | Linux binary (ELF/dynamically-linked) compat layer |
+| `uefi/bootuefi.c` `uefi/enter_kernel.S` `linker.ld` `linker64.ld` | UEFI boot & 32/64-bit linker scripts |
+| `csharp/` | **C# managed shell**: `NexOS.Core`/`NexOS.Forms` API + `apps/Shell` (desktop/window/browser/login/AI Agent) + `winhost` host |
+| `win11-ui/` | **Web console**: browser Win11 desktop + distributed-network panel + Agent Forge (`nexos-desktop.html`) + WinUI 3 standard controls/tokens |
+| `dcn/` | **Distributed compute runtime**: `dcn_*` (crypto/discovery/sched/transport/wifi/kernel) + `rt/` + `build_qemu/` |
+| `mono_port/` | **Mono runtime port**: `pal/` (platform abstraction) + build output, runs .NET managed code on NexOS |
+| `agent/` | AI agent implementation (works with `ai_engine`/`gguf_infer`/`distnet`) |
+| `tools/` | Build & ops scripts: `sfs_gen.py`, `embed_model.py`, `gen_zfont.py`, `gen_ime_dict.py`, `nexos_bridge.py`, `nexos_l2hub.py`, `distnet_host_peer.py`, `check_k64_fit.sh`, `analyze_login.py`/`analyze_ppms.py`, etc. |
+| `sfs_files/` `docs/` `Makefile` `test.sh` `test_uefi.sh` | SFS sources, planning docs, build & headless tests |
 
 ## Memory & Disk Layout
 
@@ -1465,6 +1122,5 @@ The final right of interpretation of this license belongs to the Project Owner. 
 
 <p align="right"><a href="#nexos--two-stage-bootloader-c-kernel">⬆ Back to top</a></p>
 ```
->>>>>>> d538f6f4b837bdd949c7b929adb37126b8dead74
 
 ---
