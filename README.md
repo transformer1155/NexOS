@@ -692,6 +692,18 @@ UEFI 启动后 CPU 在长模式,而内核是 32 位代码。**兼容模式方案
 `L=0, D=1` 段在长模式内执行 32 位指令,UEFI 页表保持有效,所有
 I/O/VGA/内存行为与 32 位保护模式一致,避免完整切换(关分页→关 PAE→
 关 LME)的三重错误风险。CR0/CR4/EFER 仍保持长模式配置,对内核透明。
+## 展望未来
+
+NexOS 当前已是一个可运行、可联网、可跑 AI 推理与分布式算力的教学级全栈系统。下一步重点（详见 [NEXOS_ROADMAP.md](NEXOS_ROADMAP.md)）：
+
+- **内核与硬件驱动**：完善 SMP 多核调度与核间中断；补齐 USB（键鼠/存储）、AHCI/SATA、ACPI 电源管理、PCI 枚举；扩展显卡驱动（Bochs/QXL/原生 GFX），支持更高分辨率与硬件光标。
+- **存储与文件系统**：在 MKFS/SFS 之上引入 ext2/FAT 完整读写、增量快照与加密卷；用户数据盘支持更大容量与磨损均衡。
+- **网络与分布式算力**：`distnet` 从“点对点 UDP 发现”演进为带容错与负载均衡的多节点调度器；`dcn/` 接入真实 WiFi 网卡，把大模型推理/编译等重任务分片到异构节点合并；探索 P2P 自组织算力网。
+- **AI 与 Agent**：内置更大规模量化模型（如 Qwen2.5 系列）的 64 位流式推理；增加语音/多模态输入；`agent/` 从单步指令走向自主任务编排与 RAG 知识检索；Agent Forge 提供可分享的节点模板。
+- **兼容层**：Win32 子系统补齐更多 GDI/USER/系统 API，跑更复杂的 Windows 应用；Linux 兼容扩展到更多 libc/动态链接器与系统调用；Mono/.NET 运行时跑通更多托管程序与 NuGet 包。
+- **桌面体验**：C# 托管壳丰富标准控件与动画合成器，支持高分屏 DPI、多显示器、主题与无障碍；GUI Terminal 支持 TrueType 渲染。
+- **Web 控制台与生态**：`win11-ui/` 增加实时性能/算力可视化面板、内核调试器前端与“一键部署到多 VM”的编排；建设文档站、包管理与自举工具链，让社区更易参与。
+
 # 开源协议（MIT License）
 
 NexOS 采用 **MIT 许可证**——一款 OSI 认证的宽松开源协议，具有明确法律效力，且**允许商业使用**（已删除原自定义协议中的“禁止商业使用”与“最终解释权归项目方”等削弱法律确定性的条款）。权威英文文本见仓库根目录 `LICENSE`；以下为便于阅读的中文释文。
@@ -1052,75 +1064,30 @@ UEFI starts in long mode while the kernel is 32-bit code. The **compatibility mo
 
 ---
 
-# NexOS Open Source License
+## Future Roadmap
 
-**NexOS Open Source License (MiniOS Open Source License)**  
-Copyright (c) 2026 MiniOS Project Developers (hereinafter "Project Owner")
+NexOS is already a runnable, network-capable, AI-inferencing and distributed-compute teaching-grade full-stack OS. Next focuses (see [NEXOS_ROADMAP.md](NEXOS_ROADMAP.md)):
 
-Permission is hereby granted, free of charge, to any person or organization obtaining a copy of this software and associated documentation files (the "Software"), to use, copy, modify, merge, publish, and distribute the Software and its derivative works, for the purposes of learning, research, teaching, personal interest, or non-commercial internal use, subject to the following conditions:
+- **Kernel & drivers**: complete SMP multi-core scheduling with IPI; add USB (HID/storage), AHCI/SATA, ACPI power management, PCI enumeration; more GPU drivers (Bochs/QXL/native GFX) with higher resolution and hardware cursor.
+- **Storage & file systems**: on top of MKFS/SFS, add full ext2/FAT read/write, incremental snapshots and encrypted volumes; larger, wear-leveled user data disks.
+- **Network & distributed compute**: evolve `distnet` from point-to-point UDP discovery into a fault-tolerant, load-balanced multi-node scheduler; `dcn/` onto real WiFi NICs; shard heavy tasks (LLM inference / compile) across heterogeneous nodes; explore a P2P self-organizing compute mesh.
+- **AI & agents**: 64-bit streaming inference of larger quantized models (e.g. Qwen2.5); speech / multimodal input; `agent/` from single-step commands to autonomous task orchestration with RAG; shareable Agent Forge node templates.
+- **Compat layers**: more Win32 GDI/USER/system APIs to run richer Windows apps; broader Linux compat (more libc / loaders / syscalls); Mono/.NET running more managed apps and NuGet packages.
+- **Desktop**: richer C# managed-shell controls and an animation compositor; HiDPI / multi-monitor / themes / accessibility; TrueType rendering in the GUI Terminal.
+- **Web console & ecosystem**: more `win11-ui/` live performance & compute panels, a kernel-debugger front-end, and one-click multi-VM orchestration; a docs site, package manager and a self-hosting toolchain to lower the barrier to contribution.
 
-## 1. Definitions
+# License (MIT License)
 
-1.1 "Software" refers to the source code, binary files, documentation, and related resources governed by this license.
+NexOS is released under the **MIT License** — an OSI-approved permissive license that is legally effective and **permits commercial use** (the former non-commercial and "final interpretation" clauses have been removed). The authoritative text is in the `LICENSE` file at the repository root; a Chinese summary appears in the main (Chinese) section above.
 
-1.2 "Derivative Work" refers to any new version created by modifying, extending, or porting the original Software.
+Copyright (c) 2026 transformer1155
 
-## 2. Permitted Uses
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
-2.1 **Learning and Research**  
-Anyone may view, analyze, and run the Software for the purpose of learning operating system principles, programming techniques, or conducting scientific research.
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
-2.2 **Modification and Extension**  
-Anyone may modify, optimize, or enhance the Software and create Derivative Works.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-2.3 **Distribution of Derivative Works**  
-Anyone may distribute Derivative Works based on the Software, provided they comply with this license. When distributing, the Derivative Work must clearly indicate the modifications made and retain this license and copyright notice.
-
-2.4 **Internal Use**  
-Organizations may use the Software internally for educational, training, or internal technology validation purposes, without being subject to the commercial use restrictions.
-
-## 3. Prohibited Uses
-
-3.1 **Commercial Use**  
-Without explicit written permission from the Project Owner, no one may use the Software or its Derivative Works for any commercial purpose, including but not limited to:
-
-a) Charging fees or generating profit directly or indirectly through the Software;  
-b) Selling the Software as part of a product or service;  
-c) Integrating the Software into products intended for sale or rental;  
-d) Using the Software to provide paid technical services, outsourcing, or consulting to commercial clients.
-
-3.2 **Plagiarism or Misappropriation**  
-No one may claim the Software or its Derivative Works as their own original creation, nor remove or alter copyright notices, author information, or the terms of this license.
-
-3.3 **Malicious Use**  
-No one may use the Software for any illegal activities, network security violations, or infringement of others' rights.
-
-## 4. Requirements for Derivative Works
-
-4.1 Any Derivative Work must retain the full text of this license or provide a clear link to it in a prominent location.
-
-4.2 The distributor of a Derivative Work must clearly state the modifications made to the original Software, and ensure that the Derivative Work does not mislead others into believing it is directly affiliated with the original Project Owner.
-
-4.3 Derivative Works are subject to the same terms of this license, especially the commercial use restrictions.
-
-## 5. Disclaimer of Warranty
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, OR SECURITY. IN NO EVENT SHALL THE PROJECT OWNER BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE USE OF THE SOFTWARE.
-
-## 6. Termination
-
-Any violation of the terms of this license will result in the automatic termination of the rights granted herein. Violators must immediately cease use and destroy all copies.
-
-## 7. Final Interpretation
-
-The final right of interpretation of this license belongs to the Project Owner. The Project Owner reserves the right to modify the terms of this license as needed, with changes being notified through appropriate channels.
-
-**Version: 1.0**  
-**Effective Date: 2026-08-11**
-
----
-
-<p align="right"><a href="#nexos--two-stage-bootloader-c-kernel">⬆ Back to top</a></p>
-```
+<p align="right"><a href="#english-version">⬆ Back to top</a></p>
 
 ---
