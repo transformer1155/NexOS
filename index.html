@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>NexOS — 自研 x86 操作系统</title>
+<style>
+  :root{
+    --bg:#0d1117; --bg2:#11161f; --card:#161b24; --card2:#1c232f;
+    --fg:#e6edf3; --muted:#9aa7b4; --accent:#4cc2ff; --accent2:#7c5cff;
+    --line:#232b36; --good:#3fb950;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 600px at 70% -10%,#16202c 0%,var(--bg) 60%);
+    color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+    line-height:1.7;-webkit-font-smoothing:antialiased}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 22px}
+  header.hero{padding:72px 0 48px;border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,rgba(124,92,255,.10),transparent)}
+  .hero-grid{display:flex;gap:28px;align-items:center;flex-wrap:wrap}
+  .logo{width:108px;height:108px;border-radius:20px;box-shadow:0 8px 30px rgba(76,194,255,.25);background:#0b0e13}
+  h1{font-size:42px;margin:0 0 6px;letter-spacing:.5px}
+  .tag{color:var(--muted);font-size:18px;margin:0}
+  .badges{margin-top:16px;display:flex;gap:10px;flex-wrap:wrap}
+  .badge{display:inline-flex;align-items:center;gap:6px;background:var(--card);border:1px solid var(--line);
+    padding:6px 12px;border-radius:999px;font-size:13px;color:var(--fg)}
+  section{padding:46px 0;border-bottom:1px solid var(--line)}
+  h2{font-size:28px;margin:0 0 18px;display:flex;align-items:center;gap:10px}
+  h2 .dot{width:10px;height:10px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2))}
+  p.lead{color:var(--muted);max-width:820px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-top:22px}
+  .card{background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--line);
+    border-radius:16px;padding:18px;transition:transform .15s ease,border-color .15s ease}
+  .card:hover{transform:translateY(-3px);border-color:#33425a}
+  .card h3{margin:0 0 8px;font-size:17px;color:#fff}
+  .card p{margin:0;color:var(--muted);font-size:14px}
+  .gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;margin-top:22px}
+  .shot{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+  .shot img{width:100%;height:auto;display:block}
+  .shot .cap{padding:10px 14px;font-size:13px;color:var(--muted);border-top:1px solid var(--line)}
+  ul.road{columns:2;column-gap:32px;padding-left:18px;color:var(--muted)}
+  ul.road li{margin:0 0 10px;break-inside:avoid}
+  ul.road b{color:var(--fg)}
+  footer{padding:40px 0 64px;color:var(--muted);font-size:14px}
+  footer a{color:var(--accent)}
+  .pill{display:inline-block;background:rgba(63,185,80,.12);color:var(--good);
+    border:1px solid rgba(63,185,80,.4);padding:3px 10px;border-radius:999px;font-size:12px;margin-left:8px}
+  @media(max-width:640px){h1{font-size:32px}ul.road{columns:1}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap hero-grid">
+    <img class="logo" src="assets/Logo.png" alt="NexOS Logo" />
+    <div>
+      <h1>NexOS</h1>
+      <p class="tag">自研 x86 操作系统 · 内核 · C# 桌面壳 · Web 控制台 · AI · 分布式算力</p>
+      <div class="badges">
+        <span class="badge">⌨ BIOS + UEFI 双引导</span>
+        <span class="badge">🧠 本地大模型推理</span>
+        <span class="badge">🌐 分布式算力网络</span>
+        <span class="badge">⚖ MIT License</span>
+        <a class="badge" href="https://github.com/transformer1155/NexOS">★ GitHub</a>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section id="about">
+  <div class="wrap">
+    <h2><span class="dot"></span>项目介绍</h2>
+    <p class="lead">
+      NexOS 是一个从零自研的 <b>x86 操作系统</b>：起点是一个支持 BIOS + UEFI 双引导、可切换
+      32/64 位保护模式的 C++ 内核与二阶引导加载器，如今已演进为
+      <b>融合图形桌面、本地大模型推理、分布式算力网络与 Windows/Linux 兼容能力的全栈系统</b>。
+      它以自研 C++ 内核为底座，叠加 C# 托管桌面壳、浏览器 Web 控制台、Qwen2 GGUF 推理引擎与
+      distnet/dcn 分布式算力运行时，是一个面向操作系统原理学习与实验的<b>教学级全栈系统</b>。
+    </p>
+    <div class="cards">
+      <div class="card"><h3>🪟 内核与引导</h3><p>Stage1→Stage2 二阶引导，32 位保护模式 + 64 位长模式双内核，UEFI/BIOS 双路径汇合到同一 C++ 入口。</p></div>
+      <div class="card"><h3>🎨 图形桌面</h3><p>gui.cpp 在帧缓冲上自绘 Win11 风格桌面，叠加 C# 托管壳（NexOS.Forms / NexOS.Core）实现窗口管理器。</p></div>
+      <div class="card"><h3>🌐 Web 控制台</h3><p>win11-ui/ 浏览器端 Win11 桌面 + 分布式网络面板 + Agent Forge，经 WebSocket 桥直连真 QEMU 内核。</p></div>
+      <div class="card"><h3>🧠 AI 推理</h3><p>ai_engine.cpp + 内置 Qwen2-0.5B GGUF Transformer 推理引擎，ask64 切换 64 位流式推理。</p></div>
+      <div class="card"><h3>⚡ 分布式算力</h3><p>distnet.cpp UDP 发现/调度 + dcn/ 运行时，将推理/计算任务分片到多节点合并。</p></div>
+      <div class="card"><h3>🔌 兼容层</h3><p>自研 PE/Win32 子系统、Linux 二进制兼容、Mono/.NET 运行时移植，可跑 Windows/Linux/.NET 程序。</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="shots">
+  <div class="wrap">
+    <h2><span class="dot"></span>项目截图</h2>
+    <p class="lead">以下为真实运行截图（含 Web 控制台 Win11 桌面、开始菜单、多窗口、暗色模式、通知中心、小组件，以及内核中文 GUI 与 Win32 应用运行）。</p>
+    <div class="gallery">
+      <div class="shot"><img src="win11-desktop/shot_01_desktop.png" alt="桌面" loading="lazy"><div class="cap">桌面（Win11 风格）</div></div>
+      <div class="shot"><img src="win11-desktop/shot_02_startmenu.png" alt="开始菜单" loading="lazy"><div class="cap">开始菜单</div></div>
+      <div class="shot"><img src="win11-desktop/shot_03_windows.png" alt="多窗口" loading="lazy"><div class="cap">多窗口并排</div></div>
+      <div class="shot"><img src="win11-desktop/shot_04_dark.png" alt="暗色模式" loading="lazy"><div class="cap">暗色模式</div></div>
+      <div class="shot"><img src="win11-desktop/shot_05_notify.png" alt="通知中心" loading="lazy"><div class="cap">通知中心</div></div>
+      <div class="shot"><img src="win11-desktop/shot_06_widgets.png" alt="小组件" loading="lazy"><div class="cap">小组件面板</div></div>
+      <div class="shot"><img src="win11-desktop/gui_zh_720p.png" alt="中文 GUI" loading="lazy"><div class="cap">内核中文 GUI 渲染</div></div>
+      <div class="shot"><img src="win11-desktop/winapp_720p.png" alt="Win32 应用" loading="lazy"><div class="cap">运行 Win32 应用（自研 IE 浏览器）</div></div>
+    </div>
+  </div>
+</section>
+
+<section id="roadmap">
+  <div class="wrap">
+    <h2><span class="dot"></span>未来规划 <span class="pill">Roadmap</span></h2>
+    <p class="lead">NexOS 已可运行、可联网、可跑 AI 推理与分布式算力。下一步重点（详见仓库 <a href="https://github.com/transformer1155/NexOS/blob/main/NEXOS_ROADMAP.md">NEXOS_ROADMAP.md</a>）：</p>
+    <ul class="road">
+      <li><b>内核与驱动</b>：完善 SMP 多核调度与核间中断；补齐 USB、AHCI/SATA、ACPI、PCI 枚举；扩展显卡驱动（Bochs/QXL/原生 GFX），支持更高分辨率与硬件光标。</li>
+      <li><b>存储与文件系统</b>：在 MKFS/SFS 之上引入 ext2/FAT 完整读写、增量快照与加密卷；更大容量、磨损均衡的用户数据盘。</li>
+      <li><b>网络与分布式算力</b>：distnet 演进为带容错与负载均衡的多节点调度器；dcn/ 接入真实 WiFi 网卡；探索 P2P 自组织算力网。</li>
+      <li><b>AI 与 Agent</b>：更大规模量化模型（Qwen2.5 系列）的 64 位流式推理；语音/多模态输入；agent/ 走向自主任务编排与 RAG。</li>
+      <li><b>兼容层</b>：Win32 补齐更多 GDI/USER/系统 API；Linux 兼容扩展 libc/动态链接/系统调用；Mono/.NET 跑通更多托管程序与 NuGet 包。</li>
+      <li><b>桌面体验</b>：C# 托管壳丰富控件与动画合成器；高分屏 DPI、多显示器、主题与无障碍；GUI Terminal 支持 TrueType 渲染。</li>
+      <li><b>Web 控制台与生态</b>：实时性能/算力可视化面板、内核调试器前端、“一键部署到多 VM”编排；建设文档站、包管理与自举工具链。</li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>NexOS 采用 <b>MIT License</b> —— 允许商业使用，具有明确法律效力。© 2026 transformer1155</p>
+    <p>仓库：<a href="https://github.com/transformer1155/NexOS">github.com/transformer1155/NexOS</a> · 说明文档：<a href="https://github.com/transformer1155/NexOS/blob/main/bootloader/README.md">bootloader/README.md</a> · <a href="https://github.com/transformer1155/NexOS/blob/main/NEXOS_ROADMAP.md">NEXOS_ROADMAP.md</a></p>
+  </div>
+</footer>
+
+</body>
+</html>
