@@ -1,0 +1,185 @@
+VBEFQ0SFBZ[K0] kmain entered, PIC masked
+[GDT] ring-0 + ring-3 segments + 64-bit TSS loaded
+[K-g] gdt_init done
+[K-i] idt_init done
+[K-p] pic_init done
+[VMM] Setting up 32-bit paging (PSE)...
+[VMM] VBE LFB mapped in page directory
+[VMM] ring-3 user region 0x04000000-0x08000000 (PG_USER)
+[VMM] Paging enabled (32 MiB identity-mapped, 4 MiB PSE)
+[K1] kmain entered
+[HW] ===== Hardware Detection =====
+[HW] CPU: AuthenticAMD Family=15 Model=107 [x86-64] [SSE2]
+[HW] E820 not available, using CMOS fallback
+[HW] PS/2 controller: OK
+[HW] PS/2 mouse: detected
+[HW] PCI bus scan:
+[HW]   00:00.0 vendor=8086 dev=1237 class=0600
+[HW]   00:01.0 vendor=8086 dev=7000 class=0601
+[HW]   00:01.1 vendor=8086 dev=7010 class=0101
+[HW]   -> Mass storage controller
+[HW]   00:01.3 vendor=8086 dev=7113 class=0680
+[HW]   00:02.0 vendor=1234 dev=1111 class=0300
+[HW]   -> Display controller detected
+[HW]   00:03.0 vendor=8086 dev=100E class=0200
+[HW] PCI: 6 devices found
+[HW] Disk: QEMU HARDDISK                            (6 MB)
+[HW] VBE: available 1280x720 [mode_set] fmt=BGRX32
+[HW] ===== Detection Complete =====
+[K2] VBE graphics mode active (set by BIOS/UEFI)
+[FBCON] Framebuffer console initialized
+[K-DBG] 0x500D=01
+[K-DBG] 0x5000=00
+
+[K-VBE] VBE info available (GUI ready)
+[K3] terminal init done
+[MOUSE] Intellimouse (4-byte packets, wheel)
+[K4] mouse init done
+[MKFS] Data disk: ATA primary master
+[MKFS] Not formatted - type 'mkfs' to format the data disk
+[K6] Linux partition mounted at LBA 3836
+[K6] filesystem init done
+[VFS] mounted on SFS, 8 fds, sandbox roots active
+[PERM] Y/N prompt engine armed (fail-safe: no answer = DENY)
+[PMM] .bss+lmboot reserved 00120000 .. 01828000
+[PMM] lmboot 01800000 .. 01828000 (k32 stack/PML4/k64 stack)
+[PMM] RAM-SFS region reserved 01400000 .. 01800000
+[PMM] Initialised
+[HEAP] Initialised: 14 MiB at 0x500000
+[K7] memory management init done
+[K] Command-line shell (GUI starts on demand via 'run <winfile>')
+[K8] Initializing network...
+[NET] Initializing network...
+[NET] NE2000 initialized, MAC=FF:FF:FF:FF:FF:FF
+[NET] Network ready. IP=10.0.2.15:8080
+[K8] Network initialized successfully
+Hello world from C++ kernel!
+[K5] Hello world written
+Two-stage boot succeeded. 32-bit protected mode.
+
+MKFS: not formatted (use 'mkfs' to format)
+SFS:  mounted (50 files)
+FAT32: not mounted (use 'part' + 'mount')
+MEM:  64 MiB RAM, 10487 free pages, paging ON (32-bit PSE)
+NET:  UP  HTTP server on http://10.0.2.15@:8080
+GUI:  VBE 0x0 (text shell by default; 'gui' to enter desktop)
+
+Initializing security system...
+[K32] sign-in deferred to the graphical lock screen
+Sign-in deferred to the graphical lock screen.
+
+Shell ready. Type 'help' for commands.
+Tab=autocomplete, Arrows=cursor/history, PgUp/PgDn=scroll, Home/End, Ctrl+C/V/L/Z/A.
+In the GUI: Ctrl+Left/Right/Up switch virtual desktops (default / AI / toggle).
+
+[K] boot: auto-launch Win11 GUI desktop (32-bit)
+[GUI] font mode = BIOS 1-bit 8x16 (thin)
+[DGOP] fb_base=0xFD000000 fb64=0x00000000 w=1280 h=720 bpp=16 pitch=2560 nominal=2560 MATCH
+[GUI] Pixel format: BGRX32
+[GUI] BGA: yes, BIOS mode set: yes, source: BIOS-VBE/BGA
+[GUI] Framebuffer initialized with double-buffering
+Entering Win11 Desktop GUI mode...
+[K32] Entering Win11 GUI mode
+[CLR] MiniCLR initialised (11 internal calls)
+[CLR] loaded shell.mex  methods=621 types=73 strings=546 code=62407
+[LOGIN] lock screen armed
+NexOS.Forms.Shell initialised
+[MFORMS] managed shell ready
+[MFORMS] mforms: shell.mex ready
+[GUI] VBE mode set via BGA ports
+[GUI] LFB cleared
+[ANIM] TSC 2500821 ticks/ms
+[GUI] IME reset done
+[GUI] render_all begin
+[clr] NexOS.Forms.Shell::PaintDesktop
+[icall] NexOS.Forms.Host::TickMs
+[icall] NexOS.Forms.Host::SetAnim
+[icall] NexOS.Forms.Gfx::HasImage
+[icall] NexOS.Forms.Gfx::Image
+[icall] NexOS.Forms.Host::Hour
+[icall] NexOS.Sys::IntToStr
+[icall] NexOS.Sys::StrConcat
+[icall] NexOS.Forms.Host::Minute
+[icall] NexOS.Sys::IntToStr
+[icall] NexOS.Sys::StrConcat
+[icall] NexOS.Sys::StrConcat
+[icall] NexOS.Forms.Gfx::Measure
+[icall] NexOS.Forms.Gfx::Text
+[icall] NexOS.Forms.Gfx::Text
+[icall] NexOS.Forms.Gfx::Text
+[icall] NexOS.Forms.Host::OsName
+[icall] NexOS.Sys::StrConcat
+[icall] NexOS.Forms.Gfx::Measure
+[icall] NexOS.Forms.Gfx::Text
+[icall] NexOS.Forms.Gfx::Text
+[icall] NexOS.Forms.Gfx::FillRound
+[icall] NexOS.Forms.Gfx::DrawRound
+[icall] NexOS.Forms.Gfx::FillCircle
+[icall] NexOS.Forms.Gfx::FillCircle
+[icall] NexOS.Sys::StrCharAt
+[icall] NexOS.Forms.Host::CharStr
+[icall] NexOS.Forms.Gfx::Measure
+[icall] NexOS.Forms.Gfx::Text
+[icall] NexOS.Forms.Gfx::TextCenter
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Forms.Gfx::TextCenter
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Forms.Gfx::Text
+[icall] NexOS.Forms.Gfx::FillRound
+[icall] NexOS.Forms.Gfx::DrawRound
+[icall] NexOS.Forms.Gfx::Text
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Forms.Gfx::Text
+[icall] NexOS.Forms.Gfx::FillRound
+[icall] NexOS.Forms.Gfx::DrawRound
+[icall] NexOS.Forms.Gfx::Text
+[icall] NexOS.Forms.Host::TickMs
+[icall] NexOS.Forms.Gfx::FillRound
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Forms.Gfx::TextCenter
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Sys::StrEq
+[icall] NexOS.Forms.Gfx::TextCenter
+[icall] NexOS.Forms.Host::UserName
+[icall] NexOS.Sys::StrCharAt
+[icall] NexOS.Sys::StrCharAt
+[icall] NexOS.Sys::StrCharAt
+[icall] NexOS.Sys::StrCharAt
+[icall] NexOS.Sys::StrCharAt
+[icall] NexOS.Sys::StrCharAt
+[icall] NexOS.Sys::StrCharAt
+[icall] NexOS.Sys::StrCharAt
+[icall] NexOS.Forms.Gfx::FillRound
+[icall] NexOS.Forms.Gfx::DrawRound
+[icall] NexOS.Forms.Gfx::TextCenter
+[icall] NexOS.Forms.Host::UserName
+[icall] NexOS.Forms.Gfx::FillRound
+[icall] NexOS.Forms.Gfx::DrawRound
+[icall] NexOS.Forms.Gfx::TextCenter
+[clr] NexOS.Forms.Desktop::DeferredRun
+[icall] NexOS.Sys::IntToStr
+[icall] NexOS.Sys::StrConcat
+[icall] NexOS.Sys::StrConcat
+[icall] NexOS.Sys::StrConcat
+[icall] NexOS.Forms.Host::Log
+[AIDESK] DeferredRun thinking=0 pending=no
+[icall] NexOS.Forms.Host::SetAnim
+[clr] NexOS.Forms.Shell::PaintOverlay
+[clr] NexOS.Forms.Voice::Dispatch
+[clr] NexOS.Forms.Shell::DesktopMenuOpen
+[GUI] render_all end
+[GUI] Entered GUI mode

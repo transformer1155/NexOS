@@ -1,0 +1,2 @@
+npm warn "where.exe" is being parsed as a normal command line argument.
+npm warn Unknown cli config "--g;". This will stop working in the next major version of npm.

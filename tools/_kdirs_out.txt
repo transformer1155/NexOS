@@ -1,0 +1,5 @@
+START  
+D:\MyOS\Bootloader\kernel\pmm.cpp
+D:\MyOS\Bootloader\kernel\pmm.h
+D:\MyOS\Bootloader\kernel\vmm.cpp
+D:\MyOS\Bootloader\kernel\vmm.h

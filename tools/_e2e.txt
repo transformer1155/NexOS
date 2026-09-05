@@ -1,0 +1,18 @@
+
+==== FRONTEND RECEIVED for 'whoami' ====
+
+
+==== FRONTEND RECEIVED for 'about' ====
+
+
+==== FRONTEND RECEIVED for 'users' ====
+
+
+==== FRONTEND RECEIVED for 'ls' ====
+
+
+==== SUMMARY ====
+  [PASS] login authenticated
+  [FAIL] whoami -> nexos
+  [FAIL] about echoed
+  [FAIL] users/ls forwarded (any IN)

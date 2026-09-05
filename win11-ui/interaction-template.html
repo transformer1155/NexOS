@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<!--
+  NexOS · Interaction Template (WinUI 3 HTML framework)
+  ----------------------------------------------------------------
+  Self-contained, no build step: open directly in a browser.
+  Uses the same design tokens as ./winui3-tokens.json so the look
+  matches the C# NexOS.Forms and the in-kernel GUI.  Every component
+  here is interactive (real JS) so the interaction model can be
+  validated on the web first, then ported into the real virtual-machine
+  GUI (bootloader/gui.cpp).
+
+  Components demonstrated:
+    - Draggable Win11 window w/ min / fullscreen / close title-bar buttons
+    - Mica / acrylic desktop backdrop (backdrop-filter blur)
+    - Button (default / hover / pressed), ToggleSwitch, Slider,
+      single-select ListView, TextBox, Tooltip
+    - Context menu WITHOUT a background fill (matches the in-kernel
+      change where fill_rounded_rect(0xF7F9FC) was removed)
+    - Light / Dark theme toggle via the shared token palette
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NexOS · Interaction Template</title>
+  <style>
+    /* ---- WinUI 3 design tokens (mirror winui3-tokens.json) ---- */
+    :root {
+      --font: 'Segoe UI Variable', 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
+      --radius-window: 10px;
+      --radius-control: 6px;
+      --radius-menu: 8px;
+    }
+    :root[data-theme="light"] {
+      --accent: #0067C0;
+      --accent-hover: rgba(0,103,192,0.90);
+      --accent-pressed: rgba(0,103,192,0.80);
+      --text-1: rgba(0,0,0,0.89);
+      --text-2: rgba(0,0,0,0.62);
+      --text-3: rgba(0,0,0,0.45);
+      --card: rgba(255,255,255,0.70);
+      --card-solid: #FFFFFF;
+      --control-fill: rgba(255,255,255,0.70);
+      --control-fill-2: rgba(0,0,0,0.04);
+      --control-stroke: rgba(0,0,0,0.06);
+      --layer: rgba(255,255,255,0.50);
+      --layer-alt: rgba(255,255,255,0.30);
+      --hover: rgba(0,0,0,0.04);
+      --pressed: rgba(0,0,0,0.08);
+      --menu-border: #D5DDE8;
+      --menu-hover: #E7EEF8;
+      --menu-text: #1B1B1B;
+      --danger: #C42B1C;
+      --desktop-1: #1C5FB0;
+      --desktop-2: #6A3FB5;
+      --desktop-3: #B5446E;
+    }
+    :root[data-theme="dark"] {
+      --accent: #4CC2FF;
+      --accent-hover: rgba(76,194,255,0.90);
+      --accent-pressed: rgba(76,194,255,0.80);
+      --text-1: rgba(255,255,255,0.90);
+      --text-2: rgba(255,255,255,0.77);
+      --text-3: rgba(255,255,255,0.54);
+      --card: rgba(44,44,44,0.70);
+      --card-solid: #2C2C2C;
+      --control-fill: rgba(255,255,255,0.06);
+      --control-fill-2: rgba(255,255,255,0.06);
+      --control-stroke: rgba(255,255,255,0.07);
+      --layer: rgba(255,255,255,0.04);
+      --layer-alt: rgba(0,0,0,0.20);
+      --hover: rgba(255,255,255,0.06);
+      --pressed: rgba(255,255,255,0.10);
+      --menu-border: #3A3A3A;
+      --menu-hover: rgba(255,255,255,0.08);
+      --menu-text: rgba(255,255,255,0.90);
+      --danger: #FF7A7A;
+      --desktop-1: #0B1F3A;
+      --desktop-2: #2A1B4D;
+      --desktop-3: #3D1830;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%; height: 100%; overflow: hidden;
+      font-family: var(--font); font-size: 14px;
+      color: var(--text-1);
+      -webkit-font-smoothing: antialiased;
+      user-select: none;
+    }
+
+    /* ---- Mica / acrylic desktop backdrop ---- */
+    #desktop {
+      position: absolute; inset: 0;
+      background:
+        radial-gradient(120% 120% at 10% 0%, var(--desktop-1) 0%, transparent 55%),
+        radial-gradient(120% 120% at 90% 10%, var(--desktop-2) 0%, transparent 50%),
+        radial-gradient(140% 140% at 50% 110%, var(--desktop-3) 0%, transparent 55%),
+        linear-gradient(135deg, #0b1020, #161a2e);
+      display: flex; align-items: center; justify-content: center;
+    }
+    #desktop::before {
+      content: ""; position: absolute; inset: 0;
+      backdrop-filter: blur(40px) saturate(1.2);
+      -webkit-backdrop-filter: blur(40px) saturate(1.2);
+      background: var(--layer-alt);
+    }
+
+    /* ---- Window ---- */
+    .window {
+      position: absolute;
+      width: 560px; min-height: 380px;
+      background: var(--card);
+      backdrop-filter: blur(30px) saturate(1.4);
+      -webkit-backdrop-filter: blur(30px) saturate(1.4);
+      border: 1px solid var(--control-stroke);
+      border-radius: var(--radius-window);
+      box-shadow: 0 32px 64px rgba(0,0,0,0.40), 0 2px 8px rgba(0,0,0,0.20);
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+    .titlebar {
+      height: 32px; flex: 0 0 32px;
+      display: flex; align-items: center;
+      padding: 0 4px 0 12px;
+      background: transparent;
+      cursor: default;
+    }
+    .titlebar .title {
+      font-size: 12px; color: var(--text-2); flex: 1;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .title-btn {
+      width: 28px; height: 24px; border: 0; border-radius: 4px;
+      background: transparent; color: var(--text-1);
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; font-size: 12px;
+    }
+    .title-btn:hover { background: var(--hover); }
+    .title-btn.close:hover { background: var(--danger); color: #fff; }
+
+    .body { flex: 1; padding: 16px; overflow: auto; display: flex; flex-direction: column; gap: 14px; }
+
+    .section-title { font-size: 12px; color: var(--text-3); letter-spacing: .04em; text-transform: uppercase; }
+
+    /* ---- Button ---- */
+    .btn {
+      height: 32px; padding: 0 16px;
+      border: 1px solid var(--control-stroke);
+      border-radius: var(--radius-control);
+      background: var(--control-fill);
+      color: var(--text-1); font-family: var(--font); font-size: 14px;
+      cursor: pointer; transition: background .12s ease, transform .04s ease;
+    }
+    .btn:hover { background: var(--hover); }
+    .btn:active { background: var(--pressed); transform: translateY(1px); }
+    .btn.accent { background: var(--accent); color: #fff; border-color: transparent; }
+    .btn.accent:hover { background: var(--accent-hover); }
+    .btn.accent:active { background: var(--accent-pressed); }
+    .btn.danger { color: var(--danger); }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+    /* ---- ToggleSwitch ---- */
+    .toggle { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; }
+    .toggle .track {
+      width: 40px; height: 20px; border-radius: 10px;
+      background: var(--control-fill-2); border: 1px solid var(--control-stroke);
+      position: relative; transition: background .15s ease;
+    }
+    .toggle .thumb {
+      position: absolute; top: 1px; left: 1px;
+      width: 16px; height: 16px; border-radius: 50%;
+      background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.4);
+      transition: left .15s ease;
+    }
+    .toggle.on .track { background: var(--accent); border-color: transparent; }
+    .toggle.on .thumb { left: 21px; }
+
+    /* ---- Slider ---- */
+    .slider { width: 240px; height: 24px; display: flex; align-items: center; cursor: pointer; }
+    .slider .rail { position: relative; width: 100%; height: 4px; border-radius: 2px; background: var(--control-fill-2); }
+    .slider .fill { position: absolute; left: 0; top: 0; height: 100%; border-radius: 2px; background: var(--accent); }
+    .slider .knob {
+      position: absolute; width: 16px; height: 16px; border-radius: 50%;
+      background: #fff; border: 1px solid var(--control-stroke);
+      box-shadow: 0 1px 3px rgba(0,0,0,.3); top: -6px; transform: translateX(-8px);
+    }
+
+    /* ---- ListView ---- */
+    .list { border: 1px solid var(--control-stroke); border-radius: var(--radius-control); overflow: hidden; background: var(--layer); }
+    .list .item {
+      padding: 10px 14px; display: flex; align-items: center; gap: 12px;
+      cursor: pointer; border-bottom: 1px solid var(--control-stroke);
+    }
+    .list .item:last-child { border-bottom: 0; }
+    .list .item:hover { background: var(--hover); }
+    .list .item.sel { background: var(--accent); color: #fff; }
+    .list .item .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); flex: 0 0 10px; }
+    .list .item.sel .dot { background: #fff; }
+
+    /* ---- TextBox ---- */
+    .textbox {
+      height: 32px; padding: 0 10px; width: 240px;
+      border: 1px solid var(--control-stroke); border-radius: var(--radius-control);
+      background: var(--card-solid); color: var(--text-1); font-family: var(--font); font-size: 14px;
+      outline: none;
+    }
+    .textbox:focus { border-color: var(--accent); }
+
+    /* ---- Tooltip ---- */
+    .tip-host { position: relative; display: inline-flex; }
+    .tooltip {
+      position: fixed; z-index: 50; pointer-events: none;
+      padding: 6px 10px; border-radius: 4px; font-size: 12px;
+      background: #1B1B1B; color: #fff; white-space: nowrap;
+      opacity: 0; transform: translateY(4px); transition: opacity .1s ease, transform .1s ease;
+    }
+    .tooltip.show { opacity: 1; transform: translateY(0); }
+
+    /* ---- Context menu (NO background fill, matches in-kernel change) ---- */
+    .ctx-menu {
+      position: fixed; z-index: 100; min-width: 190px;
+      padding: 6px 0;
+      border: 1px solid var(--menu-border);     /* keep border, drop fill */
+      border-radius: var(--radius-menu);
+      background: transparent;                   /* <-- background removed */
+      display: none;
+      font-size: 14px; color: var(--menu-text);
+    }
+    .ctx-menu.open { display: block; }
+    .ctx-menu .mi {
+      padding: 7px 14px; margin: 0 4px; border-radius: 4px; cursor: pointer;
+    }
+    .ctx-menu .mi:hover { background: var(--menu-hover); }
+    .ctx-menu .mi.danger { color: var(--danger); }
+    .ctx-menu .sep { height: 1px; margin: 4px 10px; background: var(--menu-border); }
+  </style>
+</head>
+<body>
+  <div id="desktop">
+    <div class="window" id="win" style="left:calc(50% - 280px); top:calc(50% - 200px);">
+      <div class="titlebar" id="titlebar">
+        <span class="title">Interaction Template — WinUI 3</span>
+        <button class="title-btn" id="btnMin" title="Minimize">—</button>
+        <button class="title-btn" id="btnMax" title="Fullscreen">▢</button>
+        <button class="title-btn close" id="btnClose" title="Close">✕</button>
+      </div>
+      <div class="body" id="winbody">
+        <div class="section-title">Buttons</div>
+        <div class="row">
+          <button class="btn" id="b1">Standard</button>
+          <button class="btn accent" id="b2">Accent</button>
+          <button class="btn danger" id="b3">Danger</button>
+          <span class="tip-host">
+            <button class="btn" id="b4">Hover me</button>
+            <span class="tooltip" id="tip">Tooltip text</span>
+          </span>
+        </div>
+
+        <div class="section-title">Toggle &amp; Slider</div>
+        <div class="row">
+          <div class="toggle" id="tg"><div class="track"><div class="thumb"></div></div><span>Wi-Fi</span></div>
+          <div class="slider" id="sl"><div class="rail"><div class="fill" style="width:50%"></div><div class="knob" style="left:50%"></div></div></div>
+          <span id="slVal" style="color:var(--text-2)">50%</span>
+        </div>
+
+        <div class="section-title">List (single select)</div>
+        <div class="list" id="list">
+          <div class="item" data-i="0"><span class="dot"></span>Calculator</div>
+          <div class="item" data-i="1"><span class="dot"></span>File Explorer</div>
+          <div class="item" data-i="2"><span class="dot"></span>Settings</div>
+          <div class="item" data-i="3"><span class="dot"></span>Terminal</div>
+        </div>
+
+        <div class="section-title">Text input</div>
+        <div class="row">
+          <input class="textbox" id="tb" type="text" placeholder="Type here…" />
+          <button class="btn" id="bEcho">Echo</button>
+          <span id="echoOut" style="color:var(--text-2)"></span>
+        </div>
+
+        <div class="section-title">Theme</div>
+        <div class="row">
+          <button class="btn" id="bLight">Light</button>
+          <button class="btn" id="bDark">Dark</button>
+          <span style="color:var(--text-3)">Right-click the window body for a context menu.</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Context menu: background removed, border + hover only -->
+  <div class="ctx-menu" id="ctx">
+    <div class="mi" data-a="open">Open</div>
+    <div class="mi" data-a="rename">Rename</div>
+    <div class="sep"></div>
+    <div class="mi danger" data-a="delete">Delete</div>
+  </div>
+
+  <script>
+    "use strict";
+    const $ = (s, r=document) => r.querySelector(s);
+    const $$ = (s, r=document) => [...r.querySelectorAll(s)];
+
+    /* ---- Theme ---- */
+    const root = document.documentElement;
+    root.setAttribute('data-theme', 'light');
+    $('#bLight').onclick = () => root.setAttribute('data-theme','light');
+    $('#bDark').onclick  = () => root.setAttribute('data-theme','dark');
+
+    /* ---- Window drag (titlebar) ---- */
+    const win = $('#win'), bar = $('#titlebar');
+    let dragging = false, ox = 0, oy = 0, minimized = false, saved = null;
+    bar.addEventListener('mousedown', (e) => {
+      if (e.target.classList.contains('title-btn')) return;
+      dragging = true;
+      const r = win.getBoundingClientRect();
+      ox = e.clientX - r.left; oy = e.clientY - r.top;
+      win.style.left = r.left + 'px'; win.style.top = r.top + 'px';
+      win.style.transform = 'none';
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      win.style.left = (e.clientX - ox) + 'px';
+      win.style.top  = (e.clientY - oy) + 'px';
+    });
+    window.addEventListener('mouseup', () => dragging = false);
+
+    /* ---- Title buttons ---- */
+    $('#btnClose').onclick = () => win.style.display = 'none';
+    $('#btnMin').onclick = () => {
+      if (!minimized) { saved = {h: win.style.height, display: win.style.display}; win.style.height='32px'; win.querySelector('.body').style.display='none'; minimized = true; }
+      else { win.style.height = saved.h || ''; win.querySelector('.body').style.display=''; minimized = false; }
+    };
+    $('#btnMax').onclick = () => {
+      const r = win.getBoundingClientRect();
+      if (r.left !== 0) { saved = {l:r.left, t:r.top, w:r.width, h:r.height}; win.style.left='0'; win.style.top='0'; win.style.width='100%'; win.style.height='100%'; }
+      else { win.style.left=saved.l+'px'; win.style.top=saved.t+'px'; win.style.width=saved.w+'px'; win.style.height=saved.h+'px'; }
+    };
+
+    /* ---- Buttons feedback ---- */
+    $('#b1').onclick = () => flash($('#b1'), 'Clicked!');
+    $('#b2').onclick = () => flash($('#b2'), 'Accent!');
+    $('#b3').onclick = () => flash($('#b3'), 'Danger!');
+    function flash(el, t){ const o = el.textContent; el.textContent = t; setTimeout(()=> el.textContent = o, 600); }
+
+    /* ---- Tooltip ---- */
+    const tip = $('#tip');
+    $('#b4').addEventListener('mouseenter', e => { positionTip(e); tip.classList.add('show'); });
+    $('#b4').addEventListener('mousemove', positionTip);
+    $('#b4').addEventListener('mouseleave', () => tip.classList.remove('show'));
+    function positionTip(e){ tip.style.left = (e.clientX + 12) + 'px'; tip.style.top = (e.clientY + 16) + 'px'; }
+
+    /* ---- Toggle ---- */
+    const tg = $('#tg');
+    tg.onclick = () => tg.classList.toggle('on');
+
+    /* ---- Slider ---- */
+    const sl = $('#sl'), fill = $('.fill', sl), knob = $('.knob', sl);
+    const slVal = $('#slVal');
+    function setSl(e){
+      const r = sl.getBoundingClientRect();
+      let p = (e.clientX - r.left) / r.width;
+      p = Math.max(0, Math.min(1, p));
+      fill.style.width = (p*100)+'%';
+      knob.style.left = (p*100)+'%';
+      slVal.textContent = Math.round(p*100) + '%';
+    }
+    sl.addEventListener('mousedown', e => { setSl(e); const mv = ev => setSl(ev); const up = () => { window.removeEventListener('mousemove',mv); window.removeEventListener('mouseup',up); }; window.addEventListener('mousemove',mv); window.addEventListener('mouseup',up); });
+
+    /* ---- ListView single select ---- */
+    $$('#list .item').forEach(it => it.onclick = () => {
+      $$('#list .item').forEach(x => x.classList.remove('sel'));
+      it.classList.add('sel');
+    });
+
+    /* ---- TextBox echo ---- */
+    $('#bEcho').onclick = () => $('#echoOut').textContent = $('#tb').value || '(empty)';
+
+    /* ---- Context menu (no background) ---- */
+    const ctx = $('#ctx');
+    $('#winbody').addEventListener('contextmenu', e => {
+      e.preventDefault();
+      ctx.style.left = e.clientX + 'px';
+      ctx.style.top  = e.clientY + 'px';
+      ctx.classList.add('open');
+    });
+    $$('#ctx .mi').forEach(m => m.onclick = () => {
+      ctx.classList.remove('open');
+      if (m.dataset.a === 'delete') flash($('#b3'), 'Deleted');
+    });
+    window.addEventListener('click', () => ctx.classList.remove('open'));
+    window.addEventListener('scroll', () => ctx.classList.remove('open'), true);
+  </script>
+</body>
+</html>

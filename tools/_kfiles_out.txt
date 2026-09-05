@@ -1,0 +1,8 @@
+START  
+D:\MyOS\Bootloader\kernel.cpp
+D:\MyOS\Bootloader\kernel64.cpp
+D:\MyOS\Bootloader\.attic64\kernel64.cpp
+D:\MyOS\Bootloader\dcn\dcn_kernel.cpp
+D:\MyOS\Bootloader\dcn\rt\kmain.cpp
+D:\MyOS\Bootloader\dcn\rt\serial.cpp
+D:\MyOS\Bootloader\dcn\tests\test_main.cpp

@@ -1,0 +1,305 @@
+START  
+52: //  Serial debug output (port 0x3F8)  -  for UEFI boot tracing
+54: static void serial_putc(char c){ outb(0x3F8, (uint8_t)c); }
+55: static void serial_puts(const char* s){ while(*s) outb(0x3F8, (uint8_t)*s++); }
+56: // Print a non-negative integer in decimal to the serial port.
+57: static void serial_puts_dec(int v){
+58:     if (v == 0){ serial_puts("0"); return; }
+59:     if (v < 0){ serial_puts("-"); v = -v; }
+62:     for (int i = n - 1; i >= 0; i--) outb(0x3F8, (uint8_t)t[i]);
+64: static void serial_hex(uint32_t v){
+69:     serial_puts(buf);
+71: // Non-blocking serial read: returns char if data ready, else -1.
+72: static int serial_try_getc(void){
+73:     if (inb(0x3FD) & 0x01) return (int)(unsigned char)inb(0x3F8);
+76: // Remote console buffer: commands arriving over COM1 (frontend ops terminal /
+78: static char g_serial_inbuf[256];
+79: static int  g_serial_inlen = 0;
+187:         serial_puts("[HW] CPUID not supported\n");
+245:     serial_puts("[HW] CPU: ");
+246:     serial_puts(g_hw.cpu_vendor);
+247:     serial_puts(" Family=");
+255:         serial_puts(buf);
+257:     serial_puts(" Model=");
+265:         serial_puts(buf);
+267:     serial_puts(g_hw.has_long_mode ? " [x86-64]" : " [32-bit]");
+268:     serial_puts(g_hw.has_sse2 ? " [SSE2]" : "");
+269:     serial_puts("\n");
+313:         serial_puts("[HW] E820: ");
+317:             buf[i]=0; serial_puts(buf);
+319:         serial_puts(" entries, ");
+323:             buf[i]=0; serial_puts(buf);
+325:         serial_puts(" MiB usable\n");
+327:         serial_puts("[HW] E820 not available, using CMOS fallback\n");
+348:         serial_puts("[HW] PS/2 controller: absent (port 0x64 reads 0xFF)\n");
+366:     serial_puts(controller_ok ? "[HW] PS/2 controller: OK\n" : "[HW] PS/2 controller: not detected\n");
+402:     serial_puts(mouse_ok ? "[HW] PS/2 mouse: detected\n" : "[HW] PS/2 mouse: not detected\n");
+430:         serial_puts("[HW] PCI: configuration mechanism #1 not available\n");
+434:     serial_puts("[HW] PCI bus scan:\n");
+452:                 serial_puts("[HW]   ");
+458:                     serial_puts(buf);
+461:                     serial_puts(buf);
+463:                 serial_puts(" vendor=");
+468:                     serial_puts(buf);
+470:                 serial_puts(" dev=");
+475:                     serial_puts(buf);
+477:                 serial_puts(" class=");
+482:                     serial_puts(buf);
+484:                 serial_puts("\n");
+494:                         serial_puts("[HW]   -> Network controller at I/O 0x");
+499:                             serial_puts(buf);
+501:                         serial_puts("\n");
+510:                     serial_puts("[HW]   -> Display controller detected\n");
+515:                     serial_puts("[HW]   -> Mass storage controller\n");
+532:         serial_puts("[HW] PCI: ");
+535:         buf[i]=0; serial_puts(buf);
+536:         serial_puts(" devices found\n");
+622:         serial_puts("[HW] Disk: ");
+623:         serial_puts(g_hw.disk_model);
+624:         serial_puts(" (");
+628:             buf[i]=0; serial_puts(buf);
+630:         serial_puts(" MB)\n");
+636:         serial_puts("[HW] Disk: none detected\n");
+642:     serial_puts("[HW] ===== Hardware Detection =====\n");
+671:         serial_puts("[HW] VBE: available ");
+675:             buf[i]=0; serial_puts(buf);
+677:         serial_puts("x");
+681:             buf[i]=0; serial_puts(buf);
+683:         serial_puts(g_hw.vbe_mode_set ? " [mode_set]" : " [mode_not_set]");
+686:             serial_puts(" fmt=");
+688:             if (px_fmt < 5) serial_puts(fmt_names[px_fmt]);
+689:             else { serial_puts("?"); }
+693:                 serial_puts(" [WARN:FB>4GB no shadow]");
+696:         serial_puts("\n");
+700:         serial_puts("[HW] VBE: not available\n");
+703:     serial_puts("[HW] ===== Detection Complete =====\n");
+917:         serial_puts("[MKFS] Data disk: ATA ");
+918:         serial_puts(base == 0x1F0 ? "primary" : "secondary");
+919:         serial_puts(drv == 0xE0 ? " master\n" : " slave\n");
+924:         serial_puts("[MKFS] No ATA hard disk - using boot disk (primary master)\n");
+1041: // ---- terminal -> COM1 mirror ----
+1044: // serial_puts() diagnostics reached COM1.  Mirroring every terminal
+1045: // character to 0x3F8 makes the whole shell scriptable from a test harness.
+1046: // Toggle at runtime with the `serialecho on|off` command.
+1047: static bool g_term_serial = true;
+1052: // channel instead of (or in addition to) the local VGA/serial console.  Set by
+1085:         if(g_term_serial) serial_putc(c);
+1512:             serial_puts("[MOUSE] no i8042 controller - mouse init skipped\n");
+1533:         serial_puts(m_pkt_len == 4
+1944:             serial_puts("[MKFS] Mounted, data area ");
+1945:             serial_puts(g_fs_is_data_disk ? "(user data disk)\n" : "(boot disk)\n");
+1947:             serial_puts("[MKFS] Not formatted - type 'mkfs' to format the data disk\n");
+1970:         serial_puts("[MKFS] formatted (v2, tail-pack + batch enabled)\n");
+2283:                 serial_puts("[SFS] RAM-backed image mounted at ");
+2284:                 serial_hex(ram_base);
+2285:                 serial_puts("\n");
+2287:                 serial_puts("[SFS] RAM flag set but no 'SFS' magic at base\n");
+2314:             serial_puts("[SFS] mount_at(");
+2315:             serial_puts_dec(lba);
+2316:             serial_puts(") magic Fail bytes=");
+2317:             for (int i=0;i<4;i++){ static const char* h="0123456789ABCDEF"; serial_putc(h[(g_fsbuf[i]>>4)&0xF]); serial_putc(h[g_fsbuf[i]&0xF]); }
+2318:             serial_puts("\n");
+2904:         serial_puts("[PMM] .bss+lmboot reserved "); serial_hex(bs);
+2905:         serial_puts(" .. "); serial_hex(be); serial_puts("\n");
+2906:         serial_puts("[PMM] lmboot "); serial_hex((uint32_t)(uintptr_t)__lmboot_start);
+2907:         serial_puts(" .. "); serial_hex((uint32_t)(uintptr_t)__lmboot_end);
+2908:         serial_puts(" (k32 stack/PML4/k64 stack)\n");
+2925:         serial_puts("[PMM] RAM-SFS region reserved "); serial_hex(rs);
+2926:         serial_puts(" .. "); serial_hex(re); serial_puts("\n");
+2928:     serial_puts("[PMM] Initialised\n");
+3043:         serial_puts("[VMM] Long mode – firmware paging in use\n");
+3049:         serial_puts("[VMM] Firmware paging active (not our own)\n");
+3054:     serial_puts("[VMM] Setting up 32-bit paging (PSE)...\n");
+3084:             serial_puts("[VMM] VBE LFB mapped in page directory\n");
+3106:     serial_puts("[VMM] ring-3 user region 0x04000000-0x08000000 (PG_USER)\n");
+3121:     serial_puts("[VMM] Paging enabled (32 MiB identity-mapped, 4 MiB PSE)\n");
+3189:     serial_puts("[VMM] high FB 0x");
+3190:     serial_hex((uint32_t)(fb >> 32));
+3191:     serial_hex((uint32_t)(fb & 0xFFFFFFFFULL));
+3192:     serial_puts(" mapped to VA 0x");
+3193:     serial_hex(FB_WIN_VA);
+3194:     serial_puts(" span=0x");
+3195:     serial_hex(pages << 12);
+3196:     serial_puts(" pts=0x");
+3197:     serial_hex(pt_count);
+3198:     serial_puts("\n");
+3294:         serial_puts("[HEAP] FATAL: heap overlaps .bss ");
+3295:         serial_hex((uint32_t)(uintptr_t)__bss_start);
+3296:         serial_puts("..");
+3297:         serial_hex((uint32_t)(uintptr_t)__bss_end);
+3298:         serial_puts(" -- raise HEAP_START in kernel.cpp\n");
+3303:         serial_puts("[HEAP] FATAL: heap overlaps .lmboot ");
+3304:         serial_hex((uint32_t)(uintptr_t)__lmboot_start);
+3305:         serial_puts("..");
+3306:         serial_hex((uint32_t)(uintptr_t)__lmboot_end);
+3307:         serial_puts(" -- move .lmboot in linker.ld or shrink the heap\n");
+3318:     serial_puts("[HEAP] Initialised: 14 MiB at 0x500000\n");
+4144:     serial_puts("[DISKRW] sector written\n");
+4154:     serial_puts(ok ? "[DISKRW] PASS\n" : "[DISKRW] FAIL\n");
+4174:                   serial_puts("[DISKSFS] FAIL create\n"); return; }
+4175:     serial_puts("[DISKSFS] create ok\n");
+4181:         serial_puts("[DISKSFS] FAIL size\n"); return;
+4189:     serial_puts(ok ? "[DISKSFS] read PASS\n" : "[DISKSFS] FAIL read\n");
+4194:                   serial_puts("[DISKSFS] FAIL rename\n"); return; }
+4198:     serial_puts(renamed ? "[DISKSFS] rename PASS\n" : "[DISKSFS] FAIL rename\n");
+4203:     serial_puts(removed ? "[DISKSFS] remove PASS\n" : "[DISKSFS] FAIL remove\n");
+4206:     serial_puts(all ? "[DISKSFS] ALL PASS\n" : "[DISKSFS] FAIL\n");
+4364:             // serial log so headless tests can assert on it.
+4366:             serial_puts(text);
+4407:     if (rep && rep[0]) { term.write(rep); serial_puts(rep); }
+4422:         serial_puts(msg);
+4613:     serial_puts("[SHUTDOWN] ACPI power-off requested\n");
+4630:     serial_puts("[REBOOT] Keyboard controller reset\n");
+4633:     // Small delay to let serial flush
+5339: static void kb_console(const char* s){ term.write(s); serial_puts(s); }
+5443:         serial_puts("[AI] ai_init starting...\n");
+5445:         serial_puts("[AI] ai_init returned.\n");
+5493:         serial_puts("[AI] generated Python source:\n");
+5494:         serial_puts(code);
+5495:         serial_puts("\n[AI] launching python interpreter on the generated code...\n");
+5504:         serial_puts("[AI] argv[1] = mem:"); serial_puts(arg1); serial_puts("\n");
+5591:         char buf[3072]; int n = ai_plugin_serialize(buf, sizeof(buf));
+5600:         char buf[3072]; int n = ai_plugin_serialize(buf, sizeof(buf));
+6003:             serial_puts("[webapi] unlocked\n");
+6007:             serial_puts("[webapi] auth failed\n");
+6020:         serial_puts("[webapi] denied: locked\n");
+6027:         serial_puts("[webapi] no IEFrame window\n");
+6034:         serial_puts("[webapi] selftest begin\n");
+6038:         serial_puts(p == 0x1E1E1E1E ? "[webapi] selftest ping OK\n"
+6043:         serial_puts("[webapi] selftest end\n");
+6109:     serial_puts("[PING] command for "); serial_puts(host); serial_puts("\n");
+6113:         serial_puts("[PING] OK\n");
+6116:         serial_puts("[PING] TIMEOUT\n");
+6140:     serial_puts("[DL] get "); serial_puts(url); serial_puts(" -> "); serial_puts(file); serial_puts("\n");
+6145:         serial_puts("[DL] FAIL (no data)\n");
+6157:         serial_puts("[DL] OK ");
+6158:         serial_puts(file);
+6159:         serial_puts(" (");
+6160:         serial_puts_dec(n);   // serial decimal helper defined below
+6161:         serial_puts(")\n");
+6166:         serial_puts("[DL] FAIL (write)\n");
+6184:     serial_puts("[K8] Initializing network...\n");
+6312:     serial_puts("[K32] Entering Win11 GUI mode\n");
+6401:         serial_puts("[K32] using EFI-preloaded K64 @");
+6402:         serial_hex(stage_phys);
+6403:         serial_puts(" size=");
+6404:         serial_hex(h->size);
+6405:         serial_puts("\n");
+6413:             serial_puts("[K32] ERROR: kmalloc(512K) failed\n");
+6432:             serial_puts("[K32] ERROR: stage ");
+6433:             serial_hex(stage_phys);
+6434:             serial_puts("..");
+6435:             serial_hex(stage_end);
+6436:             serial_puts(" hits .bss/.lmboot\n");
+6445:             serial_puts("[K32] ERROR: bad stage addr\n");
+6451:         serial_puts("[K32] staging at ");
+6452:         serial_hex(stage_phys);
+6453:         serial_puts(", sectors=");
+6454:         serial_hex(KERNEL64_SECTORS);
+6455:         serial_puts("\n");
+6464:     serial_puts("[K32] stage[0..3]=");
+6465:     serial_hex(*(volatile uint32_t*)stage);
+6466:     serial_puts(" (expect 03F8BA66 = '66 BA F8 03' entry64)\n");
+6468:     serial_puts("[K32] K64 image staged; entering long mode\n");
+6475:     serial_puts("[K32] ERROR: switch_to_64bit returned!\n");
+6482:     serial_puts("[K32] Switching to 64-bit kernel...\n");
+6494: // the real transformer engine, streaming the reply to serial/terminal.
+6508:     serial_puts("[K32] ask64 staged; switching\n");
+6929:         serial_puts("[PERM] no keyboard controller - cannot ask, failing safe\n");
+6936:     // --- text console rendering (also the headless/serial-visible path) ---
+6973:                 serial_puts("[PERM] prompt timed out - defaulting to DENY\n");
+7015:     term.write("Remembered grants dumped to serial. Usage: perm [reset]\n");
+7020:     serial_puts("[user] loading ring-3 demo 'userdemo'\n");
+7024:         serial_puts("[user] FAILED: userdemo not in SFS\n");
+7028:     serial_puts("[user] loaded "); serial_hex((uint32_t)sz);
+7029:     serial_puts(" bytes @0x"); serial_hex((uint32_t)USER_BASE); serial_puts("\n");
+7033:         serial_puts("[user] FAILED: process table full\n");
+7044:     serial_puts("[user] returned from ring-3 (rc=");
+7045:     serial_hex((uint32_t)rc);
+7046:     serial_puts(")\n");
+7062:         serial_puts("[vfs] cannot resolve path\n");
+7066:     serial_puts("[vfs] resolved: "); serial_puts(abs); serial_puts("\n");
+7071:         serial_puts("[vfs] open failed\n");
+7079:         serial_puts("[vfs] content: ");
+7080:         serial_puts(buf);      if (buf[n-1] != '\n') serial_puts("\n");
+7088:     // Echo every dispatched command to the serial port so headless tests can
+7090:     serial_puts("[SHELL] $ "); serial_puts(line); serial_puts("\n");
+7169:     else if(!strcmp_(cmd,"serialecho")){
+7170:         if(!strcmp_(args,"off"))      g_term_serial = false;
+7171:         else if(!strcmp_(args,"on"))  g_term_serial = true;
+7172:         term.write("serialecho: ");
+7173:         term.write(g_term_serial ? "on\n" : "off\n");
+7334:     serial_puts("[K-MEM] Memory optimization requested\n");
+7350:     serial_puts("[K-MEM] Heap coalesced ");
+7351:     char buf[16]; int_to_str(coalesced, buf); serial_puts(buf);
+7352:     serial_puts(" blocks\n");
+7741:             serial_puts("[K32-LOGIN] reject user="); serial_puts(user); serial_puts("\n");
+7748:         serial_puts("[K32-LOGIN] OK user="); serial_puts(g_users[i].name); serial_puts("\n");
+7751:     serial_puts("[K32-LOGIN] no such user\n");
+7961:     serial_puts("\n*** EXCEPTION ");
+7963:     serial_puts(nb);
+7964:     serial_puts(g_exc_name[vec < 32 ? vec : 31]);
+7965:     serial_puts(" ***\n");
+7967:     serial_puts("EIP="); serial_hex(eip); serial_puts(" ERR="); serial_hex(err);
+7968:     serial_puts(" CR2="); serial_hex(cr2); serial_puts(" ESP="); serial_hex(old_esp);
+7969:     serial_puts("\nEAX="); serial_hex(eax); serial_puts(" EBX="); serial_hex(ebx);
+7970:     serial_puts(" ECX="); serial_hex(ecx); serial_puts(" EDX="); serial_hex(edx);
+7971:     serial_puts(" ESI="); serial_hex(esi); serial_puts(" EDI="); serial_hex(edi);
+7972:     serial_puts(" EBP="); serial_hex(ebp);
+7973:     serial_puts("\nSTACK=");
+7976:         serial_hex(s[i]); serial_puts(" ");
+7978:     serial_puts("\nHALT\n");
+7980:     // Visible-on-real-hardware fault indicator.  No serial console is
+7996:     const char* msg = "EXCEPTION - see serial";
+8051: // Boot progress beacon helpers (screen-visible, no serial needed).
+8053: // records the current milestone in low RAM (0x5101) so a captured serial
+8059:     // RAW early marker: proves kmain entry is reached (bypasses C++ serial_puts)
+8060:     __asm__ __volatile__("movb $0x5A, %%al\n\tmovw $0x3F8, %%dx\n\toutb %%al, %%dx" ::: "eax","edx");
+8070:     serial_puts("[K0] kmain entered, PIC masked\n");
+8074:     serial_puts("[K-g] gdt_init done\n");
+8076:     serial_puts("[K-i] idt_init done\n");
+8078:     serial_puts("[K-p] pic_init done\n");
+8091:     serial_puts("[K1] kmain entered\n");
+8140:         serial_puts("[K2] VBE graphics mode active (set by BIOS/UEFI)\n");
+8154:         serial_puts("[K2] VGA text mode set\n");
+8161:         serial_puts("[K-DBG] 0x500D=");
+8169:         serial_puts(buf);
+8171:         serial_puts("[K-DBG] 0x5000=");
+8174:         serial_puts(buf);
+8175:         serial_puts("\n");
+8179:         serial_puts("[K-VBE] VBE info available (GUI ready)\n");
+8188:     serial_puts("[K3] terminal init done\n");
+8210:     serial_puts("[K4] mouse init done\n");
+8219:             serial_puts("[K] CD-boot RAM-SFS handoff flag present\n");
+8229:         serial_puts("[K6] Linux partition mounted at LBA ");
+8230:         serial_puts_dec(SFS_LINUX_LBA);
+8231:         serial_puts("\n");
+8233:         serial_puts("[K6] WARN: no Linux partition at LBA ");
+8234:         serial_puts_dec(SFS_LINUX_LBA);
+8235:         serial_puts(" (linux <file> falls back to main SFS)\n");
+8237:     serial_puts("[K6] filesystem init done\n");
+8273:     serial_puts("[K7] memory management init done\n");
+8274:     serial_puts("[K] Command-line shell (GUI starts on demand via 'run <winfile>')\n");
+8277:     serial_puts("[K8] Initializing network...\n");
+8282:             serial_puts("[K8] Network initialized successfully\n");
+8284:             serial_puts("[K8] Network init failed (no NIC?)\n");
+8290:     serial_puts("[K5] Hello world written\n");
+8376:         serial_puts("[K32] sign-in deferred to the graphical lock screen\n");
+8406:     // inside mforms_paint_desktop -- the last serial line before the hang is
+8424:         serial_puts("[K] boot: auto-launch Win11 GUI desktop (32-bit)\n");
+8436:         serial_puts("[K] boot: 32-bit text shell (headless, no auto-switch)\n");
+8441:         serial_puts("[K] boot: 32-bit shell (stable default)\n");
+8456:                 // Remote console over COM1 (frontend ops terminal / bridge).
+8457:                 // Characters arriving on the serial port are accumulated and
+8460:                 // back to COM1 by Terminal::put_char (g_term_serial).
+8463:                     while ((ch = serial_try_getc()) >= 0) {
+8465:                             if (g_serial_inlen > 0) {
+8466:                                 g_serial_inbuf[g_serial_inlen] = 0;
+8467:                                 run_command(g_serial_inbuf);
+8468:                                 g_serial_inlen = 0;
+8471:                             if (g_serial_inlen > 0) g_serial_inlen--;
+8472:                         } else if (g_serial_inlen < (int)sizeof(g_serial_inbuf) - 1) {
+8473:                             g_serial_inbuf[g_serial_inlen++] = (char)ch;
+8529:                         else if(e.type == K_DESK_L){ serial_puts("[desk] switch -> default (desktop 1)\n"); gui_handle_ctrl(5); }
+8530:                         else if(e.type == K_DESK_R){ serial_puts("[desk] switch -> AI (desktop 2)\n"); gui_handle_ctrl(6); }
+8531:                         else if(e.type == K_DESK_TGL){ serial_puts("[desk] toggle virtual desktop\n"); gui_handle_ctrl(7); }

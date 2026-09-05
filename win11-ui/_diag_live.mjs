@@ -1,0 +1,33 @@
+import { chromium } from 'playwright';
+import { pathToFileURL, fileURLToPath } from 'url';
+import { dirname, resolve } from 'path';
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const url = pathToFileURL(resolve(__dirname, 'nexos-desktop.html')).href;
+(async () => {
+  const browser = await chromium.launch({ executablePath: 'D:\\pw-browsers\\chromium-1234\\chrome-win64\\chrome.exe' });
+  const page = await browser.newPage();
+  page.on('pageerror', e => console.log('PAGEERROR:', e.message));
+  await page.goto(url);
+  await page.waitForTimeout(500);
+  await page.evaluate(() => window.NexOS.connect('127.0.0.1', '8765'));
+  await page.waitForFunction(() => window.NexOS && window.NexOS.connected === true, { timeout: 8000 });
+  await page.evaluate(() => { window.__all = []; window.NexOS.on(t => window.__all.push(String(t))); });
+  await page.waitForTimeout(15000);   // let the guest finish booting
+  const res = await page.evaluate(() => new Promise(r => window.NexOS.login('nexos','nexos', (ok,user,err) => r({ok:!!ok,user,err}))));
+  console.log('LOGIN result:', JSON.stringify(res));
+  await page.waitForTimeout(2000);
+  console.log('=== ALL kernel output seen by frontend during/after login (first 800 chars) ===');
+  console.log(JSON.stringify(await page.evaluate(() => window.__all.join(''))).slice(0, 800));
+  await page.evaluate(() => { ['login','conn'].forEach(id => { const e = document.getElementById(id); if (e) e.remove(); }); });
+  await page.evaluate(() => { window.__frames = []; });
+  await page.evaluate(() => window.NexOS.exec('distnet agent start'));
+  await page.waitForTimeout(2500);
+  console.log('=== frames after "distnet agent start" ===');
+  console.log(JSON.stringify(await page.evaluate(() => window.__frames.join(''))));
+  await page.evaluate(() => { window.__frames = []; });
+  await page.evaluate(() => window.NexOS.exec('distnet agent status'));
+  await page.waitForTimeout(2500);
+  console.log('=== frames after "distnet agent status" ===');
+  console.log(JSON.stringify(await page.evaluate(() => window.__frames.join(''))));
+  await browser.close();
+})().catch(e => { console.error('FAIL', e); process.exit(1); });

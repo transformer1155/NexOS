@@ -1,0 +1,1 @@
+Get-ChildItem 'D:\MyOS\Bootloader' -Filter '*.cpp' -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'serial|uart|console|kernel|shell|main' } | ForEach-Object { Write-Host $_.FullName }

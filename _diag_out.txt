@@ -1,0 +1,4 @@
+﻿[diag] connected to serial at 14:01:26
+[diag] total banner bytes: 0
+[diag] sending: b'login nexos nexos\n'
+[diag] after login got: b'[SHELL] $ login nexos nexos\nLogged in as nexos.\n'

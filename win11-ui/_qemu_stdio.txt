@@ -1,0 +1,37 @@
+VBEFQ0SFBZ[K0] kmain entered, PIC masked
+[GDT] ring-0 + ring-3 segments + 64-bit TSS loaded
+[K-g] gdt_init done
+[K-i] idt_init done
+[K-p] pic_init done
+[VMM] Setting up 32-bit paging (PSE)...
+[VMM] VBE LFB mapped in page directory
+[VMM] ring-3 user region 0x04000000-0x08000000 (PG_USER)
+[VMM] Paging enabled (32 MiB identity-mapped, 4 MiB PSE)
+[K1] kmain entered
+[HW] ===== Hardware Detection =====
+[HW] CPU: AuthenticAMD Family=15 Model=107 [x86-64] [SSE2]
+[HW] E820 not available, using CMOS fallback
+[HW] PS/2 controller: OK
+[HW] PS/2 mouse: detected
+[HW] PCI bus scan:
+[HW]   00:00.0 vendor=8086 dev=1237 class=0600
+[HW]   00:01.0 vendor=8086 dev=7000 class=0601
+[HW]   00:01.1 vendor=8086 dev=7010 class=0101
+[HW]   -> Mass storage controller
+[HW]   00:01.3 vendor=8086 dev=7113 class=0680
+[HW]   00:02.0 vendor=1234 dev=1111 class=0300
+[HW]   -> Display controller detected
+[HW]   00:03.0 vendor=8086 dev=100E class=0200
+[HW] PCI: 6 devices found
+[HW] Disk: QEMU HARDDISK                            (6 MB)
+[HW] VBE: available 1280x720 [mode_set] fmt=BGRX32
+[HW] ===== Detection Complete =====
+[K2] VBE graphics mode active (set by BIOS/UEFI)
+[FBCON] Framebuffer console initialized
+[K-DBG] 0x500D=01
+[K-DBG] 0x5000=00
+
+[K-VBE] VBE info available (GUI ready)
+[K3] terminal init done
+[MOUSE] Intellimouse (4-byte packets, wheel)
+[K4] mouse init done

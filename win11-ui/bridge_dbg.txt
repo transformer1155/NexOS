@@ -1,0 +1,4 @@
+[bridge] listening on ws://0.0.0.0:8765
+[bridge] serial not ready ([WinError 10061] 由于目标计算机积极拒绝，无法连接。); retry in 2s...
+[bridge] connected to NexOS serial 127.0.0.1:4321
+[bridge] browser connected

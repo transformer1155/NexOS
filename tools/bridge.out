@@ -1,0 +1,11 @@
+[bridge] listening on ws://0.0.0.0:8765 (browser ops console)
+[bridge] connected to NexOS serial 127.0.0.1:4321
+[bridge] browser connected
+[ops] -> 'open calc'
+[ops] -> 'theme red'
+[ops] -> 'wall sunset'
+[ops] -> 'refresh'
+[ops] -> 'ai hello world'
+[ops] -> 'ps'
+[ops] -> 'meminfo'
+[bridge] serial read error: [WinError 64] 指定的网络名不再可用。

@@ -1,0 +1,8 @@
+﻿qemu-system-x86_64.exe : D:\qemu\qemu-system-x86_64.exe: -chardev socket,id=ser0,server=on,wait=off,host=127.0.0.1,port
+=4321: Failed to find an available port: Unknown error
+所在位置 C:\Users\trans\AppData\Local\Temp\genie-ps-1787892232322-ggxjip.ps1:558 字符: 24
++ ... bootloader; & "D:\qemu\qemu-system-x86_64.exe" -drive format=raw,file ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (D:\qemu\qemu-sy...: Unknown error:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

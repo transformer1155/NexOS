@@ -1,0 +1,21 @@
+START  
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\microsoft.codeanalysis.features.ni.pdb\26992386250319fcdafe8eeff44d01601\Microsoft.CodeAnalysis.Features.ni.pdb  75.3MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\microsoft.codeanalysis.workspaces.ni.pdb\bbb5c2d98270f48b74911b5bfca82cc51\Microsoft.CodeAnalysis.Workspaces.ni.pdb  74.2MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\microsoft.visualstudio.shell.ui.internal.ni.pdb\c144b35d5d01b73313c787c4ab882eba1\Microsoft.VisualStudio.Shell.UI.Internal.ni.pdb  59.6MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\microsoft.codeanalysis.visualbasic.ni.pdb\67143c8c0d23f8c1aceb83a47dcd8af31\Microsoft.CodeAnalysis.VisualBasic.ni.pdb  37.9MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\microsoft.visualstudio.languageservices.ni.pdb\d070b658227713bbe2f8616f01adf1d21\Microsoft.VisualStudio.LanguageServices.ni.pdb  22.2MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\microsoft.codeanalysis.languageserver.protocol.ni.pdb\0102ec8369df7dd94f58cf6ca4ce3c5a1\Microsoft.CodeAnalysis.LanguageServer.Protocol.ni.pdb  21.9MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\microsoft.codeanalysis.editorfeatures.ni.pdb\4d97ca542c6c047ca6553ccc386b3c861\Microsoft.CodeAnalysis.EditorFeatures.ni.pdb  21.3MB
+C:\Users\trans\AppData\Local\Temp\codebuddy-marketplace-update-52GHB4\codebuddy-plugins-official.zip  15.3MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\microsoft.visualstudio.commonide.ni.pdb\b136f42b881aa5f26ba825f1a02294c11\Microsoft.VisualStudio.CommonIDE.ni.pdb  14.9MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\microsoft.codeanalysis.visualbasic.features.ni.pdb\89434494eb7027aea4a85e2be503b3b21\Microsoft.CodeAnalysis.VisualBasic.Features.ni.pdb  12.9MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\microsoft.build.ni.pdb\4c911b92a7dbfd397a870639ef9f00661\Microsoft.Build.ni.pdb  11.3MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\mscorlib.ni.pdb\3452d280cf55ae309a9ffbe81ea33a151\mscorlib.ni.pdb  10.9MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\presentationframework.ni.pdb\356c5d79f09a44a748f0653bdf6b71d61\PresentationFramework.ni.pdb  10.7MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\presentationcore.ni.pdb\729389850a2523f768832cd6bc27ea501\PresentationCore.ni.pdb  9.1MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\microsoft.servicehub.framework.ni.pdb\d5de10ffe60ca998a5e9da22864be4261\Microsoft.ServiceHub.Framework.ni.pdb  7.8MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\microsoft.visualstudio.shell.15.0.ni.pdb\61e925ab3c1de9ef8c7640d9ed69f2241\Microsoft.VisualStudio.Shell.15.0.ni.pdb  7.5MB
+C:\Users\trans\AppData\Local\Temp\7zECAF07AC1\chromium-main\chrome\browser\android\examples\custom_tabs_client\src\res\raw\amazing_grace.mp3  7.2MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\microsoft.visualstudio.languageservices.implementation.ni.pdb\4350bf9d260fe34d45cf578d46926eb51\Microsoft.VisualStudio.LanguageServices.Implementation.ni.pdb  6.8MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\streamjsonrpc.ni.pdb\1a9b58c7d2ba415b165935b3f5b290af1\StreamJsonRpc.ni.pdb  6.6MB
+C:\Users\trans\AppData\Local\Temp\VSTelem\NgenPdb\microsoft.visualstudio.shell.connected.ni.pdb\40ec611c745b6bd7e229f3815efe60601\Microsoft.VisualStudio.Shell.Connected.ni.pdb  6.3MB
