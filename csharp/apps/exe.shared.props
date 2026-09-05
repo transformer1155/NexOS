@@ -1,0 +1,41 @@
+<Project>
+
+  <!-- Shared build settings for every standalone per-application .exe.
+       Each app reuses EXACTLY the same NexOS C# UI sources the full WinHost
+       shell compiles - only the entry point differs (AppHost.Run(kind)). -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <DefineConstants>$(DefineConstants);WINHOST</DefineConstants>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <NoWarn>CS8618;CS0649;CS0169;CS0414</NoWarn>
+    <OutputType>WinExe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Shared NexOS C# UI sources, compiled straight from the tree. -->
+    <Compile Include="$(MSBuildThisFileDirectory)../NexOS.Core/Sys.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../NexOS.Forms/Forms.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../NexOS.Forms/Voice.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Shell.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Apps.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Desktop.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Browser.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Popup.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Login.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/AiSetup.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/AiAgent.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Demo.cs" />
+    <!-- WinHost backend (real GDI+ implementations) + single-app host. -->
+    <Compile Include="$(MSBuildThisFileDirectory)../winhost/Backend.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../winhost/AppHost.cs" />
+    <!-- ShellForm supplies the window registry (wins/WinRec/FindWin) that
+         the managed Shell.Open/Paint/Click family is coupled to. -->
+    <Compile Include="$(MSBuildThisFileDirectory)../winhost/ShellForm.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../winhost/ShellForm.Designer.cs" />
+  </ItemGroup>
+
+</Project>

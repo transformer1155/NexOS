@@ -1,0 +1,2 @@
+START  
+ = Get-Content 'D:\MyOS\Bootloader\run_nexos.ps1' -Raw;  = .Replace('-chardev socket,id=ser0,server=on,wait=off,host=127.0.0.1,port= -serial chardev:ser0', '-chardev socket,id=ser0,server=on,wait=off,host=127.0.0.1,port=' +  + ' -serial chardev:ser0'); [System.IO.File]::WriteAllText('D:\MyOS\Bootloader\run_nexos.ps1', ); Write-Host ('FIXED=' + .Contains('-chardev socket,id=ser0,server=on,wait=off,host=127.0.0.1,port=' +  + ' -serial chardev:ser0'))

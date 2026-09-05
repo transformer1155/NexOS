@@ -1,0 +1,10 @@
+wrote D:\MyOS\bootloader\build\ui\palette_surfaces.png (782, 648)
+wrote D:\MyOS\bootloader\build\ui\palette_accent.png (1592, 192)
+wrote D:\MyOS\bootloader\build\ui\palette_semantic.png (782, 136)
+wrote D:\MyOS\bootloader\build\ui\wallpaper_light.png (480, 270)
+wrote D:\MyOS\bootloader\build\ui\wallpaper_dark.png (480, 270)
+wrote D:\MyOS\bootloader\build\ui\wallpaper_presets.png (1012, 232)
+wrote D:\MyOS\bootloader\build\ui\icons_desktop.png (536, 370)
+wrote D:\MyOS\bootloader\build\ui\icons_tray.png (406, 212)
+wrote D:\MyOS\bootloader\build\ui\icons_settings.png (796, 216)
+done.

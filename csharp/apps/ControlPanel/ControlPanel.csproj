@@ -1,0 +1,8 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <Import Project="D:\MyOS\bootloader\csharp\apps\exe.shared.props" />
+  <PropertyGroup>
+    <AssemblyName>ControlPanel</AssemblyName>
+    <RootNamespace>WinHost.ControlPanel</RootNamespace>
+  </PropertyGroup>
+  <!-- Local Program.cs is picked up by the SDK default glob. -->
+</Project>

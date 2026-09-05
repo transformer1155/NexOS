@@ -1,0 +1,8 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <Import Project="D:\MyOS\bootloader\csharp\apps\exe.shared.props" />
+  <PropertyGroup>
+    <AssemblyName>Demo</AssemblyName>
+    <RootNamespace>WinHost.Demo</RootNamespace>
+  </PropertyGroup>
+  <!-- Local Program.cs is picked up by the SDK default glob. -->
+</Project>

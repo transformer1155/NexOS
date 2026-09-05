@@ -1,0 +1,4 @@
+wsl: 未能在“C:\Users\trans\AppData\Local\temp\B51ED83F-4EF4-40C4-ACA7-468440013FC4\swap.vhdx”中创建交换磁盘: 磁盘空间不足。 
+tmpfs           1.9G     0  1.9G   0% /tmp
+--- WSL swap ---
+no swap vhdx visible

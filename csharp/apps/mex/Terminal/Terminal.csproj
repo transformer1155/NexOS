@@ -1,0 +1,10 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <Import Project="D:\MyOS\bootloader\csharp\apps\mex.shared.props" />
+  <PropertyGroup>
+    <AssemblyName>Terminal</AssemblyName>
+    <RootNamespace>App</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+  </ItemGroup>
+</Project>

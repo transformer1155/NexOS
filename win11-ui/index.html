@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<!--
+  NexOS · win11-ui entry point
+  ----------------------------------------------------------------
+  Standard WinUI 3 UI controls (replacing the legacy hand-written
+  desktop mock). The controls themselves come from the WinUIonWeb
+  project (deployed in ./webui as a static Vite build), using the
+  official WinUI 3 design tokens defined in ./winui3-tokens.json.
+  Font stack is the standard WinUI 3 family:
+  'Segoe UI Variable', 'Segoe UI', 'Microsoft YaHei', system-ui.
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NexOS · WinUI 3 Controls</title>
+  <style>
+    :root {
+      --winui-font: 'Segoe UI Variable', 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
+      --winui-accent: #0067C0;
+      --winui-bg: #F3F3F3;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%; height: 100%; overflow: hidden;
+      background: var(--winui-bg);
+      font-family: var(--winui-font);
+      color: #171717;
+    }
+    #frame {
+      position: absolute; inset: 0;
+      border: 0; width: 100%; height: 100%;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <iframe id="frame" src="./webui/index.html" title="NexOS WinUI 3 controls"></iframe>
+</body>
+</html>

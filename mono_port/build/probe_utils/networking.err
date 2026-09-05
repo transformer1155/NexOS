@@ -1,0 +1,34 @@
+In file included from ../vendor/mono/utils/networking.c:11:
+../vendor/mono/utils/networking.h:57:32: error: field ‘v4’ has incomplete type
+   57 |                 struct in_addr v4;
+      |                                ^~
+../vendor/mono/utils/networking.h:72:28: error: field ‘v4’ has incomplete type
+   72 |         struct sockaddr_in v4;
+      |                            ^~
+../vendor/mono/utils/networking.h:76:25: error: field ‘addr’ has incomplete type
+   76 |         struct sockaddr addr;
+      |                         ^~~~
+../vendor/mono/utils/networking.h:82:32: error: field ‘v4’ has incomplete type
+   82 |                 struct in_addr v4;
+      |                                ^~
+../vendor/mono/utils/networking.c: In function ‘mono_address_size_for_family’:
+../vendor/mono/utils/networking.c:18:14: error: ‘AF_INET’ undeclared (first use in this function)
+   18 |         case AF_INET:
+      |              ^~~~~~~
+../vendor/mono/utils/networking.c:18:14: note: each undeclared identifier is reported only once for each function it appears in
+../vendor/mono/utils/networking.c:19:32: error: invalid application of ‘sizeof’ to incomplete type ‘struct in_addr’
+   19 |                 return sizeof (struct in_addr);
+      |                                ^~~~~~
+../vendor/mono/utils/networking.c: In function ‘mono_socket_address_init’:
+../vendor/mono/utils/networking.c:49:23: error: ‘AF_INET’ undeclared (first use in this function)
+   49 |         if (family == AF_INET) {
+      |                       ^~~~~~~
+../vendor/mono/utils/networking.c:50:32: error: invalid application of ‘sizeof’ to incomplete type ‘struct sockaddr_in’
+   50 |                 *len = sizeof (struct sockaddr_in);
+      |                                ^~~~~~
+../vendor/mono/utils/networking.c:53:35: error: invalid use of undefined type ‘struct in_addr’
+   53 |                 sa->v4.sin_addr = *(struct in_addr*)address;
+      |                                   ^
+../vendor/mono/utils/networking.c:54:35: error: implicit declaration of function ‘htons’ [-Wimplicit-function-declaration]
+   54 |                 sa->v4.sin_port = htons (port);
+      |                                   ^~~~~

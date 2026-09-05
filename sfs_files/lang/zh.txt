@@ -1,0 +1,113 @@
+# ============================================================================
+#  NexOS language pack - 简体中文 (zh)
+#  Format:  key=value      (one entry per line)
+#           '#' starts a comment
+#           literal \n inside a value becomes a real newline
+#  Business code references these via Lang.T("key"); missing keys fall back
+#  to the key string itself.  Proper nouns (NexOS, Windows, Segoe, MiniCLR,
+#  BGA, VBE, WinUI, GUI, BIOS, UEFI, CLI, HTTP, TCP, IP, CJK, YaHei, Segoe UI)
+#  are kept in English on purpose.
+# ============================================================================
+
+# ---- lock screen ---------------------------------------------------------
+lock.title      = 登录 NexOS
+lock.subtitle   = 继续登录
+lock.user       = 用户名
+lock.pass       = 密码
+lock.signin     = 登录
+lock.hint       = Tab 切换输入框 · Enter 登录
+lock.noaccount  = (无账户)
+lock.err.user   = 请输入用户名。
+lock.err.cred   = 用户名或密码错误。
+lock.defaccounts = 默认账户：
+
+# ---- start menu / taskbar pins ------------------------------------------
+app.start       = 开始
+app.search      = 搜索
+app.settings    = 设置
+app.files       = 文件资源管理器
+app.calc        = 计算器
+app.notepad     = 记事本
+app.browser     = 浏览器
+app.terminal    = 终端
+app.pictures    = 图片
+app.music       = 音乐
+app.videos      = 视频
+app.recycle     = 回收站
+app.thispc      = 此电脑
+app.network     = 网络
+app.power       = 电源
+app.shutdown    = 关机
+app.restart     = 重启
+app.sleep       = 睡眠
+app.lock        = 锁定
+app.signout     = 注销
+app.taskview    = 任务视图
+app.widgets     = 小组件
+app.notifications = 通知
+app.controlpanel = 控制面板
+app.about       = 关于
+app.help        = 帮助
+app.run         = 运行
+app.store       = 应用商店
+
+# ---- context / right-click menus ----------------------------------------
+menu.refresh    = 刷新
+menu.empty      = 清空回收站
+menu.view       = 查看
+menu.sort       = 排序
+menu.properties = 属性
+menu.new        = 新建
+menu.rename     = 重命名
+menu.delete     = 删除
+menu.copy       = 复制
+menu.paste      = 粘贴
+menu.cut        = 剪切
+menu.open       = 打开
+menu.pin        = 固定到开始
+menu.unpin      = 从开始取消固定
+
+# ---- desktop / shell chrome ---------------------------------------------
+desk.clock      = 时钟
+desk.wallpaper  = 壁纸
+desk.greeting   = 欢迎
+
+# ---- generic dialogs -----------------------------------------------------
+dlg.ok          = 确定
+dlg.cancel      = 取消
+dlg.close       = 关闭
+dlg.yes         = 是
+dlg.no          = 否
+dlg.apply       = 应用
+dlg.save        = 保存
+dlg.openf       = 打开文件
+
+# ---- start menu / power / window system menus -------------------------
+menu.pintostart   = 固定到“开始”屏幕
+menu.runasadmin   = 以管理员身份运行
+menu.appsettings  = 应用设置
+menu.startsettings = 开始设置
+menu.personalize  = 个性化
+menu.sortby       = 排序方式
+menu.display      = 显示设置
+menu.moreoptions  = 显示更多选项
+menu.openinterminal = 在终端中打开
+menu.taskmgr      = 任务管理器
+menu.switchaidesk = 切换到 AI 桌面
+menu.showdesktopicons = 显示桌面图标
+menu.autoarrange  = 自动排列图标
+menu.aligngrid    = 将图标与网格对齐
+menu.typename     = 类型
+menu.target       = 目标
+menu.namecolon    = 名称：
+menu.close        = 关闭
+win.restore       = 还原
+win.move          = 移动
+win.size          = 大小
+win.min           = 最小化
+win.max           = 最大化
+win.closewin      = 关闭窗口
+win.endprocess    = 结束进程
+win.taskbarsettings = 任务栏设置
+start.lock        = 锁定
+start.signout     = 注销

@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/解决方案项/">
+    <File Path="Shell.resx" />
+  </Folder>
+  <Project Path="Shell.csproj" />
+</Solution>

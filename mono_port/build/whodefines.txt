@@ -1,0 +1,289 @@
+=== missing symbols grouped by upstream definition site ===
+
+utils/mono-threads.c                            52
+    mono_thread_info_attach
+    mono_thread_info_begin_pulse_resume_and_request_suspension
+    mono_thread_info_begin_resume
+    mono_thread_info_begin_suspend
+    mono_thread_info_callbacks_init
+    mono_thread_info_cleanup
+    mono_thread_info_clear_self_interrupt
+    mono_thread_info_current
+    mono_thread_info_current_unchecked
+    mono_thread_info_describe_interrupt_token
+    mono_thread_info_exit
+    mono_thread_info_finish_interrupt
+    mono_thread_info_get_flags
+    mono_thread_info_get_small_id
+    mono_thread_info_get_suspend_state
+    mono_thread_info_in_critical_location
+    mono_thread_info_init
+    mono_thread_info_install_interrupt
+    mono_thread_info_is_async_context
+    mono_thread_info_is_current
+    mono_thread_info_is_exiting
+    mono_thread_info_is_interrupt_state
+    mono_thread_info_list_head
+    mono_thread_info_prepare_interrupt
+    mono_thread_info_register_small_id
+    mono_thread_info_resume
+    mono_thread_info_safe_suspend_and_run
+    mono_thread_info_self_interrupt
+    mono_thread_info_set_flags
+    mono_thread_info_set_internal_thread_gchandle
+    mono_thread_info_set_is_async_context
+    mono_thread_info_setup_async_call
+    mono_thread_info_sleep
+    mono_thread_info_suspend_lock
+    mono_thread_info_suspend_unlock
+    mono_thread_info_tls_set
+    mono_thread_info_try_get_internal_thread_gchandle
+    mono_thread_info_uninstall_interrupt
+    mono_thread_info_unset_internal_thread_gchandle
+    mono_thread_info_usleep
+    mono_thread_info_wait_multiple_handle
+    mono_thread_info_wait_one_handle
+    mono_thread_info_yield
+    mono_threads_begin_global_suspend
+    mono_threads_close_native_thread_handle
+    mono_threads_close_thread_handle
+    mono_threads_end_global_suspend
+    mono_threads_join_lock
+    mono_threads_join_unlock
+    mono_threads_open_native_thread_handle
+    mono_threads_open_thread_handle
+    mono_threads_wait_pending_operations
+
+mini/mini-runtime.c                             21
+    mini_debug_options
+    mini_get_class
+    mini_get_dbg_callbacks
+    mini_get_debug_options
+    mini_install_interp_callbacks
+    mini_should_insert_breakpoint
+    mono_aot_mode
+    mono_aot_only
+    mono_ee_api_version
+    mono_ee_features
+    mono_interp_callbacks_pointer
+    mono_interp_only_classes
+    mono_jit_compile_method_jit_only
+    mono_jit_stats
+    mono_llvm_only
+    mono_pop_lmf
+    mono_push_lmf
+    mono_runtime_print_stats
+    mono_stats_method_desc
+    mono_tramp_info_register
+    mono_use_interpreter
+
+utils/mono-state.c                              19
+    mono_crash_dump
+    mono_crash_save_failfast_msg
+    mono_create_crash_hash_breadcrumb
+    mono_dump_complete
+    mono_dump_start
+    mono_native_state_add_thread
+    mono_native_state_free
+    mono_native_state_init
+    mono_state_alloc_mem
+    mono_state_free_mem
+    mono_state_writer_init
+    mono_summarize_double_fault_log
+    mono_summarize_native_state_add_thread
+    mono_summarize_native_state_begin
+    mono_summarize_native_state_end
+    mono_summarize_set_timeline_dir
+    mono_summarize_timeline_phase_log
+    mono_summarize_timeline_read_level
+    mono_summarize_timeline_start
+
+utils/mono-threads-coop.c                       15
+    mono_polling_required
+    mono_threads_enter_gc_safe_region_internal
+    mono_threads_enter_gc_safe_region_unbalanced
+    mono_threads_enter_gc_unsafe_region_cookie
+    mono_threads_enter_gc_unsafe_region_internal
+    mono_threads_enter_gc_unsafe_region_unbalanced
+    mono_threads_enter_gc_unsafe_region_unbalanced_internal
+    mono_threads_enter_gc_unsafe_region_unbalanced_with_info
+    mono_threads_exit_gc_safe_region_internal
+    mono_threads_exit_gc_safe_region_unbalanced
+    mono_threads_exit_gc_unsafe_region_internal
+    mono_threads_exit_gc_unsafe_region_unbalanced
+    mono_threads_exit_gc_unsafe_region_unbalanced_internal
+    mono_threads_state_poll
+    mono_threads_suspend_policy_hidden_dont_modify
+
+utils/mono-proclib.c                            10
+    mono_atexit
+    mono_cpu_get_data
+    mono_pe_file_map
+    mono_pe_file_time_date_stamp
+    mono_pe_file_unmap
+    mono_process_get_data
+    mono_process_get_data_with_error
+    mono_process_get_name
+    mono_process_get_times
+    mono_process_list
+
+utils/mono-threads-posix.c                      10
+    mono_memory_barrier_process_wide
+    mono_native_thread_create
+    mono_native_thread_get_name
+    mono_native_thread_id_equals
+    mono_native_thread_id_get
+    mono_native_thread_join
+    mono_native_thread_set_name
+    mono_thread_info_get_system_max_stack_size
+    mono_thread_platform_create_thread
+    mono_threads_platform_yield
+
+mini/mini-native-types.c                        6
+    mini_magic_is_float_type
+    mini_magic_is_int_type
+    mini_magic_type_size
+    mini_native_type_replace_type
+    mono_class_is_magic_float
+    mono_class_is_magic_int
+
+mini/jit-icalls.c                               5
+    mono_break
+    mono_fconv_u4_2
+    mono_fconv_u8_2
+    mono_rconv_u4
+    mono_rconv_u8
+
+mini/mini-generic-sharing.c                     5
+    mini_get_gsharedvt_in_sig_wrapper
+    mini_get_gsharedvt_out_sig_wrapper
+    mini_is_gsharedvt_variable_klass
+    mini_type_get_underlying_type
+    mini_type_is_reference
+
+mini/mini.c                                     5
+    mini_get_underlying_type
+    mono_jit_trace_calls
+    mono_llvm_cpp_catch_exception
+    mono_time_track_end
+    mono_time_track_start
+
+utils/mono-dl.c                                 5
+    mono_dl_build_path
+    mono_dl_close
+    mono_dl_open
+    mono_dl_open_runtime_lib
+    mono_dl_symbol
+
+utils/mono-threads-state-machine.c              5
+    mono_thread_info_is_live
+    mono_thread_info_is_running
+    mono_thread_info_suspend_count
+    mono_thread_info_will_not_safepoint
+    mono_thread_is_gc_unsafe_mode
+
+utils/mono-tls.c                                5
+    mono_tls_init_gc_keys
+    mono_tls_key_domain
+    mono_tls_key_jit_tls
+    mono_tls_key_sgen_thread_info
+    mono_tls_key_thread
+
+utils/os-event-unix.c                           5
+    mono_os_event_destroy
+    mono_os_event_init
+    mono_os_event_reset
+    mono_os_event_set
+    mono_os_event_wait_one
+
+metadata/mono-config-dirs.c                     4
+    mono_config_get_assemblies_dir
+    mono_config_get_bin_dir
+    mono_config_get_cfg_dir
+    mono_config_get_reloc_lib_dir
+
+mini/mini-exceptions.c                          4
+    mono_handle_exception
+    mono_llvm_load_exception
+    mono_llvm_reraise_exception
+    mono_restore_context
+
+utils/mono-rand-windows.c                       4
+    mono_rand_close
+    mono_rand_init
+    mono_rand_open
+    mono_rand_try_get_bytes
+
+mini/trace.c                                    3
+    mono_trace_enter_method
+    mono_trace_eval
+    mono_trace_leave_method
+
+utils/mono-io-portability.c                     3
+    mono_io_portability_helpers
+    mono_portability_find_file
+    mono_portability_helpers_init
+
+utils/mono-log-common.c                         3
+    mono_log_close_logfile
+    mono_log_open_logfile
+    mono_log_write_logfile
+
+utils/mono-log-flight-recorder.c                3
+    mono_log_close_recorder
+    mono_log_open_recorder
+    mono_log_write_recorder
+
+utils/mono-log-posix.c                          3
+    mono_log_close_syslog
+    mono_log_open_syslog
+    mono_log_write_syslog
+
+metadata/w32socket.c                            2
+    mono_network_cleanup
+    mono_network_init
+
+mini/arch-stubs.c                               2
+    mono_arch_do_ip_adjustment
+    mono_arch_get_interp_to_native_trampoline
+
+mini/mini-trampolines.c                         2
+    mini_get_breakpoint_trampoline
+    mini_get_single_step_trampoline
+
+utils/mono-dl-darwin.c                          2
+    mono_dl_get_executable_path
+    mono_dl_get_system_dir
+
+utils/mono-networkinterfaces.c                  2
+    mono_network_get_data
+    mono_networkinterface_list
+
+utils/mono-proclib-windows.c                    2
+    mono_cpu_count
+    mono_process_current_pid
+
+utils/mono-threads-mach.c                       2
+    mono_threads_suspend_get_restart_signal
+    mono_threads_suspend_get_suspend_signal
+
+metadata/icall.c                                1
+    environ
+
+mini/aot-runtime.c                              1
+    mono_aot_get_trampoline
+
+mini/debug-mini.c                               1
+    mono_debugger_method_has_breakpoint
+
+mini/llvmonly-runtime.c                         1
+    mini_llvmonly_create_ftndesc
+
+utils/mono-proclib-windows-uwp.c                1
+    mono_cpu_usage
+
+utils/mono-publib.c                             1
+    mono_free
+
+utils/mono-threads-mach-helper.c                1
+    mono_thread_info_detach

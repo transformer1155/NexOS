@@ -1,0 +1,173 @@
+====================================================================
+ NexOS 64-bit 诊断镜像 使用说明 (build/os.img, BIOS raw 4MiB)
+====================================================================
+ 目的：不再靠"看屏幕最后常驻颜色"反推冻结点，而是让 64 位内核把
+       "走到哪一步"直接写进串口日志 + 磁盘扇区，覆盖最全。
+
+ 适用镜像：
+   - build/os.img          BIOS raw 镜像（kernel64 @LBA2048，32 位加载器
+        kmalloc 暂存后跳入长模式）。烧盘 / QEMU 均可。
+   - build/os_uefi_diag.img  UEFI/GPT 镜像（kernel64 编进 BOOTX64.EFI
+        blob，由 UEFI 加载器 preload 到 0x1400000）。华为等纯 UEFI 笔记本
+        烧盘启动用这个。
+
+ 验证路径说明：
+   * BIOS raw 路径（os.img）与 UEFI 路径（os_uefi_diag.img）本机均可重建
+     并验证。UEFI 的 kernel64 编进 BOOTX64.EFI 的二进制 blob，但走
+     tools/build_uefi_gnuefi_free.sh（x86_64-elf 交叉链 + elf2efi.py，不依赖
+     host gcc / gnu-efi）即可重建；再用 tools/fat16_replace.py 把新
+     BOOTX64.EFI 换进现有 ESP 分区（或重跑 make_gpt_uefi.py 组装）。
+   * BIOS 实测：QEMU tcg 跑 os.img，串口捕获 + VGA 截图。
+   * UEFI 实测：QEMU OVMF(tcg) 跑 os_uefi_diag.img，串口捕获 + GOP/ramfb
+     截图（capture 脚本强制 -vga none + ramfb，console0 即 GOP 表面）。
+
+--------------------------------------------------------------------
+ 1. 串口日志 (COM1, 0x3F8, 115200 8N1)  —— 主诊断源，始终有效
+--------------------------------------------------------------------
+ 内核启动早期即装好真正的 64 位 IDT（kmain64 顶部，build_idt 用
+ lea %rip 取运行地址减链接地址算 delta 重定位 gate；BIOS 路径实测
+ delta=0x7，正确，不再 triple-fault）：
+   [K64-1] kmain64 entered
+   [K64-IDT] delta=0000000000000007
+   [K64-IDT] installed            <-- IDT 装好，此后任何 #PF/#GP/#UD 都会被捕获
+   ... (原有 [K64-2]..[K64-8] 等里程碑)
+
+ 每经过一个命名步骤，串口打印一行（同一步号只打印一次，热循环不刷屏）：
+   [DIAG] step=<id> <name>
+
+ 若发生同步故障（缺页/通用保护/未定义指令…），fault_common 打印并 halt：
+   [DIAG-FAULT] vec=<向量号> err=<错误码hex> rip=<rip hex> cr2=<cr2 hex> step=<最后步号> name=<最后步名>
+
+ 读法：
+   - 若串口最后一行是某个 [DIAG] step=N，且之后无任何 [DIAG-FAULT]，
+     说明内核在该步之后、下一步之前卡死（可能死循环或硬件冻结，未触发
+     CPU 异常）。结合"屏幕最后状态"一起看。
+   - 若出现 [DIAG-FAULT]，step=N 即"崩溃前最后到达的步骤"，rip/cr2
+     给出精确地址。把 rip 对照 `objdump -d build/kernel64.elf` 可定位到
+     具体 C++ 函数/指令。
+
+ 已知现象（BIOS 路径）：kmain64 会进入两次。第一次（#1）常在早期静默
+ triple-fault 复位，32 位重新引导后第二次（#2）正式接管并出 GUI。这是
+ 32 位→64 位早期初始化的既有行为，最终 GUI 正常即视为通过。
+
+--------------------------------------------------------------------
+ 2. 步骤号表 (diag_step id -> 含义)
+--------------------------------------------------------------------
+ [64 位内核 kmain64 自身]
+   1    kmain64 post-build_idt       IDT 装好后（串口+落盘均跳过，见 §3）
+   2    kmain64 post-boot_beacon    GREEN 信标画完（串口+落盘均跳过）
+   333  gui_enter starting          见下方 gui.cpp 分组
+
+ [gui.cpp]
+   100  render_all enter                      每帧渲染开始
+   101  render_all before mforms_paint_desktop  即将调用托管桌面绘制
+   102  render_all after mforms_paint_desktop   托管桌面绘制返回
+   110  enter_gui enter                        GUI 进入开始
+   111  enter_gui gfx initialized             VBE 图形可用
+   112  enter_gui vbe mode set                enable_vbe_mode() 返回
+   113  enter_gui lfb cleared                 force_clear_lfb() 完成（清 OVMF 残影）
+   300  mh_fill_rect        （托管 Win32 回调）画矩形
+   301  mh_fill_round       （回调）圆角填充
+   302  mh_draw_round       （回调）圆角描边
+   303  mh_draw_rect        （回调）矩形描边
+   304  mh_draw_line        （回调）画线
+   305  mh_fill_grad        （回调）渐变填充
+   306  mh_text             （回调）绘制文本（透明底）
+   307  mh_text_bg          （回调）绘制文本（实底）
+   308  mh_fill_circle      （回调）填充圆
+   309  mh_draw_circle      （回调）描边圆
+   310  mh_icon             （回调）绘制图标
+   311  mh_progress         （回调）进度条
+   320  mh_image enter      纹理 blit 进入
+   321  mforms_boot textures loaded  SFS 纹理加载完
+   330  mforms_init done    C# 宿主表注册完
+   331  mforms_start FAILED 托管壳启动失败（clr 错误）
+   332  mforms_start OK     托管壳启动成功
+   333  gui_enter starting  GUI 正式拉起
+
+ [mforms.cpp]
+   200  mforms_paint_desktop enter          进入 PaintDesktop（任何 host 回调之前）
+   201  mforms_paint_desktop returned        PaintDesktop 返回，进入 DeferredRun
+
+ 注意：300–311 是每帧每个图标的 per-call 绘制标记，正常 GUI 下会高频
+       重复；落盘时跳过此区间（见 §3），避免刷盘。
+
+--------------------------------------------------------------------
+ 3. 磁盘落盘记录 (LBA1500)  —— second source，故障/后期步落盘
+--------------------------------------------------------------------
+ fault_common 在任何 [DIAG-FAULT] 时，以及 diag_step 在"步号变化时且
+ 步号≥100（且不在 300–311 区间）"时，把 512 字节记录写进 LBA1500。
+
+ 为什么是 LBA1500 而不是更早的扇区：
+   * kernel.bin 占 LBA 33..1056（KERNEL32_SECTORS=1024），kernel64 @2048。
+   * 两者之间的空隙 1057..2047 是真正空闲的，1500 落盘不会破坏任一内核
+     镜像。早期版本误用 LBA34（落在 kernel.bin 内部）会污染镜像，已修正。
+
+ 为什么早期步（1/2）不落盘（关键发现）：
+   * 实测：在 kmain64 早期（build_idt 之后、boot_beacon 之前）调用
+     ata_write_sector 会令内核在 boot_beacon 处硬冻结（串口停在 step=1，
+     kmain64 只进 1 次、无恢复、无 [DIAG-FAULT]）。原 triple-fault 可恢复
+     的重启路径，一旦早期写盘就变成不可恢复的硬挂死。
+   * 机理疑为 64 位长模式下 ATA PIO 写盘对早期启动状态的副作用（具体待查，
+     可能与显示初始化读盘/页表窗口有关）。这是一个真实的 64 位早期启动
+     稳定性 bug，与"真机 64 位 UEFI 黑屏冻结"很可能同源，值得单独深挖。
+   * 规避：diag_step 落盘只覆盖步号≥100 的后期阶段（boot_beacon 之后），
+     既避开冻结窗口，又能在后期（render_all / mforms_init 等）冻结时留下
+     盘上最后步号。早期（1/2）仅留串口。
+
+ 布局（小端，单位 uint16 字，512 字节）：
+   rec[0]  = 0x4E45  ('N')   magic 高字
+   rec[1]  = 0x5844  ('XD')  magic 低字   => 合起来 "NEXD"
+   rec[2]  = 最后到达/出错步骤号 (last step id)
+   rec[3]  = 故障向量号 (fault vector；0=进度标记非故障)
+   rec[4]  = 错误码 (error code；进度标记为 0)
+   rec[5..8]  = RIP  (64 位, 低字在前)
+   rec[9..12] = CR2  (64 位, 低字在前)
+   字节 28..57 = 步骤名 ASCII (最长 30 字节)
+
+ 读取示例（从镜像文件）：
+   dd if=os.img of=/tmp/rec.bin bs=512 skip=1500 count=1
+   xxd /tmp/rec.bin        # 看 magic "NEXD" + 各字段
+   # 正常启动后 rec[2] 应为最后到达的后期步号（如 320/332/333）；
+   # 若冻结在后期阶段，rec[2] 即"冻结前最后到达步骤"。
+
+ 注意：legacy PIO IDE (0x1F0) 在 AHCI/SATA 真机或 QEMU q35 上
+       ata_write_sector 可能返回全零（不落盘）；串口日志始终有效。
+       故落盘记录是"尽力而为"的 second source，串口为准。
+   * 实测确认：UEFI 路径（OVMF/q35）完整 GUI 启动后 LBA1500 仍为全零，
+       即 UEFI 下盘上日志不生效。UEFI 真机诊断以【串口日志】+【屏上颜色
+       信标 GREEN/MAGENTA/WHITE】(bootuefi.c 的 fb_beacon) 为准。
+
+--------------------------------------------------------------------
+ 4. 关键安全前提（为什么装真 IDT 不会炸）
+--------------------------------------------------------------------
+   - 64 位内核从不 sti（全文件无硬件中断开启），故加载 IDT 只捕获
+     同步 CPU 故障（#PF/#GP/#UD/#DE…），不会引来 IRQ 风暴。
+   - IDT gate 目标为绝对地址，必须按实际加载 delta 重定位（见 build_idt）。
+     BIOS 路径实测 delta=0x7，正确。UEFI 路径 kernel64 由 PE 加载器决定
+     基址，同一 lea %rip 自适应重定位同样适用。
+   - 32 位内核有独立 ISR 框架，diag_step 在 32 位侧为空实现，仅 64 位
+     走本诊断路径。
+
+====================================================================
+ 实测结论（2026-08-18, QEMU tcg）
+====================================================================
+   [BIOS 路径 os.img]
+   - build_idt 的 IDT gate 重定位（lea %rip 取址）修正后，BIOS 路径
+     delta=0x7 正确，不再 triple-fault 重启循环；GUI 正常显示
+     （VGA 100% non-black），[DIAG] step= 流 100→110→200→320→330→332→333
+     贯通，无 [DIAG-FAULT]。
+   - 落盘验证：LBA1500 写入 "NEXD"+步号 320（"mh_image enter"），
+     LBA34（kernel.bin 区）保持原镜像魔数未被污染。
+
+   [UEFI 路径 os_uefi_diag.img, OVMF tcg]
+   - 同款修复 kernel64 经 build_uefi_gnuefi_free.sh 重编进 BOOTX64.EFI
+     后，OVMF(tcg) 引导成功：串口命中 [K64-IDT] delta=0000000000000007 /
+     installed，诊断步流 1→2→333→321/330/332→110/111/112→100/101→200→
+     300+ 绘制原语 贯通，[DIAG-FAULT]=0；GOP/ramfb 截图 98.76% non-black
+     （800x600 满屏 GUI）。UEFI 路径 IDT 重定位修复同样生效。
+   - 盘上日志 LBA1500 在 UEFI 下不落盘（AHCI PIO 写无效），符合预期；
+     UEFI 真机诊断以串口 + 颜色信标为准。
+   - 已知限制：64 位早期（boot_beacon 前）写盘会冻结内核——已规避
+     （仅后期步落盘）。该冻结 bug 建议作为"真机黑屏"候选根因单独排查。
+====================================================================

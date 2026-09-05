@@ -1,0 +1,4 @@
+../vendor/mono/metadata/w32socket-unix.c:16:10: fatal error: sys/socket.h: No such file or directory
+   16 | #include <sys/socket.h>
+      |          ^~~~~~~~~~~~~~
+compilation terminated.

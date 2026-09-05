@@ -1,0 +1,21 @@
+In file included from ../vendor/mono/utils/networking-missing.c:11:
+../vendor/mono/utils/networking.h:57:32: error: field ‘v4’ has incomplete type
+   57 |                 struct in_addr v4;
+      |                                ^~
+../vendor/mono/utils/networking.h:72:28: error: field ‘v4’ has incomplete type
+   72 |         struct sockaddr_in v4;
+      |                            ^~
+../vendor/mono/utils/networking.h:76:25: error: field ‘addr’ has incomplete type
+   76 |         struct sockaddr addr;
+      |                         ^~~~
+../vendor/mono/utils/networking.h:82:32: error: field ‘v4’ has incomplete type
+   82 |                 struct in_addr v4;
+      |                                ^~
+../vendor/mono/utils/networking-missing.c: In function ‘inet_pton’:
+../vendor/mono/utils/networking-missing.c:25:23: error: ‘AF_INET’ undeclared (first use in this function)
+   25 |         if (family == AF_INET) {
+      |                       ^~~~~~~
+../vendor/mono/utils/networking-missing.c:25:23: note: each undeclared identifier is reported only once for each function it appears in
+../vendor/mono/utils/networking-missing.c:43:34: error: implicit declaration of function ‘inet_addr’ [-Wimplicit-function-declaration]
+   43 |                         inaddr = inet_addr (address);
+      |                                  ^~~~~~~~~

@@ -1,0 +1,59 @@
+{
+  "_comment": "Standard WinUI 3 design tokens, extracted from WinUIonWeb (src/styles/theme.css). This is the single source of truth for all NexOS UI surfaces (C# NexOS.Forms, win11-ui web, WebView pages, kernel theme). Values are the official WinUI 3 (Windows App SDK) palette.",
+  "font": {
+    "family": "'Segoe UI Variable', 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif",
+    "family_en": "'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif",
+    "family_zh": "'Microsoft YaHei', 'Segoe UI Variable', 'Segoe UI', sans-serif",
+    "size_base_px": 14,
+    "icon_font": "SEGOEICONS.TTF"
+  },
+  "light": {
+    "_comment": "Light theme (Fluent / WinUI 3 default)",
+    "accent_base": "#0067C0",
+    "accent_hover": "rgba(0, 103, 192, 0.90)",
+    "accent_pressed": "rgba(0, 103, 192, 0.80)",
+    "text_primary": "rgba(0, 0, 0, 0.89)",
+    "text_secondary": "rgba(0, 0, 0, 0.62)",
+    "text_tertiary": "rgba(0, 0, 0, 0.45)",
+    "text_disabled": "rgba(0, 0, 0, 0.36)",
+    "card_background": "rgba(255, 255, 255, 0.70)",
+    "card_background_solid": "#FFFFFF",
+    "control_fill_default": "rgba(255, 255, 255, 0.70)",
+    "control_fill_secondary": "rgba(0, 0, 0, 0.04)",
+    "control_stroke_default": "rgba(0, 0, 0, 0.06)",
+    "card_stroke_default": "rgba(0, 0, 0, 0.06)",
+    "subtle_fill_secondary": "rgba(0, 0, 0, 0.04)",
+    "layer_fill_default": "rgba(255, 255, 255, 0.50)",
+    "layer_alt_fill_default": "rgba(255, 255, 255, 0.30)",
+    "accent_text": "#0067C0",
+    "system_success": "#0F7B0F",
+    "system_caution": "#9D5A00",
+    "system_critical": "#C42B1C"
+  },
+  "dark": {
+    "_comment": "Dark theme (Fluent / WinUI 3 default)",
+    "accent_base": "#4CC2FF",
+    "accent_hover": "rgba(76, 194, 255, 0.90)",
+    "accent_pressed": "rgba(76, 194, 255, 0.80)",
+    "text_primary": "rgba(255, 255, 255, 0.90)",
+    "text_secondary": "rgba(255, 255, 255, 0.77)",
+    "text_tertiary": "rgba(255, 255, 255, 0.54)",
+    "text_disabled": "rgba(255, 255, 255, 0.36)",
+    "card_background": "rgba(44, 44, 44, 0.70)",
+    "card_background_solid": "#2C2C2C",
+    "control_fill_default": "rgba(255, 255, 255, 0.06)",
+    "control_fill_secondary": "rgba(255, 255, 255, 0.06)",
+    "control_stroke_default": "rgba(255, 255, 255, 0.07)",
+    "card_stroke_default": "rgba(0, 0, 0, 0.10)",
+    "subtle_fill_secondary": "rgba(255, 255, 255, 0.06)",
+    "layer_fill_default": "rgba(255, 255, 255, 0.04)",
+    "layer_alt_fill_default": "rgba(0, 0, 0, 0.20)",
+    "accent_text": "#4CC2FF",
+    "system_success": "#54CF73",
+    "system_caution": "#F2A24B",
+    "system_critical": "#FF7A7A"
+  },
+  "system_accent_ramp": [
+    "#0067C0", "#8B5CF6", "#0EA5E9", "#0F7B0F", "#E11D8A", "#F59E0B"
+  ]
+}

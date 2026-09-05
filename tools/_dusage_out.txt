@@ -1,0 +1,7 @@
+START  
+bootloader  1.7GB
+FreeAPI  0GB
+host_browser  0GB
+toolchain  0.3GB
+win11-desktop  0.22GB
+D: Free=10.58GB

@@ -1,0 +1,4 @@
+../vendor/mono/metadata/icall-windows-uwp.c:11:10: fatal error: windows.h: No such file or directory
+   11 | #include <windows.h>
+      |          ^~~~~~~~~~~
+compilation terminated.

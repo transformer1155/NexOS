@@ -1,0 +1,4 @@
+START  
+PID=22092
+RUNNING -> serial should be listening
+
