@@ -45,3 +45,47 @@ extern "C" int proc_spawn(const char* name, uint32_t uid, const char* root_path,
     *out = p;
     return 0;
 }
+
+// ---------------------------------------------------------------------
+//  proc_list / proc_kill  -- referenced by the text-shell `ps` / `kill`
+//  commands (kernel.cpp, _kp.cpp).  Foundation 0 has no real scheduler,
+//  so these just walk the flat table.
+// ---------------------------------------------------------------------
+static void proc_puts(char* buf, int& n, int bufsz, const char* s) {
+    while (*s && n < bufsz - 1) buf[n++] = *s++;
+}
+static void proc_dec(char* buf, int& n, int bufsz, int v) {
+    if (v == 0) { buf[n++] = '0'; return; }
+    char rev[16]; int k = 0, t = v;
+    while (t) { rev[k++] = (char)('0' + (t % 10)); t /= 10; }
+    while (k) buf[n++] = rev[--k];
+}
+
+extern "C" int proc_list(char* buf, int bufsz) {
+    int n = 0;
+    proc_puts(buf, n, bufsz, "PID  NAME            UID  RING\n");
+    proc_dec(buf, n, bufsz, (int)g_kernel_proc.pid); proc_puts(buf, n, bufsz, "    kernel          0    0\n");
+    for (int i = 0; i < g_proc_count; i++) {
+        proc_dec(buf, n, bufsz, (int)g_procs[i].pid);
+        proc_puts(buf, n, bufsz, "    ");
+        proc_puts(buf, n, bufsz, g_procs[i].name);
+        // pad name to 16 (manual length, freestanding build has no strlen)
+        int nl = 0; while (g_procs[i].name[nl]) nl++;
+        for (int p = 0; p < 16 - nl; p++) proc_puts(buf, n, bufsz, " ");
+        proc_dec(buf, n, bufsz, (int)g_procs[i].uid);  proc_puts(buf, n, bufsz, "    ");
+        proc_dec(buf, n, bufsz, (int)g_procs[i].ring); proc_puts(buf, n, bufsz, "\n");
+    }
+    buf[n] = 0;
+    return n;
+}
+
+extern "C" int proc_kill(uint32_t pid) {
+    for (int i = 0; i < g_proc_count; i++) {
+        if (g_procs[i].pid == pid) {
+            for (int j = i; j < g_proc_count - 1; j++) g_procs[j] = g_procs[j + 1];
+            g_proc_count--;
+            return 0;
+        }
+    }
+    return -1;
+}
