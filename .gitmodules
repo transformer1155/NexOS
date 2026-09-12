@@ -1,0 +1,12 @@
+[submodule "vendor/chromium"]
+	path = vendor/chromium
+	url = https://github.com/chromium/chromium.git
+	shallow = true
+	# NOTE: the gitlink is pinned to a real upstream commit (refs/heads/main).
+	# The content is intentionally NOT vendored into this repository: the tree
+	# is ~4.1 GB / 550k files, which would break RULES.md's size rules and
+	# GitHub's push limits.  Materialise it only when needed:
+	#     git submodule update --init --depth 1 vendor/chromium
+	# A downloaded snapshot (e.g. chromium-main.zip) is NOT a git checkout and
+	# cannot satisfy the pinned commit; keep it outside the repo as a
+	# read-only reference.

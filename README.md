@@ -62,6 +62,7 @@ NexOS 是一个从零自研的 **x86 操作系统**：起点是一个支持 BIOS
 | `agent/`                  | AI 智能体实现（与 `ai_engine`/`gguf_infer`/`distnet` 协作）     |
 | `tools/`                  | 构建与运维脚本：`sfs_gen.py`、`embed_model.py`、`gen_zfont.py`、`gen_ime_dict.py`、`nexos_bridge.py`、`nexos_l2hub.py`、`distnet_host_peer.py`、`check_k64_fit.sh`、`analyze_login.py`/`analyze_ppms.py` 等 |
 | `sfs_files/` `docs/` `Makefile` `test.sh` `test_uefi.sh` | SFS 源文件、规划文档、构建与无头测试         |
+| `vendor/chromium`（submodule） | **Chromium 源码引用**（仅记录 gitlink，不随仓库分发）。内容约 4.1 GB / 55 万文件，按需拉取：`git submodule update --init --depth 1 vendor/chromium`；移植计划见 [docs/chromium_bringup_roadmap.md](docs/chromium_bringup_roadmap.md) |
 
 ## 内存与磁盘布局
 
@@ -703,6 +704,7 @@ NexOS 当前已是一个可运行、可联网、可跑 AI 推理与分布式算�
 - **兼容层**：Win32 子系统补齐更多 GDI/USER/系统 API，跑更复杂的 Windows 应用；Linux 兼容扩展到更多 libc/动态链接器与系统调用；Mono/.NET 运行时跑通更多托管程序与 NuGet 包。
 - **桌面体验**：C# 托管壳丰富标准控件与动画合成器，支持高分屏 DPI、多显示器、主题与无障碍；GUI Terminal 支持 TrueType 渲染。
 - **Web 控制台与生态**：`win11-ui/` 增加实时性能/算力可视化面板、内核调试器前端与“一键部署到多 VM”的编排；建设文档站、包管理与自举工具链，让社区更易参与。
+- **把 Chromium 核心搬进 NexOS**：这是一条需要先补平台的长路线（64 位主内核 → musl/libc++ → 真 pthread/TLS → 真 mmap/W^X → ELF64 动态加载 → GB 级内存 → Chromium `base/`/`net/`/headless content）。分阶段计划、验收标准与实测基线见 [docs/chromium_bringup_roadmap.md](docs/chromium_bringup_roadmap.md)；本路线**不含**窗口/显示接入。注意 `.attic64/chrome.c` 只是用 Win32 API 画的 Chrome 外观，与 Chromium 引擎无关。
 
 # 开源协议（MIT License）
 
