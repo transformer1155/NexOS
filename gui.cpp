@@ -5540,20 +5540,39 @@ struct Win11Desktop {
     // p is 0..1000 (per-mille); returns eased 0..1000.  Cubic easing removes
     // the robotic constant-speed feel of the old linear ramp.
     // All math stays in int32: 1000^3 = 1e9 < INT32_MAX, so no 64-bit helpers.
+    // Precomputed easing tables: 1001 samples for p in [0,1000].  Generated once
+    // (guarded by g_ease_inited -- a plain flag, NOT a C++ magic-static, so it
+    // links cleanly in the freestanding -nostdlib kernel) and then looked up in
+    // O(1).  The math is identical to the original integer cubic, so animation is
+    // visually unchanged; we just skip the per-call multiply/divide per frame.
+    static int  g_ease_out[1001];
+    static int  g_ease_inout[1001];
+    static bool g_ease_inited = false;
+    static void ease_init(void) {
+        if (g_ease_inited) return;
+        for (int p = 0; p <= 1000; p++) {
+            if (p <= 0)          { g_ease_out[p] = 0;    g_ease_inout[p] = 0; }
+            else if (p >= 1000)   { g_ease_out[p] = 1000; g_ease_inout[p] = 1000; }
+            else {
+                int u = 1000 - p;
+                g_ease_out[p]   = 1000 - (u * u * u) / 1000000;
+                g_ease_inout[p] = (p < 500) ? 4 * ((p * p * p) / 1000000)
+                                            : 1000 - 4 * ((u * u * u) / 1000000);
+            }
+        }
+        g_ease_inited = true;
+    }
     static int ease_out_cubic(int p) {
         if (p <= 0) return 0;
         if (p >= 1000) return 1000;
-        int u = 1000 - p;                    // (1 - x) * 1000
-        return 1000 - (u * u * u) / 1000000; // 1 - (1-x)^3
+        if (!g_ease_inited) ease_init();
+        return g_ease_out[p];
     }
     static int ease_in_out_cubic(int p) {
         if (p <= 0) return 0;
         if (p >= 1000) return 1000;
-        if (p < 500) {
-            return 4 * ((p * p * p) / 1000000);
-        }
-        int u = 1000 - p;
-        return 1000 - 4 * ((u * u * u) / 1000000);
+        if (!g_ease_inited) ease_init();
+        return g_ease_inout[p];
     }
 
     void draw_window_animated(int id) {
