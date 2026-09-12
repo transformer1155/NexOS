@@ -1398,23 +1398,28 @@ int ai_model_recognize_mem(const void* data, int len, struct ModelInfo* info){
             for (uint64_t kv = 0; kv < kv_count && off + 12 <= len; kv++){
                 if (off + 8 > len) break;
                 uint64_t klen = mu_rd64(p + off); off += 8;
-                if (off + (int)klen + 4 > len) break;
+                // klen is a uint64 read from the file.  The old `(int)klen`
+                // truncated it (going negative for large values) and defeated
+                // this bounds check outright; the copy loop also never checked
+                // off+i against len.
+                if (klen > (uint64_t)len - (uint64_t)off) break;
                 char key[48]; int kl = 0;
-                for (uint64_t i = 0; i < klen && kl < 47; i++) key[kl++] = (char)p[off+i];
-                key[kl] = 0; off += (int)klen;
+                for (uint64_t i = 0; i < klen && kl < 47 && off + i < (uint64_t)len; i++)
+                    key[kl++] = (char)p[off+i];
+                key[kl] = 0; off += klen;
                 if (off + 4 > len) break;
                 uint32_t vtype = mu_rd32(p + off); off += 4;
                 if (vtype == 8){ // STRING
                     if (off + 8 > len) break;
                     uint64_t slen = mu_rd64(p + off); off += 8;
-                    if (off + (int)slen > len) break;
+                    if (slen > (uint64_t)len - (uint64_t)off) break;
                     if (ai_strcmp(key, "general.architecture") == 0)
                         mu_copy(info->family, sizeof(info->family), (const char*)(p+off), (int)slen);
                     else if (ai_strcmp(key, "general.name") == 0)
                         mu_copy(info->name, sizeof(info->name), (const char*)(p+off), (int)slen);
                     else if (ai_strcmp(key, "general.quantization_type") == 0)
                         mu_copy(info->quant, sizeof(info->quant), (const char*)(p+off), (int)slen);
-                    off += (int)slen;
+                    off += slen;
                 } else if (vtype == 10){ // FLOAT64
                     if (off + 8 > len) break;
                     if (ai_strcmp(key, "general.parameter_count") == 0){

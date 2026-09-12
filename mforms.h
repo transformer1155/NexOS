@@ -41,6 +41,14 @@ struct MFormsHost {
     void (*draw_circle) (int cx, int cy, int r, uint32_t c);
     void (*icon)        (int x, int y, int sz, uint32_t bg, char letter, uint32_t lc);
     void (*progress)    (int x, int y, int w, int h, int pct, uint32_t c);
+    // Frosted-glass rounded panel (blurs the backdrop behind it, like the
+    // Win11 Mica/Acrylic sign-in card). tint = base colour, alpha = opacity,
+    // blur = blur radius in px.
+    void (*glass)       (int x, int y, int w, int h, int r, uint32_t tint, int alpha, int blur);
+    // UTF-8 text at an explicit glyph height `px` (default Gfx.Text uses 16).
+    void (*text_px)     (int x, int y, const char* s, uint32_t fg, int px);
+    // Pixel width of a UTF-8 string at glyph height `px` (for centring).
+    int  (*measure_px)  (const char* s, int px);
     int  (*measure)     (const char* s);      // pixel width of a UTF-8 string
     // ---- texture cache (SFS-backed .tex files, see tools/tex_pack.py) --
     int  (*has_image)   (int id);
@@ -155,6 +163,16 @@ const char* mforms_title(int id);
 // Paint app `id` into the client rectangle (screen coordinates).
 void mforms_paint(int id, int ox, int oy, int w, int h);
 
+// Paint with a content scroll offset: the drawing origin shifts by (px,py)
+// while the clip stays the client rect, so content that overflows the client
+// can be panned into view (window scrollbars).  px,py are >= 0.
+void mforms_paint_pan(int id, int ox, int oy, int w, int h, int px, int py);
+
+// Largest client-space extent drawn by the last mforms_paint[_pan]()
+// (content size, >= client size).  Used to size the window scrollbars.
+int  mforms_content_w(void);
+int  mforms_content_h(void);
+
 // Deliver a click at screen point (mx,my).  Returns non-zero when the
 // app consumed it.  Client rect is passed so layout matches the paint.
 int  mforms_click(int id, int ox, int oy, int w, int h, int mx, int my);
@@ -205,6 +223,11 @@ int  mforms_rclick(int id, int ox, int oy, int w, int h, int mx, int my);
 
 // Non-zero while the Start menu is open (it is modal: give it the click).
 int  mforms_desktop_menu_open(void);
+
+// Keyboard control of the Start menu / desktop UI.
+//   code 0 = toggle open/close, 1 = up, 2 = down, 3 = activate, 4 = close.
+// Returns the app Kind to launch (>=0) or -1 when nothing is to be launched.
+int  mforms_desktop_menu(int code);
 
 // Bit i set == a window of Kind i is open.  Drives the taskbar's
 // running-app indicators; call once per frame before painting.

@@ -1,0 +1,11 @@
+Using built-in specs.
+COLLECT_GCC=i686-elf-gcc.exe
+Target: i686-elf
+Configured with: ../gcc-13.2.0/configure --host=i686-w64-mingw32.static --target=i686-elf --disable-nls --enable-languages=c,c++ --without-headers --prefix=/root/build-i686-elf/windows/output
+Thread model: single
+Supported LTO compression algorithms: zlib
+gcc version 13.2.0 (GCC) 
+COLLECT_GCC_OPTIONS='-m32' '-v' '-c' '-o' '/tmp/t.o' '-mtune=generic' '-march=pentiumpro' '-dumpdir' '/tmp/'
+ cc1plus -quiet -v -iprefix D:/MyOS/bootloader/../lib/gcc/i686-elf/13.2.0/ /tmp/t.cpp -quiet -dumpdir /tmp/ -dumpbase t.cpp -dumpbase-ext .cpp -m32 -mtune=generic -march=pentiumpro -version -o C:\Users\trans\AppData\Local\Temp\ccXxyFZ9.s
+i686-elf-gcc.exe: fatal error: cannot execute 'cc1plus': CreateProcess: No such file or directory
+compilation terminated.

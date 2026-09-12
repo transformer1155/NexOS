@@ -24,13 +24,14 @@ import sys, os, struct
 
 def main():
     if len(sys.argv) < 3 or sys.argv[1].startswith('-'):
-        print(f"Usage: {sys.argv[0]} <source_dir> <output_img> [--exclude-tex]")
+        print(f"Usage: {sys.argv[0]} <source_dir> <output_img> [--exclude-tex] [--exclude-fonts]")
         print(f"  Note: this tool PACKS files; it cannot list an existing image.")
         sys.exit(1)
 
     src_dir = sys.argv[1]
     out_img = sys.argv[2]
     exclude_tex = '--exclude-tex' in sys.argv[3:]
+    exclude_fonts = '--exclude-fonts' in sys.argv[3:]
 
     if not os.path.isdir(src_dir):
         print(f"Error: source directory '{src_dir}' does not exist")
@@ -43,6 +44,8 @@ def main():
             fpath = os.path.join(src_dir, name)
             if os.path.isfile(fpath):
                 if exclude_tex and name.startswith('tex_'):
+                    continue
+                if exclude_fonts and name in ('zfont.bin', 'afont.bin'):
                     continue
                 data = open(fpath, 'rb').read()
                 if len(name) >= 20:

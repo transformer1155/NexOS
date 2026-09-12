@@ -1,0 +1,204 @@
+﻿diff --git a/kernel.cpp b/kernel.cpp
+index 58ab224..e63780e 100644
+--- a/kernel.cpp
++++ b/kernel.cpp
+@@ -417,6 +417,112 @@ static void pci_write_config(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off
+     outl(0xCFC, val);
+ }
+ 
++// ---- VirtualBox VMMDev absolute mouse (no Guest Additions) ----
++// VBox exposes absolute pointer coordinates through its VMMDev PCI device
++// (vendor 0x80EE, device 0xCAFE).  A request is submitted by writing the
++// PHYSICAL address of a request struct to the device's I/O port; the host
++// fills rc + fields.  With Mouse Integration on, the host reports absolute
++// coords (0..0xFFFF) which we scale to the framebuffer, so the guest pointer
++// == the host cursor == where clicks land.  Falls back to relative PS/2 if
++// VMMDev is absent or integration is disabled.
++#define VMMDEV_VENDOR 0x80EE
++#define VMMDEV_DEVICE 0xCAFE
++#define VMMDEV_HDR_VERSION 0x10001
++#define VMMDEV_MOUSE_GUEST_CAN_ABSOLUTE 0x01
++#define VMMDEV_MOUSE_HOST_WANTS_ABSOLUTE 0x02
++
++struct VMMDevReqHeader {
++    uint32_t size;
++    uint32_t version;
++    uint32_t requestType;
++    int      rc;
++    uint32_t reserved1;
++    uint32_t fRequestor;
++};
++struct VMMDevReqMouseStatus {
++    VMMDevReqHeader header;
++    uint32_t mouseFeatures;
++    int      pointerXPos;
++    int      pointerYPos;
++};
++
++// Request buffer at a fixed low physical address (identity-mapped, like 0x5000).
++static volatile VMMDevReqMouseStatus* g_vbox_req = (volatile VMMDevReqMouseStatus*)0x6000;
++static uint16_t g_vbox_port = 0;     // 0 => VMMDev not found
++bool g_host_cursor_active = false;    // true when absolute mouse is live
++static uint32_t g_vbox_get_type = 34; // VMMDevReq_GetMouseStatus
++static uint32_t g_vbox_set_type = 35; // VMMDevReq_SetMouseStatus
++
++static void vbox_req_submit(void) {
++    outl(g_vbox_port + 0, 0x6000);   // physical address of the request struct
++}
++
++static bool vbox_try(uint32_t get_t, uint32_t set_t) {
++    g_vbox_req->header.size = sizeof(VMMDevReqMouseStatus);
++    g_vbox_req->header.version = VMMDEV_HDR_VERSION;
++    g_vbox_req->header.requestType = set_t;
++    g_vbox_req->header.rc = 0;
++    g_vbox_req->header.reserved1 = 0;
++    g_vbox_req->header.fRequestor = 0;
++    g_vbox_req->mouseFeatures = VMMDEV_MOUSE_GUEST_CAN_ABSOLUTE;
++    vbox_req_submit();
++    if (g_vbox_req->header.rc != 0) return false;
++
++    g_vbox_req->header.requestType = get_t;
++    g_vbox_req->header.rc = 0;
++    g_vbox_req->mouseFeatures = 0;
++    vbox_req_submit();
++    if (g_vbox_req->header.rc != 0) return false;
++    if (!(g_vbox_req->mouseFeatures & VMMDEV_MOUSE_HOST_WANTS_ABSOLUTE)) return false;
++    g_vbox_get_type = get_t;
++    g_vbox_set_type = set_t;
++    return true;
++}
++
++static void vbox_mouse_init(void) {
++    for (uint8_t dev = 0; dev < 32; dev++) {
++        for (uint8_t func = 0; func < 8; func++) {
++            uint32_t id = pci_read_config(0, dev, func, 0);
++            if ((id & 0xFFFF) == 0xFFFF) { if (func == 0) break; else continue; }
++            uint16_t vid = id & 0xFFFF;
++            uint16_t did = (id >> 16) & 0xFFFF;
++            if (vid == VMMDEV_VENDOR && did == VMMDEV_DEVICE) {
++                uint32_t bar0 = pci_read_config(0, dev, func, 0x10);
++                if (bar0 & 0x01) g_vbox_port = (uint16_t)(bar0 & 0xFFFC);
++                goto found;
++            }
++        }
++    }
++found:
++    if (g_vbox_port == 0) { serial_puts("[VBOX] VMMDev not found\n"); return; }
++
++    // Try the official request-type numbers, then the alternate subset.
++    if (vbox_try(34, 35) || vbox_try(1, 2)) {
++        g_host_cursor_active = true;
++        serial_puts("[VBOX] absolute mouse enabled\n");
++    } else {
++        g_host_cursor_active = false;
++        serial_puts("[VBOX] absolute mouse unavailable (enable Mouse Integration)\n");
++    }
++}
++
++static void vbox_ensure_init(void) {
++    static bool done = false;
++    if (!done) { done = true; vbox_mouse_init(); }
++}
++
++static bool vbox_get_mouse(uint32_t* x, uint32_t* y) {
++    if (!g_host_cursor_active) return false;
++    g_vbox_req->header.requestType = g_vbox_get_type;
++    g_vbox_req->header.rc = 0;
++    g_vbox_req->mouseFeatures = 0;
++    vbox_req_submit();
++    if (g_vbox_req->header.rc != 0) return false;
++    *x = (uint32_t)g_vbox_req->pointerXPos;
++    *y = (uint32_t)g_vbox_req->pointerYPos;
++    return true;
++}
++
+ // ---- Scan PCI bus for devices ----
+ static void pci_scan(){
+     g_hw.pci_devices_found = 0;
+@@ -1552,8 +1658,16 @@ public:
+             ev.left   = m_pkt[0] & 0x01;
+             ev.right  = m_pkt[0] & 0x02;
+             ev.middle = m_pkt[0] & 0x04;
++            // PS/2 relative deltas are 9-bit signed: the low 8 bits live in
++            // m_pkt[1]/[2] and the 9th (sign) bit is bit4/bit5 of the start
++            // byte.  Using a bare int8_t here mis-signs any movement with
++            // |delta| > 127 (QEMU splits a fast drag into +/-255 packets, so
++            // a 0xFF01 byte is wrongly read as +1 instead of -255), which
++            // makes the cursor veer the wrong way / never reach the target.
+             ev.dx     = (int8_t)m_pkt[1];
++            if (m_pkt[0] & 0x10) ev.dx -= 256;        // X sign bit (bit4)
+             ev.dy     = (int8_t)m_pkt[2];
++            if (m_pkt[0] & 0x20) ev.dy -= 256;        // Y sign bit (bit5)
+             ev.dz     = (m_pkt_len >= 4) ? (int8_t)m_pkt[3] : 0;
+         }
+         return ev;
+@@ -1645,6 +1759,7 @@ extern "C" {
+     int  gui_available(void);
+     void gui_enter(void);
+     void gui_mouse_move(int dx, int dy);
++    void gui_mouse_position(uint32_t raw_x, uint32_t raw_y);
+     void gui_mouse_down(void);
+     void gui_mouse_up(void);
+     void gui_mouse_down_right(void);
+@@ -1659,6 +1774,9 @@ extern "C" {
+     void gui_render_text_mode(void);
+     void gui_exit(void);
+     void gui_render(void);
++    void gui_remote_begin(const char* who);   // arm the "being remotely controlled" overlay
++    void gui_remote_cmd(const char* cmd);     // record + show a remote command
++    void gui_remote_end(void);                // dismiss the overlay
+     void gui_tick(void);
+     void gui_animate_frame(void);
+     // Open a Windows executable file (exe/bat/ps1/com) inside the GUI.
+@@ -7246,6 +7364,10 @@ extern "C" int nexos_auth(const char* user, const char* pw){
+ // arming g_ssh_out_fn (via term_set_ssh_sink) so command output is forwarded
+ // over the encrypted channel; kernel_exec_line itself does not touch the sink.
+ extern "C" void kernel_exec_line(const char* line){
++    // Remote command (SSH / bridge): arm the security-guard overlay so an
++    // observer in the NexOS GUI can see the machine is being controlled.
++    gui_remote_begin("远程终端 (SSH/桥接)");
++    gui_remote_cmd(line);
+     run_command(line);
+ }
+ 
+@@ -8470,6 +8592,16 @@ extern "C" void kmain(){
+             bool gui_prev_right = false;
+             int gui_tick_counter = 0;
+             while(gui_is_active()){
++                // Absolute (VMMDev) mouse: poll every frame so the OS cursor
++                // tracks the host pointer even when no PS/2 interrupt arrives
++                // (e.g. VirtualBox "usbtablet" presents no PS/2 mouse).
++                // vbox_ensure_init() is internally guarded and only probes once.
++                vbox_ensure_init();
++                if (g_host_cursor_active) {
++                    uint32_t vx = 0, vy = 0;
++                    if (vbox_get_mouse(&vx, &vy)) gui_mouse_position(vx, vy);
++                }
++
+                 if(g_net_initialized) net_poll();
+ 
+                 // Remote console over COM1 (frontend ops terminal / bridge).
+@@ -8483,6 +8615,10 @@ extern "C" void kmain(){
+                         if (ch == '\r' || ch == '\n') {
+                             if (g_serial_inlen > 0) {
+                                 g_serial_inbuf[g_serial_inlen] = 0;
++                                // Remote command over COM1 (frontend ops console / bridge):
++                                // arm the security-guard overlay before executing it.
++                                gui_remote_begin("远程运维通道 (COM1)");
++                                gui_remote_cmd(g_serial_inbuf);
+                                 run_command(g_serial_inbuf);
+                                 g_serial_inlen = 0;
+                             }
+@@ -8510,7 +8646,11 @@ extern "C" void kmain(){
+                     if(st & 0x20){
+                         MouseEvent me = mouse.process(data);
+                         if(me.valid){
+-                            if(me.dx != 0 || me.dy != 0){
++                            uint32_t vx=0, vy=0;
++                            vbox_ensure_init();
++                            if(g_host_cursor_active && vbox_get_mouse(&vx, &vy)){
++                                gui_mouse_position(vx, vy);
++                            } else if(me.dx != 0 || me.dy != 0){
+                                 gui_mouse_move(me.dx, -me.dy);
+                             }
+                             if(me.left && !gui_prev_left){

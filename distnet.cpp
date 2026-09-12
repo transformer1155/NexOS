@@ -38,6 +38,15 @@ static void rcat(char* out, int* rp, const char* s){
     out[*rp] = 0;
 }
 
+// Capacity-bounded rcat().  rcat() takes no size argument and is used with
+// buffers of several different sizes, but the task payload arrives from the
+// network (up to 511 bytes of UDP), so every site appending peer-controlled
+// text into a fixed buffer must use this or it walks off the end.
+static void rcat_cap(char* out, int* rp, const char* s, int cap){
+    while (*s && *rp < cap - 1) out[(*rp)++] = *s++;
+    out[*rp] = 0;
+}
+
 // Write an unsigned int at buf, return chars written (no terminator).
 static int my_utoa(unsigned v, char* b){
     if (v == 0){ b[0]='0'; return 1; }
@@ -141,18 +150,18 @@ static void exec_task(char* task, char result[400]){
             task[id_end] = 0;                   // terminate <id> (safe: we return)
             char* q = p + 2;                    // skip "ai"
             while (*q==' '||*q=='\t') q++;      // skip spaces before prompt
-            rcat(result, &rp, "RESULT ");
-            rcat(result, &rp, id);
-            rcat(result, &rp, " ok ");
+            rcat_cap(result, &rp, "RESULT ", 400);
+            rcat_cap(result, &rp, id, 400);
+            rcat_cap(result, &rp, " ok ", 400);
             char ai_out[401];
             int rc = kern_ai_ask(q, ai_out, 401);
             if (rc < 0){
                 // -2 == engine could not boot (no /boot/model.gguf): report
                 // gracefully so the scheduler + user understand, instead of
                 // hanging or faulting.
-                rcat(result, &rp, (rc == -2) ? "err no_model" : "err ai_fail");
+                rcat_cap(result, &rp, (rc == -2) ? "err no_model" : "err ai_fail", 400);
             } else {
-                rcat(result, &rp, ai_out);
+                rcat_cap(result, &rp, ai_out, 400);
             }
             return;
         }
@@ -183,8 +192,9 @@ static void exec_task(char* task, char result[400]){
     }
     else if (my_strlen(type) == 4 && type[0]=='e' && type[1]=='c' && type[2]=='h' && type[3]=='o'){
         for (int i=3; i<nt; i++){
-            for (int j=0;j<tl[i];j++) result[rp++] = tok[i][j];
-            if (i < nt-1) result[rp++] = ' ';
+            for (int j=0;j<tl[i] && rp < 399;j++) result[rp++] = tok[i][j];
+            if (i < nt-1 && rp < 399) result[rp++] = ' ';
+            if (rp >= 399) break;
         }
         result[rp] = 0;
     }
@@ -431,7 +441,9 @@ void distnet_scheduler_ask(const char* prompt){
     int plen = my_strlen(prompt);
     int start = 0, end = plen;
     if (plen >= 2 && prompt[0]=='"' && prompt[plen-1]=='"'){ start=1; end=plen-1; }
-    for (int i=start;i<end;i++) task[rp++] = prompt[i];
+    // Bound by the buffer: the prompt length is caller/peer controlled and used
+    // to run past the end of task[].
+    for (int i=start;i<end && rp < 255;i++) task[rp++] = prompt[i];
     task[rp] = 0;
 
     for (int n=0; n<g_node_count; n++){

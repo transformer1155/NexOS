@@ -85,20 +85,20 @@ namespace NexOS.Forms
         // ---- geometry -------------------------------------------------
         static void Layout(int w, int h)
         {
-            cardW = 400; cardH = 430;
-            if (cardW > w - 40) cardW = w - 40;
+            cardW = 420; cardH = 486;
+            if (cardW > w - 48) cardW = w - 48;
             cardX = (w - cardW) / 2;
-            cardY = (h - cardH) / 2 + 20;
-            if (cardY < 96) cardY = 96;
+            cardY = (h - cardH) / 2 + 36;     // drop lower to give the clock room
+            if (cardY < 188) cardY = 188;
 
             fieldW = cardW - 96;
-            fieldH = 36;
+            fieldH = 42;
             fieldX = cardX + 48;
 
-            userY = cardY + 190;
-            passY = cardY + 248;
-            btnY  = cardY + 306;
-            chipY = cardY + 364;
+            userY = cardY + 214;
+            passY = cardY + 280;
+            btnY  = cardY + 350;
+            chipY = cardY + 436;
         }
 
         // ---- painting --------------------------------------------------
@@ -116,41 +116,51 @@ namespace NexOS.Forms
             Card(w, h);
         }
 
-        // Big centred clock across the top, Windows-lock-screen style.
-        // The bitmap font is one fixed size, so "big" is faked by drawing
-        // the string four times one pixel apart (a cheap bold).
+        // Big centred clock across the top, the visual anchor of the lock
+        // screen (Windows 11 style).  Drawn at an explicit large glyph height
+        // via Gfx.TextPx, with a soft offset drop shadow for depth.
         static void Clock(int w)
         {
             string t = U.Cat(Two(Host.Hour()), ":", Two(Host.Minute()));
-            int tw = Gfx.Measure(t);
+            int px = 66;
+            int tw = Gfx.MeasurePx(t, px);
             int tx = (w - tw) / 2;
-            Gfx.Text(tx + 1, 49, t, 0x000000);          // drop shadow
-            Gfx.Text(tx,     48, t, FG);
-            Gfx.Text(tx + 1, 48, t, FG);                // 1px smear == bold
+            int ty = 56;                                // top of the glyphs
+            Gfx.TextPx(tx + 3, ty + 4, t, 0x000000, px);   // soft shadow
+            Gfx.TextPx(tx,     ty,     t, FG,        px);   // face
 
-            string sub = U.Cat("NexOS  ", Host.OsName());
+            string sub = Host.OsName();                 // e.g. "NexOS v2.0 [Win11]"
             int sw = Gfx.Measure(sub);
-            Gfx.Text((w - sw) / 2 + 1, 71, sub, 0x000000);
-            Gfx.Text((w - sw) / 2,     70, sub, FG_DIM);
+            int sx = (w - sw) / 2;
+            Gfx.Text(sx + 1, ty + px + 16, sub, 0x000000);
+            Gfx.Text(sx,     ty + px + 15, sub, FG_DIM);
         }
 
         static void Card(int w, int h)
         {
-            Gfx.FillRound(cardX, cardY, cardW, cardH, 16, CARD_BG);
+            // ---- soft contact shadow (depth cue) ----------------------
+            Gfx.FillRound(cardX + 8, cardY + 12, cardW, cardH, 20, 0x05070B);
+
+            // ---- frosted Mica/Acrylic panel ---------------------------
+            // Gfx.Glass blurs the wallpaper behind it, so the card reads as a
+            // real translucent surface -- the signature Windows 11 material.
+            Gfx.Glass(cardX, cardY, cardW, cardH, 16, CARD_BG, 208, 6);
+            // 1px top highlight rim for a crisp premium edge.
             Gfx.DrawRound(cardX, cardY, cardW, cardH, 16, CARD_EDGE);
 
             // ---- avatar: an accent disc with the account initial -------
             int cx = cardX + cardW / 2;
-            int ay = cardY + 78;
-            Gfx.FillCircle(cx, ay, 46, U.Shade(Theme.Accent, -30));
-            Gfx.FillCircle(cx, ay, 42, Theme.Accent);
+            int ay = cardY + 86;
+            Gfx.FillCircle(cx, ay + 3, 46, 0x05070B);          // avatar shadow
+            Gfx.FillCircle(cx, ay, 47, U.Shade(Theme.Accent, -34));
+            Gfx.FillCircle(cx, ay, 43, Theme.Accent);
             string ini = Initial();
-            Gfx.Text(cx - Gfx.Measure(ini) / 2, ay - 8, ini, FG);
+            Gfx.Text(cx - Gfx.Measure(ini) / 2, ay - 9, ini, FG);
 
             // ---- account name -----------------------------------------
             string nm = (user == null || user.Length == 0) ? Lang.T("lock.noaccount") : user;
-            Gfx.TextCenter(cardX, cardY + 138, cardW, nm, FG);
-            Gfx.TextCenter(cardX, cardY + 158, cardW, Lang.T("lock.subtitle"), FG_DIM);
+            Gfx.TextCenter(cardX, cardY + 150, cardW, nm, FG);
+            Gfx.TextCenter(cardX, cardY + 174, cardW, Lang.T("lock.subtitle"), FG_DIM);
 
             // ---- fields ------------------------------------------------
             Field(fieldX, userY, Lang.T("lock.user"), user, focus == 0, false);
@@ -158,13 +168,13 @@ namespace NexOS.Forms
 
             // ---- sign-in button ----------------------------------------
             Gfx.FillRound(fieldX, btnY, fieldW, fieldH, 6, Theme.Accent);
-            Gfx.TextCenter(fieldX, btnY + 10, fieldW, Lang.T("lock.signin"), FG);
+            Gfx.TextCenter(fieldX, btnY + (fieldH - 16) / 2, fieldW, Lang.T("lock.signin"), FG);
 
             // ---- error / hint ------------------------------------------
             if (err != null && err.Length > 0)
-                Gfx.TextCenter(cardX, btnY + 46, cardW, err, ERR_FG);
+                Gfx.TextCenter(cardX, btnY + fieldH + 18, cardW, err, ERR_FG);
             else
-                Gfx.TextCenter(cardX, btnY + 46, cardW, Lang.T("lock.hint"), FG_DIM);
+                Gfx.TextCenter(cardX, btnY + fieldH + 18, cardW, Lang.T("lock.hint"), FG_DIM);
 
             // ---- account chips (only worth drawing for >1 account) -----
             if (nuser > 1) Chips();
@@ -185,14 +195,14 @@ namespace NexOS.Forms
             Gfx.DrawRound(x, y, fieldW, fieldH, 6, hot ? Theme.Accent : CARD_EDGE);
 
             string s = text == null ? "" : text;
-            Gfx.Text(x + 12, y + 10, s, FG);
+            Gfx.Text(x + 12, y + (fieldH - 16) / 2, s, FG);
 
             // Blinking caret on the focused field (500 ms duty cycle).
             if (hot && ((Host.TickMs() / 500) % 2) == 0)
             {
                 int caret = x + 12 + Gfx.Measure(s) + 1;
                 if (caret > x + fieldW - 6) caret = x + fieldW - 6;
-                Gfx.FillRect(caret, y + 8, 2, 20, FG);
+                Gfx.FillRect(caret, y + (fieldH - 20) / 2, 2, 20, FG);
             }
         }
 

@@ -251,8 +251,19 @@ namespace NexOS.Forms
         int dblT;      // TickMs() of the last row click (double-click detect)
         int dblIdx;    // row index of that click
         static string clip;   // last "copied" path
+        // Address bar (location box) at the top of the window.  It shows the
+        // volume the explorer currently points at; clicking it starts inline
+        // editing and Enter navigates (an unknown location is reported).
+        string addr;     // committed address text, e.g. "C:\"
+        string addrBuf;  // scratch buffer while editing
+        bool   addrEdit; // true while the box owns the keyboard
+        bool   addrDirty;// true once the user typed -- first key replaces the text
+        bool   addrErr;  // true while the "invalid address" dialog is up
+        bool   openWith; // true while the "open with" chooser is up
+        string owFile;   // file being opened by the chooser
+        string owExt;    // its extension (recorded on pick)
 
-        public FileExplorerApp() { fs = 0; sel = -1; scroll = 0; editMode = 0; editBuf = ""; editOld = ""; editDirty = false; dblT = -100000; dblIdx = -1; }
+        public FileExplorerApp() { fs = 0; sel = -1; scroll = 0; editMode = 0; editBuf = ""; editOld = ""; editDirty = false; dblT = -100000; dblIdx = -1; addr = AddrOf(0); addrBuf = ""; addrEdit = false; addrDirty = false; addrErr = false; openWith = false; owFile = ""; owExt = ""; }
 
         public override string GetTitle() { return "File Explorer"; }
 
@@ -266,15 +277,24 @@ namespace NexOS.Forms
             Gfx.FillRect(0, 0, navW, h, 0xFAFAFA);
             Gfx.DrawLine(navW, 0, navW, h, C.Border);
             Nav(10, 14, navW - 20, "This PC", false);
-            Nav(10, 14 + 40, navW - 20, "Local Disk (MKFS)", fs == 0);
-            Nav(10, 14 + 80, navW - 20, "System (SFS)", fs == 1);
+            Nav(10, 14 + 40, navW - 20, "MKFS", fs == 0);
+            Nav(10, 14 + 80, navW - 20, "SFS", fs == 1);
 
-            // File area header.
+            // File area header: an editable address bar showing the location
+            // this explorer points at, plus an item-count (or edit hint) line.
             int ax = navW + pad, ay = pad;
             int aw = w - ax - pad;
             int n = Host.FileCount(fs);
-            Gfx.Text(ax, ay, fs == 0 ? "Local Disk (MKFS)" : "System (SFS)", C.Text);
-            Gfx.Text(ax, ay + 20, U.Cat(U.I(n), " items"), C.TextSub);
+            int bh = BarH();
+            Gfx.FillRound(ax, ay, aw, bh, 6, addrEdit ? 0xFFFFFF : C.Card);
+            Gfx.DrawRound(ax, ay, aw, bh, 6, addrEdit ? C.Accent : C.Border);
+            Gfx.Icon(ax + 8, ay + (bh - 18) / 2, 18, 0x0078D4u, 'P', 0xFFFFFF);
+            string shownAddr = addrEdit ? addrBuf : addr;
+            if (addrEdit && (Host.Ticks() / 30) % 2 == 0) shownAddr = U.Cat(shownAddr, "|");
+            Gfx.Text(ax + 32, ay + (bh - 16) / 2, shownAddr, C.Text);
+            Gfx.Text(ax, ay + bh + 2,
+                     addrEdit ? "输入路径后回车 · 例如 C:\\ 或 S:\\" : U.Cat(U.I(n), " items"),
+                     C.TextSub);
 
             int ly = ay + 48;
             int rows = (h - ly - pad) / W.RowH;
@@ -300,15 +320,56 @@ namespace NexOS.Forms
                     int ri = sel - scroll;
                     if (ri >= 0 && ri < rows) inputY = ly + ri * W.RowH;
                 }
-                int bx = ax + 4, bw = aw - 8, bh = W.RowH - 2;
-                Gfx.FillRound(bx, inputY, bw, bh, 4, 0xFFFFFFFF);
-                Gfx.DrawRound(bx, inputY, bw, bh, 4, C.Accent);
+                int bx = ax + 4, bw = aw - 8, ebh = W.RowH - 2;
+                Gfx.FillRound(bx, inputY, bw, ebh, 4, 0xFFFFFFFF);
+                Gfx.DrawRound(bx, inputY, bw, ebh, 4, C.Accent);
                 string shown = editBuf;
                 if ((Host.Ticks() / 30) % 2 == 0) shown = U.Cat(shown, "|");
                 Gfx.Text(bx + 6, inputY + 6, shown, C.Text);
                 // Explicit finish/cancel hint so the mode is never a mystery.
                 Gfx.Text(ax + 4, inputY + W.RowH - 4,
                          editMode == 1 ? "Enter 确认 · Esc 取消" : "", C.TextSub);
+            }
+
+            // Invalid-address dialog.  Drawn INSIDE the window (not the
+            // shared screen Popup): the native compositor caches the managed
+            // overlay layer and only repaints it on desktop input, while the
+            // window layer is redrawn every frame -- so this is the only one
+            // guaranteed to show right after an address Enter.  Any click or
+            // key dismisses it.
+            if (addrErr)
+            {
+                int dw = 320; if (dw > w - 40) dw = w - 40;
+                int dh = 120;
+                int dx = (w - dw) / 2, dy = (h - dh) / 2;
+                Gfx.FillRound(dx, dy, dw, dh, 8, 0xFFFFFFFF);
+                Gfx.DrawRound(dx, dy, dw, dh, 8, C.Accent);
+                Gfx.DrawLine(dx + 1, dy + 44, dx + dw - 1, dy + 44, C.Border);
+                Gfx.TextCenter(dx, dy + 16, dw, "你输入的地址无效", C.Text);
+                int dbw = 96, dbh = 30;
+                int dbx = dx + (dw - dbw) / 2, dby = dy + dh - dbh - 16;
+                Gfx.FillRound(dbx, dby, dbw, dbh, 6, C.Accent);
+                Gfx.TextCenter(dbx, dby + (dbh - 16) / 2, dbw, "确定", C.White);
+            }
+
+            // "Open with" chooser panel (in-window modal).
+            if (openWith)
+            {
+                int rowH = OwRowH();
+                int pw = 300; if (pw > w - 40) pw = w - 40;
+                int ph = 34 + OW_N * rowH + 26;
+                int px = (w - pw) / 2, py = (h - ph) / 2;
+                Gfx.FillRound(px, py, pw, ph, 8, 0xFFFFFFFF);
+                Gfx.DrawRound(px, py, pw, ph, 8, C.Accent);
+                Gfx.Text(px + 12, py + 8, U.Cat("选择打开方式：", owFile), C.TextSub);
+                for (int i = 0; i < OW_N; i++)
+                {
+                    int ry = py + 34 + i * rowH;
+                    bool hot = W.Hot(px + 6, ry, pw - 12, rowH - 2);
+                    if (hot) Gfx.FillRound(px + 6, ry, pw - 12, rowH - 2, 4, C.Hover);
+                    Gfx.Text(px + 20, ry + 8, OwLabel(i), C.Text);
+                }
+                Gfx.Text(px + 12, py + ph - 20, "选择后该后缀以后都用此应用打开（Esc 取消）", C.TextSub);
             }
         }
 
@@ -317,6 +378,213 @@ namespace NexOS.Forms
             if (active) Gfx.FillRound(x, y, w, 30, 6, C.Sel);
             else if (W.Hot(x, y, w, 30)) Gfx.FillRound(x, y, w, 30, 6, C.Hover);
             Gfx.Text(x + 12, y + 7, label, active ? C.Accent : C.Text);
+        }
+
+        // ---- address bar (location box) -----------------------------
+        static int BarH() { return 30; }
+
+        // Canonical address text for a volume.
+        static string AddrOf(int f) { return f == 1 ? "SFS" : "MKFS"; }
+
+        // Trim surrounding blanks + lowercase ASCII, so address matching is
+        // case-insensitive without String.ToUpper (MiniCLR-safe).
+        static string TrimLow(string s)
+        {
+            if (s == null) return "";
+            int a = 0, b = s.Length;
+            while (a < b && (s[a] == ' ' || s[a] == '\t')) a++;
+            while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t')) b--;
+            string r = "";
+            for (int i = a; i < b; i++)
+            {
+                int c = (int)s[i];
+                if (c >= 'A' && c <= 'Z') c = c + 32;
+                r = U.Cat(r, Host.CharStr(c));
+            }
+            return r;
+        }
+
+        // Map a typed address to a volume index, or -1 when it is not a
+        // location this (flat, two-volume) explorer can open.
+        static int ParseAddr(string s)
+        {
+            string t = TrimLow(s);
+            // Drop a trailing path separator so "C:\" == "C:".
+            if (t.Length > 0)
+            {
+                int last = (int)t[t.Length - 1];
+                if (last == '\\' || last == '/')
+                {
+                    string r = "";
+                    for (int i = 0; i < t.Length - 1; i++) r = U.Cat(r, Host.CharStr((int)t[i]));
+                    t = r;
+                }
+            }
+            if (t == "c:" || t == "c" || t == "mkfs" || t == "local disk (mkfs)" || t == "local disk") return 0;
+            if (t == "s:" || t == "s" || t == "sfs" || t == "system (sfs)" || t == "system") return 1;
+            return -1;
+        }
+
+        void BeginAddrEdit()
+        {
+            addrEdit = true; addrDirty = false;
+            addrBuf = addr;   // show current location; first keystroke replaces it
+        }
+
+        // Commit the address box: navigate on a valid location, otherwise
+        // report the bad address and fall back to the default interface.
+        void CommitAddr()
+        {
+            addrEdit = false;
+            int nf = ParseAddr(addrBuf);
+            addrBuf = ""; addrDirty = false;
+            if (nf >= 0) { GoVolume(nf); return; }
+            GoVolume(0);          // invalid -> default view (Local Disk)
+            ShowInvalidAddr();
+        }
+
+        void GoVolume(int nf)
+        {
+            fs = nf; sel = -1; scroll = 0;
+            addr = AddrOf(nf);
+            Host.FileRefresh();
+        }
+
+        // Raise the in-window "invalid address" dialog (see OnPaint).  It is
+        // dismissed by the next click or keystroke.
+        void ShowInvalidAddr() { addrErr = true; }
+
+        // =============================================================
+        //  File-type associations + "Open with"
+        // =============================================================
+        // Double-click semantics: executables run directly (.mex managed app,
+        // .exe PE image).  Every other file opens with the app associated to
+        // its extension; if there is no association yet we ask the user to
+        // pick one, then remember it in MKFS "assoc.cfg" so the same suffix
+        // opens with that app from then on.
+
+        static string assocData;         // "ext=kind\n" lines (lazy load)
+        static bool   assocLoaded;
+
+        static string FxSub(string s, int a, int b)
+        {
+            string r = "";
+            for (int i = a; i < b && i < s.Length; i++) r = U.Cat(r, Host.CharStr((int)s[i]));
+            return r;
+        }
+        static bool FxEq(string a, string b)
+        {
+            if (a == null || b == null) return false;
+            if (a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++)
+            {
+                int x = (int)a[i], y = (int)b[i];
+                if (x >= 'A' && x <= 'Z') x += 32;
+                if (y >= 'A' && y <= 'Z') y += 32;
+                if (x != y) return false;
+            }
+            return true;
+        }
+        static int FxAtoi(string s)
+        {
+            int v = 0;
+            for (int i = 0; i < s.Length; i++)
+            {
+                int c = (int)s[i];
+                if (c < '0' || c > '9') break;
+                v = v * 10 + (c - '0');
+            }
+            return v;
+        }
+
+        // Lower-case extension without the dot ("" when there is none).
+        static string ExtOf(string nm)
+        {
+            if (nm == null) return "";
+            int dot = -1;
+            for (int i = 0; i < nm.Length; i++) if (nm[i] == '.') dot = i;
+            if (dot < 0 || dot == nm.Length - 1) return "";
+            string r = "";
+            for (int i = dot + 1; i < nm.Length; i++)
+            {
+                int c = (int)nm[i];
+                if (c >= 'A' && c <= 'Z') c += 32;
+                r = U.Cat(r, Host.CharStr(c));
+            }
+            return r;
+        }
+
+        static void LoadAssoc()
+        {
+            if (assocLoaded) return;
+            assocData = Host.ReadText(0, "assoc.cfg");
+            if (assocData == null) assocData = "";
+            assocLoaded = true;
+        }
+
+        // Kind previously registered for `ext`, or -1.
+        static int AssocOf(string ext)
+        {
+            LoadAssoc();
+            string d = assocData;
+            if (d == null) return -1;
+            int i = 0, n = d.Length;
+            while (i < n)
+            {
+                int j = i; while (j < n && d[j] != '\n') j++;
+                int eq = -1;
+                for (int k = i; k < j; k++) if (d[k] == '=') { eq = k; break; }
+                if (eq > i && FxEq(FxSub(d, i, eq), ext))
+                    return FxAtoi(FxSub(d, eq + 1, j));
+                i = j + 1;
+            }
+            return -1;
+        }
+
+        // Remember (and persist) that `ext` opens with `kind`.
+        static void SetAssoc(string ext, int kind)
+        {
+            LoadAssoc();
+            string outS = "";
+            string d = assocData; int i = 0, n = d.Length;
+            while (i < n)
+            {
+                int j = i; while (j < n && d[j] != '\n') j++;
+                int eq = -1;
+                for (int k = i; k < j; k++) if (d[k] == '=') { eq = k; break; }
+                bool drop = (eq > i) && FxEq(FxSub(d, i, eq), ext);
+                if (!drop)
+                {
+                    for (int k = i; k < j; k++) outS = U.Cat(outS, Host.CharStr((int)d[k]));
+                    outS = U.Cat(outS, "\n");
+                }
+                i = j + 1;
+            }
+            outS = U.Cat(outS, ext); outS = U.Cat(outS, "=");
+            outS = U.Cat(outS, U.I(kind)); outS = U.Cat(outS, "\n");
+            assocData = outS;
+            Host.WriteText(0, "assoc.cfg", outS);
+        }
+
+        // Map a .mex base name to a launchable Kind, or -1 when unknown.
+        static int KindForMex(string nm)
+        {
+            int dot = -1;
+            for (int i = 0; i < nm.Length; i++) if (nm[i] == '.') { dot = i; break; }
+            string b = dot > 0 ? FxSub(nm, 0, dot) : nm;
+            if (FxEq(b, "ControlPanel")) return Kind.ControlPanel;
+            if (FxEq(b, "FileExplorer")) return Kind.FileExplorer;
+            if (FxEq(b, "TaskManager"))  return Kind.TaskManager;
+            if (FxEq(b, "Terminal"))     return Kind.Terminal;
+            if (FxEq(b, "Calculator"))   return Kind.Calculator;
+            if (FxEq(b, "About"))        return Kind.About;
+            if (FxEq(b, "MemOptimizer")) return Kind.MemOptimizer;
+            if (FxEq(b, "Notepad"))      return Kind.Notepad;
+            if (FxEq(b, "Browser"))      return Kind.Browser;
+            if (FxEq(b, "AiSetup"))      return Kind.AiSetup;
+            if (FxEq(b, "AiAgent"))      return Kind.AiAgent;
+            if (FxEq(b, "Demo"))         return Kind.Demo;
+            return -1;
         }
 
         void SelectAt(int mx, int my)
@@ -337,6 +605,38 @@ namespace NexOS.Forms
 
         public override void OnClick(int mx, int my)
         {
+            // The invalid-address dialog is modal: any click dismisses it.
+            if (addrErr) { addrErr = false; return; }
+
+            // The "open with" chooser is modal: click a row to pick that app,
+            // click anywhere else to cancel.
+            if (openWith)
+            {
+                int rowH = OwRowH();
+                int pw = 300; if (pw > Gfx.Width() - 40) pw = Gfx.Width() - 40;
+                int ph = 34 + OW_N * rowH + 26;
+                int px = (Gfx.Width() - pw) / 2, py = (Gfx.Height() - ph) / 2;
+                for (int i = 0; i < OW_N; i++)
+                {
+                    int ry = py + 34 + i * rowH;
+                    if (U.In(mx, my, px + 6, ry, pw - 12, rowH - 2)) { ApplyOpenWith(OwKind(i)); return; }
+                }
+                openWith = false; return;
+            }
+
+            // Address bar owns the top strip: a click focuses it for editing.
+            int bnavW = 150, bpad = 12;
+            int bax = bnavW + bpad, bay = bpad;
+            int baw = Gfx.Width() - bax - bpad;
+            if (U.In(mx, my, bax, bay, baw, BarH()))
+            {
+                if (editMode != 0) CommitEdit();
+                BeginAddrEdit();
+                return;
+            }
+            // A click anywhere else commits a pending address edit (navigate).
+            if (addrEdit) { CommitAddr(); return; }
+
             // While editing, a click inside the inline box is ignored (the
             // editor handles key input). A click outside commits the edit and
             // then keeps processing, so nav buttons still work while a rename
@@ -357,8 +657,8 @@ namespace NexOS.Forms
                 CommitEdit();
             }
             int navW2 = 150, pad2 = 12;
-            if (U.In(mx, my, 10, 14 + 40, navW2 - 20, 30)) { fs = 0; sel = -1; scroll = 0; Host.FileRefresh(); return; }
-            if (U.In(mx, my, 10, 14 + 80, navW2 - 20, 30)) { fs = 1; sel = -1; scroll = 0; Host.FileRefresh(); return; }
+            if (U.In(mx, my, 10, 14 + 40, navW2 - 20, 30)) { GoVolume(0); return; }
+            if (U.In(mx, my, 10, 14 + 80, navW2 - 20, 30)) { GoVolume(1); return; }
 
             int ax = navW2 + pad2, ay = pad2, aw = Gfx.Width() - ax - pad2;
             int ly = ay + 48;
@@ -386,11 +686,37 @@ namespace NexOS.Forms
 
         public override void OnKey(int ch)
         {
+            // The invalid-address dialog is modal: any key dismisses it.
+            if (addrErr) { addrErr = false; return; }
+
+            // The "open with" chooser is modal: any key cancels it.
+            if (openWith) { openWith = false; return; }
+
+            // The kernel bridge delivers Enter as -2 and Backspace as -1 to
+            // managed apps (see gui.cpp), while the WinForms host sends the
+            // raw 13 / 8.  Accept both so inline editing works in the VM too.
+            if (addrEdit)
+            {
+                if (ch == -2 || ch == 10 || ch == 13) { CommitAddr(); return; }   // Enter -> navigate
+                if (ch == 27) { addrEdit = false; addrBuf = ""; addrDirty = false; return; } // Esc
+                if (ch == -1 || ch == 8)                                          // Backspace
+                {
+                    if (!addrDirty) { addrBuf = ""; addrDirty = true; return; }
+                    int m = addrBuf.Length;
+                    if (m > 0) { string r = ""; for (int i = 0; i < m - 1; i++) r = U.Cat(r, Host.CharStr((int)addrBuf[i])); addrBuf = r; }
+                    return;
+                }
+                if ((ch >= 0x20 && ch < 0x7F) || (ch >= 0x80 && ch <= 0xFFFF)) {
+                    if (!addrDirty) { addrBuf = Host.CharStr(ch); addrDirty = true; return; }
+                    addrBuf = U.Cat(addrBuf, Host.CharStr(ch)); return;
+                }
+                return;
+            }
             if (editMode != 0)
             {
-                if (ch == 27) { CancelEdit(); return; }                 // Esc
-                if (ch == 10 || ch == 13) { CommitEdit(); return; }     // Enter
-                if (ch == 8) {                                           // Backspace
+                if (ch == 27) { CancelEdit(); return; }                             // Esc
+                if (ch == -2 || ch == 10 || ch == 13) { CommitEdit(); return; }     // Enter
+                if (ch == -1 || ch == 8) {                                          // Backspace
                     if (!editDirty) { editBuf = ""; editDirty = true; return; }
                     int m = editBuf.Length;
                     if (m > 0) { string r = ""; for (int i = 0; i < m - 1; i++) r = U.Cat(r, Host.CharStr((int)editBuf[i])); editBuf = r; }
@@ -445,18 +771,87 @@ namespace NexOS.Forms
             else if (code == Desktop.A_F_SHARE) Host.Log("[FILE] share (no-op)");
         }
 
-        // Default action for a double-click / "Open".  Windows Explorer
-        // semantics: a .exe is a PROGRAM, so it is EXECUTED by the kernel's
-        // PE loader (the same path as `winapp foo.exe`); anything else is a
-        // document and opens in Notepad.  A .exe never lands in Notepad
-        // unless the user explicitly picks "Open with... > Notepad".
+        // Default action for a double-click / "Open".
+        //   1. .mex -> run the managed app directly (no viewer).
+        //   2. .exe -> run through the kernel PE loader.
+        //   3. otherwise -> open with the extension's associated app, or ask
+        //      the user to choose one (and remember the choice).
         void OpenSelected()
         {
             if (sel < 0 || sel >= Host.FileCount(fs)) return;
             if (Host.FileIsDir(fs, sel) != 0) return;     // dirs: no viewer
-            string nm = Host.FileName(fs, sel);
-            if (U.IsExe(nm)) { RunExe(nm); return; }
-            Shell.OpenNotepad(nm);
+            OpenFile(Host.FileName(fs, sel));
+        }
+
+        void OpenFile(string nm)
+        {
+            if (nm == null || nm == "") return;
+            string ext = ExtOf(nm);
+            if (ext == "mex") { RunMex(nm); return; }
+            if (U.IsExe(nm))  { RunExe(nm); return; }
+            int k = AssocOf(ext);
+            if (k >= 0) { OpenWith(k, nm); return; }
+            OpenWithChooser(nm, ext);
+        }
+
+        // Run a .mex managed executable.  Known built-in apps are launched
+        // through the resident shell (same as the taskbar); anything else
+        // goes through the `clrapp` shell command.
+        void RunMex(string nm)
+        {
+            Host.Log(U.Cat("[FILES] run mex ", nm));
+            int k = KindForMex(nm);
+            if (k >= 0) { Host.OpenApp(k); return; }
+            Host.Exec(U.Cat("clrapp ", nm));
+        }
+
+        // Open a document with a specific app.
+        void OpenWith(int kind, string nm)
+        {
+            if (kind == Kind.Notepad) { Shell.OpenNotepad(nm); return; }
+            // The other apps take no file argument, so we launch them and log
+            // the request; only the text viewer can actually display a file.
+            Host.Log(U.Cat("[FILES] open ", nm, " with ", Desktop.KindName(kind)));
+            Host.OpenApp(kind);
+        }
+
+        // "Open with" chooser.  Drawn INSIDE the window (the managed overlay
+        // layer is cached by the native compositor and only repaints on
+        // desktop input, whereas the window layer is redrawn every frame), so
+        // it is guaranteed to appear right after a double-click.
+        const int OW_N = 6;
+        static int OwRowH() { return 32; }
+        static string OwLabel(int i)
+        {
+            if (i == 0) return "记事本 (文本/二进制)";
+            if (i == 1) return "浏览器";
+            if (i == 2) return "终端";
+            if (i == 3) return "计算器";
+            if (i == 4) return "任务管理器";
+            return "设置";
+        }
+        static int OwKind(int i)
+        {
+            if (i == 0) return Kind.Notepad;
+            if (i == 1) return Kind.Browser;
+            if (i == 2) return Kind.Terminal;
+            if (i == 3) return Kind.Calculator;
+            if (i == 4) return Kind.TaskManager;
+            return Kind.ControlPanel;
+        }
+
+        void OpenWithChooser(string nm, string ext)
+        {
+            openWith = true; owFile = nm; owExt = ext;
+        }
+
+        // Remember the pick for this extension, then open with it.
+        void ApplyOpenWith(int kind)
+        {
+            SetAssoc(owExt, kind);
+            string nm = owFile;
+            openWith = false; owFile = ""; owExt = "";
+            OpenWith(kind, nm);
         }
 
         // Execute a .exe through the PE loader.  On failure we report the
@@ -1998,6 +2393,8 @@ namespace NexOS.Forms
         string name;   // currently loaded file
         bool picking;   // showing the open list
         bool saved;    // last action was a successful Ctrl+S (title hint)
+        bool binary;   // file is not decodable text -> show a hex view
+        string hex;    // raw bytes as hex (only meaningful when binary)
 
         public NotepadApp()
         {
@@ -2006,17 +2403,61 @@ namespace NexOS.Forms
             if (pending != null && pending != "")
             {
                 name = pending;
-                t.text = Host.ReadText(1, pending);
-                if (t.text == "") t.text = Host.ReadText(0, pending);
-                if (t.text == "") t.text = "Untitled - type below, or click Open to read a file.";
+                // Probe the RAW bytes first: if the file is not verifiable
+                // text (NULs / control bytes) fall back to a binary view
+                // instead of showing mangled characters.
+                int pfs = 1;
+                string hx = Host.ReadHex(1, pending);
+                if (hx == "") { pfs = 0; hx = Host.ReadHex(0, pending); }
+                if (IsBinaryHex(hx))
+                {
+                    binary = true; hex = hx; t.text = "";
+                }
+                else
+                {
+                    binary = false; hex = "";
+                    t.text = Host.ReadText(pfs, pending);
+                    if (t.text == "") t.text = "Untitled - type below, or click Open to read a file.";
+                }
             }
             else
             {
                 t.text = "Untitled - type below, or click Open to read a file.";
                 name = "Untitled";
+                binary = false; hex = "";
             }
             picking = false;
             saved = false;
+        }
+
+        // ---- binary detection / hex formatting --------------------------
+        static int HxNib(int c)
+        {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        }
+        static int HxByte(string h, int i)
+        {
+            if (i + 1 >= h.Length) return -1;
+            int a = HxNib((int)h[i]), b = HxNib((int)h[i + 1]);
+            if (a < 0 || b < 0) return -1;
+            return (a << 4) | b;
+        }
+        static bool IsBinaryHex(string h)
+        {
+            if (h == null) return false;
+            int n = h.Length / 2;
+            for (int i = 0; i < n; i++)
+            {
+                int v = HxByte(h, i * 2);
+                if (v < 0) return true;                          // malformed
+                if (v == 0) return true;                         // NUL
+                if (v < 0x20 && v != 9 && v != 10 && v != 13) return true; // control
+                if (v == 0x7F) return true;
+            }
+            return false;
         }
 
         // Ctrl+S save: persist the document body to the MKFS data disk.
@@ -2046,6 +2487,7 @@ namespace NexOS.Forms
             if (saved) { int sw = Gfx.Measure(name); Gfx.Text(pad + 178 + sw, 12, "(saved)", 0x107C10); }
 
             if (picking) { DrawPicker(w, h); return; }
+            if (binary) { DrawBinary(pad, w, h); return; }
 
             // Text body.
             Gfx.FillRect(pad, 48, w - 2 * pad, h - 48 - pad, C.White);
@@ -2077,6 +2519,55 @@ namespace NexOS.Forms
                 Gfx.Icon(pad + 8, ry + 4, 22, 0x60A5FA, 'F', 0xFFFFFF);
                 Gfx.Text(pad + 40, ry + 8, Host.FileName(1, i), C.Text);
             }
+        }
+
+        // Binary (hex) view: offset + 8 bytes hex + ASCII gutter.  Read-only.
+        void DrawBinary(int pad, int w, int h)
+        {
+            Gfx.FillRect(pad, 48, w - 2 * pad, h - 48 - pad, C.White);
+            Gfx.FillRound(pad + 6, 52, w - 2 * pad - 12, 24, 4, 0xFFF3CD);
+            Gfx.Text(pad + 12, 56, "二进制模式：该文件不是可解码文本，按原始字节显示", 0x7A4F00);
+            int y = 84;
+            int total = hex.Length / 2;
+            for (int off = 0; off < total && y < h - pad - 12; off += 8)
+            {
+                string line = Hx8(off);
+                line = U.Cat(line, "  ");
+                for (int j = 0; j < 8; j++)
+                {
+                    if (off + j < total) line = U.Cat(line, HxSub(hex, (off + j) * 2, 2));
+                    else line = U.Cat(line, "  ");
+                    line = U.Cat(line, " ");
+                }
+                line = U.Cat(line, " ");
+                for (int j = 0; j < 8; j++)
+                {
+                    if (off + j < total)
+                    {
+                        int v = HxByte(hex, (off + j) * 2);
+                        if (v >= 0x20 && v < 0x7F) line = U.Cat(line, Host.CharStr(v));
+                        else line = U.Cat(line, ".");
+                    }
+                }
+                Gfx.Text(pad + 8, y, line, 0x1F2937);
+                y += 18;
+            }
+        }
+        static string HxSub(string s, int a, int len)
+        {
+            string r = "";
+            for (int i = a; i < a + len && i < s.Length; i++) r = U.Cat(r, Host.CharStr((int)s[i]));
+            return r;
+        }
+        static string Hx8(int v)
+        {
+            string r = "";
+            for (int sh = 28; sh >= 0; sh -= 4)
+            {
+                int d = (v >> sh) & 15;
+                r = U.Cat(r, Host.CharStr(d < 10 ? ('0' + d) : ('a' + d - 10)));
+            }
+            return r;
         }
 
         static void DrawLines(int x, int y, string s, uint col, int maxY, bool caret)
@@ -2125,6 +2616,7 @@ namespace NexOS.Forms
         public override void OnKey(int ch)
         {
             if (picking) { return; }
+            if (binary) { return; }                     // binary view is read-only
             if (ch == -10) { Save(); return; }          // Ctrl+S -> save
             if (ch == -2) { t.Insert("\n"); saved = false; return; }
             t.Key(ch);

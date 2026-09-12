@@ -1,0 +1,14 @@
+﻿diff --git a/csharp/winhost/Backend.cs b/csharp/winhost/Backend.cs
+index ee4b77c..c4e4823 100644
+--- a/csharp/winhost/Backend.cs
++++ b/csharp/winhost/Backend.cs
+@@ -670,6 +670,9 @@ namespace NexOS.Forms
+         // kernel framebuffer, so it is a no-op.  Kept for Theme.ApplyPixel
+         // parity between the two build targets.
+         public static void SetPixel(int mode, int scale, int scan) { }
++        // Experimental perf-optimization toggle.  No-op on the WinForms host
++        // (kept for Theme.ApplyPerf parity between the two build targets).
++        public static void SetPerf(int on) { }
+     }
+ }
+ 

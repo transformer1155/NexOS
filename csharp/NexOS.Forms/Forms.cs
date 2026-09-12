@@ -45,6 +45,14 @@ namespace NexOS.Forms
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void DrawCircle(int cx, int cy, int r, uint c);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void Icon(int x, int y, int sz, uint bg, int letter, uint lc);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void Progress(int x, int y, int w, int h, int pct, uint c);
+        // Frosted-glass rounded panel (Win11 Mica/Acrylic): blurs the
+        // backdrop behind it.  tint = base colour, alpha = 0..255 opacity,
+        // blur = blur radius in px.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void Glass(int x, int y, int w, int h, int r, uint tint, int alpha, int blur);
+        // UTF-8 text at an explicit glyph height (default Gfx.Text is 16px).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void TextPx(int x, int y, string s, uint fg, int px);
+        // Pixel width of a UTF-8 string at glyph height px (for centring).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int  MeasurePx(string s, int px);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int  HasImage(int id);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void Image(int id, int x, int y, int w, int h);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int  Measure(string s);
@@ -106,6 +114,9 @@ namespace NexOS.Forms
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int FileIsDir(int fs, int idx);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int FileRefresh();
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern string ReadText(int fs, string name);
+        // Raw bytes of a file as a lower-case hex string (2 chars/byte), so a
+        // viewer can tell text from binary (ReadText scrubs control bytes).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern string ReadHex(int fs, string name);
         // Persist a UTF-8 text body to stable storage.  Returns bytes written
         // (>=0) or -1 on error.  Used by the shell to save personalization
         // settings ("nexos.cfg") and Notepad documents.  fs selects the

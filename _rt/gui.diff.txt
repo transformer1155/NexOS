@@ -1,0 +1,1795 @@
+﻿diff --git a/gui.cpp b/gui.cpp
+index 0f96bbc..63ff9c4 100644
+--- a/gui.cpp
++++ b/gui.cpp
+@@ -21,6 +21,46 @@
+ #include "addrman.h"       // Address Management Registry (single source of truth)
+ #include "font_vec.h"       // runtime vector font rasterizer (stb_truetype)
+ 
++// ---- Precomputed sRGB <-> linear (gamma 2.4) lookup tables ----
++// Used by blend_pixel_lin() for gamma-correct, crisp anti-aliased text.
++// Computed offline (pow-free) so the kernel stays freestanding (no libm).
++static const uint8_t G_TO_LIN[256] = {
++      0,   0,   0,   0,   0,   0,   0,   1,   1,   1,   1,   1,   1,   1,   1,   1,
++      1,   1,   2,   2,   2,   2,   2,   2,   2,   2,   3,   3,   3,   3,   3,   3,
++      4,   4,   4,   4,   4,   5,   5,   5,   5,   6,   6,   6,   6,   7,   7,   7,
++      8,   8,   8,   8,   9,   9,   9,  10,  10,  10,  11,  11,  12,  12,  12,  13,
++     13,  13,  14,  14,  15,  15,  16,  16,  17,  17,  17,  18,  18,  19,  19,  20,
++     20,  21,  22,  22,  23,  23,  24,  24,  25,  25,  26,  27,  27,  28,  29,  29,
++     30,  30,  31,  32,  32,  33,  34,  35,  35,  36,  37,  37,  38,  39,  40,  41,
++     41,  42,  43,  44,  45,  45,  46,  47,  48,  49,  50,  51,  51,  52,  53,  54,
++     55,  56,  57,  58,  59,  60,  61,  62,  63,  64,  65,  66,  67,  68,  69,  70,
++     71,  72,  73,  74,  76,  77,  78,  79,  80,  81,  82,  84,  85,  86,  87,  88,
++     90,  91,  92,  93,  95,  96,  97,  99, 100, 101, 103, 104, 105, 107, 108, 109,
++    111, 112, 114, 115, 116, 118, 119, 121, 122, 124, 125, 127, 128, 130, 131, 133,
++    134, 136, 138, 139, 141, 142, 144, 146, 147, 149, 151, 152, 154, 156, 157, 159,
++    161, 163, 164, 166, 168, 170, 171, 173, 175, 177, 179, 181, 183, 184, 186, 188,
++    190, 192, 194, 196, 198, 200, 202, 204, 206, 208, 210, 212, 214, 216, 218, 220,
++    222, 224, 226, 229, 231, 233, 235, 237, 239, 242, 244, 246, 248, 250, 253, 255,
++};
++static const uint8_t G_TO_SRGB[256] = {
++      0,  13,  22,  28,  34,  38,  42,  46,  50,  53,  56,  59,  61,  64,  66,  69,
++     71,  73,  75,  77,  79,  81,  83,  85,  86,  88,  90,  92,  93,  95,  96,  98,
++     99, 101, 102, 104, 105, 106, 108, 109, 110, 112, 113, 114, 115, 117, 118, 119,
++    120, 121, 122, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136,
++    137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 148, 149, 150, 151,
++    152, 153, 154, 155, 155, 156, 157, 158, 159, 159, 160, 161, 162, 163, 163, 164,
++    165, 166, 167, 167, 168, 169, 170, 170, 171, 172, 173, 173, 174, 175, 175, 176,
++    177, 178, 178, 179, 180, 180, 181, 182, 182, 183, 184, 185, 185, 186, 187, 187,
++    188, 189, 189, 190, 190, 191, 192, 192, 193, 194, 194, 195, 196, 196, 197, 197,
++    198, 199, 199, 200, 200, 201, 202, 202, 203, 203, 204, 205, 205, 206, 206, 207,
++    208, 208, 209, 209, 210, 210, 211, 212, 212, 213, 213, 214, 214, 215, 215, 216,
++    216, 217, 218, 218, 219, 219, 220, 220, 221, 221, 222, 222, 223, 223, 224, 224,
++    225, 226, 226, 227, 227, 228, 228, 229, 229, 230, 230, 231, 231, 232, 232, 233,
++    233, 234, 234, 235, 235, 236, 236, 237, 237, 238, 238, 238, 239, 239, 240, 240,
++    241, 241, 242, 242, 243, 243, 244, 244, 245, 245, 246, 246, 246, 247, 247, 248,
++    248, 249, 249, 250, 250, 251, 251, 251, 252, 252, 253, 253, 254, 254, 255, 255,
++};
++
+ // ---------------------------------------------------------------------
+ //  NexOS.Forms managed (C#) GUI shell bridge.
+ //  The shell is driven by MiniCLR, which only ships in the 32-bit kernel;
+@@ -59,11 +99,28 @@ static inline void        mforms_set_running(uint32_t) {}
+ // that reaches the bottom of the screen.
+ constexpr int MANAGED_TASKBAR_H = 48;
+ 
++// =====================================================================
++//  Remote-control security guard  (kernel-native -- no Python dependency)
++//  Full-screen "NexOS 安全卫士" overlay shown whenever a command arrives
++//  over a remote channel (COM1 bridge / SSH).  State + forward decls live
++//  here (file scope, before the Win11Desktop class) so class methods such
++//  as render_all() and handle_mouse_down() can reach them.
++// =====================================================================
++static bool   g_remote_active   = false;                 // machine is being remotely controlled
++static char   g_remote_who[64]  = {0};                   // controller identity shown to the user
++static char   g_remote_cmd[512] = {0};                   // latest command (center display)
++static char   g_remote_log[8][256] = {{0}};              // recent command scrollback
++static int    g_remote_log_n    = 0;
++static int    g_remote_btn_x = 0, g_remote_btn_y = 0, g_remote_btn_w = 0, g_remote_btn_h = 0;
++extern "C" void gui_remote_end(void);                    // defined below, called by handle_mouse_down
++extern "C" void draw_remote_guard(void);                 // defined below (inside extern "C"), called by render_all
++
+ // Clipboard is owned by the kernel but shared with the GUI (terminal /
+ // browser URL copy-paste) and the C# host bridge.
+ extern char g_clipboard[256];
+ extern int  g_clipboard_len;
+ extern void clipboard_set(const char* text, int len);
++extern bool g_host_cursor_active;   // defined in kernel.cpp (VMMDev absolute-mouse flag)
+ 
+ // ---- VBE info structure (at physical address 0x5000, set by stage2/UEFI) ----
+ // Extended for real-hardware UEFI GOP support
+@@ -427,26 +484,48 @@ static void uint_to_str(uint32_t val, char* buf) {
+ // =====================================================================
+ typedef uint32_t Color;
+ 
+-// Win11 accent colors
+-constexpr Color C_ACCENT       = 0x0067C0;  // Win11 blue
+-constexpr Color C_ACCENT_LIGHT = 0x4CC2FF;  // Light blue hover
+-constexpr Color C_ACCENT_DARK  = 0x003E92;  // Dark blue pressed
++// Unified accent (Windows 7 Aero blue)
++constexpr Color C_ACCENT       = 0x2A82DA;  // Aero blue (unified accent)
++constexpr Color C_ACCENT_LIGHT = 0x5AA9F0;  // Light blue hover
++constexpr Color C_ACCENT_DARK  = 0x1B5FB0;  // Dark blue pressed
+ constexpr Color C_ACCENT_ORANGE = 0xFF8C00; // Orange accent for start menu icon
+ 
+-// Desktop wallpaper (gradient from dark blue to lighter blue)
+-constexpr Color C_WALLPAPER_TOP    = 0x0A2540;  // Deep navy
+-constexpr Color C_WALLPAPER_BOT    = 0x1B4965;  // Medium blue
+-
+-// Top status bar
+-constexpr Color C_TOPBAR_BG        = 0x1F1F1F;  // Near-black with transparency feel
+-constexpr Color C_TOPBAR_BORDER    = 0x2D2D2D;
++// Aero frosted-glass material constants (Windows 7 "毛玻璃")
++constexpr Color C_GLASS_TINT        = 0xF2F6FB;  // neutral window glass (light frost)
++constexpr Color C_GLASS_TINT_ACT    = 0xD4E7F8;  // active window: accent-tinted glass
++constexpr int   C_GLASS_ALPHA       = 180;       // body glass opacity (lower = more blur shows)
++constexpr int   C_GLASS_BLUR_R      = 6;         // frosted-glass blur radius (px)
++// Iterations of the separable box blur.  A single box pass looks blocky/boxy;
++// repeating it 2-3 times converges to a Gaussian, which is what makes acrylic
++// look smooth ("丝滑").  2 passes is the quality/perf sweet spot under TCG.
++constexpr int   C_GLASS_BLUR_PASSES = 2;
++constexpr int   C_GLASS_TITLE_ALPHA = 200;       // extra title-band opacity
++constexpr Color C_GLASS_EDGE        = 0xFFFFFF;  // 1px top glass highlight
++constexpr int   C_GLASS_EDGE_ALPHA  = 60;
++constexpr Color C_GLASS_GLOW        = 0x2A82DA;  // active-window accent glow
++constexpr int   C_GLASS_GLOW_ALPHA  = 38;
++
++// Desktop wallpaper — deep dark Mica gradient with a soft accent bloom
++constexpr Color C_WALLPAPER_TOP    = 0x0B0F16;  // Near-black navy
++constexpr Color C_WALLPAPER_BOT    = 0x16202E;  // Dark slate
++constexpr Color C_WALLPAPER_GLOW    = 0x1E3A5F; // Accent bloom focal
++
++// Unified corner radius
++constexpr int   WIN_RADIUS = 8;   // windows / start menu / major surfaces
++constexpr int   CTL_RADIUS = 6;   // controls (buttons, inputs)
++
++// Top status bar (dark frosted glass)
++constexpr Color C_TOPBAR_BG        = 0x161D27;  // dark glass base
++constexpr int   C_TOPBAR_GLASS_A   = 175;       // glass opacity over wallpaper
++constexpr Color C_TOPBAR_BORDER    = 0x2A3340;
+ constexpr Color C_TOPBAR_TEXT      = 0xFFFFFF;
+-constexpr Color C_TOPBAR_HOVER     = 0x323232;
++constexpr Color C_TOPBAR_HOVER     = 0x27313F;
+ 
+-// Start menu
+-constexpr Color C_STARTMENU_BG     = 0x202020;
+-constexpr Color C_STARTMENU_BORDER = 0x3D3D3D;
+-constexpr Color C_STARTMENU_HOVER  = 0x383838;
++// Start menu (dark frosted glass)
++constexpr Color C_STARTMENU_BG     = 0x161D27;  // dark glass base
++constexpr int   C_STARTMENU_GLASS_A= 185;       // glass opacity
++constexpr Color C_STARTMENU_BORDER = 0x3A4756;
++constexpr Color C_STARTMENU_HOVER  = 0x27313F;
+ 
+ // Windows
+ constexpr Color C_WIN_BG           = 0xF3F3F3;  // Win11 light gray window bg
+@@ -898,8 +977,18 @@ int g_font_px = 16;                 // target glyph height in pixels (BIOS 8x16)
+ // Font rendering mode:
+ //   0 = BIOS default 1-bit 8x16 bitmap (thin, no anti-aliasing, low memory)
+ //   1 = baked grayscale AA Latin (font_la16.bin) + vector TrueType (msyh.ttf)
+-// BIOS mode is the default to keep text crisp/thin and to save RAM on small
+-// (512 MB) VMs.  Set g_font_mode = 1 before gui_init() for the AA look.
++// Mode 1 (vector) is the default: both ASCII (Latin) and CJK glyphs are
++// rasterized from the TrueType outline in msyh.ttf (the thin/light YaHei subset
++// baked into SFS), so English and Chinese share one consistent, anti-aliased
++// vector face at every UI size.  Mode 0 falls back to the 1-bit 8x16 BIOS bitmap
++// (no AA) for tiny VMs.  Per user request the GUI now boots in vector mode with
++// English and Chinese rendered identically.
++// Font rendering mode:
++//   0 = BIOS 8x16 bitmap font (code page 437) -- the default, a clean,
++//       high-contrast bitmap glyph that users associate with a classic PC.
++//   1 = baked grayscale AA Latin (font_la16.bin) + vector TrueType (msyh.ttf).
++// The AA path was found to look muddy/ugly, so BIOS is the default; the
++// smoother font is opt-in via the experimental settings toggle.
+ static int g_font_mode = 0;
+ 
+ // Dirty-rectangle tracking for compositing.  render_all() accumulates the
+@@ -909,18 +998,120 @@ static int g_font_mode = 0;
+ // to a full flip; localized overlays (popups, IME bar, cursor) keep the dirty
+ // rect small so only that strip is copied.  The mouse-move path in the main
+ // loop already uses present_rect() directly and never calls render_all().
+-static int g_dirty_x0 = 0, g_dirty_y0 = 0, g_dirty_x1 = 0, g_dirty_y1 = 0;
++// Damage is a short LIST of rectangles, not one bounding box.  With a single
++// union box the cost was dominated by geometry, not by real change: the
++// pointer near the top of the screen and the taskbar clock strip at the bottom
++// union into almost the whole display, so the "partial" redraw still
++// post-processed and flipped ~900k pixels every frame.  Keeping a few small
++// separate rects makes the work proportional to what actually changed.
++// A tile grid is what real compositors use for damage: rects are marked at
++// tile granularity while drawing, then coalesced back into tight rectangles
++// when the frame is flushed.  Unlike a bounding box (or a small fixed list,
++// which silently folds its overflow into one huge rect) this keeps the
++// post-process and flip cost proportional to the pixels that really changed,
++// however the damage is scattered across the screen.
++enum { TILE_SHIFT = 5, TILE = 32,          // 32x32 tiles
++       TILE_NX = 64, TILE_NY = 40,         // covers up to 2048x1280
++       DMG_RECT_MAX = 24 };
++
++static uint8_t g_tile[TILE_NX * TILE_NY];  // 1 = damaged
++static int  g_tile_nx = 0, g_tile_ny = 0;
++static int  g_sw = 0, g_sh = 0;            // screen size for this frame
+ static bool g_dirty_valid = false;
+-static inline void dirty_reset() { g_dirty_valid = false; }
++// Tile-space bounding box of the damage, so reset/flush touch only the part
++// of the grid that is actually in use.  Clearing and scanning all ~920 tiles
++// every frame cost more than the pixels they saved.
++static int  g_tbx0 = 0, g_tby0 = 0, g_tbx1 = -1, g_tby1 = -1;
++
++// Coalesced output rectangles for the current frame (filled by dirty_flush).
++static int g_dmg[DMG_RECT_MAX][4];
++static int g_dmg_n = 0;
++
++static void dirty_reset(int sw, int sh) {
++    g_sw = sw; g_sh = sh;
++    bool resized = false;
++    int nx = (sw + TILE - 1) >> TILE_SHIFT;
++    int ny = (sh + TILE - 1) >> TILE_SHIFT;
++    if (nx > TILE_NX) nx = TILE_NX;
++    if (ny > TILE_NY) ny = TILE_NY;
++    if (nx != g_tile_nx || ny != g_tile_ny) { resized = true; g_tile_nx = nx; g_tile_ny = ny; }
++    // Clear only the tiles we touched last frame (or everything if the grid
++    // was just resized, since the bbox no longer maps to the same layout).
++    if (resized) {
++        for (int i = 0; i < g_tile_nx * g_tile_ny; i++) g_tile[i] = 0;
++    } else if (g_tbx1 >= 0) {
++        for (int ty = g_tby0; ty <= g_tby1; ty++)
++            for (int tx = g_tbx0; tx <= g_tbx1; tx++)
++                g_tile[ty * g_tile_nx + tx] = 0;
++    }
++    g_tbx0 = g_tile_nx; g_tby0 = g_tile_ny; g_tbx1 = -1; g_tby1 = -1;
++    g_dmg_n = 0;
++    g_dirty_valid = false;
++}
++
+ static inline void dirty_add(int x, int y, int w, int h) {
++    if (w <= 0 || h <= 0) return;
++    if (x < 0) { w += x; x = 0; }
++    if (y < 0) { h += y; y = 0; }
+     if (w <= 0 || h <= 0) return;
+     int x1 = x + w, y1 = y + h;
+-    if (!g_dirty_valid) { g_dirty_x0 = x; g_dirty_y0 = y; g_dirty_x1 = x1; g_dirty_y1 = y1; g_dirty_valid = true; }
+-    else {
+-        if (x  < g_dirty_x0) g_dirty_x0 = x;
+-        if (y  < g_dirty_y0) g_dirty_y0 = y;
+-        if (x1 > g_dirty_x1) g_dirty_x1 = x1;
+-        if (y1 > g_dirty_y1) g_dirty_y1 = y1;
++    if (x1 > g_sw) x1 = g_sw;
++    if (y1 > g_sh) y1 = g_sh;
++    if (x >= x1 || y >= y1 || g_tile_nx <= 0) return;
++    int tx0 = x >> TILE_SHIFT,  tx1 = (x1 - 1) >> TILE_SHIFT;
++    int ty0 = y >> TILE_SHIFT,  ty1 = (y1 - 1) >> TILE_SHIFT;
++    if (tx1 >= g_tile_nx) tx1 = g_tile_nx - 1;
++    if (ty1 >= g_tile_ny) ty1 = g_tile_ny - 1;
++    for (int ty = ty0; ty <= ty1; ty++)
++        for (int tx = tx0; tx <= tx1; tx++)
++            g_tile[ty * g_tile_nx + tx] = 1;
++    if (tx0 < g_tbx0) g_tbx0 = tx0;
++    if (ty0 < g_tby0) g_tby0 = ty0;
++    if (tx1 > g_tbx1) g_tbx1 = tx1;
++    if (ty1 > g_tby1) g_tby1 = ty1;
++    g_dirty_valid = true;
++}
++
++// Coalesce the grid: take each horizontal run of damaged tiles, then grow it
++// downwards for as long as the same columns stay damaged.  Clears as it goes,
++// so the grid is empty for the next frame.
++static void dirty_flush() {
++    g_dmg_n = 0;
++    if (g_tbx1 < 0) return;                 // nothing damaged this frame
++    for (int ty = g_tby0; ty <= g_tby1; ty++) {
++        int tx = g_tbx0;
++        while (tx <= g_tbx1) {
++            if (!g_tile[ty * g_tile_nx + tx]) { tx++; continue; }
++            int tx2 = tx;
++            while (tx2 < g_tile_nx && g_tile[ty * g_tile_nx + tx2]) tx2++;
++            int ty2 = ty + 1;
++            while (ty2 < g_tile_ny) {
++                bool ok = true;
++                for (int k = tx; k < tx2; k++)
++                    if (!g_tile[ty2 * g_tile_nx + k]) { ok = false; break; }
++                if (!ok) break;
++                ty2++;
++            }
++            for (int y2 = ty; y2 < ty2; y2++)
++                for (int k = tx; k < tx2; k++)
++                    g_tile[y2 * g_tile_nx + k] = 0;
++            int rx0 = tx << TILE_SHIFT,  ry0 = ty << TILE_SHIFT;
++            int rx1 = tx2 << TILE_SHIFT, ry1 = ty2 << TILE_SHIFT;
++            if (rx1 > g_sw) rx1 = g_sw;      // clip tiles that overhang the edge
++            if (ry1 > g_sh) ry1 = g_sh;
++            if (g_dmg_n < DMG_RECT_MAX) {
++                g_dmg[g_dmg_n][0] = rx0; g_dmg[g_dmg_n][1] = ry0;
++                g_dmg[g_dmg_n][2] = rx1; g_dmg[g_dmg_n][3] = ry1;
++                g_dmg_n++;
++            } else {
++                int* r = g_dmg[DMG_RECT_MAX - 1];   // rare: fold the remainder
++                if (rx0 < r[0]) r[0] = rx0;
++                if (ry0 < r[1]) r[1] = ry0;
++                if (rx1 > r[2]) r[2] = rx1;
++                if (ry1 > r[3]) r[3] = ry1;
++            }
++            tx = tx2;
++        }
+     }
+ }
+ 
+@@ -934,6 +1125,36 @@ static inline void dirty_add(int x, int y, int w, int h) {
+ // is detected automatically without touching every call site.
+ static bool g_desk_needs_full = true;   // first frame must paint the desktop
+ static uint32_t g_desk_sig = 0;
++// Forced taskbar/overlay repaint (set by gui_invalidate_managed).
++static bool g_over_force = false;
++
++// Invalidate the cached managed layers.  The desktop and overlay layers are
++// cached for speed, but their CONTENT is owned by C#, whose state changes
++// (Start menu opening, theme edits, icon selection) are invisible to the
++// native window-set signature used as the cache key.  Without this the Start
++// menu would never appear: C# opens it, the signature does not change, and
++// the retained layer keeps painting the old frame.  Any managed input event
++// may change that state, so the managed entry points call this.
++extern "C" void gui_invalidate_managed(void) {
++    g_desk_needs_full = true;
++    g_over_force = true;
++}
++// Partial-redraw compositing (dirty-rect + desktop-layer caching).
++// 1 = ON by default -- this is what makes the desktop smooth: the managed
++//    (C#) desktop costs ~95 ms per frame, so re-running it every frame caps
++//    the shell at ~5 fps.  When the window set is unchanged the desktop layer
++//    is retained and only the changed rectangles are post-processed and
++//    flipped to the LFB, which is the same damage model WinUI/DWM uses.
++// 0 = OFF: repaint the managed desktop in full every frame (debug path --
++//    correct but ~5 fps).  Toggle in Settings > Display.
++int g_perf_opt = 1;
++extern "C" void gui_set_perf_opt(int on) { g_perf_opt = on ? 1 : 0; }
++
++// Frame-rate instrumentation (render_all prints at most once per second).
++static uint32_t fps_t0 = 0;
++static uint32_t fps_frames = 0;
++
++
+ // desk_sig() is defined just before render_all() so it can see `windows`/`Win`.
+ constexpr int TOPBAR_H = 32;
+ 
+@@ -1492,28 +1713,88 @@ struct Graphics {
+         backbuffer[y * width + x] = (uint32_t)((r << 16) | (g << 8) | b);
+     }
+ 
+-    // Alpha-blend a solid colour inside a rounded rect over existing pixels.
+-    // Used for the Win11-style soft shadow + frosted (translucent) rim.
++    // ---- Gamma-correct alpha blend (modern, crisp text rendering) ----
++    // Plain alpha-over blends in (perceptual) sRGB space, which makes thin AA
++    // glyph edges look washed-out / blurry.  Blending in linear light instead
++    // is what FreeType/ClearType-style engines do, and yields the tight,
++    // high-contrast strokes users associate with a modern OS font.  The LUTs
++    // (G_TO_LIN / G_TO_SRGB) are precomputed offline into file scope so we stay
++    // freestanding (no libm / pow()).
++    inline void blend_pixel_lin(int x, int y, Color c, int alpha) {
++        if (alpha <= 0) return;
++        if ((uint32_t)x >= width || (uint32_t)y >= height) return;
++        if (alpha >= 255) { put_pixel(x, y, c); return; }
++        uint32_t d = backbuffer[y * width + x];
++        int dr = G_TO_LIN[(d >> 16) & 0xFF], dg = G_TO_LIN[(d >> 8) & 0xFF], db = G_TO_LIN[d & 0xFF];
++        int cr = G_TO_LIN[(c >> 16) & 0xFF], cg = G_TO_LIN[(c >> 8) & 0xFF], cb = G_TO_LIN[c & 0xFF];
++        int a = alpha;
++        int r = (dr * (255 - a) + cr * a) / 255;
++        int g = (dg * (255 - a) + cg * a) / 255;
++        int b = (db * (255 - a) + cb * a) / 255;
++        backbuffer[y * width + x] =
++            ((uint32_t)G_TO_SRGB[r] << 16) | ((uint32_t)G_TO_SRGB[g] << 8) | G_TO_SRGB[b];
++    }
++
++    // Sample a ClearType coverage bitmap (3 subpixels per destination pixel)
++    // at subpixel column c3.  vec_glyph() rasterizes at 3x horizontal
++    // resolution, so the buffer is cov_w = 3*pixel_w bytes wide and subpixel
++    // c3 = 3*col + k lands directly on the R/G/B coverage for destination col.
++    static int sample_cov(const uint8_t* s, int wc, int c3) {
++        if (c3 < 0)   c3 = 0;
++        if (c3 >= wc) c3 = wc - 1;
++        return s[c3];
++    }
++
++    // Gamma-correct subpixel (ClearType-style) blend: R/G/B are composited
++    // with their own coverage value independently, so a glyph can sharpen
++    // horizontal stems by ~3x without changing its vertical size.
++    inline void blend_subpixel(int x, int y, Color fg, int aR, int aG, int aB) {
++        if ((uint32_t)x >= width || (uint32_t)y >= height) return;
++        if (aR <= 4 && aG <= 4 && aB <= 4) return;
++        uint32_t d = backbuffer[y * width + x];
++        int dr = G_TO_LIN[(d >> 16) & 0xFF], dg = G_TO_LIN[(d >> 8) & 0xFF], db = G_TO_LIN[d & 0xFF];
++        int fr = G_TO_LIN[(fg >> 16) & 0xFF], fg2 = G_TO_LIN[(fg >> 8) & 0xFF], fb = G_TO_LIN[fg & 0xFF];
++        int r = (dr * (255 - aR) + fr * aR) / 255;
++        int g = (dg * (255 - aG) + fg2 * aG) / 255;
++        int b = (db * (255 - aB) + fb * aB) / 255;
++        backbuffer[y * width + x] =
++            ((uint32_t)G_TO_SRGB[r] << 16) | ((uint32_t)G_TO_SRGB[g] << 8) | G_TO_SRGB[b];
++    }
++
++    // Anti-aliased filled rounded rectangle (Win11 soft shadow / frosted rim /
++    // glass body).  A signed-distance field to the rounded-rect outline drives
++    // coverage: pixels well inside blend at full `alpha`, pixels within ~1px of
++    // an edge get partial coverage, pixels outside are skipped.  The result is
++    // smooth, *truly* rounded corners with no aliasing and no libm — gfx_isqrt
++    // only fires for the thin boundary ring, so large interior fills stay fast.
+     void blend_rounded_rect(int x, int y, int w, int h, int r, Color c, int alpha) {
+         if (alpha <= 0) return;
+         if (alpha > 255) alpha = 255;
++        if (r < 0) r = 0;
+         if (r > h / 2) r = h / 2;
+         if (r > w / 2) r = w / 2;
+-        if (r < 0) r = 0;
+-        // Center rectangle
+-        blend_rect(x + r, y, w - 2 * r, h, c, alpha);
+-        // Top and bottom strips
+-        blend_rect(x, y + r, r, h - 2 * r, c, alpha);
+-        blend_rect(x + w - r, y + r, r, h - 2 * r, c, alpha);
+-        // Corners
+-        for (int dy = 0; dy < r; dy++) {
+-            int dx = (int)(r * 0.7 - dy * 0.3);
+-            if (dx < 0) dx = 0;
+-            for (int i = 0; i <= dx; i++) {
+-                blend_pixel(x + r - 1 - i, y + r - 1 - dy, c, alpha);
+-                blend_pixel(x + w - r + i, y + r - 1 - dy, c, alpha);
+-                blend_pixel(x + r - 1 - i, y + h - r + dy, c, alpha);
+-                blend_pixel(x + w - r + i, y + h - r + dy, c, alpha);
++        if (r == 0) { blend_rect(x, y, w, h, c, alpha); return; }
++        int x0 = x - 1, y0 = y - 1, x1 = x + w + 1, y1 = y + h + 1;
++        if (x0 < 0) x0 = 0;
++        if (y0 < 0) y0 = 0;
++        if (x1 > width)  x1 = width;
++        if (y1 > height) y1 = height;
++        if (x1 <= x0 || y1 <= y0) return;
++        int hw = w / 2, hh = h / 2;
++        int cx = x + w / 2, cy = y + h / 2;
++        for (int py = y0; py < y1; py++) {
++            int ay = ((py < cy) ? (cy - py) : (py - cy)) - (hh - r);
++            int qy = (ay > 0) ? ay : 0;
++            for (int px = x0; px < x1; px++) {
++                int ax = ((px < cx) ? (cx - px) : (px - cx)) - (hw - r);
++                int qx = (ax > 0) ? ax : 0;
++                int d;
++                if (qx == 0 && qy == 0) d = -r;                 // deep inside
++                else d = gfx_isqrt(qx * qx + qy * qy) - r;      // SDF (px)
++                int t = 128 - d * 256;                          // (0.5 - d) · 256
++                if (t <= 0) continue;                           // outside shape
++                if (t > 256) t = 256;                           // full coverage
++                blend_pixel(px, py, c, (t * alpha) >> 8);
+             }
+         }
+     }
+@@ -1537,53 +1818,94 @@ struct Graphics {
+         }
+     }
+ 
+-    // Filled rounded rectangle (Win11 style corners)
++    // Integer square root (freestanding, no libm).  Used for true circular
++    // rounded corners and the radial gradient helpers.
++    static int gfx_isqrt(int v) {
++        if (v <= 0) return 0;
++        int res = 0;
++        for (int bit = 1 << 15; bit != 0; bit >>= 1) {
++            int t = res | bit;
++            if (t * t <= v) res = t;
++        }
++        return res;
++    }
++
++    // Filled rounded rectangle (Win11 style corners).
++    // The four corner squares keep the quarter-disc and cut the outer tip,
++    // so the corners are real circular arcs instead of a chunky approximation.
+     void fill_rounded_rect(int x, int y, int w, int h, int r, Color c) {
+         if (r > h / 2) r = h / 2;
+         if (r > w / 2) r = w / 2;
+-        if (r < 0) r = 0;
+-        // Center rectangle
++        if (r <= 0) { fill_rect(x, y, w, h, c); return; }
++        // Center full-height band + left/right middle bands
+         fill_rect(x + r, y, w - 2 * r, h, c);
+-        // Top and bottom strips
+         fill_rect(x, y + r, r, h - 2 * r, c);
+         fill_rect(x + w - r, y + r, r, h - 2 * r, c);
+-        // Corners (approximate with quarter circles)
+-        for (int dy = 0; dy < r; dy++) {
+-            int dx = (int)(r * 0.7 - dy * 0.3);
+-            if (dx < 0) dx = 0;
+-            // Top-left
+-            for (int i = 0; i <= dx; i++) put_pixel(x + r - 1 - i, y + r - 1 - dy, c);
+-            // Top-right
+-            for (int i = 0; i <= dx; i++) put_pixel(x + w - r + i, y + r - 1 - dy, c);
+-            // Bottom-left
+-            for (int i = 0; i <= dx; i++) put_pixel(x + r - 1 - i, y + h - r + dy, c);
+-            // Bottom-right
+-            for (int i = 0; i <= dx; i++) put_pixel(x + w - r + i, y + h - r + dy, c);
+-        }
+-    }
+-
+-    // Draw rounded rectangle outline
++        int r2 = r * r;
++        // top-left
++        for (int py = y; py < y + r; py++)
++            for (int px = x; px < x + r; px++)
++                if ((px - (x + r)) * (px - (x + r)) + (py - (y + r)) * (py - (y + r)) <= r2) put_pixel(px, py, c);
++        // top-right
++        for (int py = y; py < y + r; py++)
++            for (int px = x + w - r; px < x + w; px++)
++                if ((px - (x + w - r)) * (px - (x + w - r)) + (py - (y + r)) * (py - (y + r)) <= r2) put_pixel(px, py, c);
++        // bottom-left
++        for (int py = y + h - r; py < y + h; py++)
++            for (int px = x; px < x + r; px++)
++                if ((px - (x + r)) * (px - (x + r)) + (py - (y + h - r)) * (py - (y + h - r)) <= r2) put_pixel(px, py, c);
++        // bottom-right
++        for (int py = y + h - r; py < y + h; py++)
++            for (int px = x + w - r; px < x + w; px++)
++                if ((px - (x + w - r)) * (px - (x + w - r)) + (py - (y + h - r)) * (py - (y + h - r)) <= r2) put_pixel(px, py, c);
++    }
++
++    // Draw rounded rectangle outline (true quarter-circle arcs)
+     void draw_rounded_rect(int x, int y, int w, int h, int r, Color c) {
+         if (r > h / 2) r = h / 2;
+         if (r > w / 2) r = w / 2;
+-        if (r < 0) r = 0;
+-        // Top and bottom edges
++        if (r <= 0) { draw_rect(x, y, w, h, c); return; }
+         draw_line(x + r, y, x + w - r - 1, y, c);
+         draw_line(x + r, y + h - 1, x + w - r - 1, y + h - 1, c);
+-        // Left and right edges
+         draw_line(x, y + r, x, y + h - r - 1, c);
+         draw_line(x + w - 1, y + r, x + w - 1, y + h - r - 1, c);
+-        // Corner arcs
+         for (int dy = 0; dy < r; dy++) {
+-            int dx = (int)(r * 0.7 - dy * 0.3);
+-            if (dx < 0) dx = 0;
+-            put_pixel(x + r - 1 - dx, y + r - 1 - dy, c);
+-            put_pixel(x + w - r + dx, y + r - 1 - dy, c);
+-            put_pixel(x + r - 1 - dx, y + h - r + dy, c);
+-            put_pixel(x + w - r + dx, y + h - r + dy, c);
++            int s2 = r * r - (r - dy) * (r - dy);
++            if (s2 < 0) s2 = 0;
++            int hw = gfx_isqrt(s2);
++            put_pixel(x + r - 1 - hw, y + dy, c);              // top-left  arc
++            put_pixel(x + w - r + hw, y + dy, c);              // top-right arc
++            put_pixel(x + r - 1 - hw, y + h - 1 - dy, c);      // bottom-left arc
++            put_pixel(x + w - r + hw, y + h - 1 - dy, c);      // bottom-right arc
++        }
++    }
++
++    // ---- Inverse (XOR) rectangle — "反矩形" -----------------------------
++    // Flips every pixel's RGB (keeps the high byte).  Re-drawing the same rect
++    // restores the original, so it is ideal for selection / drag / focus
++    // rectangles that must stand out over any background without a backing
++    // store.  Bounds-clipped exactly like fill_rect.
++    void invert_rect(int x, int y, int w, int h) {
++        if (x < 0) { w += x; x = 0; }
++        if (y < 0) { h += y; y = 0; }
++        if (x + w > width)  w = width - x;
++        if (y + h > height) h = height - y;
++        if (w <= 0 || h <= 0) return;
++        for (int row = 0; row < h; row++) {
++            uint32_t* p = backbuffer + (y + row) * width + x;
++            for (int col = 0; col < w; col++) p[col] ^= 0x00FFFFFF;
+         }
+     }
+ 
++    // Inverse (XOR) rectangle outline
++    void invert_rect_outline(int x, int y, int w, int h) {
++        if (w <= 0 || h <= 0) return;
++        invert_rect(x, y, w, 1);
++        invert_rect(x, y + h - 1, w, 1);
++        invert_rect(x, y, 1, h);
++        invert_rect(x + w - 1, y, 1, h);
++    }
++
+ 
+     // Draw one Latin glyph.  X-stage: rasterize the TrueType outline via
+     // ---- Modern glyph cache -------------------------------------------
+@@ -1610,9 +1932,9 @@ struct Graphics {
+         }
+         if (slot < 0) return nullptr;
+         if (g_gc[slot].bmp) kfree(g_gc[slot].bmp);
+-        uint8_t* b = (uint8_t*)kmalloc((uint32_t)(w * h));
++        uint8_t* b = (uint8_t*)kmalloc((uint32_t)(3 * w * h));
+         if (!b) return nullptr;
+-        for (int i = 0; i < w * h; i++) b[i] = src[i];
++        for (int i = 0; i < 3 * w * h; i++) b[i] = src[i];
+         g_gc[slot].cp = cp; g_gc[slot].px = px;
+         g_gc[slot].w = w; g_gc[slot].h = h; g_gc[slot].xo = xo; g_gc[slot].yo = yo;
+         g_gc[slot].bmp = b; g_gc[slot].used = ++g_gc_seq;
+@@ -1643,11 +1965,16 @@ struct Graphics {
+                 int gx = x + xo;
+                 int gy = y + g_font_px + yo;
+                 if (bg != (Color)-1) fill_rect(gx, gy, w, h, bg);
+-                for (int row = 0; row < h; row++)
++                for (int row = 0; row < h; row++) {
++                    const uint8_t* src = g + row * (3 * w);
+                     for (int col = 0; col < w; col++) {
+-                        int a = g[row * w + col];
+-                        if (a > 4) blend_pixel(gx + col, gy + row, fg, a);
++                        int aR = sample_cov(src, 3 * w, col * 3 - 1);
++                        int aG = sample_cov(src, 3 * w, col * 3 + 0);
++                        int aB = sample_cov(src, 3 * w, col * 3 + 1);
++                        if (aR > 4 || aG > 4 || aB > 4)
++                            blend_subpixel(gx + col, gy + row, fg, aR, aG, aB);
+                     }
++                }
+                 int adv = vec_advance(c, g_font_px);
+                 (void)cached;
+                 return adv > 0 ? adv : (w + 1);
+@@ -1660,11 +1987,14 @@ struct Graphics {
+             const uint8_t* g = fla16_glyph(c, &w, &h);
+             if (g) {
+                 if (bg != (Color)-1) fill_rect(x, y, w, h, bg);
+-                for (int row = 0; row < h; row++)
++                for (int row = 0; row < h; row++) {
++                    const uint8_t* src = g + row * w;
+                     for (int col = 0; col < w; col++) {
+-                        int a = g[row * w + col];
+-                        if (a > 4) blend_pixel(x + col, y + row, fg, a);
++                        int a = sample_cov(src, w, col);
++                        if (a > 4)
++                            blend_subpixel(x + col, y + row, fg, a, a, a);
+                     }
++                }
+                 return fla16_advance(c);   // real per-glyph advance
+             }
+         }
+@@ -1705,6 +2035,35 @@ struct Graphics {
+         }
+     }
+ 
++    // Faux-bold: stroke the glyph 4x with 1px offsets then once centered.
++    // Gives the UI modern weight for window titles / accent labels.
++    void draw_text_bold(int x, int y, const char* s, Color fg) {
++        draw_text_transparent(x - 1, y, s, fg);
++        draw_text_transparent(x + 1, y, s, fg);
++        draw_text_transparent(x, y - 1, s, fg);
++        draw_text_transparent(x, y + 1, s, fg);
++        draw_text_transparent(x, y, s, fg);
++    }
++    void draw_text_bold_bg(int x, int y, const char* s, Color fg, Color bg) {
++        draw_text(x - 1, y, s, fg, bg);
++        draw_text(x + 1, y, s, fg, bg);
++        draw_text(x, y - 1, s, fg, bg);
++        draw_text(x, y + 1, s, fg, bg);
++        draw_text(x, y, s, fg, bg);
++    }
++    // Text with a soft offset shadow (modern glass / depth cue).
++    // sh = shadow colour, so = shadow offset in px.
++    void draw_text_shadow(int x, int y, const char* s, Color fg,
++                          Color sh = 0x000000, int so = 1) {
++        draw_text_transparent(x + so, y + so, s, sh);
++        draw_text_transparent(x, y, s, fg);
++    }
++    void draw_text_shadow_bg(int x, int y, const char* s, Color fg, Color bg,
++                             Color sh = 0x000000, int so = 1) {
++        draw_text(x + so, y + so, s, sh, bg);
++        draw_text(x, y, s, fg, bg);
++    }
++
+     // ================= CJK (GB2312 16x16) rendering =================
+     static int zfont_find_unicode(uint32_t cp) {
+         int lo = 0, hi = (int)zfont_count - 1;
+@@ -1729,11 +2088,16 @@ struct Graphics {
+                 int gx = x + xo;
+                 int gy = y + g_font_px + yo;
+                 if (bg != (Color)-1) fill_rect(gx, gy, w, h, bg);
+-                for (int row = 0; row < h; row++)
++                for (int row = 0; row < h; row++) {
++                    const uint8_t* src = g + row * (3 * w);
+                     for (int col = 0; col < w; col++) {
+-                        int a = g[row * w + col];
+-                        if (a > 4) blend_pixel(gx + col, gy + row, fg, a);
++                        int aR = sample_cov(src, 3 * w, col * 3 - 1);
++                        int aG = sample_cov(src, 3 * w, col * 3 + 0);
++                        int aB = sample_cov(src, 3 * w, col * 3 + 1);
++                        if (aR > 4 || aG > 4 || aB > 4)
++                            blend_subpixel(gx + col, gy + row, fg, aR, aG, aB);
+                     }
++                }
+                 int adv = vec_advance(cp, g_font_px);
+                 return adv > g_font_px ? adv : g_font_px;
+             }
+@@ -1771,8 +2135,9 @@ struct Graphics {
+                 int gy = y + g_font_px + yo;
+                 for (int row = 0; row < h; row++)
+                     for (int col = 0; col < w; col++) {
+-                        int a = g[row * w + col];
+-                        if (a > 4) blend_pixel(gx + col, gy + row, fg, a);
++                        int base = row * (3 * w) + col * 3;
++                        int a = (g[base] + g[base + 1] + g[base + 2]) / 3;
++                        if (a > 4) blend_pixel_lin(gx + col, gy + row, fg, a);
+                     }
+                 int adv = vec_advance(cp, g_font_px);
+                 return adv > g_font_px ? adv : g_font_px;
+@@ -2229,13 +2594,143 @@ enum AppType {
+     APP_AISETUP,        // one-tap AI enablement wizard (managed)
+     APP_AIAGENT,        // AI Agent runner (managed): Planner/Actor/Critic
+     APP_DEMO,           // button-shrink + reply "啊" demo window (managed)
++    APP_START_MENU,      // Start menu: loaded into the window DB so it is
++                         // composited & dirty-tracked like any other window
+ };
+ 
+-constexpr int MAX_WINDOWS = 8;
++constexpr int MAX_WINDOWS = 10;   // +headroom: slot 0 is permanently the Start menu
+ constexpr int TITLE_BAR_H = 32;
+ constexpr int MAX_ICONS = 8;
+ constexpr int MAX_START_ITEMS = 8;
+ 
++// ---- Frosted-glass (毛玻璃) blur helpers (file scope, not class members) ----
++// One reusable scratch buffer for the separable box blur; grown on demand.
++static uint32_t* g_glass_tmp = nullptr;
++static int       g_glass_tmp_n = 0;
++static uint32_t* glass_tmp(int n) {
++    if (n > g_glass_tmp_n) {
++        if (g_glass_tmp) kfree(g_glass_tmp);
++        g_glass_tmp = (uint32_t*)kmalloc((uint32_t)(n * 4u));
++        g_glass_tmp_n = n;
++    }
++    return g_glass_tmp;
++}
++// Local integer sqrt (mirrors Graphics::gfx_isqrt) so these helpers stay
++// independent of the Graphics class's private members.
++static int glass_isqrt(int v) {
++    if (v <= 0) return 0;
++    int res = 0;
++    for (int bit = 1 << 15; bit != 0; bit >>= 1) {
++        int t = res | bit;
++        if (t * t <= v) res = t;
++    }
++    return res;
++}
++// Linear-space color mix: out = mix(dst, src, a) with a in 0..255.  Gamma
++// correction keeps the frosted tint from washing out / banding.
++static inline uint32_t mix_colors(uint32_t dst, uint32_t src, int a) {
++    int dr = G_TO_LIN[(dst >> 16) & 0xFF], dg = G_TO_LIN[(dst >> 8) & 0xFF], db = G_TO_LIN[dst & 0xFF];
++    int sr = G_TO_LIN[(src >> 16) & 0xFF], sg = G_TO_LIN[(src >> 8) & 0xFF], sb = G_TO_LIN[src & 0xFF];
++    int r = (dr * (255 - a) + sr * a) / 255;
++    int g = (dg * (255 - a) + sg * a) / 255;
++    int b = (db * (255 - a) + sb * a) / 255;
++    return ((uint32_t)G_TO_SRGB[r] << 16) | ((uint32_t)G_TO_SRGB[g] << 8) | G_TO_SRGB[b];
++}
++// Separable box blur over a screen rectangle, writing the blurred result back
++// into the backbuffer.  O(area) via sliding-window sums (no per-pixel inner
++// loop).  tmp must hold bw*bh uint32s.
++static void glass_blur_rect(Graphics& g, int x, int y, int w, int h, int r, uint32_t* tmp) {
++    if (r <= 0 || w <= 0 || h <= 0) return;
++    uint32_t* bb = g.backbuffer;
++    int W = g.width;
++    // horizontal pass: backbuffer -> tmp
++    for (int yy = 0; yy < h; yy++) {
++        int base = (y + yy) * W + x;
++        int sr = 0, sg = 0, sb = 0, cnt = 0;
++        int s1 = r; if (s1 > w - 1) s1 = w - 1;
++        for (int k = 0; k <= s1; k++) { uint32_t p = bb[base + k]; sr += (p >> 16) & 0xFF; sg += (p >> 8) & 0xFF; sb += p & 0xFF; }
++        cnt = s1 + 1;
++        for (int xx = 0; xx < w; xx++) {
++            tmp[yy * w + xx] = (((uint32_t)(sr / cnt)) << 16) | (((uint32_t)(sg / cnt)) << 8) | ((uint32_t)(sb / cnt));
++            int addx = xx + r + 1;
++            int remx = xx - r;
++            if (addx < w) { uint32_t p = bb[base + addx]; sr += (p >> 16) & 0xFF; sg += (p >> 8) & 0xFF; sb += p & 0xFF; cnt++; }
++            if (remx >= 0) { uint32_t p = bb[base + remx]; sr -= (p >> 16) & 0xFF; sg -= (p >> 8) & 0xFF; sb -= p & 0xFF; cnt--; }
++        }
++    }
++    // vertical pass: tmp -> backbuffer
++    for (int xx = 0; xx < w; xx++) {
++        int sr = 0, sg = 0, sb = 0, cnt = 0;
++        int s1 = r; if (s1 > h - 1) s1 = h - 1;
++        for (int k = 0; k <= s1; k++) { uint32_t p = tmp[k * w + xx]; sr += (p >> 16) & 0xFF; sg += (p >> 8) & 0xFF; sb += p & 0xFF; }
++        cnt = s1 + 1;
++        for (int yy = 0; yy < h; yy++) {
++            bb[(y + yy) * W + (x + xx)] = (((uint32_t)(sr / cnt)) << 16) | (((uint32_t)(sg / cnt)) << 8) | ((uint32_t)(sb / cnt));
++            int addy = yy + r + 1;
++            int remy = yy - r;
++            if (addy < h) { uint32_t p = tmp[addy * w + xx]; sr += (p >> 16) & 0xFF; sg += (p >> 8) & 0xFF; sb += p & 0xFF; cnt++; }
++            if (remy >= 0) { uint32_t p = tmp[remy * w + xx]; sr -= (p >> 16) & 0xFF; sg -= (p >> 8) & 0xFF; sb -= p & 0xFF; cnt--; }
++        }
++    }
++}
++// Frosted glass: blur the rectangle behind, then lay a translucent tint over the
++// rounded shape (outside the rounding the original sharp pixels remain).
++// Falls back to the plain translucent fill if scratch memory is unavailable.
++static void glass_rounded_rect(Graphics& g, int x, int y, int w, int h, int r,
++                               Color c, int alpha, int blur_r) {
++    if (alpha <= 0) return;
++    if (r < 0) r = 0;
++    if (r > h / 2) r = h / 2;
++    if (r > w / 2) r = w / 2;
++    int x0 = x - 1, y0 = y - 1, x1 = x + w + 1, y1 = y + h + 1;
++    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
++    if (x1 > g.width)  x1 = g.width;
++    if (y1 > g.height) y1 = g.height;
++    if (x1 <= x0 || y1 <= y0) return;
++    int bw = x1 - x0, bh = y1 - y0;
++    uint32_t* tmp = glass_tmp(bw * bh);
++    if (!tmp) { g.blend_rounded_rect(x, y, w, h, r, c, alpha); return; }
++    // Iterated box blur -> Gaussian-like frost (each pass re-reads the already
++    // blurred backbuffer, so the result converges to a smooth falloff).
++    for (int p = 0; p < C_GLASS_BLUR_PASSES; p++)
++        glass_blur_rect(g, x0, y0, bw, bh, blur_r, tmp);
++    int hw = w / 2, hh = h / 2, cx = x + w / 2, cy = y + h / 2;
++    for (int py = y0; py < y1; py++) {
++        for (int px = x0; px < x1; px++) {
++            int ax = ((px < cx) ? (cx - px) : (px - cx)) - (hw - r);
++            int ay = ((py < cy) ? (cy - py) : (py - cy)) - (hh - r);
++            int qx = (ax > 0) ? ax : 0, qy = (ay > 0) ? ay : 0;
++            int d = (qx == 0 && qy == 0) ? -r : glass_isqrt(qx * qx + qy * qy) - r;
++            if (d > 0) continue;                       // outside rounding: leave sharp
++            int t = 128 - d * 256;                     // AA at the 1px edge
++            if (t > 256) t = 256;
++            if (t <= 0) continue;
++            int a_eff = (t * alpha) >> 8;
++            uint32_t blurred = g.backbuffer[py * g.width + px];
++            g.backbuffer[py * g.width + px] = mix_colors(blurred, c, a_eff);
++        }
++    }
++}
++// Rectangular frosted glass (no rounding), e.g. the top status bar.
++static void glass_rect(Graphics& g, int x, int y, int w, int h, Color c, int alpha, int blur_r) {
++    if (alpha <= 0) return;
++    int x0 = x, y0 = y, x1 = x + w, y1 = y + h;
++    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
++    if (x1 > g.width) x1 = g.width;
++    if (y1 > g.height) y1 = g.height;
++    if (x1 <= x0 || y1 <= y0) return;
++    int bw = x1 - x0, bh = y1 - y0;
++    uint32_t* tmp = glass_tmp(bw * bh);
++    if (!tmp) { g.blend_rect(x, y, w, h, c, alpha); return; }
++    for (int p = 0; p < C_GLASS_BLUR_PASSES; p++)
++        glass_blur_rect(g, x0, y0, bw, bh, blur_r, tmp);
++    for (int py = y0; py < y1; py++)
++        for (int px = x0; px < x1; px++) {
++            uint32_t blurred = g.backbuffer[py * g.width + px];
++            g.backbuffer[py * g.width + px] = mix_colors(blurred, c, alpha);
++        }
++}
++
+ struct Win11Window {
+     int x, y, w, h;
+     char title[40];
+@@ -2286,6 +2781,8 @@ struct Win11Window {
+     bool fullscreen;        // covers whole screen (floats over taskbar)
+     bool floating;          // always-on-top
+     int restore_x, restore_y, restore_w, restore_h; // pre-fullscreen rect
++    int snap;               // 0=free-floating, 1=tiled/snap (磁贴窗口)
++    int snap_rx, snap_ry, snap_rw, snap_rh; // pre-snap rect, for un-snapping
+     // Portal desktop state
+     int portal_tab;         // selected navigation tab (0=home,1=apps,2=system,3=tools)
+     // Win32 application state
+@@ -3111,6 +3608,7 @@ struct Win11Desktop {
+     StartMenuItem start_items[MAX_START_ITEMS];
+     int start_item_count;
+     bool start_menu_open;
++    int start_menu_id = -1;   // reserved window-DB slot for the Start menu
+ 
+     bool gui_mode;
+     int mouse_x, mouse_y;
+@@ -3172,6 +3670,25 @@ struct Win11Desktop {
+         drag_counter = 0;
+         prev_mouse_left = false;
+         start_menu_open = false;
++        // The fe_menu / fe_info structs are only closed by fe_menu_close();
++        // since g_wm is zero-initialised they otherwise start with win==0 (a
++        // "valid" slot) and fe_menu_paint() draws four stray menu strings
++        // ("Properties/Refresh/New folder/Delete") on the login / lock screen.
++        fe_menu_close();
++        // Reserve a window-DB slot for the Start menu so it is composited and
++        // dirty-tracked exactly like any other window.  It stays invisible until
++        // opened; render_all() syncs its geometry/visibility from start_menu_open.
++        start_menu_id = create_window(8, TOPBAR_H + 2, 380, 248, "Start", APP_START_MENU);
++        if (start_menu_id >= 0) {
++            windows[start_menu_id].visible   = false;
++            windows[start_menu_id].active    = false;
++            windows[start_menu_id].floating  = true;
++            windows[start_menu_id].minimized = false;
++            // setup_window() set active_window = start_menu_id (slot 0); the menu
++            // is closed now, so it must NOT claim keyboard focus.  Reset to "none"
++            // or the lock screen / desktop would never receive keystrokes.
++            active_window = -1;
++        }
+         anim_active_prev = false;
+         anim_tsc_per_ms = 0;
+         anim_ms_scale = 0;
+@@ -3313,9 +3830,14 @@ struct Win11Desktop {
+     // ---- Drawing functions ----
+ 
+     void draw_wallpaper() {
+-        // Portal-style light background with subtle gradient
++        // Deep dark Mica vertical gradient (the "desktop material")
+         gfx.fill_gradient(0, TOPBAR_H, gfx.width, gfx.height - TOPBAR_H,
+-                          C_PORTAL_BG, 0xE8EDF2);
++                          C_WALLPAPER_TOP, C_WALLPAPER_BOT);
++        // Soft accent "Aero bloom": faint accent wash in the upper region so
++        // the frosted glass windows sitting on top pick up a coloured glow.
++        int wb = gfx.width, hb = gfx.height - TOPBAR_H;
++        gfx.blend_rect(0, TOPBAR_H, wb, hb / 3, C_WALLPAPER_GLOW, 14);
++        gfx.blend_rect(0, TOPBAR_H, wb, hb / 6, C_WALLPAPER_GLOW, 12);
+     }
+ 
+     void draw_portal_desktop() {
+@@ -3346,7 +3868,7 @@ struct Win11Desktop {
+         // NexOS logo text above search
+         const char* logo = "NexOS";
+         int logo_w = strlen_(logo) * g_font_w * 2; // larger spacing
+-        gfx.draw_text_transparent(dx + (dw - logo_w)/2, sy - 28, logo, C_ACCENT);
++        gfx.draw_text_shadow(dx + (dw - logo_w)/2, sy - 28, logo, C_ACCENT, 0x0A0A0A, 1);
+ 
+         // ---- Quick access shortcuts grid ----
+         int grid_y = sy + search_h + 24;
+@@ -3412,7 +3934,7 @@ struct Win11Desktop {
+         {
+             int cx = dx + 16;
+             gfx.draw_card(cx, card_y, card_w, card_h, C_CARD_BG);
+-            gfx.draw_text_transparent(cx + 12, card_y + 8, "System Status", C_ACCENT);
++            gfx.draw_text_bold(cx + 12, card_y + 8, "System Status", C_ACCENT);
+             gfx.draw_line(cx + 12, card_y + 26, cx + card_w - 12, card_y + 26, C_WIN_BORDER);
+ 
+             char buf[64];
+@@ -3475,36 +3997,34 @@ struct Win11Desktop {
+     }
+ 
+     void draw_topbar() {
+-        // Top status bar background
+-        gfx.fill_rect(0, 0, gfx.width, TOPBAR_H, C_TOPBAR_BG);
++        // Top status bar — dark frosted glass over the Mica wallpaper.
++        glass_rect(gfx, 0, 0, gfx.width, TOPBAR_H, C_TOPBAR_BG, C_TOPBAR_GLASS_A, C_GLASS_BLUR_R);
++        // 1px bottom glass hairline (highlight + border sandwich)
++        gfx.blend_rect(0, TOPBAR_H - 1, gfx.width, 1, C_GLASS_EDGE, 40);
+         gfx.draw_line(0, TOPBAR_H, gfx.width, TOPBAR_H, C_TOPBAR_BORDER);
+ 
+         // Start button (Win logo square)
+         int sbx = 8, sby = 6;
+         int sbw = 44, sbh = 20;
+-        Color sb_bg = start_menu_open ? C_TOPBAR_HOVER : C_TOPBAR_BG;
+-        // Check hover
+-        if (mouse_x >= sbx && mouse_x < sbx + sbw && mouse_y >= 0 && mouse_y < TOPBAR_H) {
+-            sb_bg = C_TOPBAR_HOVER;
+-        }
+-        gfx.fill_rect(sbx, sby, sbw, sbh, sb_bg);
++        bool sb_hover = (mouse_x >= sbx && mouse_x < sbx + sbw && mouse_y >= 0 && mouse_y < TOPBAR_H)
++                        || start_menu_open;
++        gfx.blend_rounded_rect(sbx, sby, sbw, sbh, 4, C_TOPBAR_HOVER, sb_hover ? 150 : 80);
+         // 4 squares logo
+         gfx.fill_rect(sbx + 8, sby + 3, 6, 6, C_ACCENT);
+         gfx.fill_rect(sbx + 16, sby + 3, 6, 6, C_ACCENT_LIGHT);
+         gfx.fill_rect(sbx + 8, sby + 11, 6, 6, C_ACCENT_LIGHT);
+         gfx.fill_rect(sbx + 16, sby + 11, 6, 6, C_ACCENT_ORANGE);
+-        gfx.draw_text(sbx + 26, sby + 2, "Start", C_TOPBAR_TEXT, sb_bg);
++        gfx.draw_text_transparent(sbx + 26, sby + 2, "Start", C_TOPBAR_TEXT);
+ 
+         // Running app indicators (center area)
+         int ax = sbx + sbw + 16;
+         for (int i = 0; i < window_count; i++) {
+             if (!windows[i].visible) continue;
+             int aw = strlen_(windows[i].title) * g_font_w + 24;
+-            Color abg = windows[i].active ? C_TOPBAR_HOVER : C_TOPBAR_BG;
+-            if (mouse_x >= ax && mouse_x < ax + aw && mouse_y >= 0 && mouse_y < TOPBAR_H)
+-                abg = C_TOPBAR_HOVER;
+-            gfx.fill_rect(ax, 4, aw, TOPBAR_H - 8, abg);
+-            gfx.draw_text(ax + 8, 8, windows[i].title, C_TOPBAR_TEXT, abg);
++            bool ahover = (mouse_x >= ax && mouse_x < ax + aw && mouse_y >= 0 && mouse_y < TOPBAR_H);
++            gfx.blend_rounded_rect(ax, 4, aw, TOPBAR_H - 8, 4, C_TOPBAR_HOVER,
++                                   (ahover || windows[i].active) ? 150 : 70);
++            gfx.draw_text_transparent(ax + 8, 8, windows[i].title, C_TOPBAR_TEXT);
+             // Active indicator line
+             if (windows[i].active) {
+                 gfx.fill_rect(ax, TOPBAR_H - 4, aw, 3, C_ACCENT);
+@@ -3527,13 +4047,13 @@ struct Win11Desktop {
+             int ml = strlen_(mem_str);
+             mem_str[ml] = '%'; mem_str[ml+1] = 0;
+             int mw = strlen_(mem_str) * g_font_w + 8;
+-            gfx.draw_text(rx - mw, 8, mem_str, C_TOPBAR_TEXT, C_TOPBAR_BG);
++            gfx.draw_text_transparent(rx - mw, 8, mem_str, C_TOPBAR_TEXT);
+             rx -= mw + 8;
+         }
+ 
+         // 64-bit indicator
+         if (g_cb.is_64bit && g_cb.is_64bit()) {
+-            gfx.draw_text(rx - 3*g_font_w, 8, "64b", C_MEM_GOOD, C_TOPBAR_BG);
++            gfx.draw_text_transparent(rx - 3*g_font_w, 8, "64b", C_MEM_GOOD);
+             rx -= 3 * g_font_w + 8;
+         }
+     }
+@@ -3560,16 +4080,16 @@ struct Win11Desktop {
+         const int mw = 380, mh = 248;
+         const int mx = 8, my = TOPBAR_H + 2;
+ 
+-        // Shadow + background
+-        gfx.fill_rect(mx + 3, my + 3, mw, mh, 0x40000000);
+-        gfx.fill_rounded_rect(mx, my, mw, mh, 10, C_STARTMENU_BG);
+-        gfx.draw_rounded_rect(mx, my, mw, mh, 10, C_STARTMENU_BORDER);
++        // Shadow + dark frosted-glass background
++        gfx.blend_rounded_rect(mx + 3, my + 3, mw, mh, WIN_RADIUS + 2, 0x000000, 40);
++        glass_rounded_rect(gfx, mx, my, mw, mh, WIN_RADIUS, C_STARTMENU_BG, C_STARTMENU_GLASS_A, C_GLASS_BLUR_R);
++        gfx.draw_rounded_rect(mx, my, mw, mh, WIN_RADIUS, C_STARTMENU_BORDER);
+ 
+         // Header
+-        gfx.draw_text(mx + 16, my + 12, "Pinned", C_TOPBAR_TEXT, C_STARTMENU_BG);
+-        gfx.draw_text(mx + mw - 16 - 8 * g_font_w, my + 12, "All apps", C_ACCENT, C_STARTMENU_BG);
++        gfx.draw_text_transparent(mx + 16, my + 12, "Pinned", C_TOPBAR_TEXT);
++        gfx.draw_text_transparent(mx + mw - 16 - 8 * g_font_w, my + 12, "All apps", C_ACCENT);
+ 
+-        // Pinned grid: 4 columns x 2 rows of app tiles
++        // Pinned grid: 4 columns x 2 rows of app tiles (translucent glass)
+         const int tile_w = 80, tile_h = 64, gap = 8;
+         const int grid_x = mx + 16, grid_y = my + 40;
+         for (int i = 0; i < start_item_count; i++) {
+@@ -3578,13 +4098,13 @@ struct Win11Desktop {
+             int ty = grid_y + row * (tile_h + gap);
+             bool hover = (mouse_x >= tx && mouse_x < tx + tile_w &&
+                           mouse_y >= ty && mouse_y < ty + tile_h);
+-            Color tbg = hover ? C_STARTMENU_HOVER : C_STARTMENU_BG;
+-            gfx.fill_rounded_rect(tx, ty, tile_w, tile_h, 6, tbg);
++            gfx.blend_rounded_rect(tx, ty, tile_w, tile_h, CTL_RADIUS,
++                                   C_STARTMENU_HOVER, hover ? 160 : 70);
+             gfx.draw_icon(tx + (tile_w - 32) / 2, ty + 8, 32,
+                           start_items[i].color, start_items[i].letter, COLOR_WHITE);
+             int lw = strlen_(start_items[i].label) * g_font_w;
+             int lx = tx + (tile_w - lw) / 2; if (lx < tx) lx = tx;
+-            gfx.draw_text(lx, ty + tile_h - 16, start_items[i].label, C_TOPBAR_TEXT, tbg);
++            gfx.draw_text_transparent(lx, ty + tile_h - 16, start_items[i].label, C_TOPBAR_TEXT);
+         }
+ 
+         // Power bar (bottom): Shut down / Restart
+@@ -3594,15 +4114,17 @@ struct Win11Desktop {
+         int sx = mx + 16, rx = sx + pw + 12;
+         bool sh_hover = (mouse_x >= sx && mouse_x < sx + pw && mouse_y >= pbar_y && mouse_y < pbar_y + 32);
+         bool rs_hover = (mouse_x >= rx && mouse_x < rx + pw && mouse_y >= pbar_y && mouse_y < pbar_y + 32);
+-        gfx.fill_rounded_rect(sx, pbar_y, pw, 32, 6, sh_hover ? C_STARTMENU_HOVER : C_STARTMENU_BG);
+-        gfx.fill_rounded_rect(rx, pbar_y, pw, 32, 6, rs_hover ? C_STARTMENU_HOVER : C_STARTMENU_BG);
+-        gfx.draw_text(sx + 10, pbar_y + 9, "Shut down", C_TOPBAR_TEXT, sh_hover ? C_STARTMENU_HOVER : C_STARTMENU_BG);
+-        gfx.draw_text(rx + 10, pbar_y + 9, "Restart",   C_TOPBAR_TEXT, rs_hover ? C_STARTMENU_HOVER : C_STARTMENU_BG);
++        gfx.blend_rounded_rect(sx, pbar_y, pw, 32, CTL_RADIUS, C_STARTMENU_HOVER, sh_hover ? 170 : 80);
++        gfx.blend_rounded_rect(rx, pbar_y, pw, 32, CTL_RADIUS, C_STARTMENU_HOVER, rs_hover ? 170 : 80);
++        gfx.draw_text_transparent(sx + 10, pbar_y + 9, "Shut down", C_TOPBAR_TEXT);
++        gfx.draw_text_transparent(rx + 10, pbar_y + 9, "Restart",   C_TOPBAR_TEXT);
+     }
+ 
+     void draw_window(int id, int rx = -1, int ry = -1, int rw = -1, int rh = -1, int alpha = 255) {
+         Win11Window& win = windows[id];
+         if (!win.visible || win.minimized) return;
++        // Start menu: drawn as a frosted panel (no title bar / shadow / controls).
++        if (win.app == APP_START_MENU) { draw_start_menu(); return; }
+         if (rx < 0) { rx = win.x; ry = win.y; rw = win.w; rh = win.h; }
+ 
+         // ---- Win11-style soft drop shadow (acrylic float) ----
+@@ -3626,27 +4148,32 @@ struct Win11Desktop {
+             gfx.blend_rounded_rect(rx - 3, ry - 3, rw + 6, rh + 6, 9, 0xD2D2D2, 55);
+         }
+ 
+-        // Window background
+-        if (win.fullscreen)
++        // ---- Aero frosted-glass window (Windows 7 "毛玻璃" over dark Mica) ----
++        Color glass = win.active ? C_GLASS_TINT_ACT : C_GLASS_TINT;
++        if (win.fullscreen) {
+             gfx.fill_rect(rx, ry, rw, rh, C_WIN_BG);
+-        else
+-            gfx.fill_rounded_rect(rx, ry, rw, rh, 6, C_WIN_BG);
+-
+-        // Title bar
+-        Color tb_color = win.active ? C_WIN_TITLEBAR_ACT : C_WIN_TITLEBAR;
+-        if (win.fullscreen)
+-            gfx.fill_rect(rx, ry, rw, TITLE_BAR_H, tb_color);
+-        else {
+-            gfx.fill_rounded_rect(rx, ry, rw, TITLE_BAR_H, 6, tb_color);
+-            gfx.fill_rect(rx, ry + TITLE_BAR_H - 6, rw, 6, tb_color);
+-        }
+-        // Chrome texture over the title bar (subtle; flat colour if absent)
+-        if (g_tex[TEX_CHROME].loaded)
+-            gfx.draw_image(g_tex[TEX_CHROME], rx, ry, rw, TITLE_BAR_H);
+-
+-        // Title text (centered)
++            gfx.fill_rect(rx, ry, rw, TITLE_BAR_H,
++                          win.active ? C_GLASS_TINT_ACT : C_GLASS_TINT);
++        } else {
++            // Frosted translucent body: blurred desktop/wallpaper shows through.
++            glass_rounded_rect(gfx, rx, ry, rw, rh, WIN_RADIUS, glass, C_GLASS_ALPHA, C_GLASS_BLUR_R);
++            // Active-window accent glow across the title band.
++            if (win.active)
++                gfx.blend_rect(rx + WIN_RADIUS, ry, rw - 2*WIN_RADIUS, TITLE_BAR_H,
++                               C_GLASS_GLOW, C_GLASS_GLOW_ALPHA);
++            // Title-band glass (extra opacity so text stays crisp).
++            gfx.blend_rect(rx + WIN_RADIUS, ry, rw - 2*WIN_RADIUS, TITLE_BAR_H,
++                           glass, C_GLASS_TITLE_ALPHA);
++            // 1px top glass highlight + bottom separator under the title.
++            gfx.blend_rect(rx + WIN_RADIUS, ry + 1, rw - 2*WIN_RADIUS, 1,
++                           C_GLASS_EDGE, C_GLASS_EDGE_ALPHA);
++            gfx.blend_rect(rx + WIN_RADIUS, ry + TITLE_BAR_H - 1, rw - 2*WIN_RADIUS, 1,
++                           0x000000, 40);
++        }
++
++        // Title text (centered, faux-bold for modern weight) — drawn over glass.
+         int tw = strlen_(win.title) * g_font_w;
+-        gfx.draw_text(rx + (rw - tw) / 2, ry + 8, win.title, C_WIN_TEXT, tb_color);
++        gfx.draw_text_bold(rx + (rw - tw) / 2, ry + 8, win.title, C_WIN_TEXT);
+ 
+         // Title-bar control buttons: which 0=close 1=fullscreen 2=minimize 3=float
+         for (int b = 0; b < 4; b++) {
+@@ -3654,21 +4181,24 @@ struct Win11Desktop {
+             int by = ry + 4;
+             bool hover = (mouse_x >= bx && mouse_x < bx + 24 &&
+                           mouse_y >= by && mouse_y < by + 24);
+-            Color bbg = hover ? C_CLOSE_HOVER : tb_color;
+-            gfx.fill_rounded_rect(bx, by, 24, 24, 4, bbg);
++            // translucent button plate (glass), or red on close-hover
++            if (hover && b == 0)
++                gfx.fill_rounded_rect(bx, by, 24, 24, CTL_RADIUS, C_CLOSE_HOVER);
++            else
++                gfx.blend_rounded_rect(bx, by, 24, 24, CTL_RADIUS, C_TOPBAR_HOVER,
++                                       hover ? 150 : 60);
+             const char* g = (b == 0) ? "X" : (b == 1) ? "M" : (b == 2) ? "_" : "T";
+             bool active_state = (b == 1 && win.fullscreen) || (b == 3 && win.floating);
+             Color gcol = active_state ? C_ACCENT : (hover ? COLOR_WHITE : C_CLOSE_TEXT);
+-            gfx.draw_text(bx + 8, by + 4, g, gcol, bbg);
++            gfx.draw_text_transparent(bx + 8, by + 4, g, gcol);
+         }
+ 
+-        // Border — 1px hairline.  Active window gets a soft steel-blue tint
+-        // (Win11 uses a faint accent hairline, not a loud blue ring).
+-        Color border = win.active ? 0x9DB9D8 : C_WIN_BORDER;
++        // Border — 1px hairline.  Active window gets a soft accent hairline.
++        Color border = win.active ? C_ACCENT : C_WIN_BORDER;
+         if (win.fullscreen)
+             gfx.draw_rect(rx, ry, rw, rh, border);
+         else
+-            gfx.draw_rounded_rect(rx, ry, rw, rh, 6, border);
++            gfx.draw_rounded_rect(rx, ry, rw, rh, WIN_RADIUS, border);
+ 
+         // Separator line below title bar
+         gfx.draw_line(rx + 1, ry + TITLE_BAR_H, rx + rw - 2, ry + TITLE_BAR_H, C_WIN_BORDER);
+@@ -4863,6 +5393,7 @@ struct Win11Desktop {
+         uint32_t m = 0;
+         for (int i = 0; i < window_count; i++) {
+             if (!windows[i].visible) continue;
++            if (windows[i].app == APP_START_MENU) continue;   // not a running app
+             int k = managed_kind_for(windows[i].launch_kind);
+             if (k >= 0 && k < 32) m |= (1u << k);
+         }
+@@ -4936,6 +5467,7 @@ struct Win11Desktop {
+     }
+ 
+     void finish_close(int id) {
++        if (windows[id].app == APP_START_MENU) return;   // Start menu is not a closable window
+         if (windows[id].app == APP_WIN32 && windows[id].w32_index >= 0) {
+             win32_window_close(windows[id].w32_index);
+             windows[id].w32_index = -1;
+@@ -5004,23 +5536,44 @@ struct Win11Desktop {
+         anim_active_prev = any_animating();
+     }
+ 
++    // ---- Smooth easing curves (丝滑动画) --------------------------------
++    // p is 0..1000 (per-mille); returns eased 0..1000.  Cubic easing removes
++    // the robotic constant-speed feel of the old linear ramp.
++    // All math stays in int32: 1000^3 = 1e9 < INT32_MAX, so no 64-bit helpers.
++    static int ease_out_cubic(int p) {
++        if (p <= 0) return 0;
++        if (p >= 1000) return 1000;
++        int u = 1000 - p;                    // (1 - x) * 1000
++        return 1000 - (u * u * u) / 1000000; // 1 - (1-x)^3
++    }
++    static int ease_in_out_cubic(int p) {
++        if (p <= 0) return 0;
++        if (p >= 1000) return 1000;
++        if (p < 500) {
++            return 4 * ((p * p * p) / 1000000);
++        }
++        int u = 1000 - p;
++        return 1000 - 4 * ((u * u * u) / 1000000);
++    }
++
+     void draw_window_animated(int id) {
+         Win11Window& w = windows[id];
+         int rx = w.x, ry = w.y, rw = w.w, rh = w.h, alpha = 255;
+         int ty = gfx.height - 48; // top of taskbar
+         if (w.anim_state == 1 || w.anim_state == 2) {
+-            int a = (w.anim_state == 1) ? w.anim_p : (1000 - w.anim_p);
++            int a = (w.anim_state == 1) ? ease_out_cubic(w.anim_p)
++                                        : (1000 - ease_in_out_cubic(w.anim_p));
+             alpha = (a * 255) / 1000;
+             ry = w.y + ((1000 - a) * ANIM_SLIDE) / 1000;
+         } else if (w.anim_state == 3) { // minimize: collapse toward taskbar
+-            int p = w.anim_p;
++            int p = ease_in_out_cubic(w.anim_p);
+             ry = w.y + ((ty - w.y) * p) / 1000;
+             rh = w.h - (w.h * 900 * p) / 10000;
+             rw = w.w - (w.w * 700 * p) / 10000;
+             rx = w.x + (w.w - rw) / 2;
+             alpha = 255 - (p * 180) / 1000;
+         } else if (w.anim_state == 4) { // restore: expand from taskbar
+-            int p = w.anim_p;
++            int p = ease_out_cubic(w.anim_p);
+             ry = ty + ((w.y - ty) * p) / 1000;
+             rh = w.h - (w.h * 900 * (1000 - p)) / 10000;
+             rw = w.w - (w.w * 700 * (1000 - p)) / 10000;
+@@ -5260,7 +5813,13 @@ struct Win11Desktop {
+     //      declaration -- indexing it needs an out-of-class definition, else the
+     //      link fails with `undefined reference to Win11Desktop::BAYER4`.
+ 
+-    void pixelate_framebuffer() {
++    void pixelate_framebuffer() { pixelate_rect(0, 0, (int)gfx.width, (int)gfx.height); }
++
++    // Retro post-process over ONE rectangle.  Block boundaries stay on the
++    // same grid as a full-screen pass (multiples of `scale` from the origin),
++    // so a partial pass is pixel-identical to a full one -- that is what lets
++    // us post-process only the region that was actually redrawn.
++    void pixelate_rect(int rx, int ry, int rw, int rh) {
+         if (g_pixel_mode == 0) return;
+         if (!gfx.backbuffer || gfx.width == 0 || gfx.height == 0) return;
+ 
+@@ -5287,11 +5846,49 @@ struct Win11Desktop {
+ 
+         const int scale = g_pixel_scale > 1 ? g_pixel_scale : 1;
+         const int W = (int)gfx.width, H = (int)gfx.height;
++        int x0 = rx, y0 = ry, x1 = rx + rw, y1 = ry + rh;
++        if (x0 < 0) x0 = 0;
++        if (y0 < 0) y0 = 0;
++        if (x1 > W) x1 = W;
++        if (y1 > H) y1 = H;
++        if (x0 >= x1 || y0 >= y1) return;
++        x0 = (x0 / scale) * scale;      // stay on the block grid
++        y0 = (y0 / scale) * scale;
+         uint32_t* fb = gfx.backbuffer;
+ 
+-        for (int by = 0; by < H; by += scale) {
++        // Common case (scale == 1): a flat per-pixel pass.  The general block
++        // loop below re-enters its inner loops once per pixel here, and that
++        // overhead dominated the frame (a full screen was ~63 ms).
++        if (scale == 1) {
++            for (int y = y0; y < y1; y++) {
++                const uint8_t* brow = &BAYER4[(y & 3) * 4];
++                const bool dim = (g_pixel_scan != 0) && ((y & 1) != 0);
++                uint32_t* row = fb + (uint32_t)y * (uint32_t)W;
++                for (int x = x0; x < x1; x++) {
++                    uint32_t p = row[x];
++                    int sb = (int)(p & 0xFF);
++                    int sg = (int)((p >> 8) & 0xFF);
++                    int sr = (int)((p >> 16) & 0xFF);
++                    // Non-negative dither: quantisation stays idempotent, so a
++                    // block processed twice keeps its value instead of
++                    // drifting a step darker every frame.
++                    int off = (int)brow[x & 3] >> 2;   // 0 .. +3
++                    int qr = sr + off; if (qr > 255) qr = 255;
++                    int qg = sg + off; if (qg > 255) qg = 255;
++                    int qb = sb + off; if (qb > 255) qb = 255;
++                    int r = r5[qr], g = g6[qg], b = b5[qb];
++                    if (dim) {
++                        r = (r * 21) >> 5; g = (g * 21) >> 5; b = (b * 21) >> 5;
++                    }
++                    row[x] = (uint32_t)b | ((uint32_t)g << 8) | ((uint32_t)r << 16);
++                }
++            }
++            return;
++        }
++
++        for (int by = y0; by < y1; by += scale) {
+             int ylim = by + scale; if (ylim > H) ylim = H;
+-            for (int bx = 0; bx < W; bx += scale) {
++            for (int bx = x0; bx < x1; bx += scale) {
+                 int xlim = bx + scale; if (xlim > W) xlim = W;
+ 
+                 uint32_t p = fb[by * W + bx];   // block origin colour
+@@ -5306,7 +5903,11 @@ struct Win11Desktop {
+                     for (int x = bx; x < xlim; x++) {
+                         // Very light dither: +/-4 prevents smooth gradients
+                         // from banding, but does not disturb flat UI fills.
+-                        int off = ((int)brow[x & 3] - 8) >> 1;   // -4 .. +3
++                        // Dither must be NON-NEGATIVE: quantisation is then
++                        // idempotent (a block processed twice keeps its value
++                        // instead of drifting a step darker every frame),
++                        // which is what makes partial passes safe.
++                        int off = (int)brow[x & 3] >> 2;   // 0 .. +3
+ 
+                         int qr = sr + off; if (qr < 0) qr = 0; else if (qr > 255) qr = 255;
+                         int qg = sg + off; if (qg < 0) qg = 0; else if (qg > 255) qg = 255;
+@@ -5328,9 +5929,7 @@ struct Win11Desktop {
+         if (!gfx.initialized) return;
+         if (!gui_mode) return;   // never paint after gui_exit() (e.g. "Terminal" shortcut)
+         frame_counter++;
+-        dirty_reset();           // begin dirty-rect tracking for this frame
+-        serial_puts("[GUI] render_all begin\n");
+-        diag_step(100, "render_all enter");
++        dirty_reset(gfx.width, gfx.height);   // begin damage tracking for this frame
+         // DIAG markers moved to AFTER the managed (C#) paint (see cyan/
+         // yellow/magenta below) so they survive on screen -- the managed
+         // desktop fills the whole framebuffer and would otherwise erase a
+@@ -5365,8 +5964,15 @@ struct Win11Desktop {
+         static int g_pixel_prev = -1;
+         if (g_pixel_prev < 0) g_pixel_prev = g_pixel_mode;
+         if (g_pixel_mode != g_pixel_prev) { g_desk_needs_full = true; g_pixel_prev = g_pixel_mode; }
++        bool repaint_desk = false;
+         if (managed_desk) {
+-            if (g_desk_needs_full || cur_sig != g_desk_sig) {
++            // Partial-redraw compositing: only repaint the managed desktop when
++            // its window set changed.  The C# desktop costs ~95 ms/frame, so
++            // this is the difference between ~5 fps and an interactive shell.
++            repaint_desk = (g_perf_opt == 0)
++                                ? true
++                                : (g_desk_needs_full || cur_sig != g_desk_sig);
++            if (repaint_desk) {
+                 mforms_set_mouse(mouse_x, mouse_y);
+                 mforms_set_running(running_mask());
+                 diag_step(101, "render_all before mforms_paint_desktop");
+@@ -5384,6 +5990,18 @@ struct Win11Desktop {
+             dirty_add(0, 0, gfx.width, gfx.height);
+         }
+ 
++        // Start menu lives in the window DB: sync its state/geometry from the
++        // open flag so it is composited (and dirty-tracked) like any other
++        // window.  When it toggles, cur_sig changes below and the desktop layer
++        // is repainted, so the menu appears/disappears correctly.
++        if (start_menu_id >= 0) {
++            Win11Window& sm = windows[start_menu_id];
++            sm.visible   = start_menu_open;
++            sm.active    = start_menu_open;
++            sm.floating  = true;
++            sm.x = 8; sm.y = TOPBAR_H + 2; sm.w = 380; sm.h = 248;
++        }
++
+         // Draw windows with proper z-order:
+         //  normal inactive -> normal active -> floating inactive -> floating active
+         for (int i = 0; i < window_count; i++)
+@@ -5401,10 +6019,41 @@ struct Win11Desktop {
+         // frame (clock), so we only mark that strip dirty -- the Start menu
+         // itself is covered by the desktop full-repaint when focus changes.
+         if (managed_desk) {
+-            mforms_paint_overlay(gfx.width, gfx.height);
+-            dirty_add(0, gfx.height - MANAGED_TASKBAR_H, gfx.width, MANAGED_TASKBAR_H);
+-        }
+-        else if (start_menu_open) { draw_start_menu(); dirty_add(0, 0, gfx.width, gfx.height); }
++            // The taskbar overlay is the second C# paint and costs ~14 ms, so
++            // it is also cached.  Its content only changes on: a clock tick,
++            // pointer hover over the taskbar, Start-menu open/close, a change
++            // in the running-app set, or a full desktop repaint (which must
++            // restore the strip it just overwrote).  A periodic refresh is
++            // kept as a safety net for state we cannot observe from here
++            // (toasts, network/AI indicators).
++            static uint32_t g_over_sig  = 0xFFFFFFFFu;
++            static int      g_over_idle = 0;
++            uint32_t osig = running_mask();
++            osig ^= start_menu_open ? 0x5A5A5A5Au : 0u;
++            if (mouse_y >= gfx.height - MANAGED_TASKBAR_H)
++                osig ^= (uint32_t)mouse_x * 31u + (uint32_t)mouse_y * 17u;
++            // With an animation pending (toasts, AI dots) the strip must keep
++            // updating, but not at the full frame rate -- it is the single
++            // most expensive op in the frame (~14 ms of C#).  Every 4th frame
++            // still animates it at ~10-15 Hz, which reads as smooth, while
++            // amortising the cost to ~3.5 ms/frame.
++            bool over_dirty = repaint_desk            // desktop overwrote the strip
++                            || ((g_mforms_anim != 0) && ((g_over_idle & 3) == 0))
++                            || g_over_force           // managed state changed
++                            || g_over_idle >= 30      // clock tick / safety net
++                            || osig != g_over_sig;
++            if (over_dirty) {
++                mforms_paint_overlay(gfx.width, gfx.height);
++                g_over_sig  = osig;
++                g_over_idle = 0;
++                g_over_force = false;
++                dirty_add(0, gfx.height - MANAGED_TASKBAR_H, gfx.width, MANAGED_TASKBAR_H);
++            }
++            g_over_idle++;
++        }
++        // NOTE: the Start menu is now a window in the DB and is drawn by the
++        // window loop above (draw_window -> draw_start_menu).  It is no longer
++        // drawn here.
+ 
+         // A Win32 TrackPopupMenu sits above everything, taskbar included.
+         draw_win32_popup();
+@@ -5441,33 +6090,88 @@ struct Win11Desktop {
+             gfx.draw_text_utf8(lx, 8, lang, fg, C_TOPBAR_BG);
+         }
+ 
+-        // Redraw cursor on top without hide/show flicker
+-        // Invalidate saved background so it's re-captured from the freshly-drawn screen
+-        if (cursor.visible) {
++        // Remote-control security guard overlay (drawn on top of everything)
++        draw_remote_guard();
++
++        // The guest draws its own software cursor at its LOGICAL pointer position
++        // (mouse_x/mouse_y).  This is the only way to keep "what you see" aligned
++        // with "where clicks land" while using a relative PS/2 mouse -- QEMU's
++        // host cursor (show-cursor) lives in a different coordinate space and
++        // would drift away from the OS's notion of the pointer.  QEMU's host
++        // cursor is forced OFF in run_nexos.ps1 so the two never appear together.
++        // Redraw cursor on top without hide/show flicker.
++        // CRITICAL: the backbuffer may still hold the cursor pixels left by the
++        // previous move()/frame (the desktop layer is "retained", so it is NOT
++        // always repainted).  If we re-capture the background without first
++        // removing that stale cursor, we snapshot the cursor itself as
++        // "background"; the next move()/restore_bg then can't erase it and a
++        // permanent ghost cursor is left pinned where the click happened.
++        // Restore the previously-saved background first so save_bg captures the
++        // real (cursor-free) pixels.
++        if (!::g_host_cursor_active && cursor.visible) {
+             int cw = MouseCursor::CURSOR_SIZE, ch = MouseCursor::CURSOR_SIZE;
++            // Clear the PREVIOUS cursor pixels in the backbuffer and mark that
++            // rectangle dirty, so the flip re-copies the now-cursor-free
++            // background to the LFB.  Without this, the old position leaves a
++            // square ghost while the desktop layer is retained (not repainted).
++            if (cursor.saved_valid) {
++                int ox = cursor.x, oy = cursor.y;
++                cursor.restore_bg(gfx);
++                dirty_add(ox, oy, cw, ch);
++            }
+             int cx0 = cursor.x, cy0 = cursor.y;   // hotspot at (0,0): top-left = (x,y)
+             cursor.saved_valid = false;
+             cursor.save_bg(gfx);
+             cursor.draw(gfx);
+-            dirty_add(cx0, cy0, cw, ch);   // ensure cursor region is flipped
++            dirty_add(cx0, cy0, cw, ch);   // ensure new cursor region is flipped
+         }
+ 
+         // Retro pixel / CRT-monitor post-process over the whole backbuffer
+         // BEFORE presenting.  The backbuffer is always in the internal 0x00RRGGBB
+         // (= BGRx in memory) format, so this path is independent of the real
+         // framebuffer pixel format and avoids double-conversion artefacts.
+-        pixelate_framebuffer();
+-
++        // Post-process only the region that was actually redrawn this frame.
++        // Retained (cached) pixels were already processed when they were
++        // first painted and must not be touched again.
++        dirty_flush();           // coalesce the tile grid into tight rects
++        if (g_dirty_valid) {
++            for (int i = 0; i < g_dmg_n; i++)
++                pixelate_rect(g_dmg[i][0], g_dmg[i][1],
++                              g_dmg[i][2] - g_dmg[i][0], g_dmg[i][3] - g_dmg[i][1]);
++        } else {
++            pixelate_framebuffer();
++        }
+         // Flip only the dirty region to the LFB (degrades to full-screen when
+         // the managed desktop marked a full dirty rect, which it always does
+         // today).  This keeps the compositor path uniform with the cursor-move
+         // fast path that already calls present_rect() directly.
+-        if (g_dirty_valid)
+-            gfx.present_rect(g_dirty_x0, g_dirty_y0, g_dirty_x1 - g_dirty_x0, g_dirty_y1 - g_dirty_y0);
+-        else
++        if (g_dirty_valid) {
++            for (int i = 0; i < g_dmg_n; i++)
++                gfx.present_rect(g_dmg[i][0], g_dmg[i][1],
++                                 g_dmg[i][2] - g_dmg[i][0], g_dmg[i][3] - g_dmg[i][1]);
++        } else {
+             gfx.present();
++        }
+ 
+-        serial_puts("[GUI] render_all end\n");
++        // ---------------------------------------------------------------
++        // Frame-rate instrumentation.  Prints AT MOST once per second, so it
++        // costs ~40 bytes/s of serial output instead of the previous two
++        // per-frame prints (which dominated the frame budget: every character
++        // is a polled port write).  Lets the compositor be profiled from the
++        // serial console using nothing but external observation.
++        // ---------------------------------------------------------------
++        fps_frames++;
++        uint32_t now_ms = tick_ms_now();
++        if (fps_t0 == 0) fps_t0 = now_ms;
++        uint32_t dt = now_ms - fps_t0;
++        if (dt >= 1000) {
++            uint32_t fps = (uint32_t)(((uint64_t)fps_frames * 1000u) / (dt ? dt : 1u));
++            serial_puts("[FPS] ");
++            serial_putdec((int)fps);
++            serial_puts(" fps\n");
++            fps_t0 = now_ms;
++            fps_frames = 0;
++        }
+     }
+ 
+         void enter_gui() {
+@@ -5515,15 +6219,32 @@ struct Win11Desktop {
+ 
+     void handle_mouse_move(int dx, int dy) {
+         if (!gui_mode) return;
+-        int ox = cursor.x, oy = cursor.y;
+-        cursor.move(gfx, dx, dy);
++        int oldx = cursor.x, oldy = cursor.y;
++        bool was_drag = (drag_window >= 0 && drag_window < window_count);
++
++        // When we own the cursor (no hardware sprite — QEMU / headless / VMMDev
++        // absent) we must erase the previous soft-cursor pixels *before* moving,
++        // otherwise a stale cursor is left pinned where the pointer last was.
++        if (!::g_host_cursor_active && cursor.visible && cursor.saved_valid) {
++            cursor.restore_bg(gfx);
++            gfx.present_rect(oldx, oldy, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
++            cursor.saved_valid = false;
++        }
++
++        // The pointer position is always recorded so a later click routes right.
++        cursor.x += dx; cursor.y += dy;
++        if (cursor.x < 0) cursor.x = 0;
++        if (cursor.y < 0) cursor.y = 0;
++        if (cursor.x >= gfx.width  - MouseCursor::CURSOR_SIZE) cursor.x = gfx.width  - MouseCursor::CURSOR_SIZE;
++        if (cursor.y >= gfx.height - MouseCursor::CURSOR_SIZE) cursor.y = gfx.height - MouseCursor::CURSOR_SIZE;
+         mouse_x = cursor.x;
+         mouse_y = cursor.y;
+ 
+-        if (drag_window >= 0 && drag_window < window_count) {
++        // Dragging a window is a real UI state change (the window itself moves),
++        // so it legitimately needs a full redraw — render_all repaints the cursor.
++        if (was_drag) {
+             windows[drag_window].x = mouse_x - drag_off_x;
+             windows[drag_window].y = mouse_y - drag_off_y;
+-            // Keep title bar below top bar
+             if (windows[drag_window].y < TOPBAR_H)
+                 windows[drag_window].y = TOPBAR_H;
+             drag_counter++;
+@@ -5531,20 +6252,33 @@ struct Win11Desktop {
+                 drag_counter = 0;
+                 render_all();
+             }
+-        } else {
+-            // Just move the cursor, no topbar redraw.
+-            // Flip only the union of the old and new cursor boxes to avoid
+-            // a full-screen tear and the per-move full blit cost.
+-            if (cursor.visible) {
+-                int nx = cursor.x, ny = cursor.y;
+-                int minx = ox < nx ? ox : nx;
+-                int miny = oy < ny ? oy : ny;
+-                int maxx = (ox > nx ? ox : nx) + MouseCursor::CURSOR_SIZE;
+-                int maxy = (oy > ny ? oy : ny) + MouseCursor::CURSOR_SIZE;
+-                gfx.present_rect(minx, miny, maxx - minx, maxy - miny);
+-            } else {
+-                gfx.present();
+-            }
++            return;
++        }
++
++        // No hardware cursor: repaint the soft cursor at its new position and
++        // flip just its rect (the cursor-move fast path).  With a hardware
++        // cursor this branch is skipped — the GPU owns the sprite.
++        if (!::g_host_cursor_active && cursor.visible) {
++            cursor.save_bg(gfx);
++            cursor.draw(gfx);
++            gfx.present_rect(cursor.x, cursor.y, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
++        }
++    }
++
++    void set_mouse_position(int x, int y) {
++        if (!gui_mode) return;
++        if (x < 0) x = 0;
++        if (y < 0) y = 0;
++        if (x >= gfx.width  - MouseCursor::CURSOR_SIZE) x = gfx.width  - MouseCursor::CURSOR_SIZE;
++        if (y >= gfx.height - MouseCursor::CURSOR_SIZE) y = gfx.height - MouseCursor::CURSOR_SIZE;
++        cursor.x = x; cursor.y = y;
++        mouse_x = x; mouse_y = y;
++        if (drag_window >= 0 && drag_window < window_count) {
++            windows[drag_window].x = mouse_x - drag_off_x;
++            windows[drag_window].y = mouse_y - drag_off_y;
++            if (windows[drag_window].y < TOPBAR_H) windows[drag_window].y = TOPBAR_H;
++            drag_counter++;
++            if (drag_counter >= 3) { drag_counter = 0; render_all(); }
+         }
+     }
+ 
+@@ -5618,6 +6352,17 @@ struct Win11Desktop {
+ 
+     void handle_mouse_down() {
+         if (!gui_mode) return;
++        // ---- Remote-control security guard: modal overlay ----
++        // While the machine is being remotely controlled, the only interactive
++        // element is the "结束控制" button; every other click is swallowed.
++        if (g_remote_active) {
++            if (mouse_x >= g_remote_btn_x && mouse_x < g_remote_btn_x + g_remote_btn_w &&
++                mouse_y >= g_remote_btn_y && mouse_y < g_remote_btn_y + g_remote_btn_h) {
++                gui_remote_end();
++            }
++            render_all();
++            return;
++        }
+         mouse_left = true;
+         start_menu_open = false; // close by default, reopen if clicked
+ 
+@@ -5716,6 +6461,7 @@ struct Win11Desktop {
+             int ax = 52 + 16;
+             for (int i = 0; i < window_count; i++) {
+                 if (!windows[i].visible) continue;
++                if (windows[i].app == APP_START_MENU) continue;
+                 int aw = strlen_(windows[i].title) * g_font_w + 24;
+                 if (mouse_x >= ax && mouse_x < ax + aw) {
+                     if (windows[i].minimized) {
+@@ -5873,9 +6619,65 @@ struct Win11Desktop {
+         active_window = ex;
+     }
+ 
++    // ---- Snap layouts (磁贴窗口) ----------------------------------------
++    // Dragging a window's title bar into a screen edge or corner tiles it to a
++    // half / quarter of the desktop (Windows 11 snap layouts).
++    void apply_snap(int id) {
++        if (id < 0 || id >= window_count) return;
++        Win11Window& w = windows[id];
++        const int TASKBAR_H = 48;        // bottom taskbar height
++        const int EDGE      = 24;        // snap trigger distance, px
++        int avail_y = TOPBAR_H;
++        int avail_h = gfx.height - TASKBAR_H - avail_y;
++        if (avail_h < 120) return;
++
++        int mx = cursor.x, my = cursor.y;
++        bool at_left   = (mx <= EDGE);
++        bool at_right  = (mx >= gfx.width - 1 - EDGE);
++        bool at_top    = (my <= avail_y + EDGE);
++        bool at_bottom = (my >= avail_y + avail_h - 1 - EDGE);
++        int  half_w    = gfx.width / 2;
++        int  half_h    = avail_h / 2;
++
++        int nx = w.x, ny = w.y, nw = w.w, nh = w.h;
++        if      (at_left  && at_top)    { nx = 0;      ny = avail_y;          nw = half_w;             nh = half_h; }
++        else if (at_right && at_top)    { nx = half_w; ny = avail_y;          nw = gfx.width - half_w; nh = half_h; }
++        else if (at_left  && at_bottom) { nx = 0;      ny = avail_y + half_h; nw = half_w;             nh = avail_h - half_h; }
++        else if (at_right && at_bottom) { nx = half_w; ny = avail_y + half_h; nw = gfx.width - half_w; nh = avail_h - half_h; }
++        else if (at_left)               { nx = 0;      ny = avail_y;          nw = half_w;             nh = avail_h; }
++        else if (at_right)              { nx = half_w; ny = avail_y;          nw = gfx.width - half_w; nh = avail_h; }
++        else if (at_top)                { nx = 0;      ny = avail_y;          nw = gfx.width;          nh = avail_h; }
++        else {
++            // Dropped away from every edge: a tiled window springs back to its
++            // pre-snap size and follows the pointer (Windows 11 behaviour).
++            if (w.snap) {
++                if (w.snap_rw > 0) w.w = w.snap_rw;
++                if (w.snap_rh > 0) w.h = w.snap_rh;
++                w.snap = 0;
++                if (w.x + w.w > gfx.width)          w.x = gfx.width - w.w;
++                if (w.y + w.h > avail_y + avail_h)  w.y = avail_y + avail_h - w.h;
++                if (w.x < 0)      w.x = 0;
++                if (w.y < avail_y) w.y = avail_y;
++            }
++            return;
++        }
++
++        if (!w.snap) {   // remember the free-floating rect before tiling
++            w.snap_rx = w.x; w.snap_ry = w.y; w.snap_rw = w.w; w.snap_rh = w.h;
++        }
++        w.snap = 1;
++        w.x = nx; w.y = ny; w.w = nw; w.h = nh;
++        w.fullscreen = false;
++    }
++
+     void handle_mouse_up() {
+         mouse_left = false;
++        int dw = drag_window;
+         drag_window = -1;
++        if (dw >= 0 && gui_mode) {
++            apply_snap(dw);
++            render_all();
++        }
+     }
+ 
+     // Right mouse button: open the kernel-native context menus.  Only
+@@ -6759,7 +7561,7 @@ struct Win11Desktop {
+         ime_reset();
+         if (g_ime_cn) serial_puts("[GUI] IME mode -> Chinese (中文)\n");
+         else          serial_puts("[GUI] IME mode -> English (EN)\n");
+-        if (gui_mode) render_all();
++        if (gui_mode) { g_desk_needs_full = true; render_all(); }
+     }
+ 
+     bool handle_key(char ch) {
+@@ -6767,6 +7569,7 @@ struct Win11Desktop {
+         if (ch == 27) { // ESC: cancel the IME, never leave the desktop
+             if (g_ime_active) {
+                 ime_reset();
++                g_desk_needs_full = true;   // IME composition bar (desktop-surface overlay) is being removed
+                 render_all();
+                 return true;
+             }
+@@ -6785,6 +7588,12 @@ struct Win11Desktop {
+         // desktop is in rename mode).
+         if (active_window < 0 && !mforms_desktop_menu_open()) {
+             mforms_desktop_key((int)(unsigned char)ch);
++            // A keystroke mutates desktop-surface content (lock-screen password
++            // field, inline rename editor, IME bar).  The desktop layer is cached
++            // by window-set signature in render_all(), which does NOT change on a
++            // plain key press, so without this flag the managed desktop paint is
++            // skipped and the typed characters never reach the screen.
++            g_desk_needs_full = true;
+             render_all();
+             return true;
+         }
+@@ -7916,6 +8725,13 @@ void gui_mouse_move(int dx, int dy) {
+     g_wm.handle_mouse_move(dx, dy);
+ }
+ 
++void gui_mouse_position(uint32_t raw_x, uint32_t raw_y) {
++    if (!g_wm.gui_mode) return;
++    int x = (int)((uint64_t)raw_x * g_wm.gfx.width  / 0xFFFF);
++    int y = (int)((uint64_t)raw_y * g_wm.gfx.height / 0xFFFF);
++    g_wm.set_mouse_position(x, y);
++}
++
+ void gui_mouse_down(void) {
+     g_wm.handle_mouse_down();
+ }
+@@ -7975,7 +8791,10 @@ void gui_tick(void) {
+     //    costs ZERO repaints -- we never paint "just in case".
+     if (g_mforms_anim) {
+         uint32_t now = g_wm.tick_ms_now();
+-        if ((uint32_t)(now - g_wm.last_ai_repaint_ms) >= 33) {
++        // ~60 fps cadence.  This used to be 33 ms, which hard-capped the whole
++        // shell at 30 fps even after the compositor was optimised down to a
++        // ~14 ms frame -- the cap, not the renderer, was the bottleneck.
++        if ((uint32_t)(now - g_wm.last_ai_repaint_ms) >= 16) {
+             g_wm.last_ai_repaint_ms = now;
+             g_wm.render_all();
+         }
+@@ -8097,6 +8916,109 @@ void gui_exit(void) {
+     serial_puts("[GUI] Exited GUI mode, fbcon text mode (VBE stays active)\n");
+ }
+ 
++// ---- Remote-control security guard: implementation ----
++// Full-screen "NexOS 安全卫士" overlay.  Triggered by kernel.cpp's remote
++// command entry points (COM1 bridge / SSH) via gui_remote_begin()/cmd().
++
++static void remote_log_push(const char* cmd) {
++    if (g_remote_log_n < 8) {
++        int i = 0; while (cmd[i] && i < 255) g_remote_log[g_remote_log_n][i] = cmd[i], i++;
++        g_remote_log[g_remote_log_n][i] = 0; g_remote_log_n++;
++    } else {
++        for (int k = 0; k < 7; k++) {
++            int j = 0; while (g_remote_log[k+1][j] && j < 255) g_remote_log[k][j] = g_remote_log[k+1][j], j++;
++            g_remote_log[k][j] = 0;
++        }
++        int i = 0; while (cmd[i] && i < 255) g_remote_log[7][i] = cmd[i], i++;
++        g_remote_log[7][i] = 0;
++    }
++}
++
++extern "C" void gui_remote_begin(const char* who) {
++    g_remote_active = true;
++    int i = 0;
++    if (who) while (who[i] && i < 63) g_remote_who[i] = who[i], i++;
++    g_remote_who[i] = 0;
++}
++
++extern "C" void gui_remote_cmd(const char* cmd) {
++    if (!cmd) return;
++    g_remote_active = true;
++    int i = 0; while (cmd[i] && i < 511) g_remote_cmd[i] = cmd[i], i++;
++    g_remote_cmd[i] = 0;
++    remote_log_push(cmd);
++    if (g_wm.gui_mode) g_wm.render_all();   // pop the panel immediately
++}
++
++extern "C" void gui_remote_end(void) {
++    g_remote_active = false;
++}
++
++void draw_remote_guard(void) {
++    if (!g_remote_active) return;
++    int W = g_wm.gfx.width, H = g_wm.gfx.height;
++
++    // Opaque full-screen backdrop
++    g_wm.gfx.fill_rect(0, 0, W, H, 0x0B0E14);
++
++    // Top status bar: "NexOS 安全卫士"
++    const int BAR_H = 46;
++    g_wm.gfx.fill_rect(0, 0, W, BAR_H, 0x123A6B);
++    g_wm.gfx.draw_line(0, BAR_H, W, BAR_H, 0x2E6FB5);
++    g_wm.gfx.draw_text_utf8(16, 14, "NexOS 安全卫士", 0xFFFFFF, 0x123A6B);
++    g_wm.gfx.draw_text_utf8(W - 64, 16, "安全中心", 0x9FC7EF, 0x123A6B);
++
++    // Alert strip: "正在被远程控制" + controller identity
++    const int ALERT_H = 70;
++    int ay = BAR_H;
++    g_wm.gfx.fill_rect(0, ay, W, ALERT_H, 0x7A1020);
++    g_wm.gfx.draw_text_utf8(16, ay + 14, "正在被远程控制", 0xFFE6E6, 0x7A1020);
++    char src[160];
++    int sl = 0;
++    const char* pre = "控制来源: ";
++    for (int k = 0; pre[k] && sl < 150; ) src[sl++] = pre[k++];
++    for (int k = 0; g_remote_who[k] && sl < 150; ) src[sl++] = g_remote_who[k++];
++    src[sl] = 0;
++    g_wm.gfx.draw_text_utf8(16, ay + 42, src, 0xFFB0B0, 0x7A1020);
++
++    // Command panel (center): instructions sent by the controller
++    int pan_x = 40, pan_y = ay + ALERT_H + 24, pan_w = W - 80;
++    int pan_h = H - pan_y - 130;
++    if (pan_h < 90) pan_h = 90;
++    g_wm.gfx.fill_rect(pan_x, pan_y, pan_w, pan_h, 0x141A24);
++    g_wm.gfx.draw_line(pan_x, pan_y, pan_x + pan_w, pan_y, 0x2E6FB5);
++    g_wm.gfx.draw_text_utf8(pan_x + 12, pan_y + 10, "远程控制者发来的指令:", 0x8FD0FF, 0x141A24);
++
++    int lh = 22;
++    int max_lines = pan_h / lh - 1;
++    if (max_lines < 1) max_lines = 1;
++    int start = (g_remote_log_n > max_lines) ? g_remote_log_n - max_lines : 0;
++    int ly = pan_y + 40;
++    int maxc = pan_w / 8 - 6;
++    if (maxc < 8) maxc = 8;
++    for (int k = start; k < g_remote_log_n && ly < pan_y + pan_h - lh; k++) {
++        char line[320];
++        int li = 0;
++        line[li++] = '>'; line[li++] = ' ';
++        const char* c = g_remote_log[k];
++        for (int q = 0; c[q] && li < maxc + 2 && li < 319; ) line[li++] = c[q++];
++        line[li] = 0;
++        g_wm.gfx.draw_text_utf8(pan_x + 16, ly, line, 0xE6F0FF, 0x141A24);
++        ly += lh;
++    }
++
++    // "结束控制" button (centered, bottom)
++    g_remote_btn_w = 180; g_remote_btn_h = 46;
++    g_remote_btn_x = (W - g_remote_btn_w) / 2;
++    g_remote_btn_y = H - 90;
++    g_wm.gfx.fill_rect(g_remote_btn_x, g_remote_btn_y, g_remote_btn_w, g_remote_btn_h, 0xC0392B);
++    g_wm.gfx.draw_line(g_remote_btn_x, g_remote_btn_y, g_remote_btn_x + g_remote_btn_w, g_remote_btn_y, 0xE74C3C);
++    g_wm.gfx.draw_line(g_remote_btn_x, g_remote_btn_y + g_remote_btn_h, g_remote_btn_x + g_remote_btn_w, g_remote_btn_y + g_remote_btn_h, 0x7B241C);
++    g_wm.gfx.draw_text_utf8(g_remote_btn_x + (g_remote_btn_w - 64) / 2, g_remote_btn_y + 14, "结束控制", 0xFFFFFF, 0xC0392B);
++
++    dirty_add(0, 0, W, H);   // ensure the overlay is presented
++}
++
+ // ---- Open a Windows executable inside the GUI (on-demand startup) ----
+ // Called by the shell's `run <file>` when the file is .exe/.bat/.ps1/.com.
+ // Initializes the GUI if it is not already active, then shows a window

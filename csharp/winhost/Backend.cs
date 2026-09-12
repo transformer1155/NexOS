@@ -269,6 +269,40 @@ namespace NexOS.Forms
             if (fw > 0) FillRound(x, y, fw < h ? h : fw, h, h / 2, c);
         }
 
+        // Frosted-glass panel (WinHost parity: a Translucent rounded fill,
+        // since GDI+ has no live backdrop blur).  Good enough for previews.
+        public static void Glass(int x, int y, int w, int h, int r, uint tint, int alpha, int blur)
+        {
+            if (w <= 0 || h <= 0) return;
+            int a = alpha; if (a < 0) a = 0; if (a > 255) a = 255;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var p = Round(x, y, w, h, r))
+                g.FillPath(new SolidBrush(Color.FromArgb(a, (int)(tint & 0xFF),
+                                    (int)((tint >> 8) & 0xFF), (int)((tint >> 16) & 0xFF))), p);
+        }
+
+        // Text at an explicit glyph height (scales the host font).
+        public static void TextPx(int x, int y, string s, uint fg, int px)
+        {
+            if (string.IsNullOrEmpty(s)) return;
+            int sz = px; if (sz < 4) sz = 4; if (sz > 128) sz = 128;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            using (var f = new Font(font.FontFamily, sz, font.Style))
+                g.DrawString(s, f, B(fg), x - 1, y + 1, sf);
+        }
+
+        // Width of s at glyph height px (matches the kernel's vector advance).
+        public static int MeasurePx(string s, int px)
+        {
+            if (string.IsNullOrEmpty(s)) return 0;
+            int sz = px; if (sz < 4) sz = 4; if (sz > 128) sz = 128;
+            using (var f = new Font(font.FontFamily, sz, font.Style))
+            {
+                var szf = g.MeasureString(s, f);
+                return (int)(szf.Width + 0.5f);
+            }
+        }
+
         // Byte-for-byte equivalent of mh_measure() in gui.cpp: ASCII
         // advances 8px, a CJK codepoint (3 UTF-8 bytes) advances 16px,
         // 2-byte sequences carry no glyph in the kernel font.
@@ -563,6 +597,23 @@ namespace NexOS.Forms
                 if (!File.Exists(p)) return "";
                 string t = File.ReadAllText(p);
                 return t.Length > 4096 ? t.Substring(0, 4096) : t;
+            }
+            catch { return ""; }
+        }
+
+        // Raw bytes as a lower-case hex string (WinHost parity with the VM).
+        public static string ReadHex(int fs, string name)
+        {
+            if (!FsOk(fs) || string.IsNullOrEmpty(name)) return "";
+            try
+            {
+                string p = Path.Combine(Dir(fs), Path.GetFileName(name));
+                if (!File.Exists(p)) return "";
+                byte[] b = File.ReadAllBytes(p);
+                int n = b.Length > 2048 ? 2048 : b.Length;
+                System.Text.StringBuilder sb = new System.Text.StringBuilder(n * 2);
+                for (int i = 0; i < n; i++) sb.Append(b[i].ToString("x2"));
+                return sb.ToString();
             }
             catch { return ""; }
         }

@@ -60,13 +60,22 @@ static void build_msg(char* buf, int sz, const char* fmt, const char* s1, int n)
     buf[bi] = 0;
 }
 
-// try a list of candidate phrases; return index of first hit + its length.
+// try a list of candidate phrases; return the EARLIEST match position + its
+// length.  Returning on the first *candidate* (rather than the earliest
+// position) picked a later marker whenever the goal held more than one: e.g.
+// CONTENT_MARKS lists "content:" before "text:", so a goal containing
+// "text: ... content: ..." reported content:'s offset and the caller's later
+// `end < cpos` comparisons split the string at the wrong place.
 static int find_any(const char* s, const char* const* cands, int n, int* matchlen){
+    int best = -1, bestlen = 0;
     for (int i = 0; i < n; i++){
         int pos = sk_istr(s, cands[i]);
-        if (pos >= 0){ if (matchlen) *matchlen = sk_strlen(cands[i]); return pos; }
+        if (pos >= 0 && (best < 0 || pos < best)){
+            best = pos; bestlen = sk_strlen(cands[i]);
+        }
     }
-    return -1;
+    if (best >= 0 && matchlen) *matchlen = bestlen;
+    return best;
 }
 
 // ---- skill: create_file ----

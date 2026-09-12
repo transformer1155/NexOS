@@ -45,6 +45,15 @@ ifeq ($(WSL),1)
   include tools/wsl_setup.mk
 endif
 
+# Tool defaults that MUST resolve even when the WSL auto-provisioning block
+# above is skipped (e.g. $(origin WSL) is not "default" because the environment
+# already exports WSL).  The UEFI/ISO targets need mtools; without these the
+# esp.img recipe expands to a broken command and silently leaves an all-zero
+# (unformatted) ESP, after which OVMF drops into the EFI Shell.
+MFORMAT ?= $(shell command -v mformat 2>/dev/null)
+MCOPY   ?= $(shell command -v mcopy 2>/dev/null)
+MMD     ?= $(shell command -v mmd 2>/dev/null)
+
 BUILD   := build
 IMG     := $(BUILD)/os_v2.img
 UEFI_IMG := $(BUILD)/os_uefi.img
@@ -96,8 +105,8 @@ EFI_INC   := /usr/include/efi
 EFI_LIB   := /usr/lib
 EFI_CRT0  := $(EFI_LIB)/crt0-efi-x86_64.o
 EFI_LDS   := $(EFI_LIB)/elf_x86_64_efi.lds
-OVMF_CODE := /usr/share/OVMF/OVMF_CODE.fd
-OVMF_VARS := /usr/share/OVMF/OVMF_VARS.fd
+OVMF_CODE := $(firstword $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd))
+OVMF_VARS := $(firstword $(wildcard /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd))
 
 EFI_CFLAGS  := -I$(EFI_INC) -I$(EFI_INC)/x86_64 -DEFI_FUNCTION_WRAPPER \
                -DGNU_EFI_USE_MS_ABI -fno-stack-protector -fshort-wchar \
@@ -205,10 +214,10 @@ $(BUILD)/font_vec.o: font_vec.c font_vec.h tools/stb/stb_truetype.h | $(BUILD)
 $(BUILD)/font_vec64.o: font_vec.c font_vec.h tools/stb/stb_truetype.h | $(BUILD)
 	$(CC64) -x c $(CXX64FLAGS) -I tools/stb -I tools/vecmath -c font_vec.c -o $@
 
-# 32-bit kernel uses the no-op stub (real rasterizer is 64-bit only, to stay
-# within the 0x10000..0x9FC00 load window).  gui.cpp falls back to font_la.
-$(BUILD)/font_vec_stub.o: font_vec_stub.c font_vec.h | $(BUILD)
-	$(CC) $(CXXFLAGS) -c font_vec_stub.c -o $@
+# Both 32-bit and 64-bit kernels now link the real stb_truetype rasterizer
+# (font_vec.o).  The 32-bit build keeps the FPU/SSE enabled for float math and
+# the kernel heap (10 MiB) covers the 2 MiB msyh.ttf buffer, so vector fonts
+# work on the 32-bit side too.  font_vec_stub.o is no longer referenced.
 
 $(BUILD)/addrman.o: addrman.cpp addrman.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c addrman.cpp -o $@
@@ -257,9 +266,21 @@ $(BUILD)/clr.o: clr.cpp clr.h | $(BUILD)
 $(BUILD)/mforms.o: mforms.cpp mforms.h clr.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -fno-optimize-sibling-calls -c mforms.cpp -o $@
 
+# ----- Early boot splash (32-bit kernel only) -----
+# Self-contained animation painted straight into the LFB before the heap,
+# SFS and the fonts exist.  Borrows the 8x16 glyphs from gui.cpp.
+$(BUILD)/bootsplash.o: bootsplash.cpp bootsplash.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c bootsplash.cpp -o $@
+
+# ----- Intel iGPU hardware-cursor backend (32-bit kernel only) -----
+# Audits the display and reports whether the GPU can present the pointer
+# itself; read-only, so it can never damage a display it does not understand.
+$(BUILD)/intel_cursor.o: intel_cursor.cpp intel_cursor.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c intel_cursor.cpp -o $@
+
 # ----- Link kernel ELF (entry.o first => _start at image offset 0) -----
-$(BUILD)/kernel.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/gui.o $(BUILD)/font_vec_stub.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o linker.ld | $(BUILD)
-	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/gui.o $(BUILD)/font_vec_stub.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o
+$(BUILD)/kernel.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o linker.ld | $(BUILD)
+	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o
 
 # ----- Extract flat kernel binary -----
 $(BUILD)/kernel.bin: $(BUILD)/kernel.elf | $(BUILD)
@@ -288,7 +309,7 @@ $(SFS_IMG): $(wildcard $(SFS_DIR)/*) tools/sfs_gen.py tools/tex_pack.py $(SFS_DI
 	$(PYTHON) tools/sfs_gen.py $(SFS_DIR) $@
 
 $(BUILD)/sfs_uefi.img: $(wildcard $(SFS_DIR)/*) tools/sfs_gen.py $(SFS_IMG) | $(BUILD)
-	$(PYTHON) tools/sfs_gen.py $(SFS_DIR) $@
+	$(PYTHON) tools/sfs_gen.py $(SFS_DIR) $@ --exclude-fonts
 
 # =====================================================================
 #  Independent Linux user-space partition
@@ -299,10 +320,10 @@ $(BUILD)/sfs_uefi.img: $(wildcard $(SFS_DIR)/*) tools/sfs_gen.py $(SFS_IMG) | $(
 # =====================================================================
 LINUX_ROOT     := linux_root
 LINUX_SFS_IMG  := $(BUILD)/linux_sfs.img
-# 12288 (6 MiB mark): main SFS grows past 8704 on the BIOS image, so 8704
-# would overlap it and clobber zfont.bin's tail.  12288 leaves ~2.8k sectors
-# of free space in the main SFS (usable by Sfs::create) before the Linux vol.
-LINUX_SFS_LBA  := 3932
+# 25600 (~12.5 MiB): the main SFS now packs the full GB2312 24x24 bitmap
+# (sfs_files/zfont.bin, ~4 MiB), so it grows to ~10 MiB; the Linux vol must
+# sit clear of it.  25600 keeps a comfortable gap past the SFS tail.
+LINUX_SFS_LBA  := 25600
 
 # Stage 6 dynamic-link test guest + libc.so are both packed into the Linux
 # SFS volume so `linux linux_dynlink` can load libc.so from there.
@@ -624,20 +645,31 @@ $(BUILD)/kernel_blob.o: $(BUILD)/kernel.bin | $(BUILD)
 	cp $< $(BUILD)/kernel.blob
 	$(LD) -r -b binary -o $@ $(BUILD)/kernel.blob
 
-# ----- Link UEFI shared object (includes embedded kernel blob) -----
-$(BUILD)/bootx64.so: $(BUILD)/bootuefi.o $(BUILD)/enter_kernel_uefi.o $(BUILD)/get_embedded_uefi.o $(BUILD)/kernel_blob.o | $(BUILD)
-	$(LD) $(EFI_LDFLAGS) $^ -o $@ -lefi -lgnuefi
+# ----- 64-bit kernel blob (RAM-staged for the 32-bit `switch64` path; the
+#       kernel's own ATA read returns zeros under UEFI/AHCI) -----
+$(BUILD)/kernel64_blob.o: $(BUILD)/kernel64.bin | $(BUILD)
+	cp $< $(BUILD)/kernel64.blob
+	$(LD) -r -b binary -o $@ $(BUILD)/kernel64.blob
 
-# ----- Convert to PE32+ EFI application -----
-# NOTE: objcopy's --target=efi-app-x86-64 does NOT properly convert ELF
-# .rela relocations to PE32+ .reloc base relocations (tested with
-# binutils 2.38).  We use gen_reloc.py to manually generate the .reloc
-# section from the ELF .rela entries and patch it into the PE32+ binary.
-$(BUILD)/BOOTX64.EFI: $(BUILD)/bootx64.so tools/gen_reloc.py | $(BUILD)
-	$(OBJCOPY) -j .text -j .sdata -j .data -j .dynamic \
-	           -j .dynsym -j .dynstr \
-	           --target=efi-app-x86_64 $< $@
-	$(PYTHON) tools/gen_reloc.py $(BUILD)/bootx64.so $@
+# ----- SFS image blob (RAM-staged: AHCI machines cannot PIO-read the disk, so
+#       Sfs::init() would never find the superblock and the shell stays black) -----
+$(BUILD)/sfs_blob.o: $(SFS_IMG) | $(BUILD)
+	cp $< $(BUILD)/sfs.blob
+	$(LD) -r -b binary -o $@ $(BUILD)/sfs.blob
+
+# ----- Build BOOTX64.EFI (gnu-efi-FREE path) -----
+# Delegates to tools/build_bootx64_efi.sh (uefi/gf_inc + efi_min.c/crt0_min.S
+# + tools/elf2efi.py, host gcc/ld).  The old gnu-efi link (bootx64.so +
+# gen_reloc.py) produced a PE that OVMF loaded but faulted with #UD; this
+# fully position-independent PE boots.  It embeds the kernel + kernel64 + SFS
+# blobs, which bootuefi.c RAM-stages (AHCI PIO cannot read the disk).
+# The bootuefi.o / enter_kernel_uefi.o / get_embedded_uefi.o rules above stay
+# because the isolated `uefi-diag` target still uses them.
+$(BUILD)/BOOTX64.EFI: uefi/bootuefi.c uefi/efi_min.c uefi/crt0_min.S \
+		uefi/enter_kernel.S uefi/get_embedded.S uefi/efi_min.lds \
+		tools/elf2efi.py tools/build_bootx64_efi.sh \
+		$(BUILD)/kernel.bin $(BUILD)/kernel64.bin $(SFS_IMG) | $(BUILD)
+	bash tools/build_bootx64_efi.sh
 
 # ----- Build ESP (EFI System Partition) image with bootloader + kernels -----
 # Uses FAT16 format (16 MiB) for El Torito CD boot (removable media = FAT12/16 OK).
@@ -661,8 +693,8 @@ $(BUILD)/esp.img: $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(SFS_IMG) | $(BUILD)
 #   LBA 2-33:   GPT partition entry array
 #   LBA 34-2047: Unused (gap)
 #   LBA 2048:   kernel64.bin (raw; read by the 32-bit kernel's `switch64`)
-#   LBA 3328:   SFS image (raw; probed by Sfs::init)
-#   LBA 8192+:  ESP partition (FAT16, contains BOOTX64.EFI at /EFI/BOOT/BOOTX64.EFI)
+#   LBA 4096:   SFS image (raw; UEFI also RAM-stages SFS, this is a fallback)
+#   LBA 16384+: ESP partition (FAT16, contains BOOTX64.EFI at /EFI/BOOT/BOOTX64.EFI)
 $(UEFI_IMG): $(BUILD)/esp.img $(BUILD)/sfs_uefi.img $(BUILD)/kernel64.bin tools/make_gpt_uefi.py | $(BUILD)
 	$(PYTHON) tools/make_gpt_uefi.py $(BUILD)/esp.img $@ $(BUILD)/kernel64.bin $(BUILD)/sfs_uefi.img
 	@echo "==> UEFI Image built: $(UEFI_IMG) ($$(stat -c%s $@) bytes)"
@@ -694,7 +726,7 @@ $(BUILD)/gui_diag.o: gui.cpp | $(BUILD)
 $(BUILD)/bootuefi_diag.o: uefi/bootuefi.c | $(BUILD)
 	$(CC) $(EFI_CFLAGS) -DFB_DIAG -c uefi/bootuefi.c -o $@
 
-$(BUILD)/kernel_diag.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/gui_diag.o $(BUILD)/font_vec_stub.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o | $(BUILD)
+$(BUILD)/kernel_diag.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/gui_diag.o $(BUILD)/font_vec.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o | $(BUILD)
 	$(LD) $(LDFLAGS) -o $@ $^
 
 $(BUILD)/kernel_diag.bin: $(BUILD)/kernel_diag.elf | $(BUILD)
@@ -743,7 +775,7 @@ UEFI_LOGO_IMG := $(BUILD)/os_uefi_logo.img
 $(BUILD)/kernel_logo.o: kernel.cpp | $(BUILD)
 	$(CC) $(CXXFLAGS) -DBOOT_LOGO_TEST -c kernel.cpp -o $@
 
-$(BUILD)/kernel_logo.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_logo.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/gui.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o | $(BUILD)
+$(BUILD)/kernel_logo.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_logo.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/gui.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o | $(BUILD)
 	$(LD) $(LDFLAGS) -o $@ $^
 
 $(BUILD)/kernel_logo.bin: $(BUILD)/kernel_logo.elf | $(BUILD)
@@ -794,7 +826,7 @@ TEXTBOOT_IMG := $(BUILD)/os_textboot.img
 $(BUILD)/kernel_textboot.o: kernel.cpp | $(BUILD)
 	$(CC) $(CXXFLAGS) -DTEXT_BOOT -c kernel.cpp -o $@
 
-$(BUILD)/kernel_textboot.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_textboot.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/gui.o $(BUILD)/font_vec_stub.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o | $(BUILD)
+$(BUILD)/kernel_textboot.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_textboot.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o | $(BUILD)
 	$(LD) $(LDFLAGS) -o $@ $^
 
 $(BUILD)/kernel_textboot.bin: $(BUILD)/kernel_textboot.elf | $(BUILD)

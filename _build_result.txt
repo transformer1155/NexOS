@@ -1,0 +1,912 @@
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c kernel.cpp -o build/kernel.o
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::cpu_brand' [-Wmissing-field-initializers]
+  137 | static HwInfo g_hw = {0};
+      |                        ^
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::cpu_family' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::cpu_model' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::cpu_stepping' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::has_fpu' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::has_sse' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::has_sse2' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::has_sse3' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::has_long_mode' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::cpu_features_edx' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::cpu_features_ecx' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::cpu_detected' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::mem_total_kb' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::mem_e820_entries' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::mem_e820_available' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::vbe_width' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::vbe_height' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::vbe_bpp' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::vbe_pitch' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::vbe_fb_phys' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::vbe_available' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::vbe_mode_set' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::keyboard_present' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::mouse_present' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::mouse_type' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::disk_present' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::disk_sectors' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::disk_size_mb' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::disk_model' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::nic_present' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::nic_io_base' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::nic_type' [-Wmissing-field-initializers]
+kernel.cpp:137:24: warning: missing initializer for member 'HwInfo::pci_devices_found' [-Wmissing-field-initializers]
+kernel.cpp: In function 'void* memcpy(void*, const void*, unsigned int)':
+kernel.cpp:825:5: warning: this 'while' clause does not guard... [-Wmisleading-indentation]
+  825 |     while(n--) *dp++=*sp++; return d;
+      |     ^~~~~
+kernel.cpp:825:29: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'while'
+  825 |     while(n--) *dp++=*sp++; return d;
+      |                             ^~~~~~
+kernel.cpp: In function 'void vmm_init()':
+kernel.cpp:3187:22: warning: unused variable 'lfb_w' [-Wunused-variable]
+ 3187 |             uint16_t lfb_w    = *(volatile uint16_t*)(0x5004);
+      |                      ^~~~~
+kernel.cpp: At global scope:
+kernel.cpp:3074:17: warning: 'uint32_t pmm_alloc_range(uint32_t)' defined but not used [-Wunused-function]
+ 3074 | static uint32_t pmm_alloc_range(uint32_t count){
+      |                 ^~~~~~~~~~~~~~~
+kernel.cpp:2043:13: warning: 'bool is_path_sep(char)' defined but not used [-Wunused-function]
+ 2043 | static bool is_path_sep(char c){ return c=='/' || c=='\\'; }
+      |             ^~~~~~~~~~~
+kernel.cpp:2001:17: warning: 'g_batch_data' defined but not used [-Wunused-variable]
+ 2001 | static uint8_t  g_batch_data[64*1024];
+      |                 ^~~~~~~~~~~~
+kernel.cpp:2000:18: warning: 'g_batch_files' defined but not used [-Wunused-variable]
+ 2000 | static BatchFile g_batch_files[CONT_MAXREC];
+      |                  ^~~~~~~~~~~~~
+kernel.cpp:1997:16: warning: 'g_cont_meta' defined but not used [-Wunused-variable]
+ 1997 | static uint8_t g_cont_meta[CONT_META_SECTORS * 512];
+      |                ^~~~~~~~~~~
+kernel.cpp:1162:13: warning: 'void {anonymous}::ssh_out_dummy(const char*, int)' defined but not used [-Wunused-function]
+ 1162 | static void ssh_out_dummy(const char*, int){}
+      |             ^~~~~~~~~~~~~
+kernel.cpp:1120:22: warning: '{anonymous}::g_vga_shadow_active' defined but not used [-Wunused-variable]
+ 1120 | static bool          g_vga_shadow_active = false;
+      |                      ^~~~~~~~~~~~~~~~~~~
+kernel.cpp:902:13: warning: 'bool ata_wait_drq()' defined but not used [-Wunused-function]
+  902 | static bool ata_wait_drq(){ return ata_wait_drq_base(0x1F0); }
+      |             ^~~~~~~~~~~~
+kernel.cpp:901:13: warning: 'bool ata_wait_bsy()' defined but not used [-Wunused-function]
+  901 | static bool ata_wait_bsy(){ return ata_wait_bsy_base(0x1F0); }
+      |             ^~~~~~~~~~~~
+kernel.cpp:818:14: warning: 'bool startswith_(const char*, const char*)' defined but not used [-Wunused-function]
+  818 | static bool  startswith_(const char* s,const char* prefix){ while(*prefix){ if(*s!=*prefix) return false; s++; prefix++; } return true; }
+      |              ^~~~~~~~~~~
+kernel.cpp: In function 'void kmain()':
+kernel.cpp:8359:18: warning: array subscript 0 is outside array bounds of 'const uint32_t [0]' [-Warray-bounds=]
+ 8359 |         if (cdf[0] == SFS_RAM_MAGIC) {
+      |             ~~~~~^
+cc1plus.exe: note: source object is likely at address zero
+kernel.cpp:8361:24: warning: array subscript 0 is outside array bounds of 'const uint32_t [0]' [-Warray-bounds=]
+ 8361 |             sfs.set_ram(cdf[1], cdf[2]);
+      |             ~~~~~~~~~~~^~~~~~~~~~~~~~~~
+cc1plus.exe: note: source object is likely at address zero
+kernel.cpp:8361:24: warning: array subscript 0 is outside array bounds of 'const uint32_t [0]' [-Warray-bounds=]
+cc1plus.exe: note: source object is likely at address zero
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c divdi3.c -o build/divdi3.o
+cc1.exe: warning: command-line option '-fno-rtti' is valid for C++/D/ObjC++ but not for C
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c ai_engine.cpp -o build/ai_engine.o
+ai_engine.cpp: In function 'void* ai_memcpy(void*, const void*, int)':
+ai_engine.cpp:43:5: warning: this 'while' clause does not guard... [-Wmisleading-indentation]
+   43 |     while(n--) *dp++=*sp++; return d;
+      |     ^~~~~
+ai_engine.cpp:43:29: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'while'
+   43 |     while(n--) *dp++=*sp++; return d;
+      |                             ^~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c ai_plugin.cpp -o build/ai_plugin.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c kb.cpp -o build/kb.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c skill.cpp -o build/skill.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c gguf.cpp -o build/gguf.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c net.cpp -o build/net.o
+net.cpp:4365:44: warning: multi-character character constant [-Wmultichar]
+ 4365 |                 dbg4[d4++]=' '; dbg4[d4++]='rl'; dbg4[d4++]='=';
+      |                                            ^~~~
+net.cpp: In function 'void* net_memcpy(void*, const void*, int)':
+net.cpp:68:5: warning: this 'while' clause does not guard... [-Wmisleading-indentation]
+   68 |     while(n--) *dp++=*sp++; return d;
+      |     ^~~~~
+net.cpp:68:29: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'while'
+   68 |     while(n--) *dp++=*sp++; return d;
+      |                             ^~~~~~
+net.cpp: In function 'void handle_tcp_client(const IpHeader*, const TcpHeader*, uint16_t, uint16_t, uint32_t, uint32_t, uint8_t, const uint8_t*, int)':
+net.cpp:1452:68: warning: unused parameter 'tcp' [-Wunused-parameter]
+ 1452 | static void handle_tcp_client(const IpHeader* ip, const TcpHeader* tcp,
+      |                                                   ~~~~~~~~~~~~~~~~~^~~
+net.cpp:1454:55: warning: unused parameter 'ack' [-Wunused-parameter]
+ 1454 |                                uint32_t seq, uint32_t ack, uint8_t flags,
+      |                                              ~~~~~~~~~^~~
+net.cpp: In function 'void handle_guest_tcp(const IpHeader*, const TcpHeader*, uint16_t, uint16_t, uint32_t, uint32_t, uint8_t, const uint8_t*, int)':
+net.cpp:1531:67: warning: unused parameter 'tcp' [-Wunused-parameter]
+ 1531 | static void handle_guest_tcp(const IpHeader* ip, const TcpHeader* tcp,
+      |                                                  ~~~~~~~~~~~~~~~~~^~~
+net.cpp:1533:54: warning: unused parameter 'ack' [-Wunused-parameter]
+ 1533 |                               uint32_t seq, uint32_t ack, uint8_t flags,
+      |                                             ~~~~~~~~~^~~
+net.cpp: In function 'const char* httpc_stristr(const char*, int, const char*)':
+net.cpp:1804:13: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 1804 |             if (a>='A'&&a<='Z') a+=32; if (b>='A'&&b<='Z') b+=32;
+      |             ^~
+net.cpp:1804:40: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 1804 |             if (a>='A'&&a<='Z') a+=32; if (b>='A'&&b<='Z') b+=32;
+      |                                        ^~
+net.cpp: In function 'void bn_mod(uint32_t*, const Bn*, Bn*)':
+net.cpp:3469:25: warning: comparison is always false due to limited range of data type [-Wtype-limits]
+ 3469 |             while (qhat >= 0x100000000ULL ||
+      |                    ~~~~~^~~~~~~~~~~~~~~~~
+net.cpp: In function 'void ssh_handle_channel_open(SshSession*, const uint8_t*, int)':
+net.cpp:4167:80: warning: unused parameter 'plen' [-Wunused-parameter]
+ 4167 | static void ssh_handle_channel_open(SshSession* s, const uint8_t* payload, int plen){
+      |                                                                            ~~~~^~~~
+net.cpp: In function 'void ssh_feed(TcpConn*)':
+net.cpp:4365:44: warning: overflow in conversion from 'int' to 'char' changes value from '29292' to '108' [-Woverflow]
+ 4365 |                 dbg4[d4++]=' '; dbg4[d4++]='rl'; dbg4[d4++]='=';
+      |                                            ^~~~
+net.cpp: At global scope:
+net.cpp:3394:13: warning: 'void bn_sub_mod(Bn*, const Bn*, const Bn*, const Bn*)' defined but not used [-Wunused-function]
+ 3394 | static void bn_sub_mod(Bn* r, const Bn* a, const Bn* b, const Bn* m){
+      |             ^~~~~~~~~~
+net.cpp:3377:13: warning: 'void bn_add_mod(Bn*, const Bn*, const Bn*, const Bn*)' defined but not used [-Wunused-function]
+ 3377 | static void bn_add_mod(Bn* r, const Bn* a, const Bn* b, const Bn* m){
+      |             ^~~~~~~~~~
+net.cpp:171:13: warning: 'void nic_select_page(uint8_t)' defined but not used [-Wunused-function]
+  171 | static void nic_select_page(uint8_t page){
+      |             ^~~~~~~~~~~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c distnet.cpp -o build/distnet.o
+distnet.cpp:32:13: warning: 'void my_strcat(char*, const char*)' defined but not used [-Wunused-function]
+   32 | static void my_strcat(char* d, const char* s){ while(*d) d++; while(*s) *d++=*s++; *d=0; }
+      |             ^~~~~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c gui.cpp -o build/gui.o
+gui.cpp: In member function 'void {anonymous}::MouseCursor::move({anonymous}::Graphics&, int, int)':
+gui.cpp:2579:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 2579 |         if (x < 0) x = 0; if (y < 0) y = 0;
+      |         ^~
+gui.cpp:2579:27: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 2579 |         if (x < 0) x = 0; if (y < 0) y = 0;
+      |                           ^~
+gui.cpp: In function 'void {anonymous}::glass_rounded_rect(Graphics&, int, int, int, int, int, Color, int, int)':
+gui.cpp:2698:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 2698 |     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+      |     ^~
+gui.cpp:2698:25: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 2698 |     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+      |                         ^~
+gui.cpp: In function 'void {anonymous}::glass_rect(Graphics&, int, int, int, int, Color, int, int)':
+gui.cpp:2730:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 2730 |     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+      |     ^~
+gui.cpp:2730:25: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 2730 |     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+      |                         ^~
+gui.cpp: In function 'bool {anonymous}::browser::eqi(const char*, const char*)':
+gui.cpp:2937:13: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 2937 |             if (ca>='A'&&ca<='Z') ca+=32; if (cb>='A'&&cb<='Z') cb+=32;
+      |             ^~
+gui.cpp:2937:43: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 2937 |             if (ca>='A'&&ca<='Z') ca+=32; if (cb>='A'&&cb<='Z') cb+=32;
+      |                                           ^~
+gui.cpp:2938:13: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 2938 |             if (ca!=cb) return false; a++; b++; }
+      |             ^~
+gui.cpp:2938:39: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 2938 |             if (ca!=cb) return false; a++; b++; }
+      |                                       ^
+gui.cpp: In function 'void {anonymous}::browser::normalize(const char*, char*)':
+gui.cpp:2966:21: warning: unused variable 'p' [-Wunused-variable]
+ 2966 |         const char* p = raw;
+      |                     ^
+gui.cpp: In function 'void {anonymous}::browser::go_back(int)':
+gui.cpp:3007:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3007 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |         ^~
+gui.cpp:3007:40: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3007 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |                                        ^~~
+gui.cpp: In function 'void {anonymous}::browser::go_forward(int)':
+gui.cpp:3013:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3013 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |         ^~
+gui.cpp:3013:40: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3013 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |                                        ^~~
+gui.cpp: In function 'void {anonymous}::browser::stop(int)':
+gui.cpp:3019:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3019 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |         ^~
+gui.cpp:3019:40: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3019 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |                                        ^~~
+gui.cpp: In function 'void {anonymous}::browser::parse_css(const char*)':
+gui.cpp:3190:17: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3190 |                 if(d>=p) break; d++;
+      |                 ^~
+gui.cpp:3190:33: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3190 |                 if(d>=p) break; d++;
+      |                                 ^
+gui.cpp: In function 'void {anonymous}::browser::css_apply_inline(const char*)':
+gui.cpp:3262:13: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3262 |             if(*d!=':') break; d++;
+      |             ^~
+gui.cpp:3262:32: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3262 |             if(*d!=':') break; d++;
+      |                                ^
+gui.cpp: In function 'void {anonymous}::browser::render({anonymous}::Graphics&, int, int, int, int)':
+gui.cpp:3357:41: warning: variable 'pre' set but not used [-Wunused-but-set-variable]
+ 3357 |         bool bold=false, in_link=false, pre=false, in_title=false, skip=false;
+      |                                         ^~~
+gui.cpp:3350:69: warning: unused parameter 'ch' [-Wunused-parameter]
+ 3350 |     static void render(Graphics& gfx, int cx0, int cy0, int cw, int ch){
+      |                                                                 ~~~~^~
+gui.cpp: In function 'void {anonymous}::browser::poll()':
+gui.cpp:3473:13: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3473 |             if (n<0) n=0; t.page[n]=0; t.page_len=n; t.loading=false; t.status=3; extract_title(t);
+      |             ^~
+gui.cpp:3473:27: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3473 |             if (n<0) n=0; t.page[n]=0; t.page_len=n; t.loading=false; t.status=3; extract_title(t);
+      |                           ^
+gui.cpp: In function 'void {anonymous}::browser::draw({anonymous}::Graphics&, int, {anonymous}::Win11Window&, int, int, int, int, int, int)':
+gui.cpp:3562:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3562 |         if (content_w < 20) content_w = 20; if (content_h < 20) content_h = 20;
+      |         ^~
+gui.cpp:3562:45: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3562 |         if (content_w < 20) content_w = 20; if (content_h < 20) content_h = 20;
+      |                                             ^~
+gui.cpp:3488:41: warning: unused parameter 'id' [-Wunused-parameter]
+ 3488 |     static void draw(Graphics& gfx, int id, Win11Window& win, int x, int y, int w, int h, int mx, int my){
+      |                                     ~~~~^~
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_control_panel(int, int, int, int, int)':
+gui.cpp:4262:62: warning: unused parameter 'h' [-Wunused-parameter]
+ 4262 |     void draw_control_panel(int id, int x, int y, int w, int h) {
+      |                                                          ~~~~^
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_file_explorer(int, int, int, int, int)':
+gui.cpp:4854:61: warning: comparison of integer expressions of different signedness: 'uint32_t' {aka 'long unsigned int'} and 'int' [-Wsign-compare]
+ 4854 |                 if ((bpp == 24 || bpp == 32) && data_offset < bytes && img_width > 0 && img_height > 0) {
+      |                                                 ~~~~~~~~~~~~^~~~~~~
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_mem_optimizer(int, int, int, int, int)':
+gui.cpp:5172:62: warning: unused parameter 'h' [-Wunused-parameter]
+ 5172 |     void draw_mem_optimizer(int id, int x, int y, int w, int h) {
+      |                                                          ~~~~^
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_calculator(int, int, int, int, int)':
+gui.cpp:5253:59: warning: unused parameter 'h' [-Wunused-parameter]
+ 5253 |     void draw_calculator(int id, int x, int y, int w, int h) {
+      |                                                       ~~~~^
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_about(int, int, int, int, int)':
+gui.cpp:5335:25: warning: unused parameter 'id' [-Wunused-parameter]
+ 5335 |     void draw_about(int id, int x, int y, int w, int h) {
+      |                     ~~~~^~
+gui.cpp:5335:47: warning: unused parameter 'w' [-Wunused-parameter]
+ 5335 |     void draw_about(int id, int x, int y, int w, int h) {
+      |                                           ~~~~^
+gui.cpp:5335:54: warning: unused parameter 'h' [-Wunused-parameter]
+ 5335 |     void draw_about(int id, int x, int y, int w, int h) {
+      |                                                  ~~~~^
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_action_button(int, int, int, int, const char*, bool, {anonymous}::Win11Window&)':
+gui.cpp:5392:56: warning: unused parameter 'win' [-Wunused-parameter]
+ 5392 |                             bool pressed, Win11Window& win) {
+      |                                           ~~~~~~~~~~~~~^~~
+gui.cpp: In member function 'bool {anonymous}::Win11Desktop::w32_popup_rect(int*, int*, int*, int*)':
+gui.cpp:5621:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 5621 |         if (x) *x = px; if (y) *y = py; if (w) *w = mw; if (h) *h = mh;
+      |         ^~
+gui.cpp:5621:25: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 5621 |         if (x) *x = px; if (y) *y = py; if (w) *w = mw; if (h) *h = mh;
+      |                         ^~
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::open_file_in_gui(const char*, const char*)':
+gui.cpp:7381:29: warning: unused variable 'gh' [-Wunused-variable]
+ 7381 |         int gw = gfx.width, gh = gfx.height;
+      |                             ^~
+gui.cpp: At global scope:
+gui.cpp:8179:13: warning: 'void vga_set_text_mode()' defined but not used [-Wunused-function]
+ 8179 | static void vga_set_text_mode(void) {
+      |             ^~~~~~~~~~~~~~~~~
+gui.cpp:1231:12: warning: 'int {anonymous}::fla_pick_size(int)' defined but not used [-Wunused-function]
+ 1231 | static int fla_pick_size(int px) {
+      |            ^~~~~~~~~~~~~
+gui.cpp:1215:23: warning: 'const uint8_t* {anonymous}::fla_glyph(int, int, int*, int*)' defined but not used [-Wunused-function]
+ 1215 | static const uint8_t* fla_glyph(int cp, int si, int* out_w, int* out_h) {
+      |                       ^~~~~~~~~
+gui.cpp:459:12: warning: 'int strncmp_(const char*, const char*, int)' defined but not used [-Wunused-function]
+  459 | static int strncmp_(const char* a, const char* b, int n) {
+      |            ^~~~~~~~
+gui.cpp:441:14: warning: 'void* memset_(void*, int, int)' defined but not used [-Wunused-function]
+  441 | static void* memset_(void* d, int v, int n) {
+      |              ^~~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c font_vec_stub.c -o build/font_vec_stub.o
+cc1.exe: warning: command-line option '-fno-rtti' is valid for C++/D/ObjC++ but not for C
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c addrman.cpp -o build/addrman.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c winloader.cpp -o build/winloader.o
+winloader.cpp: In function 'void wl_bat_exec_command(const char*, const uint8_t*, int, int*)':
+winloader.cpp:173:65: warning: unused parameter 'data' [-Wunused-parameter]
+  173 | static void wl_bat_exec_command(const char* cmd, const uint8_t* data, int size, int* cur) {
+      |                                                  ~~~~~~~~~~~~~~~^~~~
+winloader.cpp:173:75: warning: unused parameter 'size' [-Wunused-parameter]
+  173 | static void wl_bat_exec_command(const char* cmd, const uint8_t* data, int size, int* cur) {
+      |                                                                       ~~~~^~~~
+winloader.cpp:173:86: warning: unused parameter 'cur' [-Wunused-parameter]
+  173 | static void wl_bat_exec_command(const char* cmd, const uint8_t* data, int size, int* cur) {
+      |                                                                                 ~~~~~^~~
+winloader.cpp: In function 'int wl_exec_ps1(const uint8_t*, int)':
+winloader.cpp:415:33: warning: unused variable 'right' [-Wunused-variable]
+  415 |                 char left[128], right[128];
+      |                                 ^~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c win32.cpp -o build/win32.o
+win32.cpp: In function 'int K_SetEnvironmentVariableA(const char*, const char*)':
+win32.cpp:813:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+  813 |     if (!n) return 0; env_put(n, v ? v : ""); return 1;
+      |     ^~
+win32.cpp:813:23: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+  813 |     if (!n) return 0; env_put(n, v ? v : ""); return 1;
+      |                       ^~~~~~~
+win32.cpp: In function 'int U_DeleteMenu(uint32_t, uint32_t, uint32_t)':
+win32.cpp:1310:67: warning: unused parameter 'flags' [-Wunused-parameter]
+ 1310 | static int WINAPI U_DeleteMenu(uint32_t h, uint32_t pos, uint32_t flags){
+      |                                                          ~~~~~~~~~^~~~~
+win32.cpp: In function 'uint32_t K_GetModuleHandleExA(uint32_t, const char*, uint32_t*)':
+win32.cpp:1787:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 1787 |     if (out) *out = 0x00400000u; return 1;
+      |     ^~
+win32.cpp:1787:34: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 1787 |     if (out) *out = 0x00400000u; return 1;
+      |                                  ^~~~~~
+win32.cpp: In function 'uint32_t U_GetDlgItemTextA(uint32_t, int, char*, int)':
+win32.cpp:1851:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 1851 |     if (buf && n > 0) buf[0] = 0; return 0;
+      |     ^~
+win32.cpp:1851:35: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 1851 |     if (buf && n > 0) buf[0] = 0; return 0;
+      |                                   ^~~~~~
+win32.cpp: At global scope:
+win32.cpp:2143:13: warning: 'void rep_hex64(uint64_t)' defined but not used [-Wunused-function]
+ 2143 | static void rep_hex64(uint64_t v){
+      |             ^~~~~~~~~
+win32.cpp:68:13: warning: 'void w32_serial_byte(uint8_t)' defined but not used [-Wunused-function]
+   68 | static void w32_serial_byte(uint8_t b){
+      |             ^~~~~~~~~~~~~~~
+win32.cpp:61:13: warning: 'void w32_serial_hex64(uint64_t)' defined but not used [-Wunused-function]
+   61 | static void w32_serial_hex64(uint64_t v){
+      |             ^~~~~~~~~~~~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c linux_compat.cpp -o build/linux_compat.o
+linux_compat.cpp: In function 'void linux_deliver_signals(SysRegs*, int)':
+linux_compat.cpp:366:55: warning: unused parameter 'from_trap' [-Wunused-parameter]
+  366 | extern "C" void linux_deliver_signals(SysRegs* r, int from_trap){
+      |                                                   ~~~~^~~~~~~~~
+linux_compat.cpp: In function 'uint32_t linux_build_stack(int, const char**, int, const char**, uint32_t, uint32_t, uint32_t, uint32_t, uint16_t, uint16_t, uint32_t, uint32_t*, uint32_t)':
+linux_compat.cpp:1612:68: warning: unused parameter 'envc_arg' [-Wunused-parameter]
+ 1612 | static uint32_t linux_build_stack(int argc, const char** argv, int envc_arg,
+      |                                                                ~~~~^~~~~~~~
+linux_compat.cpp: In function 'int dyn_lookup_gnu(dyn_mod_t*, const char*)':
+linux_compat.cpp:1983:14: warning: unused variable 'buckets_off' [-Wunused-variable]
+ 1983 |     uint32_t buckets_off = (uint32_t)buckets_off64;
+      |              ^~~~~~~~~~~
+linux_compat.cpp: At global scope:
+linux_compat.cpp:64:13: warning: 'void dbg_hex(const char*, uint32_t)' defined but not used [-Wunused-function]
+   64 | static void dbg_hex(const char* label, uint32_t v){
+      |             ^~~~~~~
+linux_compat.cpp:59:13: warning: 'void serial_putc(char)' defined but not used [-Wunused-function]
+   59 | static void serial_putc(char c){ outb(0x3F8, (uint8_t)c); }
+      |             ^~~~~~~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c gdt.cpp -o build/gdt.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c syscall.cpp -o build/syscall.o
+syscall.cpp: In function 'void serial_hex(uint32_t)':
+syscall.cpp:28:5: warning: this 'for' clause does not guard... [-Wmisleading-indentation]
+   28 |     for (int i=0;i<8;i++) b[i]=H[(v>>(28-i*4))&0xF]; b[8]=0; serial_puts(b);
+      |     ^~~
+syscall.cpp:28:54: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'for'
+   28 |     for (int i=0;i<8;i++) b[i]=H[(v>>(28-i*4))&0xF]; b[8]=0; serial_puts(b);
+      |                                                      ^
+syscall.cpp: At global scope:
+syscall.cpp:26:13: warning: 'void serial_hex(uint32_t)' defined but not used [-Wunused-function]
+   26 | static void serial_hex(uint32_t v){
+      |             ^~~~~~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c proc.cpp -o build/proc.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c vfs.cpp -o build/vfs.o
+vfs.cpp:40:13: warning: 'int vstreq(const char*, const char*)' defined but not used [-Wunused-function]
+   40 | static int  vstreq(const char* a, const char* b){ while(*a && *a==*b){a++;b++;} return *a==*b; }
+      |             ^~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c perm.cpp -o build/perm.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c clr.cpp -o build/clr.o
+clr.cpp: In function 'int clr_run(const char*)':
+clr.cpp:1077:25: warning: comparison is always false due to limited range of data type [-Wtype-limits]
+ 1077 |     if ((int)em->n_args < 0 ||
+      |         ~~~~~~~~~~~~~~~~^~~
+clr.cpp: In function 'int clr_run_resident(const char*)':
+clr.cpp:1151:25: warning: comparison is always false due to limited range of data type [-Wtype-limits]
+ 1151 |     if ((int)em->n_args < 0 ||
+      |         ~~~~~~~~~~~~~~~~^~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -fno-optimize-sibling-calls -c mforms.cpp -o build/mforms.o
+mforms.cpp:34:13: warning: 'void serial_putdec(int)' defined but not used [-Wunused-function]
+   34 | static void serial_putdec(int v) {
+      |             ^~~~~~~~~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-ld.exe -m elf_i386 -nostdlib -T linker.ld -z noexecstack -o build/kernel.elf build/entry.o build/switch32to64.o build/kernel.o build/divdi3.o build/ai_engine.o build/ai_plugin.o build/kb.o build/skill.o build/gguf.o build/net.o build/distnet.o build/gui.o build/font_vec_stub.o build/addrman.o build/winloader.o build/win32.o build/linux_compat.o build/gdt.o build/syscall.o build/proc.o build/vfs.o build/perm.o build/clr.o build/mforms.o
+C:/Users/trans/elf_tools/bin/i686-elf-ld.exe: warning: build/kernel.elf has a LOAD segment with RWX permissions
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-objcopy.exe -O binary build/kernel.elf build/kernel.bin
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c ai_engine.cpp -o build/ai_engine64.o
+ai_engine.cpp: In function 'void* ai_memcpy(void*, const void*, int)':
+ai_engine.cpp:43:5: warning: this 'while' clause does not guard... [-Wmisleading-indentation]
+   43 |     while(n--) *dp++=*sp++; return d;
+      |     ^~~~~
+ai_engine.cpp:43:29: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'while'
+   43 |     while(n--) *dp++=*sp++; return d;
+      |                             ^~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c ai_plugin.cpp -o build/ai_plugin64.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c kb.cpp -o build/kb64.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c gguf.cpp -o build/gguf64.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c gguf_infer.cpp -o build/gguf_infer64.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c memory_adapter.c -o build/memory_adapter64.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c file_adapter.c -o build/file_adapter64.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c gguf_loader.c -o build/gguf_loader64.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c knowledge_base.c -o build/knowledge_base64.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c net.cpp -o build/net64.o
+net.cpp:4365:44: warning: multi-character character constant [-Wmultichar]
+ 4365 |                 dbg4[d4++]=' '; dbg4[d4++]='rl'; dbg4[d4++]='=';
+      |                                            ^~~~
+net.cpp: In function 'void* net_memcpy(void*, const void*, int)':
+net.cpp:68:5: warning: this 'while' clause does not guard... [-Wmisleading-indentation]
+   68 |     while(n--) *dp++=*sp++; return d;
+      |     ^~~~~
+net.cpp:68:29: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'while'
+   68 |     while(n--) *dp++=*sp++; return d;
+      |                             ^~~~~~
+net.cpp: In function 'void handle_tcp_client(const IpHeader*, const TcpHeader*, uint16_t, uint16_t, uint32_t, uint32_t, uint8_t, const uint8_t*, int)':
+net.cpp:1452:68: warning: unused parameter 'tcp' [-Wunused-parameter]
+ 1452 | static void handle_tcp_client(const IpHeader* ip, const TcpHeader* tcp,
+      |                                                   ~~~~~~~~~~~~~~~~~^~~
+net.cpp:1454:55: warning: unused parameter 'ack' [-Wunused-parameter]
+ 1454 |                                uint32_t seq, uint32_t ack, uint8_t flags,
+      |                                              ~~~~~~~~~^~~
+net.cpp: In function 'void handle_guest_tcp(const IpHeader*, const TcpHeader*, uint16_t, uint16_t, uint32_t, uint32_t, uint8_t, const uint8_t*, int)':
+net.cpp:1531:67: warning: unused parameter 'tcp' [-Wunused-parameter]
+ 1531 | static void handle_guest_tcp(const IpHeader* ip, const TcpHeader* tcp,
+      |                                                  ~~~~~~~~~~~~~~~~~^~~
+net.cpp:1533:54: warning: unused parameter 'ack' [-Wunused-parameter]
+ 1533 |                               uint32_t seq, uint32_t ack, uint8_t flags,
+      |                                             ~~~~~~~~~^~~
+net.cpp: In function 'const char* httpc_stristr(const char*, int, const char*)':
+net.cpp:1804:13: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 1804 |             if (a>='A'&&a<='Z') a+=32; if (b>='A'&&b<='Z') b+=32;
+      |             ^~
+net.cpp:1804:40: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 1804 |             if (a>='A'&&a<='Z') a+=32; if (b>='A'&&b<='Z') b+=32;
+      |                                        ^~
+net.cpp: In function 'void bn_mod(uint32_t*, const Bn*, Bn*)':
+net.cpp:3469:25: warning: comparison is always false due to limited range of data type [-Wtype-limits]
+ 3469 |             while (qhat >= 0x100000000ULL ||
+      |                    ~~~~~^~~~~~~~~~~~~~~~~
+net.cpp: In function 'void ssh_handle_channel_open(SshSession*, const uint8_t*, int)':
+net.cpp:4167:80: warning: unused parameter 'plen' [-Wunused-parameter]
+ 4167 | static void ssh_handle_channel_open(SshSession* s, const uint8_t* payload, int plen){
+      |                                                                            ~~~~^~~~
+net.cpp: In function 'void ssh_feed(TcpConn*)':
+net.cpp:4365:44: warning: overflow in conversion from 'int' to 'char' changes value from '29292' to '108' [-Woverflow]
+ 4365 |                 dbg4[d4++]=' '; dbg4[d4++]='rl'; dbg4[d4++]='=';
+      |                                            ^~~~
+net.cpp: At global scope:
+net.cpp:3394:13: warning: 'void bn_sub_mod(Bn*, const Bn*, const Bn*, const Bn*)' defined but not used [-Wunused-function]
+ 3394 | static void bn_sub_mod(Bn* r, const Bn* a, const Bn* b, const Bn* m){
+      |             ^~~~~~~~~~
+net.cpp:3377:13: warning: 'void bn_add_mod(Bn*, const Bn*, const Bn*, const Bn*)' defined but not used [-Wunused-function]
+ 3377 | static void bn_add_mod(Bn* r, const Bn* a, const Bn* b, const Bn* m){
+      |             ^~~~~~~~~~
+net.cpp:171:13: warning: 'void nic_select_page(uint8_t)' defined but not used [-Wunused-function]
+  171 | static void nic_select_page(uint8_t page){
+      |             ^~~~~~~~~~~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c distnet.cpp -o build/distnet64.o
+distnet.cpp:32:13: warning: 'void my_strcat(char*, const char*)' defined but not used [-Wunused-function]
+   32 | static void my_strcat(char* d, const char* s){ while(*d) d++; while(*s) *d++=*s++; *d=0; }
+      |             ^~~~~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c gui.cpp -o build/gui64.o
+gui.cpp: In function 'void boot_beacon(uint8_t, uint8_t, uint8_t)':
+gui.cpp:172:14: warning: unused variable 'sb' [-Wunused-variable]
+  172 |     uint32_t sb   = *(volatile uint32_t*)(vb + 0x18);
+      |              ^~
+gui.cpp: In member function 'void {anonymous}::MouseCursor::move({anonymous}::Graphics&, int, int)':
+gui.cpp:2579:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 2579 |         if (x < 0) x = 0; if (y < 0) y = 0;
+      |         ^~
+gui.cpp:2579:27: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 2579 |         if (x < 0) x = 0; if (y < 0) y = 0;
+      |                           ^~
+gui.cpp: In function 'void {anonymous}::glass_rounded_rect(Graphics&, int, int, int, int, int, Color, int, int)':
+gui.cpp:2698:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 2698 |     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+      |     ^~
+gui.cpp:2698:25: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 2698 |     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+      |                         ^~
+gui.cpp: In function 'void {anonymous}::glass_rect(Graphics&, int, int, int, int, Color, int, int)':
+gui.cpp:2730:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 2730 |     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+      |     ^~
+gui.cpp:2730:25: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 2730 |     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+      |                         ^~
+gui.cpp: In function 'bool {anonymous}::browser::eqi(const char*, const char*)':
+gui.cpp:2937:13: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 2937 |             if (ca>='A'&&ca<='Z') ca+=32; if (cb>='A'&&cb<='Z') cb+=32;
+      |             ^~
+gui.cpp:2937:43: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 2937 |             if (ca>='A'&&ca<='Z') ca+=32; if (cb>='A'&&cb<='Z') cb+=32;
+      |                                           ^~
+gui.cpp:2938:13: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 2938 |             if (ca!=cb) return false; a++; b++; }
+      |             ^~
+gui.cpp:2938:39: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 2938 |             if (ca!=cb) return false; a++; b++; }
+      |                                       ^
+gui.cpp: In function 'void {anonymous}::browser::normalize(const char*, char*)':
+gui.cpp:2966:21: warning: unused variable 'p' [-Wunused-variable]
+ 2966 |         const char* p = raw;
+      |                     ^
+gui.cpp: In function 'void {anonymous}::browser::go_back(int)':
+gui.cpp:3007:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3007 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |         ^~
+gui.cpp:3007:40: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3007 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |                                        ^~~
+gui.cpp: In function 'void {anonymous}::browser::go_forward(int)':
+gui.cpp:3013:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3013 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |         ^~
+gui.cpp:3013:40: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3013 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |                                        ^~~
+gui.cpp: In function 'void {anonymous}::browser::stop(int)':
+gui.cpp:3019:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3019 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |         ^~
+gui.cpp:3019:40: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3019 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |                                        ^~~
+gui.cpp: In function 'void {anonymous}::browser::parse_css(const char*)':
+gui.cpp:3190:17: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3190 |                 if(d>=p) break; d++;
+      |                 ^~
+gui.cpp:3190:33: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3190 |                 if(d>=p) break; d++;
+      |                                 ^
+gui.cpp: In function 'void {anonymous}::browser::css_apply_inline(const char*)':
+gui.cpp:3262:13: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3262 |             if(*d!=':') break; d++;
+      |             ^~
+gui.cpp:3262:32: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3262 |             if(*d!=':') break; d++;
+      |                                ^
+gui.cpp: In function 'void {anonymous}::browser::render({anonymous}::Graphics&, int, int, int, int)':
+gui.cpp:3357:41: warning: variable 'pre' set but not used [-Wunused-but-set-variable]
+ 3357 |         bool bold=false, in_link=false, pre=false, in_title=false, skip=false;
+      |                                         ^~~
+gui.cpp:3350:69: warning: unused parameter 'ch' [-Wunused-parameter]
+ 3350 |     static void render(Graphics& gfx, int cx0, int cy0, int cw, int ch){
+      |                                                                 ~~~~^~
+gui.cpp: In function 'void {anonymous}::browser::poll()':
+gui.cpp:3473:13: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3473 |             if (n<0) n=0; t.page[n]=0; t.page_len=n; t.loading=false; t.status=3; extract_title(t);
+      |             ^~
+gui.cpp:3473:27: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3473 |             if (n<0) n=0; t.page[n]=0; t.page_len=n; t.loading=false; t.status=3; extract_title(t);
+      |                           ^
+gui.cpp: In function 'void {anonymous}::browser::draw({anonymous}::Graphics&, int, {anonymous}::Win11Window&, int, int, int, int, int, int)':
+gui.cpp:3562:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3562 |         if (content_w < 20) content_w = 20; if (content_h < 20) content_h = 20;
+      |         ^~
+gui.cpp:3562:45: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3562 |         if (content_w < 20) content_w = 20; if (content_h < 20) content_h = 20;
+      |                                             ^~
+gui.cpp:3488:41: warning: unused parameter 'id' [-Wunused-parameter]
+ 3488 |     static void draw(Graphics& gfx, int id, Win11Window& win, int x, int y, int w, int h, int mx, int my){
+      |                                     ~~~~^~
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_control_panel(int, int, int, int, int)':
+gui.cpp:4262:62: warning: unused parameter 'h' [-Wunused-parameter]
+ 4262 |     void draw_control_panel(int id, int x, int y, int w, int h) {
+      |                                                          ~~~~^
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_file_explorer(int, int, int, int, int)':
+gui.cpp:4854:61: warning: comparison of integer expressions of different signedness: 'uint32_t' {aka 'unsigned int'} and 'int' [-Wsign-compare]
+ 4854 |                 if ((bpp == 24 || bpp == 32) && data_offset < bytes && img_width > 0 && img_height > 0) {
+      |                                                 ~~~~~~~~~~~~^~~~~~~
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_mem_optimizer(int, int, int, int, int)':
+gui.cpp:5172:62: warning: unused parameter 'h' [-Wunused-parameter]
+ 5172 |     void draw_mem_optimizer(int id, int x, int y, int w, int h) {
+      |                                                          ~~~~^
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_calculator(int, int, int, int, int)':
+gui.cpp:5253:59: warning: unused parameter 'h' [-Wunused-parameter]
+ 5253 |     void draw_calculator(int id, int x, int y, int w, int h) {
+      |                                                       ~~~~^
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_about(int, int, int, int, int)':
+gui.cpp:5335:25: warning: unused parameter 'id' [-Wunused-parameter]
+ 5335 |     void draw_about(int id, int x, int y, int w, int h) {
+      |                     ~~~~^~
+gui.cpp:5335:47: warning: unused parameter 'w' [-Wunused-parameter]
+ 5335 |     void draw_about(int id, int x, int y, int w, int h) {
+      |                                           ~~~~^
+gui.cpp:5335:54: warning: unused parameter 'h' [-Wunused-parameter]
+ 5335 |     void draw_about(int id, int x, int y, int w, int h) {
+      |                                                  ~~~~^
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_action_button(int, int, int, int, const char*, bool, {anonymous}::Win11Window&)':
+gui.cpp:5392:56: warning: unused parameter 'win' [-Wunused-parameter]
+ 5392 |                             bool pressed, Win11Window& win) {
+      |                                           ~~~~~~~~~~~~~^~~
+gui.cpp: In member function 'bool {anonymous}::Win11Desktop::w32_popup_rect(int*, int*, int*, int*)':
+gui.cpp:5621:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 5621 |         if (x) *x = px; if (y) *y = py; if (w) *w = mw; if (h) *h = mh;
+      |         ^~
+gui.cpp:5621:25: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 5621 |         if (x) *x = px; if (y) *y = py; if (w) *w = mw; if (h) *h = mh;
+      |                         ^~
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::open_file_in_gui(const char*, const char*)':
+gui.cpp:7381:29: warning: unused variable 'gh' [-Wunused-variable]
+ 7381 |         int gw = gfx.width, gh = gfx.height;
+      |                             ^~
+gui.cpp: At global scope:
+gui.cpp:8179:13: warning: 'void vga_set_text_mode()' defined but not used [-Wunused-function]
+ 8179 | static void vga_set_text_mode(void) {
+      |             ^~~~~~~~~~~~~~~~~
+gui.cpp:1231:12: warning: 'int {anonymous}::fla_pick_size(int)' defined but not used [-Wunused-function]
+ 1231 | static int fla_pick_size(int px) {
+      |            ^~~~~~~~~~~~~
+gui.cpp:1215:23: warning: 'const uint8_t* {anonymous}::fla_glyph(int, int, int*, int*)' defined but not used [-Wunused-function]
+ 1215 | static const uint8_t* fla_glyph(int cp, int si, int* out_w, int* out_h) {
+      |                       ^~~~~~~~~
+gui.cpp:459:12: warning: 'int strncmp_(const char*, const char*, int)' defined but not used [-Wunused-function]
+  459 | static int strncmp_(const char* a, const char* b, int n) {
+      |            ^~~~~~~~
+gui.cpp:441:14: warning: 'void* memset_(void*, int, int)' defined but not used [-Wunused-function]
+  441 | static void* memset_(void* d, int v, int n) {
+      |              ^~~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -x c -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -I tools/stb -I tools/vecmath -c font_vec.c -o build/font_vec64.o
+cc1.exe: warning: command-line option '-fno-rtti' is valid for C++/D/ObjC++ but not for C
+cc1.exe: warning: command-line option '-fpermissive' is valid for C++/ObjC++ but not for C
+font_vec.c:113:12: warning: "/*" within comment [-Wcomment]
+  113 |  * Fills *w/*h with the AA bitmap dimensions and *xoff/*yoff with the
+      |             
+font_vec.c:113:55: warning: "/*" within comment [-Wcomment]
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c addrman.cpp -o build/addrman64.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c winloader.cpp -o build/winloader64.o
+winloader.cpp: In function 'void wl_bat_exec_command(const char*, const uint8_t*, int, int*)':
+winloader.cpp:173:65: warning: unused parameter 'data' [-Wunused-parameter]
+  173 | static void wl_bat_exec_command(const char* cmd, const uint8_t* data, int size, int* cur) {
+      |                                                  ~~~~~~~~~~~~~~~^~~~
+winloader.cpp:173:75: warning: unused parameter 'size' [-Wunused-parameter]
+  173 | static void wl_bat_exec_command(const char* cmd, const uint8_t* data, int size, int* cur) {
+      |                                                                       ~~~~^~~~
+winloader.cpp:173:86: warning: unused parameter 'cur' [-Wunused-parameter]
+  173 | static void wl_bat_exec_command(const char* cmd, const uint8_t* data, int size, int* cur) {
+      |                                                                                 ~~~~~^~~
+winloader.cpp: In function 'int wl_exec_ps1(const uint8_t*, int)':
+winloader.cpp:415:33: warning: unused variable 'right' [-Wunused-variable]
+  415 |                 char left[128], right[128];
+      |                                 ^~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c win32.cpp -o build/win32_64.o
+win32.cpp: In function 'uint32_t K_CreateThread(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t*)':
+win32.cpp:776:22: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  776 |     ((K_THREAD_START)(void*)start)((void*)(uintptr_t)param);
+      |                      ^~~~~~~~~~~~
+win32.cpp: In function 'int K_SetEnvironmentVariableA(const char*, const char*)':
+win32.cpp:813:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+  813 |     if (!n) return 0; env_put(n, v ? v : ""); return 1;
+      |     ^~
+win32.cpp:813:23: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+  813 |     if (!n) return 0; env_put(n, v ? v : ""); return 1;
+      |                       ^~~~~~~
+win32.cpp: In function 'int U_DeleteMenu(uint32_t, uint32_t, uint32_t)':
+win32.cpp:1310:67: warning: unused parameter 'flags' [-Wunused-parameter]
+ 1310 | static int WINAPI U_DeleteMenu(uint32_t h, uint32_t pos, uint32_t flags){
+      |                                                          ~~~~~~~~~^~~~~
+win32.cpp: In function 'int U_wsprintfA(char*, const char*, ...)':
+win32.cpp:1435:29: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+ 1435 |             const char* s = (const char*)(*va++);
+      |                             ^~~~~~~~~~~~~~~~~~~~
+win32.cpp: In function 'int C_printf(const char*, ...)':
+win32.cpp:1752:37: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+ 1752 |         if (*p=='s'){ const char* s=(const char*)(*va++); if (s) while (*s && o<250) tmp[o++]=*s++; }
+      |                                     ^~~~~~~~~~~~~~~~~~~~
+win32.cpp: In function 'uint32_t K_GetModuleHandleExA(uint32_t, const char*, uint32_t*)':
+win32.cpp:1787:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 1787 |     if (out) *out = 0x00400000u; return 1;
+      |     ^~
+win32.cpp:1787:34: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 1787 |     if (out) *out = 0x00400000u; return 1;
+      |                                  ^~~~~~
+win32.cpp: In function 'uint32_t U_GetDlgItemTextA(uint32_t, int, char*, int)':
+win32.cpp:1851:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 1851 |     if (buf && n > 0) buf[0] = 0; return 0;
+      |     ^~
+win32.cpp:1851:35: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 1851 |     if (buf && n > 0) buf[0] = 0; return 0;
+      |                                   ^~~~~~
+win32.cpp: At global scope:
+win32.cpp:68:13: warning: 'void w32_serial_byte(uint8_t)' defined but not used [-Wunused-function]
+   68 | static void w32_serial_byte(uint8_t b){
+      |             ^~~~~~~~~~~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c gdt.cpp -o build/gdt64.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c proc.cpp -o build/proc64.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c vfs.cpp -o build/vfs64.o
+vfs.cpp:40:13: warning: 'int vstreq(const char*, const char*)' defined but not used [-Wunused-function]
+   40 | static int  vstreq(const char* a, const char* b){ while(*a && *a==*b){a++;b++;} return *a==*b; }
+      |             ^~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c perm.cpp -o build/perm64.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -c clr.cpp -o build/clr64.o
+clr.cpp: In function 'int32_t make_string(const char*, int)':
+clr.cpp:201:21: warning: cast from 'uint8_t*' {aka 'unsigned char*'} to 'uint32_t' {aka 'unsigned int'} loses precision [-fpermissive]
+  201 |     return (int32_t)(uint32_t)o;
+      |                     ^~~~~~~~~~~
+clr.cpp: In function 'const char* str_data(int32_t)':
+clr.cpp:204:49: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  204 | static const char* str_data(int32_t s) { return (const char*)(uint32_t)s + 8; }
+      |                                                 ^~~~~~~~~~~~~~~~~~~~~~~~
+clr.cpp: In function 'int32_t str_len(int32_t)':
+clr.cpp:205:59: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  205 | static int32_t     str_len(int32_t s)  { return (int32_t)*(uint32_t*)((uint32_t)s + 4); }
+      |                                                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+clr.cpp: In function 'int32_t ic_str_concat(int32_t*)':
+clr.cpp:240:21: warning: cast from 'uint8_t*' {aka 'unsigned char*'} to 'uint32_t' {aka 'unsigned int'} loses precision [-fpermissive]
+  240 |     return (int32_t)(uint32_t)o;
+      |                     ^~~~~~~~~~~
+clr.cpp: In function 'int32_t ic_str_flat(int32_t*)':
+clr.cpp:275:21: warning: cast from 'uint8_t*' {aka 'unsigned char*'} to 'uint32_t' {aka 'unsigned int'} loses precision [-fpermissive]
+  275 |     return (int32_t)(uint32_t)o;
+      |                     ^~~~~~~~~~~
+clr.cpp: In function 'int exec_method(uint32_t, int)':
+clr.cpp:570:36: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  570 |                     uint32_t rt = *(uint32_t*)self;
+      |                                    ^~~~~~~~~~~~~~~
+clr.cpp:593:47: warning: cast from 'uint8_t*' {aka 'unsigned char*'} to 'uint32_t' {aka 'unsigned int'} loses precision [-fpermissive]
+  593 |             g_stack[g_sp - nparam] = (int32_t)(uint32_t)obj;
+      |                                               ^~~~~~~~~~~~~
+clr.cpp:596:18: warning: cast from 'uint8_t*' {aka 'unsigned char*'} to 'uint32_t' {aka 'unsigned int'} loses precision [-fpermissive]
+  596 |             PUSH((uint32_t)obj);
+      |                  ^~~~~~~~~~~~~
+clr.cpp:506:41: note: in definition of macro 'PUSH'
+  506 |             g_stack[g_sp++] = (int32_t)(v);                                \
+      |                                         ^
+clr.cpp:707:29: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  707 |             uint32_t ti  = *(uint32_t*)o;
+      |                             ^~~~~~~~~~~~
+clr.cpp:716:19: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  716 |             PUSH(*(int32_t*)(o + off));
+      |                   ^~~~~~~~~~~~~~~~~~~
+clr.cpp:506:41: note: in definition of macro 'PUSH'
+  506 |             g_stack[g_sp++] = (int32_t)(v);                                \
+      |                                         ^
+clr.cpp:729:29: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  729 |             uint32_t ti  = *(uint32_t*)o;
+      |                             ^~~~~~~~~~~~
+clr.cpp:738:14: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  738 |             *(int32_t*)(o + off) = v;
+      |              ^~~~~~~~~~~~~~~~~~~
+clr.cpp:757:18: warning: cast from 'uint8_t*' {aka 'unsigned char*'} to 'uint32_t' {aka 'unsigned int'} loses precision [-fpermissive]
+  757 |             PUSH((uint32_t)o);
+      |                  ^~~~~~~~~~~
+clr.cpp:506:41: note: in definition of macro 'PUSH'
+  506 |             g_stack[g_sp++] = (int32_t)(v);                                \
+      |                                         ^
+clr.cpp:763:19: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  763 |             PUSH(*(int32_t*)(o + 4));
+      |                   ^~~~~~~~~~~~~~~~~
+clr.cpp:506:41: note: in definition of macro 'PUSH'
+  506 |             g_stack[g_sp++] = (int32_t)(v);                                \
+      |                                         ^
+clr.cpp:786:18: warning: cast from 'uint8_t*' {aka 'unsigned char*'} to 'uint32_t' {aka 'unsigned int'} loses precision [-fpermissive]
+  786 |             PUSH((uint32_t)a);
+      |                  ^~~~~~~~~~~
+clr.cpp:506:41: note: in definition of macro 'PUSH'
+  506 |             g_stack[g_sp++] = (int32_t)(v);                                \
+      |                                         ^
+clr.cpp:791:19: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  791 |             PUSH(*(uint32_t*)(a + 4));
+      |                   ^~~~~~~~~~~~~~~~~~
+clr.cpp:506:41: note: in definition of macro 'PUSH'
+  506 |             g_stack[g_sp++] = (int32_t)(v);                                \
+      |                                         ^
+clr.cpp:797:42: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  797 |             if (i < 0 || (uint32_t)i >= *(uint32_t*)(a + 4)) {
+      |                                          ^~~~~~~~~~~~~~~~~~
+clr.cpp:800:19: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  800 |             PUSH(*(int32_t*)(a + 12 + (uint32_t)i * 4));
+      |                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+clr.cpp:506:41: note: in definition of macro 'PUSH'
+  506 |             g_stack[g_sp++] = (int32_t)(v);                                \
+      |                                         ^
+clr.cpp:812:42: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  812 |             if (i < 0 || (uint32_t)i >= *(uint32_t*)(a + 4)) {
+      |                                          ^~~~~~~~~~~~~~~~~~
+clr.cpp:815:14: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  815 |             *(int32_t*)(a + 12 + (uint32_t)i * 4) = v;
+      |              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+clr.cpp:824:42: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  824 |             if (i < 0 || (uint32_t)i >= *(uint32_t*)(a + 4)) {
+      |                                          ^~~~~~~~~~~~~~~~~~
+clr.cpp:827:19: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  827 |             PUSH(*(int32_t*)(a + 12 + (uint32_t)i * 4));
+      |                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+clr.cpp:506:41: note: in definition of macro 'PUSH'
+  506 |             g_stack[g_sp++] = (int32_t)(v);                                \
+      |                                         ^
+clr.cpp:833:42: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  833 |             if (i < 0 || (uint32_t)i >= *(uint32_t*)(a + 4)) {
+      |                                          ^~~~~~~~~~~~~~~~~~
+clr.cpp:836:14: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  836 |             *(int32_t*)(a + 12 + (uint32_t)i * 4) = v;
+      |              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+clr.cpp:867:25: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  867 |                 if (o) *(int32_t*)o = 0;
+      |                         ^~~~~~~~~~~
+clr.cpp: In function 'int clr_run(const char*)':
+clr.cpp:1081:25: warning: comparison is always false due to limited range of data type [-Wtype-limits]
+ 1081 |     if ((int)em->n_args < 0 ||
+      |         ~~~~~~~~~~~~~~~~^~~
+clr.cpp: In function 'int clr_run_resident(const char*)':
+clr.cpp:1155:25: warning: comparison is always false due to limited range of data type [-Wtype-limits]
+ 1155 |     if ((int)em->n_args < 0 ||
+      |         ~~~~~~~~~~~~~~~~^~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -fno-optimize-sibling-calls -c mforms.cpp -o build/mforms64.o
+mforms.cpp:34:13: warning: 'void serial_putdec(int)' defined but not used [-Wunused-function]
+   34 | static void serial_putdec(int v) {
+      |             ^~~~~~~~~~~~~
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-g++.exe -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1 -I.attic64 -c smp_impl64.cpp -o build/smp_impl64.o
+smp_impl64.cpp: In function 'void wake_ap(uint8_t, uint8_t)':
+smp_impl64.cpp:40:14: warning: variable 'r' set but not used [-Wunused-but-set-variable]
+   40 |     uint32_t r;
+      |              ^
+smp_impl64.cpp: In function 'void wake_all_sipi(uint8_t)':
+smp_impl64.cpp:56:14: warning: variable 'r' set but not used [-Wunused-but-set-variable]
+   56 |     uint32_t r;
+      |              ^
+smp_impl64.cpp: In function 'void smp_init()':
+smp_impl64.cpp:119:145: warning: array subscript 12 is above array bounds of 'char [12]' [-Warray-bounds=]
+  119 |     { const char*h="0123456789ABCDEF"; char b[12]; for(int k=0;k<4;k++){ b[k*3]=h[(dst[k]>>4)&0xF]; b[k*3+1]=h[dst[k]&0xF]; b[k*3+2]=' '; } b[12]=0; serial_puts(b); }
+      |                                                                                                                                             ~~~~^
+smp_impl64.cpp:119:45: note: while referencing 'b'
+  119 |     { const char*h="0123456789ABCDEF"; char b[12]; for(int k=0;k<4;k++){ b[k*3]=h[(dst[k]>>4)&0xF]; b[k*3+1]=h[dst[k]&0xF]; b[k*3+2]=' '; } b[12]=0; serial_puts(b); }
+      |                                             ^
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-ld.exe -m elf_x86_64 -nostdlib -T .attic64/linker64.ld -z noexecstack --unresolved-symbols=ignore-all -o build/kernel64.elf build/entry64.o build/switch64to32.o build/kernel64.o build/ai_engine64.o build/ai_plugin64.o build/kb64.o build/gguf64.o build/gguf_infer64.o build/memory_adapter64.o build/file_adapter64.o build/gguf_loader64.o build/knowledge_base64.o build/net64.o build/distnet64.o build/gui64.o build/font_vec64.o build/addrman64.o build/winloader64.o build/win32_64.o build/gdt64.o build/proc64.o build/vfs64.o build/perm64.o build/clr64.o build/mforms64.o build/smp_impl64.o build/ap_trampoline.o
+C:/Users/trans/elf_tools/bin/x86_64-elf-ld.exe: warning: build/kernel64.elf has a LOAD segment with RWX permissions
+cmd.exe /c C:/Users/trans/elf_tools/bin/x86_64-elf-objcopy.exe -O binary build/kernel64.elf build/kernel64.bin
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -x c -m32 -ffreestanding -nostdlib -fno-stack-protector \
+          -fno-asynchronous-unwind-tables -O2 -Wall -Wextra -Iusr \
+          -fPIE -fno-plt -c usr/dynlink_crt.c -o build/gnudlcrt.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-gcc.exe -x c -m32 -ffreestanding -nostdlib -fno-stack-protector \
+          -fno-asynchronous-unwind-tables -O2 -Wall -Wextra -Iusr \
+          -fPIE -fno-plt -c usr/linux_dynlink.c -o build/gnudlink_app.o
+cmd.exe /c C:/Users/trans/elf_tools/bin/i686-elf-ld.exe -m elf_i386 -nostdlib -e _start --no-dynamic-linker -pie \
+          -Llinux_root -o linux_root/gnu_dynlink build/gnudlcrt.o build/gnudlink_app.o -lgnu
+==> Linux GNU_HASH dynamic-link test packed: linux_root/gnu_dynlink (1912 bytes)
+python3 tools/sfs_gen.py linux_root build/linux_sfs.img
+SFS: packing 7 files from linux_root
+  gnu_dynlink: 1912 bytes -> LBA 817 (4 sectors)
+  libc.so: 5904 bytes -> LBA 821 (12 sectors)
+  libgnu.so: 5940 bytes -> LBA 833 (12 sectors)
+  linux_argv: 8888 bytes -> LBA 845 (18 sectors)
+  linux_dynlink: 1912 bytes -> LBA 863 (4 sectors)
+  linux_net: 8720 bytes -> LBA 867 (18 sectors)
+  python: 20448 bytes -> LBA 885 (40 sectors)
+SFS image: build/linux_sfs.img (64000 bytes, 125 sectors)
+  Superblock:  LBA 800
+  Directory:   LBA 801-816
+  Data:        LBA 817-924
+cat build/boot.bin build/stage2.bin build/kernel.bin > build/os_v2.img
+truncate -s 4M build/os_v2.img
+# GUARD: kernel64.bin lives in the gap between LBA 2048 and the SFS at
+# LBA 3664, and the 32-bit loader stages exactly KERNEL64_SECTORS
+# sectors of it (kernel.cpp).  Outgrow either bound and the failure is
+# SILENT: dd overwrites the filesystem, and/or the loader hands a
+# truncated image to switch_to_64bit() which triple-faults.  That is the
+# same "image grew into a hard-coded offset" class of bug as the 0x90000
+# boot-stack collision, so make it a build error instead of a mystery.
+    K64 fit:  775608 / 819200 bytes (85 spare sectors)
+# Write the 64-bit (long-mode) kernel at LBA 2048 so the 32-bit
+# `switch` command can load it and transition to long mode.
+dd if=build/kernel64.bin of=build/os_v2.img bs=512 seek=2048 conv=notrunc 2>/dev/null
+# Write SFS image at LBA 3488
+dd if=build/sfs.img of=build/os_v2.img bs=512 seek=3664 conv=notrunc 2>/dev/null
+# Write the independent Linux user-space partition after the main SFS
+dd if=build/linux_sfs.img of=build/os_v2.img bs=512 seek=3932 conv=notrunc 2>/dev/null
+==> BIOS Image built: build/os_v2.img (7289344 bytes)
+    Kernel32: 375372 bytes
+    Kernel64: 775608 bytes at LBA 2048
+    SFS:      5413376 bytes at LBA 3664
+    Linux FS: 64000 bytes at LBA 3932
+    Model:    (none - set MODEL_GGUF=path/to/model.gguf)

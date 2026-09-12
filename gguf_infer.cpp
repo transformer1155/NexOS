@@ -431,6 +431,38 @@ static void dequant_row(float* dst, const uint8_t* w, uint32_t type, int n){
             const int8_t* q = (const int8_t*)(b + 2);
             for (int j = 0; j < 32; j++) dst[i*32 + j] = d * (float)q[j];
         }
+    } else if (type == GGUF_T_Q4_1){
+        // 32 elements per 20-byte block: f16 d, f16 m, then 16 bytes holding
+        // two 4-bit quants each.  value = d*q + m.
+        // type_supported() accepts Q4_1 but there was no branch for it, so the
+        // row was left all-zero (see the loop above) with no error at all.
+        int nb = n / 32;
+        for (int i = 0; i < nb; i++){
+            const uint8_t* b = w + i * 20;
+            float d = f16_to_f32(rd16(b));
+            float m = f16_to_f32(rd16(b + 2));
+            const uint8_t* q = b + 4;
+            for (int j = 0; j < 16; j++){
+                dst[i*32 + j]      = d * (float)(q[j] & 0xF) + m;
+                dst[i*32 + j + 16] = d * (float)(q[j] >>  4) + m;
+            }
+        }
+    } else if (type == GGUF_T_Q5_0){
+        // 32 elements per 22-byte block: f16 d, 4 bytes holding one 5th (high)
+        // bit per element, then 16 bytes of low nibbles.
+        // value = d * (q | (high << 4)) - 16.
+        int nb = n / 32;
+        for (int i = 0; i < nb; i++){
+            const uint8_t* b = w + i * 22;
+            float d = f16_to_f32(rd16(b));
+            const uint8_t* qh = b + 2;
+            const uint8_t* qs = b + 6;
+            for (int j = 0; j < 32; j++){
+                int hi = (qh[j / 8] >> (j % 8)) & 1;
+                int lo = (j < 16) ? (qs[j] & 0xF) : (qs[j - 16] >> 4);
+                dst[i*32 + j] = d * (float)((lo | (hi << 4)) - 16);
+            }
+        }
     } else if (type == GGUF_T_Q4_K){
         int nb = n / 256;
         for (int i = 0; i < nb; i++){
@@ -641,13 +673,24 @@ static const uint8_t* tptr(const char* name, uint32_t* type, uint64_t* nelem){
     for (uint32_t i = 0; i < t->n_dims && i < 4; i++) if (t->dims[i]) n *= t->dims[i];
     if (type)  *type  = t->type;
     if (nelem) *nelem = n;
+    // t->offset comes straight from the file.  Ensure the tensor's first byte
+    // lies inside the blob before handing out a pointer to it, otherwise every
+    // dequant/matmul reads from a wild address.
+    uint64_t tbase = R.info ? (uint64_t)R.info->tensor_data_offset : 0;
+    if (tbase > R.blob_size) return 0;
+    if (t->offset > R.blob_size - tbase) return 0;
     return R.tdata + t->offset;
 }
 static float* load_vec(const char* name, int n){
     uint32_t ty = 0; uint64_t ne = 0;
     const uint8_t* p = tptr(name, &ty, &ne);
     if (!p) return 0;
-    if ((int)ne < n) n = (int)ne;
+    // The element count is a uint64 read from the file.  `(int)ne` truncated it
+    // (and went negative for huge values), and silently shortening n returned a
+    // buffer smaller than what the CALLER then used -> out-of-bounds reads in
+    // rmsnorm() and the bias loops.  Refuse instead of truncating.
+    if (ne < (uint64_t)n) return 0;
+    if ((uint64_t)n > (uint64_t)0x3FFFFFFFu) return 0;
     float* v = (float*)apalloc((uint64_t)n * 4);
     if (!v) return 0;
     dequant_row(v, p, ty, n);
@@ -675,6 +718,12 @@ int qwen_load(const uint8_t* blob, uint64_t size, uint32_t max_ctx){
     if (rc != 0){ set_err("not a valid GGUF file"); big_free(R.info, (uint32_t)g_info_bytes); R.info = 0; return -2; }
 
     R.blob = blob; R.blob_size = size;
+    // tensor_data_offset is computed from the parsed header; a malformed file
+    // can push it past the blob, after which every R.tdata read is out of
+    // bounds.
+    if (R.info->tensor_data_offset > size){
+        set_err("bad tensor data offset"); return -4;
+    }
     R.tdata = blob + R.info->tensor_data_offset;
 
     // ---- geometry (prefer tensor shapes over metadata: they never lie) ----
@@ -821,9 +870,12 @@ int qwen_load(const uint8_t* blob, uint64_t size, uint32_t max_ctx){
         R.tok_len = (uint16_t*)apalloc((uint64_t)R.n_vocab * 2);
         R.htab    = (int32_t*) apalloc((uint64_t)hsz * 4);
         R.mapbuf  = (uint8_t*) apalloc(8192);
-        R.mapcap  = 8192;
+        // apalloc() can fail.  mapcap used to be set unconditionally and the
+        // guard below did not cover mapbuf, so qwen_tokenize() wrote through a
+        // null pointer.
+        R.mapcap  = R.mapbuf ? 8192 : 0;
         R.hmask   = hsz - 1;
-        if (R.tok_off && R.tok_len && R.htab){
+        if (R.tok_off && R.tok_len && R.htab && R.mapbuf){
             uint64_t p = R.info->tokens_offset;
             for (int i = 0; i < R.n_vocab && p + 8 <= size; i++){
                 uint64_t len = 0;

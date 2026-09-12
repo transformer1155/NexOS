@@ -1,0 +1,154 @@
+gui.cpp: In member function 'void {anonymous}::MouseCursor::move({anonymous}::Graphics&, int, int)':
+gui.cpp:2680:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 2680 |         if (x < 0) x = 0; if (y < 0) y = 0;
+      |         ^~
+gui.cpp:2680:27: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 2680 |         if (x < 0) x = 0; if (y < 0) y = 0;
+      |                           ^~
+gui.cpp: In function 'void {anonymous}::glass_rounded_rect(Graphics&, int, int, int, int, int, Color, int, int)':
+gui.cpp:2957:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 2957 |     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+      |     ^~
+gui.cpp:2957:25: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 2957 |     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+      |                         ^~
+gui.cpp: In function 'void {anonymous}::glass_rect(Graphics&, int, int, int, int, Color, int, int)':
+gui.cpp:2989:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 2989 |     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+      |     ^~
+gui.cpp:2989:25: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 2989 |     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+      |                         ^~
+gui.cpp: In function 'bool {anonymous}::browser::eqi(const char*, const char*)':
+gui.cpp:3196:13: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3196 |             if (ca>='A'&&ca<='Z') ca+=32; if (cb>='A'&&cb<='Z') cb+=32;
+      |             ^~
+gui.cpp:3196:43: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3196 |             if (ca>='A'&&ca<='Z') ca+=32; if (cb>='A'&&cb<='Z') cb+=32;
+      |                                           ^~
+gui.cpp:3197:13: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3197 |             if (ca!=cb) return false; a++; b++; }
+      |             ^~
+gui.cpp:3197:39: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3197 |             if (ca!=cb) return false; a++; b++; }
+      |                                       ^
+gui.cpp: In function 'void {anonymous}::browser::normalize(const char*, char*)':
+gui.cpp:3225:21: warning: unused variable 'p' [-Wunused-variable]
+ 3225 |         const char* p = raw;
+      |                     ^
+gui.cpp: In function 'void {anonymous}::browser::go_back(int)':
+gui.cpp:3266:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3266 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |         ^~
+gui.cpp:3266:40: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3266 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |                                        ^~~
+gui.cpp: In function 'void {anonymous}::browser::go_forward(int)':
+gui.cpp:3272:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3272 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |         ^~
+gui.cpp:3272:40: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3272 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |                                        ^~~
+gui.cpp: In function 'void {anonymous}::browser::stop(int)':
+gui.cpp:3278:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3278 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |         ^~
+gui.cpp:3278:40: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3278 |         if (ti<0||ti>=g_ntabs) return; Tab& t=g_tabs[ti];
+      |                                        ^~~
+gui.cpp: In function 'void {anonymous}::browser::parse_css(const char*)':
+gui.cpp:3449:17: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3449 |                 if(d>=p) break; d++;
+      |                 ^~
+gui.cpp:3449:33: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3449 |                 if(d>=p) break; d++;
+      |                                 ^
+gui.cpp: In function 'void {anonymous}::browser::css_apply_inline(const char*)':
+gui.cpp:3521:13: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3521 |             if(*d!=':') break; d++;
+      |             ^~
+gui.cpp:3521:32: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3521 |             if(*d!=':') break; d++;
+      |                                ^
+gui.cpp: In function 'void {anonymous}::browser::render({anonymous}::Graphics&, int, int, int, int)':
+gui.cpp:3616:41: warning: variable 'pre' set but not used [-Wunused-but-set-variable]
+ 3616 |         bool bold=false, in_link=false, pre=false, in_title=false, skip=false;
+      |                                         ^~~
+gui.cpp:3609:69: warning: unused parameter 'ch' [-Wunused-parameter]
+ 3609 |     static void render(Graphics& gfx, int cx0, int cy0, int cw, int ch){
+      |                                                                 ~~~~^~
+gui.cpp: In function 'void {anonymous}::browser::poll()':
+gui.cpp:3732:13: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3732 |             if (n<0) n=0; t.page[n]=0; t.page_len=n; t.loading=false; t.status=3; extract_title(t);
+      |             ^~
+gui.cpp:3732:27: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3732 |             if (n<0) n=0; t.page[n]=0; t.page_len=n; t.loading=false; t.status=3; extract_title(t);
+      |                           ^
+gui.cpp: In function 'void {anonymous}::browser::draw({anonymous}::Graphics&, int, {anonymous}::Win11Window&, int, int, int, int, int, int)':
+gui.cpp:3821:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 3821 |         if (content_w < 20) content_w = 20; if (content_h < 20) content_h = 20;
+      |         ^~
+gui.cpp:3821:45: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 3821 |         if (content_w < 20) content_w = 20; if (content_h < 20) content_h = 20;
+      |                                             ^~
+gui.cpp:3747:41: warning: unused parameter 'id' [-Wunused-parameter]
+ 3747 |     static void draw(Graphics& gfx, int id, Win11Window& win, int x, int y, int w, int h, int mx, int my){
+      |                                     ~~~~^~
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_control_panel(int, int, int, int, int)':
+gui.cpp:4526:62: warning: unused parameter 'h' [-Wunused-parameter]
+ 4526 |     void draw_control_panel(int id, int x, int y, int w, int h) {
+      |                                                          ~~~~^
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_file_explorer(int, int, int, int, int)':
+gui.cpp:5118:61: warning: comparison of integer expressions of different signedness: 'uint32_t' {aka 'long unsigned int'} and 'int' [-Wsign-compare]
+ 5118 |                 if ((bpp == 24 || bpp == 32) && data_offset < bytes && img_width > 0 && img_height > 0) {
+      |                                                 ~~~~~~~~~~~~^~~~~~~
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_mem_optimizer(int, int, int, int, int)':
+gui.cpp:5436:62: warning: unused parameter 'h' [-Wunused-parameter]
+ 5436 |     void draw_mem_optimizer(int id, int x, int y, int w, int h) {
+      |                                                          ~~~~^
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_calculator(int, int, int, int, int)':
+gui.cpp:5517:59: warning: unused parameter 'h' [-Wunused-parameter]
+ 5517 |     void draw_calculator(int id, int x, int y, int w, int h) {
+      |                                                       ~~~~^
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_about(int, int, int, int, int)':
+gui.cpp:5599:25: warning: unused parameter 'id' [-Wunused-parameter]
+ 5599 |     void draw_about(int id, int x, int y, int w, int h) {
+      |                     ~~~~^~
+gui.cpp:5599:47: warning: unused parameter 'w' [-Wunused-parameter]
+ 5599 |     void draw_about(int id, int x, int y, int w, int h) {
+      |                                           ~~~~^
+gui.cpp:5599:54: warning: unused parameter 'h' [-Wunused-parameter]
+ 5599 |     void draw_about(int id, int x, int y, int w, int h) {
+      |                                                  ~~~~^
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::draw_action_button(int, int, int, int, const char*, bool, {anonymous}::Win11Window&)':
+gui.cpp:5656:56: warning: unused parameter 'win' [-Wunused-parameter]
+ 5656 |                             bool pressed, Win11Window& win) {
+      |                                           ~~~~~~~~~~~~~^~~
+gui.cpp: In member function 'bool {anonymous}::Win11Desktop::w32_popup_rect(int*, int*, int*, int*)':
+gui.cpp:5905:9: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+ 5905 |         if (x) *x = px; if (y) *y = py; if (w) *w = mw; if (h) *h = mh;
+      |         ^~
+gui.cpp:5905:25: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+ 5905 |         if (x) *x = px; if (y) *y = py; if (w) *w = mw; if (h) *h = mh;
+      |                         ^~
+gui.cpp: In member function 'void {anonymous}::Win11Desktop::open_file_in_gui(const char*, const char*)':
+gui.cpp:7667:29: warning: unused variable 'gh' [-Wunused-variable]
+ 7667 |         int gw = gfx.width, gh = gfx.height;
+      |                             ^~
+gui.cpp: At global scope:
+gui.cpp:8465:13: warning: 'void vga_set_text_mode()' defined but not used [-Wunused-function]
+ 8465 | static void vga_set_text_mode(void) {
+      |             ^~~~~~~~~~~~~~~~~
+gui.cpp:1214:12: warning: 'int {anonymous}::fla_pick_size(int)' defined but not used [-Wunused-function]
+ 1214 | static int fla_pick_size(int px) {
+      |            ^~~~~~~~~~~~~
+gui.cpp:1198:23: warning: 'const uint8_t* {anonymous}::fla_glyph(int, int, int*, int*)' defined but not used [-Wunused-function]
+ 1198 | static const uint8_t* fla_glyph(int cp, int si, int* out_w, int* out_h) {
+      |                       ^~~~~~~~~
+gui.cpp:461:12: warning: 'int strncmp_(const char*, const char*, int)' defined but not used [-Wunused-function]
+  461 | static int strncmp_(const char* a, const char* b, int n) {
+      |            ^~~~~~~~
+gui.cpp:443:14: warning: 'void* memset_(void*, int, int)' defined but not used [-Wunused-function]
+  443 | static void* memset_(void* d, int v, int n) {
+      |              ^~~~~~~

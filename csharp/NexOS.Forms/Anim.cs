@@ -119,11 +119,19 @@ namespace NexOS.Forms
         }
 
         // Drive a key toward `target` (0..1000) over `durMs`.  Only restarts
-        // when the target actually changes, so calling Hover() every frame does
-        // NOT reset the animation.  ez: 0=Cubic, 1=Back(overshoot).
+        // when the target (or easing) actually changes, so calling Set() every
+        // frame from a Paint() must NOT reset the tween clock.  ez: 0=Cubic,
+        // 1=Back(overshoot).
+        //
+        // Without this guard, the Start menu / popup / toggle / progress-bar
+        // animations never play: an open tween snaps straight to its end value
+        // (no slide or fade) because From=V is already at the target, while a
+        // closing tween stalls for seconds because its easing clock is re-zeroed
+        // on every frame -- the exact "start menu animation is broken" symptom.
         public static void Set(int key, int target, int durMs, int ez)
         {
             int s = Slot(key);
+            if (To[s] == target && Ez[s] == ez) return;   // already heading there
             int now = Host.TickMs();
             From[s] = V[s];                 // lerp from where we are right now
             To[s] = target;

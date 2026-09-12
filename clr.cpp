@@ -444,6 +444,10 @@ static int exec_method(uint32_t midx, int depth) {
 
     const MexMethod* m = &g_methods[midx];
     const int nargs = m->n_args;
+    // n_args comes from metadata, and call/callvirt/newobj never verified the
+    // caller actually pushed that many values.  Without this, g_sp - nargs can
+    // point before the stack and every args[i] access is out of bounds.
+    if (nargs < 0 || nargs > g_sp) { fault("bad argument count"); return -1; }
     int32_t* args = &g_stack[g_sp - nargs];
     const int frame_base = g_sp - nargs;
 
@@ -472,22 +476,38 @@ static int exec_method(uint32_t midx, int depth) {
     }
 
     // ---- frame layout: [args][locals][eval stack] ---------------
+    // Bound the WHOLE frame before touching it.  n_locals is a uint16 taken
+    // straight from the file (up to 65535) while g_stack has CLR_STACK_SLOTS
+    // entries, so the zeroing loop below used to run off the end of the stack
+    // before any check executed.
+    if ((uint32_t)g_sp + (uint32_t)m->n_locals + (uint32_t)m->max_stack + 8u
+        >= (uint32_t)CLR_STACK_SLOTS) {
+        fault("stack frame overflow");
+        return -1;
+    }
     int32_t* locals = &g_stack[g_sp];
     for (int i = 0; i < m->n_locals; i++) g_stack[g_sp + i] = 0;
     g_sp += m->n_locals;
     const int eval_base = g_sp;
 
-    if (g_sp + m->max_stack + 8 >= CLR_STACK_SLOTS) {
-        fault("evaluation stack overflow");
-        return -1;
-    }
-
     const uint8_t* il = g_code + m->code_off;
     const uint32_t n  = m->code_size;
     uint32_t pc = 0;
 
-    #define PUSH(v) (g_stack[g_sp++] = (int32_t)(v))
-    #define POP()   (g_stack[--g_sp])
+    // Bounded push/pop.  PUSH used to be a bare `g_stack[g_sp++] = v`, so a
+    // loop of `ldc.i4; br` could walk g_sp past the end of g_stack and keep
+    // writing; POP could underflow below the frame (e.g. `dup` at g_sp==0
+    // read g_stack[-1]).
+    #define PUSH(v)                                                        \
+        do {                                                               \
+            if ((uint32_t)g_sp >= (uint32_t)CLR_STACK_SLOTS) {             \
+                fault("evaluation stack overflow"); return -1;             \
+            }                                                              \
+            g_stack[g_sp++] = (int32_t)(v);                                \
+        } while (0)
+    #define POP()                                                          \
+        (g_sp > eval_base ? g_stack[--g_sp]                                \
+                          : (fault("evaluation stack underflow"), (int32_t)0))
 
     while (pc < n) {
         if (g_fault) return -1;
@@ -616,6 +636,13 @@ static int exec_method(uint32_t midx, int depth) {
         case 0x45: {                                        // switch
             uint32_t cnt = rd32(il + pc); pc += 4;
             uint32_t tblbase = pc;
+            // cnt comes from the image: `pc += 4*cnt` can wrap, and the jump
+            // table itself may lie past the end of this method's IL, so the
+            // rd32() below would read outside the code.
+            if (cnt > (0xFFFFFFFFu / 4u) ||
+                (uint64_t)tblbase + (uint64_t)cnt * 4u > (uint64_t)n) {
+                fault("bad switch table"); return -1;
+            }
             pc += 4 * cnt;
             int32_t v = POP();
             if (v >= 0 && (uint32_t)v < cnt)
@@ -670,6 +697,19 @@ static int exec_method(uint32_t midx, int depth) {
             uint32_t off = rd32(il + pc); pc += 4;
             uint32_t o = (uint32_t)POP();
             if (!o) { fault("null reference in ldfld"); return -1; }
+            // `o` may be an object reference (4-byte type-id header at offset 0)
+            // OR a managed pointer -- e.g. one produced by ldelema / ldflda --
+            // that points straight at a value with no header.  We therefore
+            // cannot trust a type-id-derived instance size to bound the access
+            // (the header would be value data, giving a garbage size).  The only
+            // reliable bound is the managed heap itself: the whole accessed word
+            // must stay inside [base, base+used).  That still blocks the
+            // out-of-heap read the original unvalidated code permitted.
+            uint32_t hb = (uint32_t)(uintptr_t)g_heap;
+            if (!g_heap || g_heap_used < 4 || o < hb ||
+                (uint64_t)o + (uint64_t)off + 4 > (uint64_t)hb + (uint64_t)g_heap_used) {
+                fault("bad object reference in ldfld"); return -1;
+            }
             PUSH(*(int32_t*)(o + off));
         } break;
         case 0x7D: {                                        // stfld
@@ -677,6 +717,14 @@ static int exec_method(uint32_t midx, int depth) {
             int32_t v = POP();
             uint32_t o = (uint32_t)POP();
             if (!o) { fault("null reference in stfld"); return -1; }
+            // Same as ldfld: `o` can be a managed pointer, so bound against the
+            // heap high-water mark rather than a type-id-derived size.  This
+            // still blocks the out-of-heap arbitrary WRITE.
+            uint32_t hb = (uint32_t)(uintptr_t)g_heap;
+            if (!g_heap || g_heap_used < 4 || o < hb ||
+                (uint64_t)o + (uint64_t)off + 4 > (uint64_t)hb + (uint64_t)g_heap_used) {
+                fault("bad object reference in stfld"); return -1;
+            }
             *(int32_t*)(o + off) = v;
         } break;
         case 0x7E: {                                        // ldsfld
@@ -712,6 +760,14 @@ static int exec_method(uint32_t midx, int depth) {
             pc += 4;
             int32_t cnt = POP();
             if (cnt < 0) { fault("negative array size"); return -1; }
+            // `12 + (uint32_t)cnt * 4` can wrap: cnt = 0x40000000 wraps to 0,
+            // so heap_alloc() would reserve only 12 bytes while the header
+            // records 0x40000000 elements -- every later "in range" index then
+            // reads/writes outside the heap.  A genuinely large (non-wrapping)
+            // size is already rejected by heap_alloc() returning null below.
+            if ((uint32_t)cnt > (0xFFFFFFFFu - 12u) / 4u) {
+                fault("array too large"); return -1;
+            }
             uint8_t* a = heap_alloc(12 + (uint32_t)cnt * 4);
             if (!a) return -1;
             *(uint32_t*)a = OBJ_ARRAY;
@@ -752,12 +808,21 @@ static int exec_method(uint32_t midx, int depth) {
             pc += 4;
             int32_t i = POP(); uint32_t a = (uint32_t)POP();
             if (!a) { fault("null reference in ldelem"); return -1; }
+            // The typed forms had no bounds check at all -- unlike the
+            // 0x91..0x9A / 0x9C..0xA2 forms above.  A negative i also turns
+            // into a huge unsigned offset.
+            if (i < 0 || (uint32_t)i >= *(uint32_t*)(a + 4)) {
+                fault("array index out of range"); return -1;
+            }
             PUSH(*(int32_t*)(a + 12 + (uint32_t)i * 4));
         } break;
         case 0xA4: {                                        // stelem <type>
             pc += 4;
             int32_t v = POP(); int32_t i = POP(); uint32_t a = (uint32_t)POP();
             if (!a) { fault("null reference in stelem"); return -1; }
+            if (i < 0 || (uint32_t)i >= *(uint32_t*)(a + 4)) {
+                fault("array index out of range"); return -1;
+            }
             *(int32_t*)(a + 12 + (uint32_t)i * 4) = v;
         } break;
 
@@ -772,10 +837,20 @@ static int exec_method(uint32_t midx, int depth) {
             case 0x03: { uint32_t b=POP(),a=POP(); PUSH(a>b?1:0); } break;  // cgt.un
             case 0x04: { int32_t b=POP(),a=POP(); PUSH(a<b?1:0); } break;   // clt
             case 0x05: { uint32_t b=POP(),a=POP(); PUSH(a<b?1:0); } break;  // clt.un
-            case 0x09: PUSH(args[rd16(il + pc)]); pc += 2; break;           // ldarg
-            case 0x0B: { uint16_t i = rd16(il + pc); pc += 2; args[i] = POP(); } break;
-            case 0x0C: PUSH(locals[rd16(il + pc)]); pc += 2; break;         // ldloc
-            case 0x0E: { uint16_t i = rd16(il + pc); pc += 2; locals[i] = POP(); } break;
+            // Slot indices come straight from the IL stream and were never
+            // compared against n_args / n_locals.
+            case 0x09: { uint16_t i = rd16(il + pc); pc += 2;              // ldarg
+                         if (i >= (uint32_t)nargs) { fault("bad ldarg index"); return -1; }
+                         PUSH(args[i]); } break;
+            case 0x0B: { uint16_t i = rd16(il + pc); pc += 2;
+                         if (i >= (uint32_t)nargs) { fault("bad starg index"); return -1; }
+                         args[i] = POP(); } break;
+            case 0x0C: { uint16_t i = rd16(il + pc); pc += 2;              // ldloc
+                         if (i >= m->n_locals) { fault("bad ldloc index"); return -1; }
+                         PUSH(locals[i]); } break;
+            case 0x0E: { uint16_t i = rd16(il + pc); pc += 2;
+                         if (i >= m->n_locals) { fault("bad stloc index"); return -1; }
+                         locals[i] = POP(); } break;
             case 0x15: {                                                    // initobj
                 pc += 4;
                 uint32_t o = (uint32_t)POP();
@@ -846,6 +921,32 @@ static int load_image(const char* filename) {
         fault("truncated image"); return -2;
     }
 
+    // ---- validate every section before we point at it ---------------------
+    // Offsets and counts come from the file and used to be trusted blindly.
+    // g_methods / g_types / g_strtab / g_litdata / g_names are all derived
+    // from them, so one bad value makes every later table access (and every
+    // mex_name(name_off) string fetch) read out of bounds.  64-bit arithmetic
+    // so `off + count*sizeof(row)` cannot wrap past the check.
+    {
+        const uint64_t gsz = (uint64_t)got;
+        struct { const char* what; uint64_t off; uint64_t len; } seg[7] = {
+            { "methods", h->off_methods, (uint64_t)h->n_methods * sizeof(MexMethod) },
+            { "types",   h->off_types,   (uint64_t)h->n_types   * sizeof(MexType)   },
+            { "strings", h->off_strings, (uint64_t)h->n_strings * sizeof(MexStr)    },
+            { "litdata", h->off_litdata, (uint64_t)h->litdata_size                  },
+            { "code",    h->off_code,    (uint64_t)h->code_size                     },
+            { "icalls",  h->off_icalls,  (uint64_t)h->n_icalls  * 4u                },
+            { "names",   h->off_names,   0                                          },
+        };
+        for (int i = 0; i < 7; i++) {
+            if (seg[i].off > gsz || seg[i].off + seg[i].len > gsz) {
+                fault("bad mex section");
+                ser("       section "); ser(seg[i].what); ser(" out of range\n");
+                return -2;
+            }
+        }
+    }
+
     g_hdr     = h;
     g_methods = (MexMethod*)(g_image + h->off_methods);
     g_types   = (MexType*)(g_image + h->off_types);
@@ -894,8 +995,15 @@ static int load_image(const char* filename) {
 
     // ---- materialise string literals ---------------------------
     for (uint32_t i = 0; i < h->n_strings; i++) {
-        g_strobj[i] = make_string((const char*)(g_litdata + g_strtab[i].off),
-                                  (int)g_strtab[i].len);
+        // off/len are raw uint32s from the file and were never checked against
+        // the literal-data section, so a bad pair copied arbitrary bytes from
+        // the image (or read straight past it) into a managed string.
+        uint32_t off = g_strtab[i].off, len = g_strtab[i].len;
+        if ((uint64_t)off + (uint64_t)len > (uint64_t)h->litdata_size) {
+            if (off > h->litdata_size) { off = h->litdata_size; len = 0; }
+            else len = h->litdata_size - off;
+        }
+        g_strobj[i] = make_string((const char*)(g_litdata + off), (int)len);
     }
     for (uint32_t i = 0; i < h->n_statics; i++) g_statics[i] = 0;
 
@@ -957,6 +1065,13 @@ extern "C" int clr_run(const char* filename) {
     ser("[CLR] entry "); ser(mex_name(g_methods[entry].name_off)); ser("\n");
 
     const MexMethod* em = &g_methods[entry];
+    // n_args is metadata.  Pushing that many slots without a capacity check can
+    // run past g_stack, and a huge value would leave exec_method() computing a
+    // negative args base from it.
+    if ((int)em->n_args < 0 ||
+        (uint32_t)g_sp + (uint32_t)em->n_args > (uint32_t)CLR_STACK_SLOTS) {
+        fault("entry arguments exceed stack"); return -2;
+    }
     for (int i = 0; i < em->n_args; i++) g_stack[g_sp++] = 0;
 
     if (exec_method(entry, 0) < 0) return -5;
@@ -1024,6 +1139,13 @@ extern "C" int clr_run_resident(const char* filename) {
 
     ser("[CLR] resident entry "); ser(mex_name(g_methods[entry].name_off)); ser("\n");
     const MexMethod* em = &g_methods[entry];
+    // n_args is metadata.  Pushing that many slots without a capacity check can
+    // run past g_stack, and a huge value would leave exec_method() computing a
+    // negative args base from it.
+    if ((int)em->n_args < 0 ||
+        (uint32_t)g_sp + (uint32_t)em->n_args > (uint32_t)CLR_STACK_SLOTS) {
+        fault("entry arguments exceed stack"); return -2;
+    }
     for (int i = 0; i < em->n_args; i++) g_stack[g_sp++] = 0;
     if (exec_method(entry, 0) < 0) return -5;
     if (g_fault) return -5;

@@ -1,2 +1,3 @@
 [bridge] listening on ws://0.0.0.0:8765
 [bridge] connected to NexOS serial 127.0.0.1:4321
+[bridge] serial link lost; reconnecting...

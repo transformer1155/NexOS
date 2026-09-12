@@ -72,6 +72,11 @@ char       g_report[128] = "mforms: not started";
 int g_ox = 0, g_oy = 0;
 int g_cl = 0, g_ct = 0, g_cr = 0, g_cbot = 0;
 int g_cw = 0, g_ch = 0;          // client size handed to the managed app
+int g_pan_x = 0, g_pan_y = 0;    // content scroll offset for the current paint
+// Largest client-space extent drawn since the context was set.  Lets the
+// window manager discover that a managed app's content overflows the client
+// (and therefore needs a scrollbar) with no per-app cooperation.
+int g_max_cw = 0, g_max_ch = 0;
 
 // Pointer position in *screen* coordinates.  Kept in screen space so a
 // single update per frame stays valid for every window painted after
@@ -79,6 +84,7 @@ int g_cw = 0, g_ch = 0;          // client size handed to the managed app
 int g_msx = -1, g_msy = -1;
 
 void set_context(int ox, int oy, int w, int h) {
+    g_pan_x = 0; g_pan_y = 0;
     g_ox = ox; g_oy = oy;
     g_cw = w;  g_ch = h;
     g_cl = ox; g_ct = oy;
@@ -89,6 +95,21 @@ void set_context(int ox, int oy, int w, int h) {
         if (g_cr > g_h.screen_w) g_cr = g_h.screen_w;
         if (g_cbot > g_h.screen_h) g_cbot = g_h.screen_h;
     }
+    g_max_cw = w; g_max_ch = h;      // content is at least the client size
+}
+
+// Pan variant: shift the drawing origin by (px,py) but keep the clip at the
+// unscrolled client rect, so panned content is clipped to the window.
+void set_context_pan(int ox, int oy, int w, int h, int px, int py) {
+    set_context(ox, oy, w, h);
+    g_pan_x = px; g_pan_y = py;
+    g_ox = ox - px; g_oy = oy - py;
+}
+
+// Record a drawn client-space extent (x1,y1 = right/bottom, exclusive).
+inline void track(int x1, int y1) {
+    if (x1 > g_max_cw) g_max_cw = x1;
+    if (y1 > g_max_ch) g_max_ch = y1;
 }
 
 // Intersect a screen-space rectangle with the clip box.
@@ -164,12 +185,14 @@ int clip_text(int sx, int sy, const char* s) {
 // =====================================================================
 int32_t g_fill_rect(int32_t* a) {
     int x = g_ox + a[0], y = g_oy + a[1], w = a[2], h = a[3];
+    track(a[0] + a[2], a[1] + a[3]);
     if (clip_rect(x, y, w, h)) g_h.fill_rect(x, y, w, h, (uint32_t)a[4]);
     return 0;
 }
 
 int32_t g_fill_round(int32_t* a) {
     int x = g_ox + a[0], y = g_oy + a[1], w = a[2], h = a[3];
+    track(a[0] + a[2], a[1] + a[3]);
     if (!box_visible(x, y, w, h)) return 0;
     if (box_inside(x, y, w, h)) {
         g_h.fill_round(x, y, w, h, a[4], (uint32_t)a[5]);
@@ -182,6 +205,7 @@ int32_t g_fill_round(int32_t* a) {
 
 int32_t g_draw_round(int32_t* a) {
     int x = g_ox + a[0], y = g_oy + a[1], w = a[2], h = a[3];
+    track(a[0] + a[2], a[1] + a[3]);
     if (box_inside(x, y, w, h)) g_h.draw_round(x, y, w, h, a[4], (uint32_t)a[5]);
     return 0;
 }
@@ -195,6 +219,7 @@ int32_t g_draw_rect(int32_t* a) {
 int32_t g_draw_line(int32_t* a) {
     int x0 = g_ox + a[0], y0 = g_oy + a[1];
     int x1 = g_ox + a[2], y1 = g_oy + a[3];
+    track((a[0] > a[2] ? a[0] : a[2]) + 1, (a[1] > a[3] ? a[1] : a[3]) + 1);
     // Only axis-aligned segments are clipped precisely; those are the
     // ones UI code actually draws (separators, rules, grid lines).
     if (y0 == y1) {
@@ -220,6 +245,7 @@ int32_t g_draw_line(int32_t* a) {
 
 int32_t g_fill_grad(int32_t* a) {
     int x = g_ox + a[0], y = g_oy + a[1], w = a[2], h = a[3];
+    track(a[0] + a[2], a[1] + a[3]);
     if (box_inside(x, y, w, h))
         g_h.fill_grad(x, y, w, h, (uint32_t)a[4], (uint32_t)a[5]);
     return 0;
@@ -227,6 +253,7 @@ int32_t g_fill_grad(int32_t* a) {
 
 int32_t g_text(int32_t* a) {
     int sx = g_ox + a[0], sy = g_oy + a[1];
+    track(a[0] + g_h.measure(clr_str(a[2])), a[1] + 16);
     int dx = clip_text(sx, sy, clr_str(a[2]));
     if (dx >= 0) g_h.text(dx, sy, g_textbuf, (uint32_t)a[3]);
     return 0;
@@ -234,6 +261,7 @@ int32_t g_text(int32_t* a) {
 
 int32_t g_text_bg(int32_t* a) {
     int sx = g_ox + a[0], sy = g_oy + a[1];
+    track(a[0] + g_h.measure(clr_str(a[2])), a[1] + 16);
     int dx = clip_text(sx, sy, clr_str(a[2]));
     if (dx >= 0) g_h.text_bg(dx, sy, g_textbuf, (uint32_t)a[3], (uint32_t)a[4]);
     return 0;
@@ -242,6 +270,7 @@ int32_t g_text_bg(int32_t* a) {
 // Text horizontally centred inside a client-space box.
 int32_t g_text_center(int32_t* a) {
     const char* s = clr_str(a[3]);
+    track(a[0] + a[2], a[1] + 16);
     int tw = g_h.measure(s);
     int sx = g_ox + a[0] + (a[2] - tw) / 2;
     if (sx < g_ox + a[0]) sx = g_ox + a[0];
@@ -267,9 +296,28 @@ int32_t g_draw_circle(int32_t* a) {
 
 int32_t g_icon(int32_t* a) {
     int x = g_ox + a[0], y = g_oy + a[1], sz = a[2];
+    track(a[0] + sz, a[1] + sz);
     if (box_inside(x, y, sz, sz))
         g_h.icon(x, y, sz, (uint32_t)a[3], (char)a[4], (uint32_t)a[5]);
     return 0;
+}
+
+int32_t g_glass(int32_t* a) {
+    int x = g_ox + a[0], y = g_oy + a[1], w = a[2], h = a[3];
+    if (box_inside(x, y, w, h))
+        g_h.glass(x, y, w, h, a[4], (uint32_t)a[5], a[6], a[7]);
+    return 0;
+}
+
+int32_t g_text_px(int32_t* a) {
+    int sx = g_ox + a[0], sy = g_oy + a[1];
+    int dx = clip_text(sx, sy, clr_str(a[2]));
+    if (dx >= 0) g_h.text_px(dx, sy, g_textbuf, (uint32_t)a[3], a[4]);
+    return 0;
+}
+
+int32_t g_measure_px(int32_t* a) {
+    return g_h.measure_px(clr_str(a[0]), a[1]);
 }
 
 int32_t g_progress(int32_t* a) {
@@ -290,6 +338,7 @@ int32_t g_has_image(int32_t* a) {
 }
 int32_t g_image(int32_t* a) {
     if (!g_h.image) return 0;
+    track(a[1] + a[3], a[2] + a[4]);
     // Native draw_image clips to the framebuffer, so draw whenever the
     // rect intersects the window box (partial overlap included).
     g_h.image(a[0], g_ox + a[1], g_oy + a[2], a[3], a[4]);
@@ -418,7 +467,13 @@ void flist_load(int fs) {
     if (!g_h.list_files) return;
     int n = g_h.list_files(fs, g_flist, FLIST_MAX - 1);
     if (n < 0) n = 0;
-    g_flist[n] = 0;
+    // list_files() returns the number of DIRECTORY ENTRIES, not the number of
+    // bytes written.  Writing the terminator at g_flist[n] therefore truncated
+    // the whole listing to `n` bytes (e.g. 12 entries -> everything past byte
+    // 12 was cut).  Terminate at the end of the buffer instead: the callee may
+    // write at most FLIST_MAX-1 bytes, and the split loop below stops at the
+    // first NUL, so this is correct whichever contract the callback uses.
+    g_flist[FLIST_MAX - 1] = 0;
     // Split in place: record each line start, terminate at newline.
     int i = 0;
     while (g_flist[i] && g_flist_n < 128) {
@@ -520,6 +575,29 @@ int32_t h_read_text(int32_t* a) {
     }
     g_textread[n] = 0;
     return clr_new_str(g_textread);
+}
+
+// Host.ReadHex(fs, name): read a file's RAW bytes and return them as a
+// lower-case hex string (2 chars per byte).  h_read_text() scrubs control
+// bytes, so a binary file would look like text; this lets the Notepad verify
+// whether a file really is text and, when it is not, render a true binary
+// (hex) view instead of mangled characters.
+constexpr int HEXREAD_MAX = 2048;          // bytes -> up to 4096 hex chars
+char g_hexread[HEXREAD_MAX];
+char g_hexout[HEXREAD_MAX * 2 + 1];
+int32_t h_read_hex(int32_t* a) {
+    if (!g_h.read_file) return clr_new_str("");
+    int n = g_h.read_file(a[0], clr_str(a[1]),
+                          (unsigned char*)g_hexread, HEXREAD_MAX);
+    if (n < 0) n = 0;
+    const char* HX = "0123456789abcdef";
+    for (int i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)g_hexread[i];
+        g_hexout[i * 2]     = HX[c >> 4];
+        g_hexout[i * 2 + 1] = HX[c & 15];
+    }
+    g_hexout[n * 2] = 0;
+    return clr_new_str(g_hexout);
 }
 
 // Host.WriteText(fs, name, text): persist a UTF-8 text body to stable
@@ -629,6 +707,20 @@ int32_t h_set_pixel(int32_t* a) {
     return 0;
 }
 
+// Force the compositor to repaint its cached managed layers on the next
+// frame (see gui.cpp).  Defined in gui.cpp; the 64-bit stub lives there too.
+extern "C" void gui_invalidate_managed(void);
+
+// Host.SetPerf(on): toggle the experimental dirty-rect / desktop-layer
+// caching performance optimization.  OFF (default) repaints the managed
+// desktop in full every frame; ON skips the C# desktop paint when the window
+// set is unchanged and only flips the changed rectangles to the LFB.
+extern "C" void gui_set_perf_opt(int on);
+int32_t h_set_perf(int32_t* a) {
+    gui_set_perf_opt((a && a[0]) ? 1 : 0);
+    return 0;
+}
+
 // Host.SetClipboard(text): copy a managed string into the shared clipboard.
 int32_t h_clip_set(int32_t* a) {
     const char* s = clr_str(a[0]);
@@ -657,6 +749,9 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Gfx::DrawCircle",  g_draw_circle  },
     { "NexOS.Forms.Gfx::Icon",        g_icon         },
     { "NexOS.Forms.Gfx::Progress",    g_progress     },
+    { "NexOS.Forms.Gfx::Glass",       g_glass        },
+    { "NexOS.Forms.Gfx::TextPx",      g_text_px      },
+    { "NexOS.Forms.Gfx::MeasurePx",   g_measure_px   },
     { "NexOS.Forms.Gfx::HasImage",    g_has_image    },
     { "NexOS.Forms.Gfx::Image",       g_image        },
     { "NexOS.Forms.Gfx::Measure",     g_measure      },
@@ -701,6 +796,7 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::FileDelete",   h_file_delete },
     { "NexOS.Forms.Host::FileRename",   h_file_rename },
     { "NexOS.Forms.Host::ReadText",     h_read_text   },
+    { "NexOS.Forms.Host::ReadHex",      h_read_hex    },
     { "NexOS.Forms.Host::WriteText",    h_write_text  },
     { "NexOS.Forms.Host::Exec",         h_exec        },
     { "NexOS.Forms.Host::RunExe",       h_run_exe     },
@@ -720,6 +816,7 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::UserName",     h_user_name   },
     { "NexOS.Forms.Host::WinAction",     h_win_action  },
     { "NexOS.Forms.Host::SetPixel",     h_set_pixel   },
+    { "NexOS.Forms.Host::SetPerf",      h_set_perf    },
 };
 const int G_REG_COUNT = (int)(sizeof(g_regs) / sizeof(g_regs[0]));
 
@@ -844,6 +941,23 @@ extern "C" void mforms_paint(int id, int ox, int oy, int w, int h) {
     clr_heap_reset(mark);
 }
 
+// Pan variant: the managed app is told its client size as usual, but every
+// primitive is drawn shifted by (-px,-py) while the clip stays at the client
+// rect.  gui.cpp uses this to scroll a window whose content overflows it.
+extern "C" void mforms_paint_pan(int id, int ox, int oy, int w, int h,
+                                 int px, int py) {
+    if (!mforms_ready() || id < 0) return;
+    set_context_pan(ox, oy, w, h, px, py);
+    g_flist_fs = -1;
+    uint32_t mark = clr_heap_mark();
+    int32_t a[3] = { id, w, h }, r = 0;
+    clr_call("NexOS.Forms.Shell::Paint", a, 3, &r);
+    clr_heap_reset(mark);
+}
+
+extern "C" int mforms_content_w(void) { return g_max_cw; }
+extern "C" int mforms_content_h(void) { return g_max_ch; }
+
 extern "C" int mforms_click(int id, int ox, int oy, int w, int h,
                             int mx, int my) {
     if (!mforms_ready() || id < 0) return 0;
@@ -871,8 +985,22 @@ extern "C" void mforms_set_mouse(int mx, int my) { g_msx = mx; g_msy = my; }
 // Deliver a keystroke to the desktop surface (inline rename editor).
 extern "C" int mforms_desktop_key(int ch) {
     if (!mforms_ready()) return 0;
+    gui_invalidate_managed();   // managed desktop state may change (rename etc.)
     int32_t a[1] = { ch }, r = 0;
     if (clr_call("NexOS.Forms.Desktop::Key", a, 1, &r) != 0) { heap_recover(); return 0; }
+    rebaseline();
+    return (int)r;
+}
+
+// Toggle / navigate the managed Start menu from the keyboard.
+//   code 0 = toggle open/close, 1 = up, 2 = down, 3 = activate, 4 = close.
+// Returns the app Kind to launch (>=0), or -1 when the shell consumed the code
+// without a launch (e.g. a mere selection move or an open/close toggle).
+extern "C" int mforms_desktop_menu(int code) {
+    if (!mforms_ready() || !mforms_has_desktop()) return -1;
+    gui_invalidate_managed();   // menu sits above the taskbar: force a full repaint
+    int32_t a[1] = { code }, r = -1;
+    if (clr_call("NexOS.Forms.Shell::DesktopMenu", a, 1, &r) != 0) { heap_recover(); return -1; }
     rebaseline();
     return (int)r;
 }
@@ -931,6 +1059,10 @@ extern "C" void mforms_paint_overlay(int w, int h) {
 // synthesised by an error.
 extern "C" int mforms_desktop_click(int mx, int my) {
     if (!mforms_ready()) return -2;
+    // A click on the desktop/taskbar surface can change managed UI state that
+    // the native cache key cannot see (Start menu open/close, icon selection),
+    // so the cached managed layers must be repainted for the next frame.
+    gui_invalidate_managed();
     set_context(0, 0, g_h.screen_w, g_h.screen_h);
     g_msx = mx; g_msy = my;
     press_screen(mx, my);            // arm button press animation (screen)

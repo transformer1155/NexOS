@@ -1,0 +1,23 @@
+﻿diff --git a/csharp/apps/Shell/Shell.cs b/csharp/apps/Shell/Shell.cs
+index 046b4ae..58b1253 100644
+--- a/csharp/apps/Shell/Shell.cs
++++ b/csharp/apps/Shell/Shell.cs
+@@ -63,12 +63,18 @@ namespace NexOS.Forms
+             Theme.PixelMode  = 1;    // retro pixel / CRT-monitor look ON by default
+             Theme.PixelScale = 1;    // full spatial detail (no chunkiness) by default
+             Theme.PixelScan  = 0;    // scanlines off by default (toggle in Settings)
++            // Partial-redraw compositing.  NOTE: MiniCLR does not reliably run
++            // static field initializers, so every default that matters must be
++            // assigned explicitly here (as the fields above already are) --
++            // relying on the `= 1` initializer in Theme leaves it at 0.
++            Theme.PerfOpt    = 1;    // desktop-layer caching ON (smoothness)
+ 
+             // Re-apply any persisted personalization from a previous session
+             // (nexos.cfg on the MKFS data disk).  Safe no-op if the file is
+             // missing or empty.
+             Theme.Load();
+             Theme.ApplyPixel();      // push pixel-mode settings to the kernel
++            Theme.ApplyPerf();       // push experimental perf-optimization flag
+ 
+             apps = new App[MAX];   // heap_alloc zeroes -> all null
+             count = 0;

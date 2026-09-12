@@ -770,7 +770,10 @@ extern "C" void linux_syscall_dispatch(SysRegs* r){
                 }
                 load_name = "busybox";
             }
-            (void)load_name;
+            // load_name must be used below.  When the busybox fallback fired,
+            // the image now in the buffer is busybox, but the dynamic-link path
+            // re-read the ORIGINAL path (which does not exist), failed with
+            // -ENOENT and threw away the image we had just loaded successfully.
             // Re-arm heap/mmap for the new image.
             uint32_t stack_top = 0x0C000000u;
             g_linux_stack_top = stack_top;
@@ -780,7 +783,7 @@ extern "C" void linux_syscall_dispatch(SysRegs* r){
             linux_mmap_reset();
             // If the new image is dynamically linked, link it now (maps libs,
             // applies relocations, transfers control; returns 1 if static).
-            int dr = linux_dynload_and_exec(path, ac, av, ec, envp_to_pass, stack_top);
+            int dr = linux_dynload_and_exec(load_name, ac, av, ec, envp_to_pass, stack_top);
             if (dr < 0){ r->eax = (uint32_t)-2; return; }
             if (dr == 1) {
                 // Static image: build the new startup stack and jump.
@@ -1567,9 +1570,18 @@ static int linux_load_image(const char* name, uint32_t* out_entry,
         { static const char* h="0123456789ABCDEF"; char b[9]; int bi=0;
           uint32_t v=p_offset; for(int s=24;s>=0;s-=8){ uint8_t x=(uint8_t)(v>>s); b[bi++]=h[x>>4]; b[bi++]=h[x&0xF]; } b[bi]=0; serial_puts(b); }
         serial_puts("\n");
-        if (p_vaddr + p_memsz > 0x10000000){
+        /* p_vaddr + p_memsz is a 32-bit sum: p_vaddr=0x0FFFFF000 with
+         * p_memsz=0x2000 wraps to 0x1000 and sails straight past the old
+         * check, after which the copy loop writes to low addresses. */
+        if (p_vaddr > 0x10000000u || p_memsz > 0x10000000u - p_vaddr){
             serial_puts("linux: segment above 256 MiB identity map\n"); return -1;
         }
+        /* The file range must lie inside what was actually read, otherwise
+         * elf[p_offset + j] walks off the end of the 2 MiB buffer. */
+        if (p_filesz > (uint32_t)sz || p_offset > (uint32_t)sz - p_filesz){
+            serial_puts("linux: segment file range past EOF\n"); return -1;
+        }
+        if (p_filesz > p_memsz) p_filesz = p_memsz;   /* ELF requires filesz <= memsz */
         if (load_base == 0) load_base = p_vaddr - p_offset;
         for (uint32_t j = 0; j < p_filesz; j++)
             *(unsigned char*)(p_vaddr + j) = elf[p_offset + j];
@@ -1870,7 +1882,9 @@ static int dyn_parse(const unsigned char* elf, uint32_t bias, dyn_mod_t* mod){
                  dt_jmprel=0, dt_jmprelsz=0, dt_gnu_hash=0, dt_init=0,
                  dt_init_array=0, dt_init_array_sz=0, dt_fini_array=0,
                  dt_fini_array_sz=0;
-        for (int k = 0; d[2*k] != DYN_DT_NULL; k++){
+        // The scan terminates on DT_NULL, which a malformed file can simply
+        // omit -- cap the iterations so it cannot walk off into kernel memory.
+        for (int k = 0; k < 4096 && d[2*k] != DYN_DT_NULL; k++){
             uint32_t t = d[2*k], v = d[2*k+1];
             switch (t){
                 case DYN_DT_HASH:         dt_hash            = v; break;
@@ -1904,7 +1918,12 @@ static int dyn_parse(const unsigned char* elf, uint32_t bias, dyn_mod_t* mod){
         mod->fini_array_sz   = dt_fini_array_sz;
         if (dt_hash){
             const uint32_t* hash = (const uint32_t*)(bias + dt_hash);
-            mod->nsyms = hash[1];   /* nchain == number of .dynsym entries */
+            /* nchain is file-controlled.  An absurd value makes dyn_resolve's
+             * `for (s = 0; s < mod->nsyms; s++)` walk far past .dynsym, so
+             * clamp it to a sane ceiling (a real .dynsym is far smaller). */
+            uint32_t n = hash[1];   /* nchain == number of .dynsym entries */
+            if (n > 65536u) n = 65536u;
+            mod->nsyms = n;
         } else {
             /* GNU_HASH only: nsyms is not directly available; dyn_resolve uses
              * the bloom/bucket chain so we don't need it here. */
@@ -1945,13 +1964,25 @@ static int dyn_lookup_gnu(dyn_mod_t* mod, const char* name){
     uint32_t nbuckets    = ((uint32_t)gbp[0]) | ((uint32_t)gbp[1]<<8) | ((uint32_t)gbp[2]<<16) | ((uint32_t)gbp[3]<<24);
     uint32_t symoffset   = ((uint32_t)gbp[4]) | ((uint32_t)gbp[5]<<8) | ((uint32_t)gbp[6]<<16) | ((uint32_t)gbp[7]<<24);
     uint32_t bloom_size  = ((uint32_t)gbp[8]) | ((uint32_t)gbp[9]<<8) | ((uint32_t)gbp[10]<<16) | ((uint32_t)gbp[11]<<24);
+    /* nbuckets / bloom_size / symoffset all come from the file.  nbuckets == 0
+     * makes the modulo below raise #DE at ring 0, where there is no handler,
+     * so the kernel would simply die.  Oversized values let the *_off
+     * computations below wrap into something small enough to pass any naive
+     * bounds check. */
+    if (nbuckets == 0 || nbuckets > 65536u || bloom_size > 65536u) return -1;
     uint32_t h = dyn_gnu_hash(name);
     uint32_t hashval = h & 0xfffffff;
     /* buckets[] starts after the bloom filter. nexOS guests emit a 32-bit
      * bloom filter (4 bytes per word), not the standard 64-bit GNU_HASH layout. */
-    uint32_t buckets_off = 16 + bloom_size * 4;
-    uint32_t chain_off   = buckets_off + nbuckets * 4;
-    uint32_t n_off = buckets_off + (h % nbuckets) * 4;
+    uint64_t buckets_off64 = 16ull + (uint64_t)bloom_size * 4u;
+    uint64_t chain_off64   = buckets_off64 + (uint64_t)nbuckets * 4u;
+    uint64_t n_off64       = buckets_off64 + (uint64_t)(h % nbuckets) * 4u;
+    /* Keep every hash-table read inside this module's mapping. */
+    uint64_t tbl = (uint64_t)mod->base + (uint64_t)mod->dt_gnu_hash;
+    if (tbl + n_off64 + 4 > (uint64_t)mod->max_end) return -1;
+    uint32_t buckets_off = (uint32_t)buckets_off64;
+    uint32_t chain_off   = (uint32_t)chain_off64;
+    uint32_t n_off = (uint32_t)n_off64;
     uint32_t n = ((uint32_t)gbp[n_off]) | ((uint32_t)gbp[n_off+1]<<8) | ((uint32_t)gbp[n_off+2]<<16) | ((uint32_t)gbp[n_off+3]<<24);
     if (n < symoffset) return -1;
     uint32_t guard = 0;
@@ -2002,9 +2033,26 @@ static void dyn_apply_one(dyn_mod_t* mod, const uint32_t* relp,
     r.r_info   = relp[1];
     uint32_t sym  = r.r_info >> 8;
     uint32_t type = r.r_info & 0xff;
-    uint32_t* slot = (uint32_t*)(mod->base + r.r_offset);
-    const char* name = mod->strtab +
-        ((Elf32_Sym*)((unsigned char*)mod->symtab + sym * 16))->st_name;
+
+    /* r_offset comes straight from the file, and the kernel runs identity
+     * mapped at ring 0, so an unvalidated slot is an arbitrary 32-bit WRITE.
+     * Require the entire word to land inside this module's mapped image;
+     * 64-bit arithmetic so base + r_offset cannot wrap past the check. */
+    uint64_t tgt = (uint64_t)mod->base + (uint64_t)r.r_offset;
+    if (mod->max_end <= mod->base || tgt + 4 > (uint64_t)mod->max_end){
+        serial_puts("dyn: reloc target out of range, skipped\n");
+        return;
+    }
+    uint32_t* slot = (uint32_t*)(uintptr_t)tgt;
+
+    /* The symbol index is file-controlled too: only read a .dynsym entry that
+     * is inside the table, and only for relocs that actually use a symbol.
+     * (It used to be dereferenced unconditionally, even for R_RELATIVE.) */
+    const char* name = "";
+    if (sym && mod->symtab && mod->nsyms && sym < mod->nsyms){
+        Elf32_Sym* s = (Elf32_Sym*)((unsigned char*)mod->symtab + (size_t)sym * 16);
+        if (mod->strtab) name = mod->strtab + s->st_name;
+    }
     uint32_t addr;
     switch (type){
         case DYN_R_NONE: break;
@@ -2026,9 +2074,15 @@ static void dyn_apply_one(dyn_mod_t* mod, const uint32_t* relp,
         case DYN_R_COPY: {
             /* Copy relocation: copy symbol data from its (library) definition
              * into this module's copy slot. */
-            Elf32_Sym* csym = (Elf32_Sym*)((unsigned char*)mod->symtab + (size_t)sym * 16);
             uint32_t src = dyn_resolve(mods, nmods, name);
-            uint32_t cpsz = csym->st_size;
+            uint32_t cpsz = 0;
+            if (sym && mod->symtab && mod->nsyms && sym < mod->nsyms){
+                Elf32_Sym* csym = (Elf32_Sym*)((unsigned char*)mod->symtab + (size_t)sym * 16);
+                cpsz = csym->st_size;
+            }
+            /* st_size is file-controlled as well: clamp the copy to the
+             * remaining bytes of the image so it cannot run off the end. */
+            if (cpsz > mod->max_end - (uint32_t)tgt) cpsz = mod->max_end - (uint32_t)tgt;
             if (src && cpsz){
                 uint8_t* dstp = (uint8_t*)slot;
                 const uint8_t* srcp = (const uint8_t*)src;
@@ -2050,8 +2104,14 @@ static void dyn_apply_one(dyn_mod_t* mod, const uint32_t* relp,
         case DYN_R_IRELATIVE: {
             /* The (REL) addend stores the relative address of an IFUNC resolver;
              * call it and store the computed real address. */
-            uint32_t resolver = mod->base + *slot;
-            uint32_t (*fn)(void) = (uint32_t(*)(void))resolver;
+            /* The addend holds the resolver address and is file-controlled:
+             * confirm it points inside the image before calling it. */
+            uint64_t res = (uint64_t)mod->base + (uint64_t)*slot;
+            if (res + 1 > (uint64_t)mod->max_end){
+                serial_puts("dyn: IRELATIVE resolver out of range\n");
+                break;
+            }
+            uint32_t (*fn)(void) = (uint32_t(*)(void))(uintptr_t)res;
             *slot = fn();
             break;
         }
@@ -2071,10 +2131,32 @@ static void dyn_apply_one(dyn_mod_t* mod, const uint32_t* relp,
 
 /* Apply all relocations of `mod` (both .rel.dyn and .rel.plt). */
 static void dyn_apply(dyn_mod_t* mod, dyn_mod_t* mods, int nmods){
+    /* relsz / jmprelsz are file-controlled: stop at the image edge so a bogus
+     * size cannot walk the table past the end of the mapping. */
     uint32_t n = mod->relsz / 8;
-    for (uint32_t i = 0; i < n; i++) dyn_apply_one(mod, mod->rel + i*2, mods, nmods);
+    for (uint32_t i = 0; i < n; i++){
+        uint64_t rp = (uint64_t)(uintptr_t)(mod->rel + i*2);
+        if (rp + 8 > (uint64_t)mod->max_end) break;
+        dyn_apply_one(mod, mod->rel + i*2, mods, nmods);
+    }
     n = mod->jmprelsz / 8;
-    for (uint32_t i = 0; i < n; i++) dyn_apply_one(mod, mod->jmprel + i*2, mods, nmods);
+    for (uint32_t i = 0; i < n; i++){
+        uint64_t rp = (uint64_t)(uintptr_t)(mod->jmprel + i*2);
+        if (rp + 8 > (uint64_t)mod->max_end) break;
+        dyn_apply_one(mod, mod->jmprel + i*2, mods, nmods);
+    }
+}
+
+/* Call a constructor only when its address lies inside the module's mapping.
+ * DT_INIT / DT_INIT_ARRAY values are file-controlled and used to be called
+ * blind, which is an arbitrary indirect call at ring 0. */
+static void dyn_call_init(dyn_mod_t* mod, uint32_t rva){
+    uint64_t a = (uint64_t)mod->base + (uint64_t)rva;
+    if (mod->max_end <= mod->base || a + 1 > (uint64_t)mod->max_end){
+        serial_puts("dyn: init routine out of range, skipped\n");
+        return;
+    }
+    ((void(*)(void))(uintptr_t)a)();
 }
 
 /* Load + dynamically link + run a guest ELF.
@@ -2093,6 +2175,14 @@ static int linux_dynload_and_exec(const char* name, int argc, const char** argv,
     uint32_t phoff   = *(uint32_t*)(elf + 28);
     uint16_t phentsz = *(uint16_t*)(elf + 42);
     uint16_t phnum   = *(uint16_t*)(elf + 44);
+    /* linux_load_image() and dyn_map_image() both bound e_phnum, but this path
+     * trusted it (up to 65535) together with an arbitrary phoff/phentsz, so
+     * `elf + phoff + i*phentsz` could point well outside the 2 MiB buffer. */
+    if (phnum == 0 || phnum > 64){ serial_puts("dyn: bad e_phnum\n"); return -1; }
+    if (phentsz < 32){ serial_puts("dyn: bad e_phentsize\n"); return -1; }
+    if ((uint64_t)phoff + (uint64_t)phnum * phentsz > (uint64_t)sz){
+        serial_puts("dyn: program headers past EOF\n"); return -1;
+    }
 
     /* Choose a load bias so the main's first PT_LOAD lands at 0x08048000
      * (the guest load region), whether the main is non-PIE (linked there
@@ -2121,7 +2211,8 @@ static int linux_dynload_and_exec(const char* name, int argc, const char** argv,
     const uint32_t* d = (const uint32_t*)(main_bias + d_vaddr);
     const char* needed[DYN_MAX_LIBS];
     int nneeded = 0;
-    for (int k = 0; d[2*k] != DYN_DT_NULL; k++){
+    // Same unbounded-scan hazard as in dyn_parse().
+    for (int k = 0; k < 4096 && d[2*k] != DYN_DT_NULL; k++){
         if (d[2*k] == DYN_DT_NEEDED){
             if (nneeded >= DYN_MAX_LIBS) break;
             needed[nneeded++] = mods[0].strtab + d[2*k+1];
@@ -2170,22 +2261,32 @@ static int linux_dynload_and_exec(const char* name, int argc, const char** argv,
      * TLS setup.  Skipped entries (0) are allowed. */
     for (int m = 1; m < nmods; m++){
         dyn_mod_t* mod = &mods[m];
-        if (mod->init_func)
-            ((void(*)(void))(mod->base + mod->init_func))();
+        if (mod->init_func) dyn_call_init(mod, mod->init_func);
         if (mod->init_array){
             uint32_t n = mod->init_array_sz / 4;
             uint32_t* arr = (uint32_t*)(mod->base + mod->init_array);
-            for (uint32_t i = 0; i < n; i++)
-                if (arr[i]) ((void(*)(void))(mod->base + arr[i]))();
+            uint64_t ab = (uint64_t)mod->base + (uint64_t)mod->init_array;
+            if (mod->max_end <= mod->base ||
+                ab + (uint64_t)mod->init_array_sz > (uint64_t)mod->max_end){
+                serial_puts("dyn: init_array out of range\n");
+            } else {
+                for (uint32_t i = 0; i < n; i++)
+                    if (arr[i]) dyn_call_init(mod, arr[i]);
+            }
         }
     }
-    if (mods[0].init_func)
-        ((void(*)(void))(mods[0].base + mods[0].init_func))();
+    if (mods[0].init_func) dyn_call_init(&mods[0], mods[0].init_func);
     if (mods[0].init_array){
         uint32_t n = mods[0].init_array_sz / 4;
         uint32_t* arr = (uint32_t*)(mods[0].base + mods[0].init_array);
-        for (uint32_t i = 0; i < n; i++)
-            if (arr[i]) ((void(*)(void))(mods[0].base + arr[i]))();
+        uint64_t ab = (uint64_t)mods[0].base + (uint64_t)mods[0].init_array;
+        if (mods[0].max_end <= mods[0].base ||
+            ab + (uint64_t)mods[0].init_array_sz > (uint64_t)mods[0].max_end){
+            serial_puts("dyn: init_array out of range\n");
+        } else {
+            for (uint32_t i = 0; i < n; i++)
+                if (arr[i]) dyn_call_init(&mods[0], arr[i]);
+        }
     }
 
     /* Compute phdr load base (runtime address of the first PT_LOAD). */

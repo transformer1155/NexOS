@@ -1525,7 +1525,7 @@
      ===================================================================== */
   const FORGE_TYPES = {
     think:{ label:'思考 / AI',  color:'#744DA5',
-            params:[{k:'engine',l:'引擎 ask64/ai/ask',d:'ask64'},{k:'prompt',l:'提示词',d:'总结当前情况'}],
+            params:[{k:'engine',l:'引擎 ai(云端/统一) / ask64(内核)',d:'ai'},{k:'prompt',l:'提示词',d:'总结当前情况'}],
             cmd:p=>`${(p.engine||'ask64').trim()} "${(p.prompt||'').replace(/"/g,'\\"')}"` },
     search:{label:'搜索 / Net', color:'#0067C0', params:[{k:'url',l:'URL / 查询',d:'http://example.com'}],
             cmd:p=>`net http ${p.url||''}` },
@@ -1578,6 +1578,7 @@
             <button class="btn" id="fgDemoFile" style="height:26px;padding:0 8px;font-size:11px">文件链</button>
             <button class="btn" id="fgDemoCompute" style="height:26px;padding:0 8px;font-size:11px">算力链</button>
             <button class="btn" id="fgDemoShard" style="height:26px;padding:0 8px;font-size:11px">分布式推理</button>
+            <button class="btn accent" id="fgDemoAgent" style="height:26px;padding:0 8px;font-size:11px">Agent 示例</button>
           </div>
           <div id="fgProps" style="font-size:11px"></div>
           <textarea id="fgEditor" spellcheck="false" placeholder="Scratch blocks or Python (nexos_api)…" style="display:none;width:100%;height:150px;flex:0 0 auto;resize:vertical;border-radius:8px;border:1px solid var(--control-stroke);background:#0C0C0C;color:#E8E8E8;font-family:'Consolas',monospace;font-size:11px;padding:6px;box-sizing:border-box"></textarea>
@@ -1600,14 +1601,28 @@
       props.style.display = isGraph?'block':'none';
       ed.style.display  = isGraph?'none':'block';
       if(mode==='python' && !ed.value.trim()){
-        ed.value = `# Python mode — call unified nexos_api (HTTP /api/ai, /api/distnet)\n`+
-                   `async def main():\n`+
-                   `    nexos_api.log("running python agent...")\n`+
-                   `    r = await nexos_api.ai("summarize the situation", lambda t: nexos_api.log("token: "+t))\n`+
-                   `    nexos_api.log("AI => " + r)\n`+
-                   `    nodes = await nexos_api.distnet("10.0.2.2", "fib", 30)\n`+
-                   `    nexos_api.log("distnet => " + nodes)\n`+
-                   `await main()\n`;
+        ed.value = `# 简单 Agent 示例：LLM 规划 → 本地动作 → 观察 → 循环
+async def agent(goal):
+    nexos_api.log("🤖 agent 启动: " + goal)
+    mem = goal
+    step = 0
+    while step < 3:
+        nexos_api.log("— step " + String(step+1))
+        plan = await nexos_api.ai("你是规划型 agent。目标: " + mem + " 回复 ONE: ACTION: <本地任务> 或 DONE: <答案>")
+        nexos_api.log("LLM => " + plan)
+        if plan.indexOf("DONE") >= 0:
+            nexos_api.log("✅ " + plan)
+            return plan
+        res = await nexos_api.distnet("10.0.2.2", "fib", 25)
+        nexos_api.log("action(distnet) => " + res)
+        mem = mem + " | step" + String(step+1) + " result: " + res
+        step = step + 1
+    nexos_api.log("agent 结束(达到最大步数)")
+    nexos_api.log("🏁 结论: " + mem)
+    return mem
+
+await agent("分析系统情况并做一次本地计算")
+`;
       }
       if(mode==='scratch' && !ed.value.trim()){
         ed.value = `# Scratch-style blocks (one per line, -> chains a node)\n`+
@@ -1699,7 +1714,7 @@
       props.innerHTML=`<div style="font-weight:600;margin-bottom:4px">${T.label}</div>`+
         T.params.map(p=>`<div class="prow"><label>${p.l}</label><input data-k="${p.k}" value="${(n.params[p.k]||'').replace(/"/g,'&quot;')}"></div>`).join('')+
         (n.type==='think'
-          ? `<div style="color:#C45B0C;font-size:10px;margin-top:4px">⚠ ask64 会切换到 64 位长模式；当前镜像未嵌入 GGUF 模型（构建需 MODEL_GGUF），否则拿不到真实回答。</div>`
+          ? `<div style="color:#C45B0C;font-size:10px;margin-top:4px">引擎 ai = 统一云端/本地 API（点右上角 🧠 选 DeepSeek/OpenAI/Custom 并填 Key，无需镜像模型）；ask64 = 内核推理，需镜像内嵌 GGUF 模型（构建用 MODEL_GGUF）。</div>`
           : '')+
         (n.type==='file' && (n.params.act||'ls').trim()==='ls'
           ? `<div style="color:#C45B0C;font-size:10px;margin-top:4px">⚠ SFS 未格式化时 ls 会报 "MKFS not formatted"，请先加一个 mkfs 节点。</div>`
@@ -1726,6 +1741,7 @@
         if(n.type==='if')   return {kind:'if',   cond:n.params.cond, node:n};
         if(n.type==='loop') return {kind:'loop', times:Math.max(1,parseInt(n.params.times,10)||1), node:n};
         if(n.type==='out')  return {kind:'out',  label:n.params.label, node:n};
+        if(n.type==='think')return {kind:'ai', engine:(n.params.engine||'ai').trim(), prompt:n.params.prompt||'', node:n};
         return {kind:'cmd', cmd:T.cmd(n.params), node:n};
       });
     }
@@ -1783,6 +1799,10 @@
           let js=head
             .replace(/^async\s+def\s+([A-Za-z_]\w*)\s*\((.*)\)/, 'async function $1($2)')
             .replace(/^def\s+([A-Za-z_]\w*)\s*\((.*)\)/, 'function $1($2)')
+            .replace(/^elif\s+(.*)$/,'else if ($1)')
+            .replace(/^if\s+(.*)$/,'if ($1)')
+            .replace(/^while\s+(.*)$/,'while ($1)')
+            .replace(/^for\s+(.*)$/,'for ($1)')
             .replace(/print\(/,'console.log(')
             .replace(/lambda\s+([^:]+):/,'($1)=>');
           out.push(js+' {'); indentStack.push(sp);
@@ -1801,21 +1821,35 @@
       try{ js = pyToJs(ed.value); }
       catch(e){ log('✗ py parse: '+e.message,'#C42B1C'); return; }
       try{
-        const fn = new Function('nexos_api','console', '"use strict"; return (async()=>{\n'+js+'\n})();');
+        const fn = new Function('nexos_api','console', 'return (async()=>{\n'+js+'\n})();');
         await fn(api, { log:t=>log('py> '+t,'#9CDCFE') });
         log('— python done —','#0F7B3F');
       }catch(e){ log('✗ python: '+e.message,'#C42B1C'); }
     }
     async function run(){
       if(running) return;
-      if(mode!=='python' && !NexOS.connected){ log('✗ 未连接到内核：请先 conn → Connect，再 Run','#C42B1C'); return; }
       const plan=compile(); if(mode==='blueprint'||mode==='scratch'){ if(!plan.length){ log('图/脚本是空的'); return; } }
+      // 纯云端 agent（所有节点都是 ai 引擎、且非 ask64）不需要内核连接；
+      // python 模式保持原行为（不强制连接）。其余情况需要内核在线。
+      const needsKernel = (mode==='python') ? false
+                          : plan.some(o=> o.kind!=='ai' || o.engine==='ask64');
+      if(needsKernel && !NexOS.connected){ log('✗ 未连接到内核：请先 conn → Connect，再 Run','#C42B1C'); return; }
       running=true; $('#fgRun',body).disabled=true;
       let last='';
       const doOps=async(ops)=>{
         for(let i=0;i<ops.length;i++){
           const op=ops[i];
           if(op.kind==='cmd'){ log('$ '+op.cmd,'#9CDCFE'); last=await execCmd(op.cmd); }
+          else if(op.kind==='ai'){
+            const eng=op.engine||'ai', prompt=op.prompt||'';
+            if(eng==='ask64'){
+              log('$ ask64 '+prompt,'#9CDCFE'); last=await execCmd('ask64 '+JSON.stringify(prompt));
+            } else {
+              log('$ ai (cloud/local via nexos_api) '+prompt,'#9CDCFE');
+              try{ last=await window.nexos_api.ai(prompt); log('  -> '+(last||'(empty)')); }
+              catch(e){ log('✗ ai: '+e.message,'#C42B1C'); last=''; }
+            }
+          }
           else if(op.kind==='if'){
             const ok=String(last).indexOf(String(op.cond||''))>=0;
             log(`# if "${op.cond}" → ${ok?'成立':'不成立(跳过下一个)'}`, ok?'#0F7B3F':'#C45B0C');
@@ -1852,17 +1886,24 @@
         const a=addNode('shard',20,40); a.params.layers='12'; a.params.dim='16';
         const b=addNode('out',210,40);  b.params.label='分片推理结果';
         G.edges=[{from:a.id,to:b.id}];
+      } else if (kind==='agent'){
+        const a=addNode('think',20,20);   a.params.engine='ai'; a.params.prompt='你是一个运维 agent：分析当前任务并决定是否需要调用本地算力';
+        const b=addNode('compute',210,20); b.params.job='fib'; b.params.n='30';
+        const c=addNode('think',400,20);   c.params.engine='ai'; c.params.prompt='根据上一步算力结果，给出最终结论';
+        const d=addNode('out',590,20);     d.params.label='agent 结论';
+        G.edges=[{from:a.id,to:b.id},{from:b.id,to:c.id},{from:c.id,to:d.id}];
       } else {
         const a=addNode('compute',20,40); a.params.job='fib'; a.params.n='30';
         const b=addNode('out',210,40);    b.params.label='fib(30) 结果';
         G.edges=[{from:a.id,to:b.id}];
       }
       render(); save(); compile();
-      log('loaded demo: '+(kind==='file'?'文件链 (mkfs→touch→ls)':'算力链 (distnet fib 30)'));
+      log('loaded demo: '+(kind==='file'?'文件链 (mkfs→touch→ls)':kind==='shard'?'分布式推理 (forge shard)':kind==='agent'?'简单 Agent (think→compute→think→out)':'算力链 (distnet fib 30)'));
     }
     $('#fgDemoFile',body).onclick=()=>loadDemo('file');
     $('#fgDemoCompute',body).onclick=()=>loadDemo('compute');
     $('#fgDemoShard',body).onclick=()=>loadDemo('shard');
+    $('#fgDemoAgent',body).onclick=()=>loadDemo('agent');
 
     $('#fgSave',body).onclick=()=>{
       const name=prompt('模板名称：','agent-1'); if(!name) return;

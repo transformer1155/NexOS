@@ -116,6 +116,7 @@ namespace NexOS.Forms
 
         // ---- Start menu state -----------------------------------------
         static int startView = 0;         // 0 = Pinned, 1 = All apps
+        static int menuSel   = 0;         // keyboard-highlighted item (Win key / arrows)
         static int startMenuX, startMenuY, startMenuW, startMenuH;
         static int startRClickIdx = -1;   // tile / all-apps row under right-click
         const int START_KEY = 0x51ED270B; // stable Anim key for Start-menu open/close
@@ -1423,14 +1424,14 @@ namespace NexOS.Forms
         static void StartMenu(int w, int h)
         {
             // open/close transition: slide up + fade in, Back overshoot.
-            Anim.Set(START_KEY, menuOpen ? 1000 : 0, 220, 1);
+            Anim.Set(START_KEY, menuOpen ? 1000 : 0, 150, 1);
             int enter = (int)Anim.Get(START_KEY);
             if (!menuOpen && enter == 0) return;
 
             int mw = MenuW(w), mh = MenuH(h);
             int x  = MenuX(w),  y = MenuY(h);
             startMenuX = x; startMenuY = y; startMenuW = mw; startMenuH = mh;
-            y -= (16 * (1000 - enter)) / 1000;          // slide up from below
+            y -= (8 * (1000 - enter)) / 1000;           // slide up from below
 
             uint bg = U.Fade(MenuBg, enter);
             uint ln = U.Fade(0xFF000000 | BarLine, enter);
@@ -1439,7 +1440,7 @@ namespace NexOS.Forms
                 Gfx.Image(Tex.Menu, x + 3, y + 3, mw - 6, mh - 6);
             Gfx.DrawRound(x, y, mw, mh, 10, ln);
 
-            if (enter < 380) return;                    // delay content until faded in
+            if (enter < 120) return;                    // delay content until faded in
 
             Gfx.FillRound(x + 24, y + 18, mw - 48, 32, 8, FieldBg);
             Gfx.DrawRound(x + 24, y + 18, mw - 48, 32, 8, FieldEdge);
@@ -1476,7 +1477,7 @@ namespace NexOS.Forms
                     int row = i / 4;
                     int col = i - row * 4;
                     int tx = gx + col * tw, ty = gy + row * th;
-                    if (W.Hot(tx, ty, tw - 6, th - 6))
+                    if (W.Hot(tx, ty, tw - 6, th - 6) || i == menuSel)
                         Gfx.FillRound(tx, ty, tw - 6, th - 6, 6, 0xE7EEF8);
                     if (Gfx.HasImage(Tex.Icon + dKind[i]) != 0)
                         Gfx.Image(Tex.Icon + dKind[i], tx + (tw - 6 - 32) / 2, ty + 10, 32, 32);
@@ -1496,19 +1497,21 @@ namespace NexOS.Forms
                 // All apps list: every installed kind, alphabetical-ish order.
                 int rowH = 22, lx = x + 28, ly = y + 94, listW = mw - 56;
                 int fyEnd = FootY(y, mh);
+                int sel = 0;                          // running index over installed kinds
                 for (int i = 0; i < 12; i++)
                 {
                     int ry = ly + i * rowH;
                     if (ry + rowH > fyEnd - 4) break;
                     if (IsInstalled(i) == 0) continue;   // hidden when uninstalled
                     int kind = i;   // Kind order; good enough for the shell
-                    if (W.Hot(lx, ry, listW, rowH - 1))
+                    if (W.Hot(lx, ry, listW, rowH - 1) || sel == menuSel)
                         Gfx.FillRound(lx, ry, listW, rowH - 1, 4, BarHot);
                     if (Gfx.HasImage(Tex.Icon + kind) != 0)
                         Gfx.Image(Tex.Icon + kind, lx, ry + 2, 18, 18);
                     else
                         Gfx.Icon(lx, ry + 2, 18, AppColor(kind), AppLetter(kind), 0xFFFFFF);
                     Gfx.Text(lx + 26, ry + 3, kName[kind], Ink);
+                    sel++;
                 }
             }
 
@@ -1778,6 +1781,53 @@ namespace NexOS.Forms
                     if (U.In(mx, my, lx, ry, listW, rowH - 1)) { menuOpen = false; return i; }
                 }
             }
+            return -1;
+        }
+
+        // ---- Keyboard control of the Start menu ------------------------------
+        // Driven by the Win key (toggle) and the arrow keys in gui.cpp.
+        //   code 0 = toggle open/close, 1 = up, 2 = down, 3 = activate, 4 = close.
+        // Returns the app Kind to launch (>=0), or -1 when nothing is launched;
+        // gui.cpp launches the returned Kind through the normal click path.
+        public static int Menu(int code)
+        {
+            if (code == 0)                       // Win key -> open/close
+            {
+                menuOpen = !menuOpen;
+                menuSel = 0;
+                Host.SetAnim(1);                 // keep the open/close transition animating
+                return -1;
+            }
+            if (!menuOpen) return -1;
+            if (code == 4) { menuOpen = false; Host.SetAnim(1); return -1; }
+
+            int n = (startView == 0) ? dN : InstalledCount();
+            if (n <= 0) return -1;
+            if (menuSel >= n) menuSel = 0;
+
+            if (code == 1) { menuSel = (menuSel - 1 + n) % n; return -1; }   // up
+            if (code == 2) { menuSel = (menuSel + 1) % n; return -1; }       // down
+            if (code == 3)                                                   // activate
+            {
+                int kind = (startView == 0) ? dKind[menuSel] : InstalledKindAt(menuSel);
+                menuOpen = false;
+                Host.SetAnim(1);
+                return kind;
+            }
+            return -1;
+        }
+
+        static int InstalledCount()
+        {
+            int c = 0;
+            for (int i = 0; i < KINDS; i++) if (IsInstalled(i) != 0) c++;
+            return c;
+        }
+        static int InstalledKindAt(int idx)
+        {
+            int c = 0;
+            for (int i = 0; i < KINDS; i++)
+                if (IsInstalled(i) != 0) { if (c == idx) return i; c++; }
             return -1;
         }
 

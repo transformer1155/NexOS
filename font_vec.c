@@ -128,17 +128,29 @@ const uint8_t* vec_glyph(uint32_t cp, int px, int* w, int* h, int* xoff, int* yo
     (void)lsb; (void)advance;
 
     int rw = 0, rh = 0, rxo = 0, ryo = 0;
-    unsigned char* bmp = stbtt_GetGlyphBitmap(&g_font, scale, scale, glyph,
+    /* Subpixel (ClearType) rasterization: render at 3x horizontal resolution
+     * so every destination pixel yields independent R/G/B coverages.  The
+     * returned bitmap is cov_w (= 3 * pixel_w) wide, zero-padded to a multiple
+     * of 3; *w reports the destination (pixel) width for the caller's loop. */
+    unsigned char* bmp = stbtt_GetGlyphBitmap(&g_font, scale * 3.0f, scale, glyph,
                                               &rw, &rh, &rxo, &ryo);
     if (!bmp || rw <= 0 || rh <= 0) return NULL;
-    if (rw * rh > VEC_BUFMAX) { STBTT_free(bmp, NULL); return NULL; }
+
+    int pixel_w = (rw + 2) / 3;           /* ceil(rw/3): 3*pixel_w >= rw */
+    int cov_w   = pixel_w * 3;
+    if (cov_w * rh > VEC_BUFMAX) { STBTT_free(bmp, NULL); return NULL; }
 
     uint8_t* dst = g_buf[g_buf_idx];
     g_buf_idx = (g_buf_idx + 1) % VEC_NBUF;
-    for (int i = 0; i < rw * rh; i++) dst[i] = bmp[i];
+    for (int r = 0; r < rh; r++) {
+        const uint8_t* s = bmp + (size_t)r * rw;
+        uint8_t* d = dst + (size_t)r * cov_w;
+        for (int c = 0; c < rw; c++) d[c] = s[c];
+        for (int c = rw; c < cov_w; c++) d[c] = 0;     /* pad to multiple of 3 */
+    }
     STBTT_free(bmp, NULL);
 
-    *w = rw; *h = rh; *xoff = rxo; *yoff = ryo;
+    *w = pixel_w; *h = rh; *xoff = rxo / 3; *yoff = ryo;
     return dst;
 }
 

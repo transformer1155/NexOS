@@ -833,7 +833,12 @@ static uint32_t WINAPI K_ExpandEnvironmentStringsA(const char* src, char* dst, u
 }
 static int WINAPI K_GetComputerNameA(char* buf, uint32_t* sz){
     const char* n = "NexOS-PC";
-    if (buf) w_cpy(buf, n);
+    // *sz was ignored entirely and the copy was unconditional, so a caller
+    // with a short buffer got it overrun.  Clamp to the caller's capacity when
+    // it looks sane; fall back to a bounded default, because lpnSize is an
+    // in/out parameter and some callers pass it unset.
+    uint32_t cap = (sz && *sz && *sz < 64) ? *sz : 64;
+    if (buf) w_ncpy(buf, n, (int)cap);
     if (sz) *sz = (uint32_t)w_len(n);
     return 1;
 }
@@ -925,7 +930,13 @@ static uint32_t WINAPI K_CreateFileA(const char* name, uint32_t access, uint32_t
                    disp == 2 /*CREATE_ALWAYS*/ || disp == 4 /*OPEN_ALWAYS*/ ||
                    disp == 5 /*TRUNCATE_EXISTING*/;
     if (writing){
-        if (!g_wbuf){ g_wbuf = (uint8_t*)app_alloc(8192); g_wcap = 8192; }
+        if (!g_wbuf){
+            g_wbuf = (uint8_t*)app_alloc(8192);
+            if (g_wbuf) g_wcap = 8192;
+        }
+        // app_alloc can fail.  g_wcap used to be set unconditionally, so the
+        // first WriteFile dereferenced NULL.
+        if (!g_wbuf) return 0xFFFFFFFFu;
         g_wsize = 0;
         int i = 0; for (; name[i] && i < 255; i++) g_wname[i] = name[i];
         g_wname[i] = 0;
@@ -950,15 +961,25 @@ static uint32_t WINAPI K_GetFileSize(uint32_t, uint32_t*){ return (uint32_t)g_fs
 static int WINAPI K_WriteFile(uint32_t h, const void* buf, uint32_t n, uint32_t* written, void*){
     if (h == H_WRITE){
         if (!buf || !n) { if (written) *written = 0; return 1; }
-        if (g_wsize + (int)n > g_wcap){
-            int nc = g_wcap * 2;
-            while (nc < g_wsize + (int)n) nc *= 2;
-            uint8_t* nb = (uint8_t*)app_alloc((uint32_t)nc);
+        // Unsigned, overflow-free growth.  The old guard was
+        // `g_wsize + (int)n > g_wcap`: n is uint32, so (int)n can be negative
+        // (or overflow, which is UB), silently bypassing the check and letting
+        // the store loop run past the end of the buffer.
+        uint32_t need = (uint32_t)g_wsize + n;
+        if (need < (uint32_t)g_wsize){ if (written) *written = 0; return 0; }  // wrapped
+        if (need > (uint32_t)g_wcap){
+            uint32_t nc = (g_wcap > 0) ? (uint32_t)g_wcap : 8192u;
+            while (nc < need){
+                if (nc > (1u << 30)){ if (written) *written = 0; return 0; }   // absurd size
+                nc *= 2;
+            }
+            uint8_t* nb = (uint8_t*)app_alloc(nc);
+            if (!nb){ if (written) *written = 0; return 0; }   // keep the old buffer
             for (int i = 0; i < g_wsize; i++) nb[i] = g_wbuf[i];
-            g_wbuf = nb; g_wcap = nc;
+            g_wbuf = nb; g_wcap = (int)nc;
         }
-        for (uint32_t i = 0; i < n; i++) g_wbuf[g_wsize + (int)i] = ((const uint8_t*)buf)[i];
-        g_wsize += (int)n;
+        for (uint32_t i = 0; i < n; i++) g_wbuf[(uint32_t)g_wsize + i] = ((const uint8_t*)buf)[i];
+        g_wsize = (int)need;
         if (written) *written = n;
         return 1;
     }
@@ -1265,7 +1286,10 @@ static int WINAPI U_AppendMenuA(uint32_t h, uint32_t flags, uint32_t id, const c
     if (mi < 0 || g_menu[mi].n >= 14) return 0;
     W32MenuItem& it = g_menu[mi].items[g_menu[mi].n++];
     it.id = id; it.flags = flags;
-    w_cpy(it.text, (flags & MF_SEPARATOR) ? "" : (text ? text : ""));
+    // it.text is a fixed array in .bss; an over-long label walked right into
+    // the following menu item.
+    w_ncpy(it.text, (flags & MF_SEPARATOR) ? "" : (text ? text : ""), (int)sizeof(it.text));
+    it.text[sizeof(it.text) - 1] = 0;
     return 1;
 }
 static int WINAPI U_InsertMenuA(uint32_t h, uint32_t pos, uint32_t flags,
@@ -1276,7 +1300,10 @@ static int WINAPI U_InsertMenuA(uint32_t h, uint32_t pos, uint32_t flags,
     if (pos > (uint32_t)m.n || m.n >= 14) return 0;
     for (int i = m.n; i > (int)pos; i--) m.items[i] = m.items[i - 1];
     m.items[(int)pos].id = id; m.items[(int)pos].flags = flags;
-    w_cpy(m.items[(int)pos].text, (flags & MF_SEPARATOR) ? "" : (text ? text : ""));
+    // Same fixed-array hazard as AppendMenuA.
+    w_ncpy(m.items[(int)pos].text, (flags & MF_SEPARATOR) ? "" : (text ? text : ""),
+           (int)sizeof(m.items[(int)pos].text));
+    m.items[(int)pos].text[sizeof(m.items[(int)pos].text) - 1] = 0;
     m.n++;
     return 1;
 }
@@ -1391,19 +1418,28 @@ static int WINAPI U_GetSystemMetrics(int idx){
     return 0;
 }
 static int WINAPI U_wsprintfA(char* out, const char* fmt, ...){
-    // minimal %s / %d / %x formatter over the stdcall-visible varargs
+    // minimal %s / %d / %x formatter over the stdcall-visible varargs.
+    // The real wsprintfA takes no output size, so it cannot be made safe by
+    // contract; bound it defensively instead.  Every caller here formats into
+    // a small buffer, and an unbounded %s used to walk straight past it.
+    constexpr int CAP = 256;
     if (!out || !fmt) return 0;
     const uint32_t* va = (const uint32_t*)((const uint8_t*)&fmt + sizeof(const char*));
     int o = 0;
-    for (const char* p = fmt; *p; p++){
-        if (*p != '%') { out[o++] = *p; continue; }
+    const char* p = fmt;
+    while (*p && o < CAP - 1){
+        if (*p != '%') { out[o++] = *p++; continue; }
         p++;
         while (*p >= '0' && *p <= '9') p++;
-        if (*p == 's'){ const char* s = (const char*)(*va++); if (s) while (*s) out[o++] = *s++; }
-        else if (*p == 'd' || *p == 'u'){ char t[12]; w_num(t, *va++); for (char* q=t; *q; q++) out[o++]=*q; }
-        else if (*p == 'x' || *p == 'X'){ char t[12]; w_hex(t, *va++, 8); for (char* q=t; *q; q++) out[o++]=*q; }
+        if (*p == 's'){
+            const char* s = (const char*)(*va++);
+            while (s && *s && o < CAP - 1) out[o++] = *s++;
+        }
+        else if (*p == 'd' || *p == 'u'){ char t[12]; w_num(t, *va++);   for (char* q=t; *q && o < CAP-1; q++) out[o++]=*q; }
+        else if (*p == 'x' || *p == 'X'){ char t[12]; w_hex(t, *va++, 8); for (char* q=t; *q && o < CAP-1; q++) out[o++]=*q; }
         else if (*p == 'c'){ out[o++] = (char)(*va++); }
         else out[o++] = *p;
+        if (*p) p++;
     }
     out[o] = 0;
     return o;
@@ -1683,7 +1719,10 @@ static uint32_t WINAPI A_RegQueryInfoKeyA(uint32_t key, char*, uint32_t*, uint32
 }
 static int WINAPI A_GetUserNameA(char* buf, uint32_t* sz){
     const char* n = "User";
-    if (buf) w_cpy(buf, n);
+    // Same hazard as GetComputerNameA: *sz was ignored, so the copy was
+    // unbounded with respect to the caller's buffer.
+    uint32_t cap = (sz && *sz && *sz < 64) ? *sz : 64;
+    if (buf) w_ncpy(buf, n, (int)cap);
     if (sz) *sz = (uint32_t)w_len(n) + 1;
     return 1;
 }
@@ -2156,7 +2195,10 @@ static int win64_run(const char* filename, const char* args, int info_only){
 
     if (fsz < 0x40 || file[0] != 'M' || file[1] != 'Z'){ kfree(file); rep("not an MZ image\n"); return -2; }
     uint32_t nt = rd32(file, 0x3C);
-    if (nt + 0xF8 > (uint32_t)fsz || rd32(file, nt) != 0x00004550u){
+    // Subtraction form: `nt + 0xF8` wraps for a hostile e_lfanew (e.g.
+    // 0xFFFFFF08) and sails past the bounds check, after which every header
+    // read below runs off the file buffer.
+    if (nt > (uint32_t)fsz || (uint32_t)fsz - nt < 0xF8u || rd32(file, nt) != 0x00004550u){
         kfree(file); rep("no PE signature\n"); return -2;
     }
     uint16_t machine = rd16(file, nt + 4);
@@ -2203,6 +2245,9 @@ static int win64_run(const char* filename, const char* args, int info_only){
     g_base = (uint8_t*)(((uintptr_t)g_image + 4095u) & ~(uintptr_t)4095u);
     w_set(g_base, 0, sizeimg);
     if (sizehdr > (uint32_t)fsz) sizehdr = (uint32_t)fsz;
+    // Also clamp to the mapped image: a header block larger than SizeOfImage
+    // is copied past g_base+sizeimg and tramples the slack/heap after it.
+    if (sizehdr > sizeimg) sizehdr = sizeimg;
     w_mov(g_base, file, sizehdr);
 
     uint32_t sh = nt + 24 + optsz;
@@ -2213,8 +2258,11 @@ static int win64_run(const char* filename, const char* args, int info_only){
         uint32_t rsz = rd32(file, e + 16);
         uint32_t rp  = rd32(file, e + 20);
         if (va >= sizeimg) continue;
-        if (rp + rsz > (uint32_t)fsz) rsz = (rp < (uint32_t)fsz) ? (uint32_t)fsz - rp : 0;
-        if (va + rsz > sizeimg) rsz = sizeimg - va;
+        // Subtraction form on both clamps: rp+rsz and va+rsz can wrap, which
+        // used to bypass the bounds check and copy ~4 GiB out of the buffer.
+        if (rsz > (uint32_t)fsz || rp > (uint32_t)fsz - rsz)
+            rsz = (rp < (uint32_t)fsz) ? (uint32_t)fsz - rp : 0;
+        if (rsz > sizeimg || va > sizeimg - rsz) rsz = sizeimg - va;
         if (rsz) w_mov(g_base + va, file + rp, rsz);
     }
 
@@ -2268,11 +2316,20 @@ static int win64_run(const char* filename, const char* args, int info_only){
     if (imp_rva){
         rep("  Imports:\n");
         for (uint32_t d = 0; ; d += 20){
+            // The descriptor array runs until a null entry; a file without one
+            // would otherwise walk off the end of the image.  64-bit compare
+            // so imp_rva + d cannot wrap.
+            if ((uint64_t)imp_rva + d + 20 > (uint64_t)sizeimg) break;
             uint32_t oft  = rd32(g_base, imp_rva + d);
             uint32_t nrva = rd32(g_base, imp_rva + d + 12);
             uint32_t ft   = rd32(g_base, imp_rva + d + 16);
             if (!oft && !nrva && !ft) break;
             if (nrva >= sizeimg) break;
+            // FirstThunk is the WRITE side of the IAT and was never range
+            // checked: a descriptor with a valid, small OriginalFirstThunk but
+            // a bogus large FirstThunk wrote 4 bytes at an arbitrary offset
+            // past the image.
+            if (ft >= sizeimg) break;
             const char* dll = (const char*)(g_base + nrva);
             rep("    "); rep(dll); rep(" -> ");
             uint32_t rt = oft ? oft : ft;
@@ -2374,7 +2431,10 @@ extern "C" int win32_run(const char* filename, const char* args, int info_only){
     // ---- validate ----
     if (fsz < 0x40 || file[0] != 'M' || file[1] != 'Z'){ kfree(file); rep("not an MZ image\n"); return -2; }
     uint32_t nt = rd32(file, 0x3C);
-    if (nt + 0xF8 > (uint32_t)fsz || rd32(file, nt) != 0x00004550u){
+    // Subtraction form: `nt + 0xF8` wraps for a hostile e_lfanew (e.g.
+    // 0xFFFFFF08) and sails past the bounds check, after which every header
+    // read below runs off the file buffer.
+    if (nt > (uint32_t)fsz || (uint32_t)fsz - nt < 0xF8u || rd32(file, nt) != 0x00004550u){
         kfree(file); rep("no PE signature\n"); return -2;
     }
     uint16_t machine = rd16(file, nt + 4);
@@ -2438,6 +2498,9 @@ extern "C" int win32_run(const char* filename, const char* args, int info_only){
     g_base = (uint8_t*)((((uintptr_t)g_image) + 4095u) & ~(uintptr_t)4095u);
     w_set(g_base, 0, sizeimg);
     if (sizehdr > (uint32_t)fsz) sizehdr = (uint32_t)fsz;
+    // Also clamp to the mapped image: a header block larger than SizeOfImage
+    // is copied past g_base+sizeimg and tramples the slack/heap after it.
+    if (sizehdr > sizeimg) sizehdr = sizeimg;
     w_mov(g_base, file, sizehdr);
 
     uint32_t sh = nt + 24 + optsz;
@@ -2448,8 +2511,11 @@ extern "C" int win32_run(const char* filename, const char* args, int info_only){
         uint32_t rsz = rd32(file, e + 16);
         uint32_t rp  = rd32(file, e + 20);
         if (va >= sizeimg) continue;
-        if (rp + rsz > (uint32_t)fsz) rsz = (rp < (uint32_t)fsz) ? (uint32_t)fsz - rp : 0;
-        if (va + rsz > sizeimg) rsz = sizeimg - va;
+        // Subtraction form on both clamps: rp+rsz and va+rsz can wrap, which
+        // used to bypass the bounds check and copy ~4 GiB out of the buffer.
+        if (rsz > (uint32_t)fsz || rp > (uint32_t)fsz - rsz)
+            rsz = (rp < (uint32_t)fsz) ? (uint32_t)fsz - rp : 0;
+        if (rsz > sizeimg || va > sizeimg - rsz) rsz = sizeimg - va;
         if (rsz) w_mov(g_base + va, file + rp, rsz);
     }
 
@@ -2464,19 +2530,30 @@ extern "C" int win32_run(const char* filename, const char* args, int info_only){
             return -3;
         }
         uint32_t off = 0, fixed = 0;
+        // The whole .reloc directory must lie inside the mapped image before
+        // we start reading fixup blocks out of it.
+        if (rel_rva >= sizeimg || rel_sz > sizeimg - rel_rva){
+            kfree(file); w32_free_image();
+            rep("  -> .reloc directory lies outside the image\n");
+            return -3;
+        }
         while (off + 8 <= rel_sz){
             uint32_t page = rd32(g_base, rel_rva + off);
             uint32_t blk  = rd32(g_base, rel_rva + off + 4);
-            if (blk < 8 || off + blk > rel_sz) break;
+            // blk <= rel_sz - off, written so `off + blk` cannot wrap.
+            if (blk < 8 || blk - 8 > rel_sz - off - 8) break;
             uint32_t n = (blk - 8) / 2;
             for (uint32_t i = 0; i < n; i++){
                 uint16_t e = rd16(g_base, rel_rva + off + 8 + i*2);
                 uint32_t ty = e >> 12, o = e & 0x0FFF;
-                if (ty == 3){
-                    uint32_t* t = (uint32_t*)(g_base + page + o);
-                    *t = (uint32_t)((int32_t)(*t) + delta);
-                    fixed++;
-                } // type 0 = absolute (padding)
+                if (ty != 3) continue;      // type 0 = absolute (padding)
+                // page and o both come from the file: verify the 4-byte fixup
+                // target stays inside the image before dereferencing it.
+                uint64_t tgt = (uint64_t)page + o;
+                if (tgt + 4 > (uint64_t)sizeimg) continue;
+                uint32_t* t = (uint32_t*)(g_base + (uint32_t)tgt);
+                *t = (uint32_t)((int32_t)(*t) + delta);
+                fixed++;
             }
             off += blk;
         }
@@ -2489,6 +2566,10 @@ extern "C" int win32_run(const char* filename, const char* args, int info_only){
         rep("  Imports:\n");
         w32_serial("[WIN32] imp_rva="); w32_serial_hex(imp_rva); w32_serial("\n");
         for (uint32_t d = 0; ; d += 20){
+            // The descriptor array runs until a null entry; a file without one
+            // would otherwise walk off the end of the image.  64-bit compare
+            // so imp_rva + d cannot wrap.
+            if ((uint64_t)imp_rva + d + 20 > (uint64_t)sizeimg) break;
             uint32_t oft  = rd32(g_base, imp_rva + d);
             uint32_t nrva = rd32(g_base, imp_rva + d + 12);
             uint32_t ft   = rd32(g_base, imp_rva + d + 16);
@@ -2499,6 +2580,11 @@ extern "C" int win32_run(const char* filename, const char* args, int info_only){
             w32_serial("\n");
             if (!oft && !nrva && !ft) break;
             if (nrva >= sizeimg) break;
+            // FirstThunk is the WRITE side of the IAT and was never range
+            // checked: a descriptor with a valid, small OriginalFirstThunk but
+            // a bogus large FirstThunk wrote 4 bytes at an arbitrary offset
+            // past the image.
+            if (ft >= sizeimg) break;
             const char* dll = (const char*)(g_base + nrva);
             rep("    "); rep(dll); rep(" -> ");
             uint32_t rt = oft ? oft : ft;
@@ -2518,6 +2604,8 @@ extern "C" int win32_run(const char* filename, const char* args, int info_only){
                     missing++;
                     if (missing <= 6){ rep("\n      MISSING "); rep(nm); }
                 }
+                // Keep the IAT store inside the image (ft + k can wrap).
+                if ((uint64_t)ft + k + 4 > (uint64_t)sizeimg) break;
                 uint32_t* wp = (uint32_t*)(g_base + ft + k);
                 if (cnt < 2){
                     w32_serial("[WIN32]   write fn="); w32_serial_hex((uint32_t)(uintptr_t)fn);
@@ -2560,6 +2648,14 @@ extern "C" int win32_run(const char* filename, const char* args, int info_only){
     w32_serial(" entry="); w32_serial_hex(fn_addr);
     w32_serial(" delta="); w32_serial_hex((uint32_t)delta);
     w32_serial("\n");
+
+    // An unvalidated entry RVA means executing the DOS header (rva 0) or, for
+    // a large value, jumping into whatever happens to follow the image.
+    if (entry_rva == 0 || (uint64_t)entry_rva + 1 > (uint64_t)sizeimg){
+        rep("  -> refusing to execute: entry point lies outside the image\n");
+        w32_free_image();
+        return -3;
+    }
 
     typedef int (WINAPI *EntryFn)(void);
     EntryFn fn = (EntryFn)(void*)(g_base + entry_rva);

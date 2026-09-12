@@ -41,10 +41,18 @@ static uint64_t rd64(const uint8_t* p){
 }
 
 // Read a GGUF string (uint64 length + bytes) into out.
-static void read_str(const uint8_t* d, uint64_t* pos, char* out, int cap){
+// Read a GGUF string (uint64 length + bytes) into out.  Returns 0 on success,
+// -1 if the string runs past the end of the buffer.
+// The length comes straight from the file, so BOTH the 8-byte length field and
+// the string bytes must be checked against `size` before reading -- otherwise a
+// corrupt or hostile model walks off the end of the mapped file.
+static int read_str(const uint8_t* d, uint64_t size, uint64_t* pos, char* out, int cap){
+    if (*pos + 8 > size) return -1;
     uint64_t len = rd64(d + *pos); *pos += 8;
+    if (len > size - *pos) return -1;
     int n = (int)len; if (n >= cap) n = cap - 1; if (n < 0) n = 0;
     gguf_memcpy(out, d + *pos, (uint64_t)n); out[n] = 0; *pos += len;
+    return 0;
 }
 
 // Byte size of a metadata VALUE type (scalar).
@@ -74,7 +82,9 @@ __attribute__((unused)) static void skip_value(const uint8_t* d, uint64_t* pos, 
 }
 
 int ai_gguf_parse(const uint8_t* data, uint64_t size, GGUFModelInfo* info){
-    if (size < 16) return -1;
+    // The header reads below need bytes 8..15 (tensor_count) and 16..23
+    // (kv_count), so a 16..23-byte "GGUF" file would read past the buffer.
+    if (size < 24) return -1;
     if (rd32(data) != 0x46554747u) return -2;   // magic "GGUF"
     info->version = rd32(data + 4);
     uint64_t pos = 8;
@@ -92,11 +102,11 @@ int ai_gguf_parse(const uint8_t* data, uint64_t size, GGUFModelInfo* info){
 
     // ---- metadata KV ----
     for (uint64_t k = 0; k < info->kv_count && pos < size; k++){
-        char key[96]; read_str(data, &pos, key, sizeof(key));
+        char key[96]; if (read_str(data, size, &pos, key, sizeof(key)) < 0) return -3;
         uint32_t type = rd32(data + pos); pos += 4;
 
         if (type == 8){                    // STRING value
-            char sval[128]; read_str(data, &pos, sval, sizeof(sval));
+            char sval[128]; if (read_str(data, size, &pos, sval, sizeof(sval)) < 0) return -3;
             if (gguf_strcmp(key, "general.architecture") == 0)
                 gguf_strcpy(info->arch, sval, sizeof(info->arch));
             else if (gguf_strcmp(key, "general.quantization_type") == 0)
@@ -126,7 +136,9 @@ int ai_gguf_parse(const uint8_t* data, uint64_t size, GGUFModelInfo* info){
         uint64_t u = 0; double fd = 0;
         int es = meta_elem_size(type);
         if (es == 1)      u = data[pos];
-        else if (es == 2) u = rd32(data + pos) & 0xFFFFu;
+        // 2-byte metadata values: read exactly two bytes.  rd32() read four,
+        // which overruns the buffer when the value sits at the very end.
+        else if (es == 2) u = (uint32_t)data[pos] | ((uint32_t)data[pos + 1] << 8);
         else if (es == 4){ u = rd32(data + pos);
                            if (type == 6){ uint32_t b = rd32(data + pos); float f; gguf_memcpy(&f, &b, 4); fd = (double)f; } }
         else if (es == 8){ u = rd64(data + pos);
@@ -159,8 +171,12 @@ int ai_gguf_parse(const uint8_t* data, uint64_t size, GGUFModelInfo* info){
     for (uint64_t t = 0; t < info->tensor_count && pos < size &&
          (uint64_t)info->n_tensors < GGUF_MAX_TENSORS; t++){
         GGUFTensor* T = &info->tensors[info->n_tensors];
-        read_str(data, &pos, T->name, sizeof(T->name));
+        if (read_str(data, size, &pos, T->name, sizeof(T->name)) < 0) return -3;
         T->n_dims = rd32(data + pos); pos += 4;
+        // Only 4 dimensions are stored.  A file declaring more must still have
+        // them consumed; otherwise type/offset below are read out of the
+        // dimension data and every tensor pointer becomes garbage.
+        if (T->n_dims > 4) return -3;
         for (int dd = 0; dd < 4; dd++) T->dims[dd] = 0;
         for (uint32_t dd = 0; dd < T->n_dims && dd < 4; dd++){
             T->dims[dd] = rd64(data + pos); pos += 8;

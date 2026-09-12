@@ -28,6 +28,7 @@
 #include "gdt.h"          // Foundation 0: ring-3 GDT/TSS
 #include "syscall.h"      // Foundation 0: unified int 0x80 syscall ABI
 #include "proc.h"         // Foundation 0: process table
+#include "bootsplash.h"   // earliest-possible boot animation (LFB, pre-heap)
 #include "vfs.h"          // Foundation 0: sandboxed virtual filesystem
 #include "perm.h"         // Security 3.3: Y/N permission prompt engine
 #include "clr.h"          // MiniCLR: CIL interpreter for Roslyn-compiled C# apps
@@ -415,6 +416,116 @@ static void pci_write_config(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off
                   | ((uint32_t)func << 8) | (offset & 0xFC);
     outl(0xCF8, addr);
     outl(0xCFC, val);
+}
+
+// ---- VirtualBox VMMDev mouse (kept for layout / boot compatibility) ----
+// The absolute-pointer path that made the guest cursor track the host and slide
+// out of the window has been DISABLED: g_host_cursor_active is forced false, so
+// the OS always uses its relative PS/2 mouse and QEMU/VBox capture it on click
+// (Ctrl+Alt / host key to release).  The probe/init functions are retained (and
+// still referenced by kmain) so the kernel's layout stays identical to the
+// known-good build -- removing them shifted the image and exposed a latent
+// CLR/MFORMS fault.
+#define VMMDEV_VENDOR 0x80EE
+#define VMMDEV_DEVICE 0xCAFE
+#define VMMDEV_HDR_VERSION 0x10001
+#define VMMDEV_MOUSE_GUEST_CAN_ABSOLUTE 0x01
+#define VMMDEV_MOUSE_HOST_WANTS_ABSOLUTE 0x02
+
+struct VMMDevReqHeader {
+    uint32_t size;
+    uint32_t version;
+    uint32_t requestType;
+    int      rc;
+    uint32_t reserved1;
+    uint32_t fRequestor;
+};
+struct VMMDevReqMouseStatus {
+    VMMDevReqHeader header;
+    uint32_t mouseFeatures;
+    int      pointerXPos;
+    int      pointerYPos;
+};
+
+// Request buffer at a fixed low physical address (identity-mapped, like 0x5000).
+static volatile VMMDevReqMouseStatus* g_vbox_req = (volatile VMMDevReqMouseStatus*)0x6000;
+static uint16_t g_vbox_port = 0;     // 0 => VMMDev not found
+bool g_host_cursor_active = false;    // true when absolute mouse is live (disabled below)
+static uint32_t g_vbox_get_type = 34; // VMMDevReq_GetMouseStatus
+static uint32_t g_vbox_set_type = 35; // VMMDevReq_SetMouseStatus
+
+static void vbox_req_submit(void) {
+    outl(g_vbox_port + 0, 0x6000);   // physical address of the request struct
+}
+
+static bool vbox_try(uint32_t get_t, uint32_t set_t) {
+    g_vbox_req->header.size = sizeof(VMMDevReqMouseStatus);
+    g_vbox_req->header.version = VMMDEV_HDR_VERSION;
+    g_vbox_req->header.requestType = set_t;
+    g_vbox_req->header.rc = 0;
+    g_vbox_req->header.reserved1 = 0;
+    g_vbox_req->header.fRequestor = 0;
+    g_vbox_req->mouseFeatures = VMMDEV_MOUSE_GUEST_CAN_ABSOLUTE;
+    vbox_req_submit();
+    if (g_vbox_req->header.rc != 0) return false;
+
+    g_vbox_req->header.requestType = get_t;
+    g_vbox_req->header.rc = 0;
+    g_vbox_req->mouseFeatures = 0;
+    vbox_req_submit();
+    if (g_vbox_req->header.rc != 0) return false;
+    if (!(g_vbox_req->mouseFeatures & VMMDEV_MOUSE_HOST_WANTS_ABSOLUTE)) return false;
+    g_vbox_get_type = get_t;
+    g_vbox_set_type = set_t;
+    return true;
+}
+
+static void vbox_mouse_init(void) {
+    for (uint8_t dev = 0; dev < 32; dev++) {
+        for (uint8_t func = 0; func < 8; func++) {
+            uint32_t id = pci_read_config(0, dev, func, 0);
+            if ((id & 0xFFFF) == 0xFFFF) { if (func == 0) break; else continue; }
+            uint16_t vid = id & 0xFFFF;
+            uint16_t did = (id >> 16) & 0xFFFF;
+            if (vid == VMMDEV_VENDOR && did == VMMDEV_DEVICE) {
+                uint32_t bar0 = pci_read_config(0, dev, func, 0x10);
+                if (bar0 & 0x01) g_vbox_port = (uint16_t)(bar0 & 0xFFFC);
+                goto found;
+            }
+        }
+    }
+found:
+    if (g_vbox_port == 0) { serial_puts("[VBOX] VMMDev not found\n"); return; }
+
+    // The absolute-pointer path (which made the guest cursor track the host and
+    // slide out of the VM window) is intentionally left DISABLED: we always keep
+    // the relative PS/2 mouse, so the window captures the cursor on click and
+    // only releases it on the host key (Ctrl+Alt / host combo).  The probe below
+    // is still run (and g_vbox_port gets set) purely to keep the kernel's code
+    // layout identical to the known-good build -- touching the layout re-exposed
+    // a latent CLR/MFORMS fault, so the function body stays but its result is
+    // ignored.
+    vbox_try(34, 35);
+    vbox_try(1, 2);
+    g_host_cursor_active = false;
+    serial_puts("[VBOX] absolute mouse disabled (relative PS/2, no slide-out)\n");
+}
+
+static void vbox_ensure_init(void) {
+    static bool done = false;
+    if (!done) { done = true; vbox_mouse_init(); }
+}
+
+static bool vbox_get_mouse(uint32_t* x, uint32_t* y) {
+    if (!g_host_cursor_active || g_vbox_port == 0) return false;  // disabled / no device
+    g_vbox_req->header.requestType = g_vbox_get_type;
+    g_vbox_req->header.rc = 0;
+    g_vbox_req->mouseFeatures = 0;
+    vbox_req_submit();
+    if (g_vbox_req->header.rc != 0) return false;
+    *x = (uint32_t)g_vbox_req->pointerXPos;
+    *y = (uint32_t)g_vbox_req->pointerYPos;
+    return true;
 }
 
 // ---- Scan PCI bus for devices ----
@@ -1373,7 +1484,7 @@ enum KbdType {
     K_CTRL_C, K_CTRL_V, K_CTRL_L, K_CTRL_UP, K_CTRL_DOWN,
     K_CTRL_Z, K_CTRL_A, K_CTRL_S,
     K_PAGEUP, K_PAGEDN, K_HOME, K_END, K_SHIFT,
-    K_DESK_L, K_DESK_R, K_DESK_TGL
+    K_DESK_L, K_DESK_R, K_DESK_TGL, K_MENU
 };
 struct KbdEvent { KbdType type; char ch; };
 
@@ -1413,7 +1524,9 @@ public:
         }
         if(m_ext){
             m_ext=false;
-            if(key==SC_LGUI||key==SC_RGUI){ m_gui=true; return e; }
+            // Windows key: also raise a K_MENU event so a plain Win press opens
+            // the Start menu (the GUI treats it as a menu toggle).
+            if(key==SC_LGUI||key==SC_RGUI){ m_gui=true; e.type=K_MENU; return e; }
             if(key==0x48){
                 if(m_ctrl && (m_gui || gui_is_active())) e.type=K_DESK_TGL;
                 else if(m_ctrl)                          e.type=K_CTRL_UP;
@@ -1552,8 +1665,16 @@ public:
             ev.left   = m_pkt[0] & 0x01;
             ev.right  = m_pkt[0] & 0x02;
             ev.middle = m_pkt[0] & 0x04;
+            // PS/2 relative deltas are 9-bit signed: the low 8 bits live in
+            // m_pkt[1]/[2] and the 9th (sign) bit is bit4/bit5 of the start
+            // byte.  Using a bare int8_t here mis-signs any movement with
+            // |delta| > 127 (QEMU splits a fast drag into +/-255 packets, so
+            // a 0xFF01 byte is wrongly read as +1 instead of -255), which
+            // makes the cursor veer the wrong way / never reach the target.
             ev.dx     = (int8_t)m_pkt[1];
+            if (m_pkt[0] & 0x10) ev.dx -= 256;        // X sign bit (bit4)
             ev.dy     = (int8_t)m_pkt[2];
+            if (m_pkt[0] & 0x20) ev.dy -= 256;        // Y sign bit (bit5)
             ev.dz     = (m_pkt_len >= 4) ? (int8_t)m_pkt[3] : 0;
         }
         return ev;
@@ -1645,11 +1766,14 @@ extern "C" {
     int  gui_available(void);
     void gui_enter(void);
     void gui_mouse_move(int dx, int dy);
+    void gui_mouse_position(uint32_t raw_x, uint32_t raw_y);
     void gui_mouse_down(void);
     void gui_mouse_up(void);
     void gui_mouse_down_right(void);
     int  gui_handle_key(char ch);
     void gui_handle_ctrl(int code);   // 1=Ctrl+C 2=Ctrl+V 3=Ctrl+Z 4=Ctrl+A
+    void gui_toggle_start_menu(void);
+    void gui_desktop_nav(int code);   // 1=up 2=down 3=left 4=right 5=tab
     void gui_toggle_ime(void);
     void gui_create_window(int x, int y, int w, int h, const char* title);
     void gui_draw_text(int x, int y, const char* text);
@@ -1659,6 +1783,9 @@ extern "C" {
     void gui_render_text_mode(void);
     void gui_exit(void);
     void gui_render(void);
+    void gui_remote_begin(const char* who);   // arm the "being remotely controlled" overlay
+    void gui_remote_cmd(const char* cmd);     // record + show a remote command
+    void gui_remote_end(void);                // dismiss the overlay
     void gui_tick(void);
     void gui_animate_frame(void);
     // Open a Windows executable file (exe/bat/ps1/com) inside the GUI.
@@ -1737,7 +1864,7 @@ static bool g_fb_console_mode = false;
 // The BIOS os.img build places the same SFS image further out on the disk so
 // it does not collide with the 64-bit kernel payload.  Probe both locations.
 #define SFS_ALT_LBA       3664   // must match Makefile SFS_LBA (kernel64 payload ends at 2048+1600=3648, SFS at 3664)
-#define SFS_LINUX_LBA     3932   // independent Linux user-space partition (after main SFS vol; matches Makefile LINUX_SFS_LBA)
+#define SFS_LINUX_LBA     25600  // independent Linux user-space partition (after main SFS vol; matches Makefile LINUX_SFS_LBA)
 
 // CD/ISO-boot RAM-SFS handoff.  boot_cd.asm streams the (texture-free) SFS
 // image off the CD into high RAM and leaves a flag at 0x0900 so the kernel
@@ -2776,7 +2903,7 @@ constexpr uint32_t PMM_MAX_PAGES   = 65536;        // 256 MB / 4 KiB
 // (and well clear of .lmboot @ 0x1800000).  The 64-bit staging buffer (720 KiB
 // kmalloc) therefore lands in 0x880000..0xF20000, clear of both.
 constexpr uint32_t HEAP_START      = 0x900000;     // 9 MiB (must stay > __bss_end; CLR globals enlarged .bss)
-constexpr uint32_t HEAP_SIZE       = 0xA00000;     // 10 MiB (HEAP_END = 0x1300000 < RAM-SFS @ 0x1400000)
+constexpr uint32_t HEAP_SIZE       = 0xAF0000;     // ~11 MiB (HEAP_END = 0x13F0000 < RAM-SFS @ 0x1400000; must also hold the ~4 MiB GB2312 24x24 CJK bitmap)
 constexpr uint32_t HEAP_END        = HEAP_START + HEAP_SIZE;
 
 // Page-table / PDE flags
@@ -6297,21 +6424,28 @@ static void cmd_gui(const char* args){
         term.set_color(make_color(WHITE, BLACK));
         return;
     }
+    // Register machine-state callbacks BEFORE gui_init(): gui_init's font
+    // loader (vec_init / load_font_la16) needs g_cb.read_file, and the 32-bit
+    // boot path used to register these only AFTER gui_init -- so the vector
+    // font (msyh.ttf) never loaded and all text fell back to the 8x16 bitmap
+    // (the persistent "jaggies" the desktop showed).  The callbacks are plain
+    // kernel functions, so wiring them first is safe.
+    register_gui_callbacks();
+
     // Bring up the GUI subsystem on demand (allocates backbuffer, etc.)
     if(gui_init() != 0){
+        boot_splash_finish();     // let the text console report the failure
         term.set_color(make_color(RED, BLACK));
         term.write("GUI initialization failed.\n");
         term.set_color(make_color(WHITE, BLACK));
         return;
     }
+    // gui_init() loads the fonts from SFS (several MB) -- the slowest step of
+    // the whole boot.  Keep the animation alive across it.
+    boot_splash_tick();
 
-    // Fill gui.cpp's g_cb machine-state callback table.  The 64-bit kernel
-    // does this in its boot path; the 32-bit path (which is the one that
-    // actually runs MiniCLR/mforms) previously never did, leaving every
-    // g_cb.* pointer NULL.  mforms_boot() copies those into g_h, so the
-    // managed shell's Host.MemTotalKb()/PagesUsed()/... would call through
-    // a NULL pointer and #PF.  Register them before gui_enter().
-    register_gui_callbacks();
+    // (Callbacks already registered above, before gui_init, so the vector
+    //  font loads.  Do NOT re-register here.)
 
     // The desktop can EXECUTE real Windows PE images now (double-click a
     // .exe in the File Explorer, or the Browser icon -> chrome.exe), so the
@@ -6331,6 +6465,7 @@ static void cmd_gui(const char* args){
     // The desktop and every window is now painted by the managed (C#)
     // NexOS.Forms shell, so the CLR must be live before we hand over.
     clr_ensure_init();
+    boot_splash_tick();
 
     // Optional: `gui <app>` opens straight into an app after GUI starts,
     // e.g. `gui calc`, `gui files`, `gui about` (the managed C# apps) or
@@ -6343,6 +6478,9 @@ static void cmd_gui(const char* args){
         }
     }
 
+    // The desktop is about to paint its first frame, so hand the screen over:
+    // the framebuffer console stands down and the compositor owns the LFB.
+    boot_splash_finish();
     gui_enter();
 
     term.set_color(make_color(WHITE, BLACK));
@@ -6389,7 +6527,9 @@ extern "C" void switch_to_64bit(uint32_t stage_phys);
 // fill_rect / blend_rect honour the clip mask) pushed it to ~754912 bytes,
 // so SFS_LBA moved 3520 -> 3536 (gap = (3536-2048)*512 = 762368 and
 // KERNEL64_SECTORS=1475 => 755200 bytes still fits with margin).
-#define KERNEL64_SECTORS    1600    // raised for ps/kill
+#define KERNEL64_SECTORS    1610    // raised: kernel64.bin hit 821400 B > 1600*512; the
+                                    // LBA 2048..3664 gap still holds 1616 sectors, so
+                                    // SFS_LBA/SFS_ALT_LBA stay put (2048+1610 <= 3664)
 
 // Load kernel64.bin from the disk into a staging buffer and jump to long
 // mode.  Shared by `switch` and `ask64`; never returns on success.
@@ -7246,6 +7386,10 @@ extern "C" int nexos_auth(const char* user, const char* pw){
 // arming g_ssh_out_fn (via term_set_ssh_sink) so command output is forwarded
 // over the encrypted channel; kernel_exec_line itself does not touch the sink.
 extern "C" void kernel_exec_line(const char* line){
+    // Remote command (SSH / bridge): arm the security-guard overlay so an
+    // observer in the NexOS GUI can see the machine is being controlled.
+    gui_remote_begin("远程终端 (SSH/桥接)");
+    gui_remote_cmd(line);
     run_command(line);
 }
 
@@ -7586,15 +7730,88 @@ static int gui_cb_session_clear(const char* name) {
     return 0;
 }
 
-// ---- Time callback (from CMOS RTC) ----
+// ---- Timezone (auto-detected from the internet at boot) ----
+// Offset in seconds east of UTC (plus the IANA name), resolved once by
+// timezone_autodetect() so the UI shows local time instead of raw UTC.
+static int  g_tz_offset_sec = 0;
+static char g_tz_name[40]   = "UTC";
+
+// Grab the integer that follows the first `key` (e.g. `"offset":`) in JSON.
+static bool tz_json_int(const char* body, const char* key, int* out) {
+    int klen = 0; while (key[klen]) klen++;
+    for (const char* p = body; *p; p++) {
+        int i = 0; while (i < klen && p[i] == key[i]) i++;
+        if (i != klen) continue;
+        const char* q = p + klen;
+        while (*q == ' ' || *q == '\t') q++;
+        int sign = 1;
+        if (*q == '-') { sign = -1; q++; } else if (*q == '+') q++;
+        if (*q < '0' || *q > '9') return false;
+        int v = 0;
+        while (*q >= '0' && *q <= '9') { v = v * 10 + (*q - '0'); q++; }
+        *out = sign * v;
+        return true;
+    }
+    return false;
+}
+
+// Copy the JSON string value after the first `key` (e.g. `"timezone":`) into out.
+static bool tz_json_str(const char* body, const char* key, char* out, int cap) {
+    int klen = 0; while (key[klen]) klen++;
+    for (const char* p = body; *p; p++) {
+        int i = 0; while (i < klen && p[i] == key[i]) i++;
+        if (i != klen) continue;
+        const char* q = p + klen;
+        if (*q != '"') return false;
+        q++;
+        int o = 0;
+        while (*q && *q != '"' && o < cap - 1) out[o++] = *q++;
+        out[o] = 0;
+        return o > 0;
+    }
+    return false;
+}
+
+// Query a geo-IP service over plain HTTP and apply the returned UTC offset.
+// Best-effort: on any failure the clock simply stays on UTC (offset 0).
+static void timezone_autodetect(void) {
+    if (!g_net_initialized) return;
+    static char buf[768];
+    serial_puts("[TZ] querying ip-api.com for the local UTC offset...\n");
+    int n = net_http_get("http://ip-api.com/json/?fields=status,offset,timezone",
+                         buf, (int)sizeof(buf) - 1);
+    if (n <= 0) { serial_puts("[TZ] no response; keeping UTC\n"); return; }
+    buf[n] = 0;
+    int off = 0;
+    if (tz_json_int(buf, "\"offset\":", &off) && off >= -50400 && off <= 50400) {
+        g_tz_offset_sec = off;
+        serial_puts("[TZ] offset = ");
+        serial_puts_dec(off / 3600);
+        serial_puts("h\n");
+    } else {
+        serial_puts("[TZ] offset not found; keeping UTC\n");
+    }
+    char nm[40];
+    if (tz_json_str(buf, "\"timezone\":", nm, (int)sizeof(nm))) {
+        int i = 0; while (nm[i] && i < (int)sizeof(g_tz_name) - 1) { g_tz_name[i] = nm[i]; i++; }
+        g_tz_name[i] = 0;
+        serial_puts("[TZ] zone = "); serial_puts(g_tz_name); serial_puts("\n");
+    }
+}
+
+// ---- Time callback (from CMOS RTC, adjusted to local time) ----
 static void gui_cb_get_time(int* h, int* m, int* s) {
     outb(0x70, 0x00); *s = inb(0x71);
     outb(0x70, 0x02); *m = inb(0x71);
     outb(0x70, 0x04); *h = inb(0x71);
     // Convert BCD to binary
-    *s = (*s & 0x0F) + ((*s >> 4) & 0x0F) * 10;
-    *m = (*m & 0x0F) + ((*m >> 4) & 0x0F) * 10;
-    *h = (*h & 0x0F) + ((*h >> 4) & 0x0F) * 10;
+    int sec = (*s & 0x0F) + ((*s >> 4) & 0x0F) * 10;
+    int mn  = (*m & 0x0F) + ((*m >> 4) & 0x0F) * 10;
+    int hr  = (*h & 0x0F) + ((*h >> 4) & 0x0F) * 10;
+    // Apply the geo-IP timezone offset (the RTC is UTC) and wrap within the day.
+    int tod = hr * 3600 + mn * 60 + sec + g_tz_offset_sec;
+    tod %= 86400; if (tod < 0) tod += 86400;
+    *h = tod / 3600; *m = (tod % 3600) / 60; *s = tod % 60;
 }
 
 // ---- OS name callback ----
@@ -8072,7 +8289,10 @@ static void pic_init(){
 // records the current milestone in low RAM (0x5101) so a captured serial
 // log or a fault marker can pin down where the kernel died.
 extern "C" void boot_beacon(uint8_t, uint8_t, uint8_t);
-static void boot_stage(uint8_t s){ *(volatile uint8_t*)0x5101 = s; }
+static void boot_stage(uint8_t s){
+    *(volatile uint8_t*)0x5101 = s;
+    boot_splash_stage((int)s);   // advance the early boot animation
+}
 
 extern "C" void kmain(){
     // RAW early marker: proves kmain entry is reached (bypasses C++ serial_puts)
@@ -8131,9 +8351,18 @@ extern "C" void kmain(){
     uint8_t boot_no_gui = *(volatile uint8_t*)0x501E;
     if (boot_no_gui) g_auto_gui = 0;
 
+    // ---- Early boot animation -------------------------------------------
+    // Start it as early as the framebuffer is addressable.  vmm_init() above
+    // has already mapped any >4 GiB GOP framebuffer into its <4 GiB window, so
+    // the LFB is writable from here on -- before hardware detection, before
+    // the heap, before SFS.  GUI-bound boots only: a text/shell boot must keep
+    // the 80x25 console readable.  No-op when there is no linear framebuffer.
+    if (g_auto_gui) boot_splash_init();
+
     // ---- Hardware detection (adapt to all devices) ----
     boot_stage(3);          // milestone: about to probe hardware
     detect_hardware();
+    boot_splash_tick();
 
     // ---- Display mode selection ----
     // If VBE mode was set by BIOS (INT 10h) or UEFI (GOP), we're already
@@ -8197,6 +8426,9 @@ extern "C" void kmain(){
         g_vbe_active = true;
         serial_puts("[K-VBE] VBE info available (GUI ready)\n");
     }
+    // Retry now the VBE block is final (some BIOS/BGA setups only fill it in
+    // during gui_probe_vbe above).  Idempotent: no-op if already running.
+    if (g_auto_gui) boot_splash_init();
 
     memset_(g_hist,0,sizeof(g_hist));
     memset_(g_diskbuf,0,sizeof(g_diskbuf));
@@ -8227,6 +8459,7 @@ extern "C" void kmain(){
     kbd  = Keyboard();
     mouse.init();
     serial_puts("[K4] mouse init done\n");
+    boot_splash_tick();
 
     mkfs.init();
     // On a CD/ISO boot the SFS image was streamed into RAM by the bootloader
@@ -8241,6 +8474,7 @@ extern "C" void kmain(){
     }
     sfs.init();
     fat32.init();
+    boot_splash_tick();
     // Independent Linux user-space partition (SFS volume at SFS_LINUX_LBA).
     // Separate from the main SFS volume so `linux <file>` resolves ELF
     // binaries from a dedicated on-disk region.
@@ -8290,6 +8524,7 @@ extern "C" void kmain(){
     // framebuffer console / beacon write.
     heap_init();
     serial_puts("[K7] memory management init done\n");
+    boot_splash_tick();
     serial_puts("[K] Command-line shell (GUI starts on demand via 'run <winfile>')\n");
 
     // ---- Network initialization ----
@@ -8302,7 +8537,11 @@ extern "C" void kmain(){
         } else {
             serial_puts("[K8] Network init failed (no NIC?)\n");
         }
+        // Resolve the local UTC offset from the internet (geo-IP) so the clock
+        // shows the user's real local time, not bare UTC.  Best-effort.
+        if (g_net_initialized) timezone_autodetect();
     }
+    boot_splash_tick();
 
     term.set_color(make_color(GREEN,BLACK));
     term.write("Hello world from C++ kernel!\n");
@@ -8383,6 +8622,7 @@ extern "C" void kmain(){
     // so the very first keystroke typed is not silently dropped.
     kbd.drain();
     kbd.reset();
+    boot_splash_tick();
 
     // ---- Sign-in ----
     // On a machine with a framebuffer the desktop comes up automatically
@@ -8470,6 +8710,15 @@ extern "C" void kmain(){
             bool gui_prev_right = false;
             int gui_tick_counter = 0;
             while(gui_is_active()){
+                // VMMDev probe is kept (for kernel layout stability); the absolute
+                // pointer path is disabled, so this is a no-op that leaves the
+                // relative PS/2 mouse in control (mouse captured, no slide-out).
+                vbox_ensure_init();
+                if (g_host_cursor_active) {
+                    uint32_t vx = 0, vy = 0;
+                    if (vbox_get_mouse(&vx, &vy)) gui_mouse_position(vx, vy);
+                }
+
                 if(g_net_initialized) net_poll();
 
                 // Remote console over COM1 (frontend ops terminal / bridge).
@@ -8483,6 +8732,10 @@ extern "C" void kmain(){
                         if (ch == '\r' || ch == '\n') {
                             if (g_serial_inlen > 0) {
                                 g_serial_inbuf[g_serial_inlen] = 0;
+                                // Remote command over COM1 (frontend ops console / bridge):
+                                // arm the security-guard overlay before executing it.
+                                gui_remote_begin("远程运维通道 (COM1)");
+                                gui_remote_cmd(g_serial_inbuf);
                                 run_command(g_serial_inbuf);
                                 g_serial_inlen = 0;
                             }
@@ -8510,7 +8763,11 @@ extern "C" void kmain(){
                     if(st & 0x20){
                         MouseEvent me = mouse.process(data);
                         if(me.valid){
-                            if(me.dx != 0 || me.dy != 0){
+                            uint32_t vx=0, vy=0;
+                            vbox_ensure_init();
+                            if(g_host_cursor_active && vbox_get_mouse(&vx, &vy)){
+                                gui_mouse_position(vx, vy);
+                            } else if(me.dx != 0 || me.dy != 0){
                                 gui_mouse_move(me.dx, -me.dy);
                             }
                             if(me.left && !gui_prev_left){
@@ -8537,7 +8794,17 @@ extern "C" void kmain(){
                             // menu / desktop "Terminal" shortcut.
                             gui_handle_key(e.ch);
                         } else if(e.type == K_TAB){
-                            gui_handle_key('\t');
+                            gui_desktop_nav(5);            // Tab: next window / menu item
+                        } else if(e.type == K_MENU){
+                            gui_toggle_start_menu();       // Win key -> Start menu
+                        } else if(e.type == K_UP){
+                            gui_desktop_nav(1);
+                        } else if(e.type == K_DOWN){
+                            gui_desktop_nav(2);
+                        } else if(e.type == K_LEFT){
+                            gui_desktop_nav(3);
+                        } else if(e.type == K_RIGHT){
+                            gui_desktop_nav(4);
                         } else if(e.type == K_SHIFT){
                             gui_toggle_ime();   // Shift toggles 中文/EN
                         }                         else if(e.type == K_CTRL_C){ gui_handle_ctrl(1); }

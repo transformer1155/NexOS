@@ -18,6 +18,8 @@
 #include <immintrin.h>       // AVX2 intrinsics (P2 glass-blur acceleration)
 #include "remote_desktop.h"  // remote-desktop ABI (nexos_fb_query)
 #include "zfont_data.h"   // embedded GB2312 16x16 CJK font (387 glyphs)
+#include "afont_data.h"   // 16x16 8-bit-alpha ASCII bitmap (baked from msyh.ttf)
+#include "intel_cursor.h" // GPU cursor-plane backend (Intel iGPU, 32-bit kernel)
 #include "ime_dict.h"     // pinyin -> Hanzi dictionary for IME
 #include "win32.h"        // Win32 subsystem: registry, PE32 loader, GDI display list
 #include "addrman.h"       // Address Management Registry (single source of truth)
@@ -93,6 +95,7 @@ static inline int         mforms_desktop_rclick(int, int) { return -2; }
 static inline int         mforms_rclick(int, int, int, int, int, int, int) { return 0; }
 static inline int         mforms_desktop_menu_open(void) { return 0; }
 static inline int         mforms_desktop_key(int) { return 0; }
+static inline int         mforms_desktop_menu(int) { return -1; }
 static inline void        mforms_set_running(uint32_t) {}
 #endif
 
@@ -123,6 +126,54 @@ extern char g_clipboard[256];
 extern int  g_clipboard_len;
 extern void clipboard_set(const char* text, int len);
 extern bool g_host_cursor_active;   // defined in kernel.cpp (VMMDev absolute-mouse flag)
+
+// ---- Cursor backend --------------------------------------------------
+// The pointer can be presented three ways.  The choice is made once, when the
+// desktop starts, and each unavailable option falls back to the next one, so
+// the pointer can never be lost:
+//   SOFT : the GUI paints the arrow into the backbuffer (always possible).
+//   HOST : the hypervisor owns the cursor.  This needs an ABSOLUTE pointing
+//          device -- with a relative mouse the host arrow and the guest's idea
+//          of the pointer drift apart, which is exactly why it is only picked
+//          when such a device is present.
+//   HW   : the GPU scans out its own cursor plane (Intel iGPU backend).
+enum CursorBackend { CURSOR_SOFT = 0, CURSOR_HOST = 1, CURSOR_HW = 2 };
+static CursorBackend g_cursor_backend        = CURSOR_SOFT;
+static int           g_cursor_backend_chosen = 0;
+
+// Choose the pointer backend once, after the framebuffer is up.  Preference:
+// GPU hardware cursor -> hypervisor cursor -> our own painted arrow.
+// (serial_puts is declared further down this file; forward-declare it here.)
+static void serial_puts(const char* s);
+
+static void select_cursor_backend(void) {
+    if (g_cursor_backend_chosen) return;
+    g_cursor_backend_chosen = 1;
+#if !defined(__x86_64__)
+    if (intel_cursor_probe()) {          // GPU cursor plane (real hardware)
+        g_cursor_backend = CURSOR_HW;
+        serial_puts("[CURSOR] backend = GPU hardware cursor\n");
+        return;
+    }
+#endif
+    if (g_host_cursor_active) {          // hypervisor cursor (absolute pointer)
+        g_cursor_backend = CURSOR_HOST;
+        serial_puts("[CURSOR] backend = hypervisor cursor\n");
+        return;
+    }
+    g_cursor_backend = CURSOR_SOFT;      // fall back to the painted arrow
+    serial_puts("[CURSOR] backend = software cursor (guest-painted)\n");
+}
+
+// Keep a GPU cursor plane in step with the logical pointer.  No-op for the
+// other backends (SOFT repaints the arrow, HOST is driven by the hypervisor).
+static inline void cursor_backend_sync(int x, int y) {
+#if !defined(__x86_64__)
+    if (g_cursor_backend == CURSOR_HW) intel_cursor_move(x, y);
+#else
+    (void)x; (void)y;
+#endif
+}
 
 // ---- VBE info structure (at physical address 0x5000, set by stage2/UEFI) ----
 // Extended for real-hardware UEFI GOP support
@@ -997,6 +1048,7 @@ int g_font_px = 16;                 // target glyph height in pixels (BIOS 8x16)
 // not present in SFS, load_font_la16() fails and draw_char() falls through to
 // the 8x16 bitmap, so behaviour is identical to mode 0 when assets are absent.
 static int g_font_mode = 1;
+static int g_font_round = 0;   // 1 = round glyph corners (rounded vector font look)
 
 // Damage tracking as a LINKED LIST of rectangles (replaces the earlier
 // single-bounding-box and tile-grid schemes).  render_all() adds every
@@ -1310,6 +1362,42 @@ static const uint8_t* fla16_glyph(int cp, int* out_w, int* out_h) {
 static int fla16_advance(int cp) {
     if (cp >= 0 && cp < 128 && g_fla16_adv[cp] > 0) return g_fla16_adv[cp];
     return g_fla16_h + 1;
+}
+
+// =====================================================================
+// Full GB2312 CJK bitmap (24x24, 8-bit alpha) loaded from SFS zfont.bin.
+// File-scope so gui_init() can load it and Graphics member funcs can blit it.
+// ZFN3: "ZFN3" + u16 count + u16 px + u16 unicode[count] + u8 glyph[count][px*px]
+// The 8-bit coverage is what the blit grayscale-blends (anti-aliased edges);
+// the embedded 16x16 1-bit font stays as the early-boot fallback.
+// =====================================================================
+static uint8_t*  g_zf_alpha  = nullptr;   // count * px*px coverage bytes
+static uint16_t* g_zf_uni    = nullptr;   // ascending codepoints
+static int       g_zf_n      = 0;
+static int       g_zf_px     = 24;
+static bool      g_zf_loaded = false;
+
+static bool load_zfont(void) {
+    if (g_zf_loaded) return true;
+    if (!g_cb.read_file) return false;
+    uint8_t hdr[8];
+    if (g_cb.read_file(1, "zfont.bin", hdr, sizeof(hdr)) != (int)sizeof(hdr)) return false;
+    if (hdr[0] != 'Z' || hdr[1] != 'F' || hdr[2] != 'N' || hdr[3] != '3') return false;
+    int cnt = hdr[4] | (hdr[5] << 8);
+    int px  = hdr[6] | (hdr[7] << 8);
+    if (cnt <= 0 || px <= 0 || px > 64) return false;
+    uint32_t stride = (uint32_t)px * (uint32_t)px;
+    uint32_t idxb   = (uint32_t)cnt * 2u;
+    uint32_t total  = 8u + idxb + (uint32_t)cnt * stride;
+    uint8_t* buf = (uint8_t*)kmalloc(total);
+    if (!buf) return false;
+    if (g_cb.read_file(1, "zfont.bin", buf, (int)total) != (int)total) { kfree(buf); return false; }
+    g_zf_uni    = (uint16_t*)(buf + 8);
+    g_zf_alpha  = buf + 8 + idxb;
+    g_zf_n      = cnt;
+    g_zf_px     = px;
+    g_zf_loaded = true;
+    return true;
 }
 
 // Glyph cache storage (file-scope, accessible from Graphics member funcs)
@@ -1753,6 +1841,14 @@ struct Graphics {
         return s[c3];
     }
 
+    // Vector glyphs are rendered as a 3x subpixel coverage bitmap and then
+    // rounded via cov_dil3() (a 1px morphological dilation, applied inline in
+    // the draw loops) before being averaged to grayscale for compositing.  This
+    // rounds the sharp glyph corners (the "rounded vector font" look) with no
+    // coloured ClearType fringe on the BGRX LFB.  The dilation reads only within
+    // the glyph bitmap (neighbourhood clamped to [0,w)x[0,h)), so it can never
+    // overflow the buffer regardless of glyph dimensions.
+
     // Gamma-correct subpixel (ClearType-style) blend: R/G/B are composited
     // with their own coverage value independently, so a glyph can sharpen
     // horizontal stems by ~3x without changing its vertical size.
@@ -1868,23 +1964,38 @@ struct Graphics {
                 if ((px - (x + w - r)) * (px - (x + w - r)) + (py - (y + h - r)) * (py - (y + h - r)) <= r2) put_pixel(px, py, c);
     }
 
-    // Draw rounded rectangle outline (true quarter-circle arcs)
+    // Anti-aliased rounded rectangle outline (1px stroke, SDF-driven so the
+    // corners are smooth — no more staircase arcs).  Straight edges stay crisp
+    // (axis-aligned, no jaggies); only the corner transition gets partial
+    // coverage.  blend_pixel() at alpha 255 is an opaque replace, so the stroke
+    // reads as solid except at the AA boundary ring.
     void draw_rounded_rect(int x, int y, int w, int h, int r, Color c) {
+        if (r < 0) r = 0;
         if (r > h / 2) r = h / 2;
         if (r > w / 2) r = w / 2;
-        if (r <= 0) { draw_rect(x, y, w, h, c); return; }
-        draw_line(x + r, y, x + w - r - 1, y, c);
-        draw_line(x + r, y + h - 1, x + w - r - 1, y + h - 1, c);
-        draw_line(x, y + r, x, y + h - r - 1, c);
-        draw_line(x + w - 1, y + r, x + w - 1, y + h - r - 1, c);
-        for (int dy = 0; dy < r; dy++) {
-            int s2 = r * r - (r - dy) * (r - dy);
-            if (s2 < 0) s2 = 0;
-            int hw = gfx_isqrt(s2);
-            put_pixel(x + r - 1 - hw, y + dy, c);              // top-left  arc
-            put_pixel(x + w - r + hw, y + dy, c);              // top-right arc
-            put_pixel(x + r - 1 - hw, y + h - 1 - dy, c);      // bottom-left arc
-            put_pixel(x + w - r + hw, y + h - 1 - dy, c);      // bottom-right arc
+        if (r == 0) { draw_rect(x, y, w, h, c); return; }
+        int x0 = x - 2, y0 = y - 2, x1 = x + w + 2, y1 = y + h + 2;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > width)  x1 = width;
+        if (y1 > height) y1 = height;
+        if (x1 <= x0 || y1 <= y0) return;
+        int hw = w / 2, hh = h / 2, cx = x + w / 2, cy = y + h / 2;
+        for (int py = y0; py < y1; py++) {
+            int ay0 = (py < cy) ? (cy - py) : (py - cy);
+            int ay  = ay0 - (hh - r);
+            int qy  = (ay > 0) ? ay : 0;
+            for (int px = x0; px < x1; px++) {
+                int ax0 = (px < cx) ? (cx - px) : (px - cx);
+                int ax  = ax0 - (hw - r);
+                int qx  = (ax > 0) ? ax : 0;
+                int d   = (qx == 0 && qy == 0) ? -r : gfx_isqrt(qx * qx + qy * qy) - r;
+                int dist = (d < 0) ? -d : d;          // |signed distance to boundary|
+                int cov = 256 - dist * 256;            // 1px stroke: centre full, edge half
+                if (cov <= 0) continue;
+                if (cov > 256) cov = 256;
+                blend_pixel(px, py, c, cov);
+            }
         }
     }
 
@@ -2016,8 +2127,72 @@ struct Graphics {
     //           (2) baked 16px grayscale AA Latin (32-bit modern path),
     //           (3) legacy 1-bit 16x16 bitmap (BIOS default) fallback.
     // Returns the horizontal advance (pixels) for the next glyph.
+    // Rounded vector font: a 1px morphological DILATION of the subpixel
+    // coverage rounds the sharp corners of glyph strokes (a "rounded sans"
+    // look) and softens edges. Coverage layout is 3 bytes/pixel (R,G,B)
+    // row-major, stride 3*w. We dilate each subpixel channel independently over
+    // a 3x3 neighborhood, applied INLINE in the draw loops via cov_dil3() /
+    // cov_dil1() (which read only within the glyph bitmap, neighbourhood
+    // clamped to [0,w)x[0,h)).  The dilation result is averaged to grayscale.
+    #define RD_MAXW 160
+    // Inline rounded-corner ("sans" look) dilation helpers.  They read ONLY
+    // within src (neighbourhood clamped to [0,w)x[0,h)), so they can never
+    // overflow the glyph bitmap no matter what w/h are passed.  Returns an
+    // averaged (grayscale) coverage 0..255 for the 3-subpixel variant, or a
+    // raw 0..255 coverage for the 1-channel variant.  Replaces the old
+    // separate static output buffer, which could be overrun for certain glyph
+    // dimensions and triggered a guest triple-fault / reboot.
+    static int cov_dil3(const uint8_t* src, int w, int h, int row, int col) {
+        int m = 0;
+        for (int dy = -1; dy <= 1; dy++) {
+            int yy = row + dy; if (yy < 0 || yy >= h) continue;
+            const uint8_t* p = src + (size_t)yy * (3 * w);
+            for (int dx = -1; dx <= 1; dx++) {
+                int xx = col + dx; if (xx < 0 || xx >= w) continue;
+                int s = (int)p[xx * 3] + p[xx * 3 + 1] + p[xx * 3 + 2];
+                if (s > m) m = s;
+            }
+        }
+        return m / 3;
+    }
+    static int cov_dil1(const uint8_t* src, int w, int h, int row, int col) {
+        int m = 0;
+        for (int dy = -1; dy <= 1; dy++) {
+            int yy = row + dy; if (yy < 0 || yy >= h) continue;
+            const uint8_t* p = src + (size_t)yy * w;
+            for (int dx = -1; dx <= 1; dx++) {
+                int xx = col + dx; if (xx < 0 || xx >= w) continue;
+                if (p[xx] > m) m = p[xx];
+            }
+        }
+        return m;
+    }
+
     int draw_char(int x, int y, char ch, Color fg, Color bg) {
         uint8_t c = (uint8_t)ch;
+
+        // (0) Native 16x16 8-bit-alpha bitmap (uniform with the CJK 24x24
+        //     bitmap).  Grayscale-blended (alpha, not binary) so glyph edges
+        //     are anti-aliased; preferred at the default 16px size.
+        if (g_font_mode != 0 && g_font_px == AFONT_H &&
+            c >= AFONT_FIRST && c < AFONT_FIRST + AFONT_COUNT) {
+            int idx = c - AFONT_FIRST;
+            const uint8_t* g = afont_alpha[idx];
+            for (int row = 0; row < AFONT_H; row++) {
+                const uint8_t* s = g + row * AFONT_W;
+                for (int col = 0; col < AFONT_W; col++) {
+                    int a = s[col];
+                    if (a == 0) {
+                        if (bg != (Color)-1) put_pixel(x + col, y + row, bg);
+                    } else if (a >= 250) {
+                        put_pixel(x + col, y + row, fg);
+                    } else {
+                        blend_pixel(x + col, y + row, fg, a);
+                    }
+                }
+            }
+            return afont_adv[idx];
+        }
 
         // (1) Vector outline via stb_truetype (64-bit kernel).
         if (g_font_mode != 0 && vec_ready()) {
@@ -2035,14 +2210,21 @@ struct Graphics {
                 int gx = x + xo;
                 int gy = y + g_font_px + yo;
                 if (bg != (Color)-1) fill_rect(gx, gy, w, h, bg);
+                // Grayscale (not ClearType) antialiasing: average the 3
+                // subpixel coverages into one alpha so glyph edges are smooth
+                // and ROUNDED with no coloured fringe (the "花" artefact that
+                // per-R/G/B subpixel compositing produces on a BGRX LFB).
+                // When rounding is on, dilate the coverage by 1px (cov_dil3)
+                // to round the sharp glyph corners -- bounds-safe (reads only
+                // within g, neighbourhood clamped to [0,w)x[0,h)).
+                const int rounding = g_font_round && w <= RD_MAXW && h <= RD_MAXW;
                 for (int row = 0; row < h; row++) {
                     const uint8_t* src = g + row * (3 * w);
                     for (int col = 0; col < w; col++) {
-                        int aR = sample_cov(src, 3 * w, col * 3 - 1);
-                        int aG = sample_cov(src, 3 * w, col * 3 + 0);
-                        int aB = sample_cov(src, 3 * w, col * 3 + 1);
-                        if (aR > 4 || aG > 4 || aB > 4)
-                            blend_subpixel(gx + col, gy + row, fg, aR, aG, aB);
+                        int a = rounding ? cov_dil3(g, w, h, row, col)
+                                         : (src[3*col] + src[3*col+1] + src[3*col+2]) / 3;
+                        if (a > 4)
+                            blend_pixel(gx + col, gy + row, fg, a);
                     }
                 }
                 int adv = vec_advance(c, g_font_px);
@@ -2056,11 +2238,12 @@ struct Graphics {
             int w = 0, h = 0;
             const uint8_t* g = fla16_glyph(c, &w, &h);
             if (g) {
+                const int rounding = g_font_round && w <= RD_MAXW && h <= RD_MAXW;
                 if (bg != (Color)-1) fill_rect(x, y, w, h, bg);
                 for (int row = 0; row < h; row++) {
                     const uint8_t* src = g + row * w;
                     for (int col = 0; col < w; col++) {
-                        int a = sample_cov(src, w, col);
+                        int a = rounding ? cov_dil1(g, w, h, row, col) : sample_cov(src, w, col);
                         if (a > 4)
                             blend_subpixel(x + col, y + row, fg, a, a, a);
                     }
@@ -2146,11 +2329,56 @@ struct Graphics {
         return -1;
     }
 
+    static int zfont_runtime_lookup(uint32_t cp) {
+        int lo = 0, hi = g_zf_n - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >> 1;
+            uint32_t u = g_zf_uni[mid];
+            if (u == cp) return mid;
+            if (u < cp) lo = mid + 1; else hi = mid - 1;
+        }
+        return -1;
+    }
+
+    // Blit one char of the SFS 24x24 alpha font. Returns the advance, or 0 if
+    // the runtime font is unavailable / the codepoint is absent (caller falls
+    // through to the vector or embedded 16x16 path).
+    int blit_cjk_alpha(int x, int y, uint32_t cp, Color fg, Color bg, bool transparent) {
+        if (!g_zf_loaded || g_font_px != AFONT_H) return 0;
+        int idx = zfont_runtime_lookup(cp);
+        if (idx < 0) return 0;
+        const uint8_t* g = g_zf_alpha + (uint32_t)idx * (uint32_t)g_zf_px * (uint32_t)g_zf_px;
+        int px = g_zf_px;
+        int oy = y - (px - g_font_h) / 2;      // centre 24px cell on the 16px line
+        for (int row = 0; row < px; row++) {
+            const uint8_t* s = g + row * px;
+            for (int col = 0; col < px; col++) {
+                int a = s[col];
+                if (a == 0) {
+                    if (!transparent && bg != (Color)-1) put_pixel(x + col, oy + row, bg);
+                } else if (a >= 250) {
+                    put_pixel(x + col, oy + row, fg);
+                } else if (transparent) {
+                    blend_pixel_lin(x + col, oy + row, fg, a);
+                } else {
+                    blend_pixel(x + col, oy + row, fg, a);
+                }
+            }
+        }
+        return px;
+    }
+
     // Draw one CJK glyph by Unicode codepoint (with background).
     // X-stage: rasterize the TrueType outline at g_font_px (true vector,
     // crisp at any size). Falls back to the 16x16 bitmap (zfont.bin).
     // Returns the horizontal advance (pixels).
     int draw_cjk(int x, int y, uint32_t cp, Color fg, Color bg) {
+        // (A) Full GB2312 24x24 8-bit-alpha bitmap from SFS (preferred: shares
+        //     the grayscale-blended look of the ASCII 16x16 bitmap).
+        {
+            int adv = blit_cjk_alpha(x, y, cp, fg, bg, false);
+            if (adv) return adv;
+        }
         if (g_font_mode != 0 && vec_ready()) {
             int w = 0, h = 0, xo = 0, yo = 0;
             const uint8_t* g = vec_glyph(cp, g_font_px, &w, &h, &xo, &yo);
@@ -2158,14 +2386,14 @@ struct Graphics {
                 int gx = x + xo;
                 int gy = y + g_font_px + yo;
                 if (bg != (Color)-1) fill_rect(gx, gy, w, h, bg);
+                const int rounding = g_font_round && w <= RD_MAXW && h <= RD_MAXW;
                 for (int row = 0; row < h; row++) {
                     const uint8_t* src = g + row * (3 * w);
                     for (int col = 0; col < w; col++) {
-                        int aR = sample_cov(src, 3 * w, col * 3 - 1);
-                        int aG = sample_cov(src, 3 * w, col * 3 + 0);
-                        int aB = sample_cov(src, 3 * w, col * 3 + 1);
-                        if (aR > 4 || aG > 4 || aB > 4)
-                            blend_subpixel(gx + col, gy + row, fg, aR, aG, aB);
+                        int a = rounding ? cov_dil3(g, w, h, row, col)
+                                         : (src[3*col] + src[3*col+1] + src[3*col+2]) / 3;
+                        if (a > 4)
+                            blend_pixel(gx + col, gy + row, fg, a);
                     }
                 }
                 int adv = vec_advance(cp, g_font_px);
@@ -2197,16 +2425,23 @@ struct Graphics {
 
     // Draw CJK glyph transparent (only fg pixels). Returns advance.
     int draw_cjk_transparent(int x, int y, uint32_t cp, Color fg) {
+        {
+            int adv = blit_cjk_alpha(x, y, cp, fg, (Color)-1, true);
+            if (adv) return adv;
+        }
         if (g_font_mode != 0 && vec_ready()) {
             int w = 0, h = 0, xo = 0, yo = 0;
             const uint8_t* g = vec_glyph(cp, g_font_px, &w, &h, &xo, &yo);
             if (g) {
                 int gx = x + xo;
                 int gy = y + g_font_px + yo;
+                const int rounding = g_font_round && w <= RD_MAXW && h <= RD_MAXW;
                 for (int row = 0; row < h; row++)
                     for (int col = 0; col < w; col++) {
-                        int base = row * (3 * w) + col * 3;
-                        int a = (g[base] + g[base + 1] + g[base + 2]) / 3;
+                        int a = rounding ? cov_dil3(g, w, h, row, col)
+                                         : (g[row * (3 * w) + col * 3] +
+                                            g[row * (3 * w) + col * 3 + 1] +
+                                            g[row * (3 * w) + col * 3 + 2]) / 3;
                         if (a > 4) blend_pixel_lin(gx + col, gy + row, fg, a);
                     }
                 int adv = vec_advance(cp, g_font_px);
@@ -2408,39 +2643,52 @@ struct Graphics {
 
     // ---- New helper methods for UI refactoring ----
 
-    // Fill a circle (for circular icons) - no math.h, uses integer math
+    // Fill a circle (for circular icons) - SDF anti-aliased, no math.h.
+    // Inside pixels are opaque; the outer ~1px boundary ring gets partial
+    // coverage so the disc no longer shows a hard staircase.
     void fill_circle(int cx, int cy, int r, Color c) {
         if (r <= 0) return;
-        int r2 = r * r;
-        for (int dy = -r; dy <= r; dy++) {
-            int rem = r2 - dy * dy;
-            if (rem < 0) continue;
-            // Integer sqrt: find largest dx where dx*dx <= rem
-            int dx = 0;
-            int s = 1;
-            while (s * s <= rem) { dx = s; s++; }
-            for (int x = cx - dx; x <= cx + dx; x++) {
-                put_pixel(x, cy + dy, c);
+        int x0 = cx - r - 1, y0 = cy - r - 1, x1 = cx + r + 1, y1 = cy + r + 1;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > width)  x1 = width;
+        if (y1 > height) y1 = height;
+        if (x1 <= x0 || y1 <= y0) return;
+        for (int py = y0; py < y1; py++) {
+            int dy = py - cy;
+            for (int px = x0; px < x1; px++) {
+                int dx   = px - cx;
+                int dist = gfx_isqrt(dx * dx + dy * dy);
+                int ds   = dist - r;                 // <0 inside, >0 outside
+                int cov  = 128 - ds * 256;           // inside -> clamp 256, edge 128, 0.5px AA out
+                if (cov <= 0) continue;
+                if (cov > 256) cov = 256;
+                blend_pixel(px, py, c, cov);
             }
         }
     }
 
-    // Draw circle outline - uses midpoint circle algorithm (no math.h)
+    // Draw circle outline - SDF anti-aliased 1px stroke (no midpoint/ jaggies).
     void draw_circle(int cx, int cy, int r, Color c) {
         if (r <= 0) return;
-        int x = r, y = 0;
-        int err = 0;
-        while (x >= y) {
-            put_pixel(cx + x, cy + y, c);
-            put_pixel(cx + y, cy + x, c);
-            put_pixel(cx - y, cy + x, c);
-            put_pixel(cx - x, cy + y, c);
-            put_pixel(cx - x, cy - y, c);
-            put_pixel(cx - y, cy - x, c);
-            put_pixel(cx + y, cy - x, c);
-            put_pixel(cx + x, cy - y, c);
-            if (err <= 0) { y++; err += 2*y + 1; }
-            if (err > 0) { x--; err -= 2*x + 1; }
+        int x0 = cx - r - 1, y0 = cy - r - 1, x1 = cx + r + 1, y1 = cy + r + 1;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > width)  x1 = width;
+        if (y1 > height) y1 = height;
+        if (x1 <= x0 || y1 <= y0) return;
+        for (int py = y0; py < y1; py++) {
+            int dy = py - cy;
+            for (int px = x0; px < x1; px++) {
+                int dx   = px - cx;
+                int dist = gfx_isqrt(dx * dx + dy * dy);
+                int ds   = dist - r;
+                int ad   = (ds < 0) ? -ds : ds;       // |distance to boundary|
+                int cov  = 256 - ad * 256;            // 1px stroke: centre full, edge half
+                if (cov <= 0) continue;
+                if (cov > 256) cov = 256;
+                blend_pixel(px, py, c, cov);
+            }
         }
     }
 
@@ -2453,10 +2701,17 @@ struct Graphics {
         while (*p) {
             unsigned char c = (unsigned char)*p;
             if (c < 0x80) {
-                total += vec_ready() ? vec_advance(c, g_font_px) : g_font_w;
+                if (g_font_mode != 0 && g_font_px == AFONT_H &&
+                    c >= AFONT_FIRST && c < AFONT_FIRST + AFONT_COUNT)
+                    total += afont_adv[c - AFONT_FIRST];
+                else
+                    total += vec_ready() ? vec_advance(c, g_font_px) : g_font_w;
                 p++;
             } else if ((c & 0xE0) == 0xC0) { total += g_font_h; p += 2; }
-            else if ((c & 0xF0) == 0xE0) { total += g_font_h; p += 3; }
+            else if ((c & 0xF0) == 0xE0) {
+                total += (g_zf_loaded && g_font_px == AFONT_H) ? g_zf_px : g_font_h;
+                p += 3;
+            }
             else { total += g_font_w; p++; }
         }
         return total;
@@ -3023,6 +3278,12 @@ struct Win11Window {
     // up managed or native.  Lets the shell focus an already-open app
     // instead of stacking a second copy of it (Win11 taskbar behaviour).
     AppType launch_kind;
+    // Managed content panning.  content_w/h is the measured extent of what the
+    // app drew (client px, from the previous paint); scroll_x/y is the current
+    // pan offset.  A scrollbar shows on each axis whose content overflows the
+    // client area, and dragging it pans the content into view.
+    int scroll_cw, scroll_ch;   // measured content extent (client px)
+    int scroll_x, scroll_y;     // current pan offset
 
     // Animation state (Phase 2 visual polish)
     int anim_state;   // 0=none,1=opening,2=closing,3=minimizing,4=restoring
@@ -3820,6 +4081,11 @@ static const uint8_t BAYER4[16] = {
     15,  7, 13,  5
 };
 
+// Precomputed easing tables (file-scope, like the BAYER4 matrix / g_pixel_*).
+static int  g_ease_out[1001]   = {0};
+static int  g_ease_inout[1001] = {0};
+static bool g_ease_inited      = false;
+
 struct Win11Desktop {
     Graphics gfx;
     MouseCursor cursor;
@@ -3828,6 +4094,9 @@ struct Win11Desktop {
     int active_window;
     int drag_window;
     int drag_off_x, drag_off_y;
+    // Managed-window scrollbar drag (axis: 1 = vertical, 2 = horizontal).
+    int scroll_drag_win;
+    int scroll_drag_axis;
 
     DesktopIcon icons[MAX_ICONS];
     int icon_count;
@@ -3893,6 +4162,8 @@ struct Win11Desktop {
         window_count = 0;
         active_window = -1;
         drag_window = -1;
+        scroll_drag_win = -1;
+        scroll_drag_axis = 0;
         gui_mode = false;
         mouse_left = false;
         drag_counter = 0;
@@ -4399,9 +4670,9 @@ struct Win11Desktop {
                            0x000000, 40);
         }
 
-        // Title text (centered, faux-bold for modern weight) — drawn over glass.
-        int tw = strlen_(win.title) * g_font_w;
-        gfx.draw_text_bold(rx + (rw - tw) / 2, ry + 8, win.title, C_WIN_TEXT);
+        // Title text (centered) — uses the same 16x16/24x24 alpha bitmap font as
+        // the rest of the UI (no faux-bold smear) so it matches body text.
+        gfx.draw_text_centered(rx, ry + 8, rw, win.title, C_WIN_TEXT);
 
         // Title-bar control buttons: which 0=close 1=fullscreen 2=minimize 3=float
         for (int b = 0; b < 4; b++) {
@@ -4466,12 +4737,78 @@ struct Win11Desktop {
                 int oy = ry + TITLE_BAR_H;
                 int mw = rw - 2;
                 int mh = rh - TITLE_BAR_H;
+                // Clamp the scroll to the content measured last frame, then
+                // paint the content shifted by (-scroll_x,-scroll_y) so the
+                // off-screen part can be scrolled into view.
+                int maxx = win.scroll_cw - mw; if (maxx < 0) maxx = 0;
+                int maxy = win.scroll_ch - mh; if (maxy < 0) maxy = 0;
+                if (win.scroll_x > maxx) win.scroll_x = maxx;
+                if (win.scroll_x < 0)    win.scroll_x = 0;
+                if (win.scroll_y > maxy) win.scroll_y = maxy;
+                if (win.scroll_y < 0)    win.scroll_y = 0;
                 mforms_set_mouse(mouse_x, mouse_y);
-                mforms_paint(win.managed_app, ox, oy, mw, mh);
+                mforms_paint_pan(win.managed_app, ox, oy, mw, mh, win.scroll_x, win.scroll_y);
+                win.scroll_cw = mforms_content_w();
+                win.scroll_ch = mforms_content_h();
+                draw_managed_scrollbars(win, ox, oy, mw, mh);
                 break;
             }
             default: break;
         }
+    }
+
+    // ---- Managed-window scrollbars -------------------------------------
+    // Shown on any axis whose measured content exceeds the client area.
+    // Drawn and dragged natively, so a managed app needs no scrollbar code
+    // and every window (current and future) gets the behaviour for free.
+    static const int SB_W = 10;
+    // Ignore small overruns (a label drawn a few px past the edge): only a
+    // real overflow should raise a scrollbar.
+    static const int SB_TOL = 16;
+
+    void draw_managed_scrollbars(Win11Window& win, int ox, int oy, int mw, int mh) {
+        if (mw <= 0 || mh <= 0) return;
+        if (win.scroll_ch > mh + SB_TOL) {
+            int track_x = ox + mw - SB_W;
+            gfx.fill_rect(track_x, oy, SB_W, mh, 0xD8D8D8);
+            int denom = win.scroll_ch - mh; if (denom < 1) denom = 1;
+            int thumb_h = (mh * mh) / win.scroll_ch;
+            if (thumb_h < 24) thumb_h = 24;
+            if (thumb_h > mh) thumb_h = mh;
+            int thumb_y = oy + (mh - thumb_h) * win.scroll_y / denom;
+            if (thumb_y < oy) thumb_y = oy;
+            if (thumb_y + thumb_h > oy + mh) thumb_y = oy + mh - thumb_h;
+            gfx.fill_rect(track_x + 2, thumb_y, SB_W - 4, thumb_h, 0x8C8C8C);
+        }
+        if (win.scroll_cw > mw + SB_TOL) {
+            int track_y = oy + mh - SB_W;
+            gfx.fill_rect(ox, track_y, mw, SB_W, 0xD8D8D8);
+            int denom = win.scroll_cw - mw; if (denom < 1) denom = 1;
+            int thumb_w = (mw * mw) / win.scroll_cw;
+            if (thumb_w < 24) thumb_w = 24;
+            if (thumb_w > mw) thumb_w = mw;
+            int thumb_x = ox + (mw - thumb_w) * win.scroll_x / denom;
+            if (thumb_x < ox) thumb_x = ox;
+            if (thumb_x + thumb_w > ox + mw) thumb_x = ox + mw - thumb_w;
+            gfx.fill_rect(thumb_x, track_y + 2, thumb_w, SB_W - 4, 0x8C8C8C);
+        }
+    }
+
+    // Which scrollbar of window `win` covers screen point (px,py):
+    // 1 = vertical, 2 = horizontal, 0 = none.
+    int scrollbar_hit(Win11Window& win, int px, int py) {
+        if (win.app != APP_MANAGED) return 0;
+        int ox = win.x + 1, oy = win.y + TITLE_BAR_H;
+        int mw = win.w - 2, mh = win.h - TITLE_BAR_H;
+        if (win.scroll_ch > mh + SB_TOL) {
+            int track_x = ox + mw - SB_W;
+            if (px >= track_x && px < ox + mw && py >= oy && py < oy + mh) return 1;
+        }
+        if (win.scroll_cw > mw + SB_TOL) {
+            int track_y = oy + mh - SB_W;
+            if (py >= track_y && py < oy + mh && px >= ox && px < ox + mw) return 2;
+        }
+        return 0;
     }
 
     // ---- Control Panel ----
@@ -5773,9 +6110,10 @@ struct Win11Desktop {
     // links cleanly in the freestanding -nostdlib kernel) and then looked up in
     // O(1).  The math is identical to the original integer cubic, so animation is
     // visually unchanged; we just skip the per-call multiply/divide per frame.
-    static int  g_ease_out[1001];
-    static int  g_ease_inout[1001];
-    static bool g_ease_inited = false;
+    // g_ease_out / g_ease_inout / g_ease_inited are declared at file scope
+    // (inside this anonymous namespace, just above struct Win11Desktop) -- a
+    // class-static non-const member may not be initialised in-class, so they
+    // live at namespace scope like the BAYER4 matrix / g_pixel_* below.
     static void ease_init(void) {
         if (g_ease_inited) return;
         for (int p = 0; p <= 1000; p++) {
@@ -6249,6 +6587,13 @@ struct Win11Desktop {
             sm.x = 8; sm.y = TOPBAR_H + 2; sm.w = 380; sm.h = 248;
         }
 
+        // An animated window is drawn at an INTERPOLATED rect that can fall
+        // outside its target rect (slide-up while opening, collapse toward the
+        // taskbar while minimizing), so target-rect damage alone would let the
+        // moving window leave trails.  Damage the whole screen for the few
+        // frames of an animation -- transient, and it keeps the motion clean.
+        if (any_animating()) dirty_add(0, 0, gfx.width, gfx.height);
+
         // Draw windows with proper z-order:
         //  normal inactive -> normal active -> floating inactive -> floating active
         for (int i = 0; i < window_count; i++)
@@ -6285,7 +6630,7 @@ struct Win11Desktop {
             // it freezes the motion (the menu used to stay stuck showing only
             // its panel background until the next click).
             bool over_dirty = repaint_desk            // desktop overwrote the strip
-                            || ((g_mforms_anim != 0) && ((g_over_idle & 3) == 0))
+                            || (g_mforms_anim != 0)   // animation: repaint EVERY frame (no down-sampling -> buttery motion)
                             || g_over_force_n > 0     // managed state settling
                             || g_over_idle >= 30      // clock tick / safety net
                             || osig != g_over_sig;
@@ -6296,9 +6641,9 @@ struct Win11Desktop {
                 // The overlay owns the Start menu, whose rect is known only to
                 // C# and reaches well above the taskbar.  Marking just the
                 // strip dirty would leave the menu painted into the backbuffer
-                // but never presented.  So flush everything while a managed
-                // change is settling, and only the strip otherwise.
-                if (g_over_force_n > 0)
+                // but never presented.  So flush everything while the menu /
+                // a managed animation is on screen, and only the strip otherwise.
+                if (g_over_force_n > 0 || g_mforms_anim != 0)
                     dirty_add(0, 0, gfx.width, gfx.height);
                 else
                     dirty_add(0, gfx.height - MANAGED_TASKBAR_H, gfx.width, MANAGED_TASKBAR_H);
@@ -6363,7 +6708,7 @@ struct Win11Desktop {
         // permanent ghost cursor is left pinned where the click happened.
         // Restore the previously-saved background first so save_bg captures the
         // real (cursor-free) pixels.
-        if (!::g_host_cursor_active && cursor.visible) {
+        if (g_cursor_backend == CURSOR_SOFT && cursor.visible) {
             int cw = MouseCursor::CURSOR_SIZE, ch = MouseCursor::CURSOR_SIZE;
             // Clear the PREVIOUS cursor pixels in the backbuffer and mark that
             // rectangle dirty, so the flip re-copies the now-cursor-free
@@ -6482,7 +6827,7 @@ struct Win11Desktop {
         // When we own the cursor (no hardware sprite — QEMU / headless / VMMDev
         // absent) we must erase the previous soft-cursor pixels *before* moving,
         // otherwise a stale cursor is left pinned where the pointer last was.
-        if (!::g_host_cursor_active && cursor.visible && cursor.saved_valid) {
+        if (g_cursor_backend == CURSOR_SOFT && cursor.visible && cursor.saved_valid) {
             cursor.restore_bg(gfx);
             gfx.present_rect(oldx, oldy, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
             cursor.saved_valid = false;
@@ -6496,6 +6841,30 @@ struct Win11Desktop {
         if (cursor.y >= gfx.height - MouseCursor::CURSOR_SIZE) cursor.y = gfx.height - MouseCursor::CURSOR_SIZE;
         mouse_x = cursor.x;
         mouse_y = cursor.y;
+        cursor_backend_sync(cursor.x, cursor.y);
+
+        // A scrollbar drag pans the managed window's content (not the window).
+        if (scroll_drag_win >= 0 && scroll_drag_win < window_count) {
+            Win11Window& w = windows[scroll_drag_win];
+            int ox = w.x + 1, oy = w.y + TITLE_BAR_H;
+            int mw = w.w - 2, mh = w.h - TITLE_BAR_H;
+            if (scroll_drag_axis == 1 && mh > 0 && w.scroll_ch > mh) {
+                int denom = w.scroll_ch - mh; if (denom < 1) denom = 1;
+                int span = mh - 24; if (span < 1) span = 1;
+                int rel = mouse_y - oy - 12;
+                if (rel < 0) rel = 0; if (rel > span) rel = span;
+                w.scroll_y = rel * denom / span;
+                render_all();
+            } else if (scroll_drag_axis == 2 && mw > 0 && w.scroll_cw > mw) {
+                int denom = w.scroll_cw - mw; if (denom < 1) denom = 1;
+                int span = mw - 24; if (span < 1) span = 1;
+                int rel = mouse_x - ox - 12;
+                if (rel < 0) rel = 0; if (rel > span) rel = span;
+                w.scroll_x = rel * denom / span;
+                render_all();
+            }
+            return;
+        }
 
         // Dragging a window is a real UI state change (the window itself moves),
         // so it legitimately needs a full redraw — render_all repaints the cursor.
@@ -6515,7 +6884,7 @@ struct Win11Desktop {
         // No hardware cursor: repaint the soft cursor at its new position and
         // flip just its rect (the cursor-move fast path).  With a hardware
         // cursor this branch is skipped — the GPU owns the sprite.
-        if (!::g_host_cursor_active && cursor.visible) {
+        if (g_cursor_backend == CURSOR_SOFT && cursor.visible) {
             cursor.save_bg(gfx);
             cursor.draw(gfx);
             gfx.present_rect(cursor.x, cursor.y, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
@@ -6530,6 +6899,7 @@ struct Win11Desktop {
         if (y >= gfx.height - MouseCursor::CURSOR_SIZE) y = gfx.height - MouseCursor::CURSOR_SIZE;
         cursor.x = x; cursor.y = y;
         mouse_x = x; mouse_y = y;
+        cursor_backend_sync(x, y);
         if (drag_window >= 0 && drag_window < window_count) {
             windows[drag_window].x = mouse_x - drag_off_x;
             windows[drag_window].y = mouse_y - drag_off_y;
@@ -6828,6 +7198,20 @@ struct Win11Desktop {
     // window's buttons are never clicked through an upper window.
     // Returns true when a window consumed the click.
     bool click_windows_z() {
+        // 0) Managed-window scrollbars sit above the content: begin a scroll
+        //    drag instead of delivering the click to the app.
+        for (int i = window_count - 1; i >= 0; i--) {
+            Win11Window& win = windows[i];
+            if (!win.visible || win.minimized) continue;
+            int ax = scrollbar_hit(win, mouse_x, mouse_y);
+            if (ax != 0) {
+                scroll_drag_win = i; scroll_drag_axis = ax;
+                for (int j = 0; j < window_count; j++) windows[j].active = false;
+                win.active = true; active_window = i;
+                render_all();
+                return true;
+            }
+        }
         // 1) Floating windows are always on top
         for (int i = window_count - 1; i >= 0; i--) {
             if (!windows[i].visible || windows[i].minimized || !windows[i].floating) continue;
@@ -6929,6 +7313,8 @@ struct Win11Desktop {
 
     void handle_mouse_up() {
         mouse_left = false;
+        scroll_drag_win = -1;
+        scroll_drag_axis = 0;
         int dw = drag_window;
         drag_window = -1;
         if (dw >= 0 && gui_mode) {
@@ -7036,7 +7422,7 @@ struct Win11Desktop {
 
         // ---- Managed (C#) app: route the click into NexOS.Forms ----
         if (win.app == APP_MANAGED) {
-            int ox = win.x + 1, oy = win.content_y();
+            int ox = win.x + 1 - win.scroll_x, oy = win.content_y() - win.scroll_y;
             int mw = win.w - 2, mh = win.content_h();
             mforms_click(win.managed_app, ox, oy, mw, mh, mouse_x, mouse_y);
             return;   // caller repaints
@@ -7821,8 +8207,71 @@ struct Win11Desktop {
         if (gui_mode) { g_desk_needs_full = true; render_all(); }
     }
 
+    // ---- Keyboard navigation + Win-key Start menu --------------------
+    // Cycle keyboard focus to the next/previous visible window (dir>0 = next).
+    void cycle_active_window(int dir) {
+        int idx[MAX_WINDOWS]; int n = 0;
+        for (int i = 0; i < window_count; i++) {
+            if (!windows[i].visible || windows[i].minimized) continue;
+            if (windows[i].app == APP_START_MENU) continue;
+            idx[n++] = i;
+        }
+        if (n == 0) return;
+        int cur = -1;
+        for (int k = 0; k < n; k++) if (idx[k] == active_window) { cur = k; break; }
+        int nxt = (dir > 0) ? (cur + 1) : (cur - 1);
+        if (nxt >= n) nxt = 0;
+        if (nxt < 0)  nxt = n - 1;
+        int id = idx[nxt];
+        for (int j = 0; j < window_count; j++) windows[j].active = false;
+        windows[id].active = true;
+        active_window = id;
+        g_desk_needs_full = true;
+        render_all();
+    }
+
+    // Win key: toggle the Start menu.  The managed shell owns it; the native
+    // Start menu is only the fallback when no managed desktop is present.
+    void toggle_start_menu() {
+        if (!gui_mode) return;
+        if (mforms_has_desktop()) {
+            gui_invalidate_managed();
+            int kind = mforms_desktop_menu(0);      // 0 = toggle open/close
+            if (kind >= 0) launch_app(app_for_managed_kind(kind));
+        } else {
+            start_menu_open = !start_menu_open;
+            g_desk_needs_full = true;
+        }
+        render_all();
+    }
+
+    // Keyboard navigation from the arrow keys / Tab.
+    //   code 1=up 2=down 3=left 4=right 5=tab
+    void desktop_nav(int code) {
+        if (!gui_mode) return;
+        if (mforms_desktop_menu_open()) {           // Start menu is modal: navigate it
+            gui_invalidate_managed();
+            int m = (code == 1 || code == 3) ? 1 : 2;   // up/left -> up, else -> down
+            int kind = mforms_desktop_menu(m);
+            if (kind >= 0) launch_app(app_for_managed_kind(kind));
+            render_all();
+            return;
+        }
+        cycle_active_window((code == 3) ? -1 : 1);  // left = previous, else next
+    }
+
     bool handle_key(char ch) {
         if (!gui_mode) return false;
+        // Start menu is modal and keyboard-navigable: Esc closes, Enter activates.
+        if (mforms_desktop_menu_open()) {
+            gui_invalidate_managed();
+            int kind = -1;
+            if (ch == 27)                     kind = mforms_desktop_menu(4);  // esc  -> close
+            else if (ch == '\n' || ch == 0x0D) kind = mforms_desktop_menu(3); // enter-> activate
+            if (kind >= 0) launch_app(app_for_managed_kind(kind));
+            render_all();
+            return true;
+        }
         if (ch == 27) { // ESC: cancel the IME, never leave the desktop
             if (g_ime_active) {
                 ime_reset();
@@ -8209,6 +8658,34 @@ void mh_fill_circle(int cx,int cy,int r,uint32_t c){ diag_step(308, "mh_fill_cir
 void mh_draw_circle(int cx,int cy,int r,uint32_t c){ diag_step(309, "mh_draw_circle"); g_wm.gfx.draw_circle(cx,cy,r,c); }
 void mh_icon       (int x,int y,int sz,uint32_t bg,char letter,uint32_t lc){ diag_step(310, "mh_icon"); g_wm.gfx.draw_icon(x,y,sz,bg,letter,lc); }
 void mh_progress   (int x,int y,int w,int h,int pct,uint32_t c){ diag_step(311, "mh_progress"); g_wm.gfx.draw_progress(x,y,w,h,pct,c); }
+// Frosted-glass rounded panel (Win11 Mica/Acrylic sign-in card look).
+void mh_glass(int x,int y,int w,int h,int r,uint32_t tint,int alpha,int blur){
+    diag_step(312, "mh_glass");
+    glass_rounded_rect(g_wm.gfx, x, y, w, h, r, (Color)tint, alpha, blur);
+}
+// UTF-8 text at an explicit glyph height (the default Gfx.Text uses g_font_px).
+void mh_text_px(int x,int y,const char* s,uint32_t fg,int px){
+    diag_step(313, "mh_text_px");
+    if (!s || !*s) return;
+    int old = g_font_px;
+    if (px > 0 && px <= 72) g_font_px = px;
+    g_wm.gfx.draw_text_utf8_transparent(x, y, s, fg);
+    g_font_px = old;
+}
+// Pixel width of a UTF-8 string at glyph height px (matches mh_text_px draws).
+int mh_measure_px(const char* s, int px){
+    diag_step(314, "mh_measure_px");
+    if (!s || px <= 0) return 0;
+    int w = 0;
+    while (*s) {
+        unsigned char c = (unsigned char)*s;
+        if (c < 0x80) { w += vec_ready() ? vec_advance(c, px) : (px * 3 / 5); s += 1; }
+        else if ((c & 0xF0) == 0xE0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) { w += px; s += 3; }
+        else if ((c & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) { s += 2; }
+        else { s += 1; }
+    }
+    return w;
+}
 
 // Pixel width of a UTF-8 string: ASCII glyphs advance 8px, 3-byte CJK
 // 16px, 2-byte sequences carry no glyph (matches draw_text_utf8).
@@ -8355,6 +8832,9 @@ static void mforms_boot(void) {
     h.draw_circle  = mh_draw_circle;
     h.icon         = mh_icon;
     h.progress     = mh_progress;
+    h.glass        = mh_glass;
+    h.text_px      = mh_text_px;
+    h.measure_px   = mh_measure_px;
     h.has_image    = mh_has_image;
     h.image        = mh_image;
     h.measure      = mh_measure;
@@ -8458,6 +8938,15 @@ void gui_set_callbacks(const GuiCallbacks* cb) {
 }
 
 int gui_init(void) {
+    // Allocate the framebuffer backbuffer FIRST: it is the single largest GUI
+    // allocation (width*height*4).  On a hi-res real machine it must win the
+    // ~11 MiB heap over the optional bitmap/vector fonts, which degrade
+    // gracefully when they do not fit (embedded 16x16 CJK, 1-bit Latin).
+    g_wm.init();
+    if (!g_wm.gfx.initialized) {
+        serial_puts("[GUI] framebuffer init failed (no VBE/GOP, or backbuffer OOM)\n");
+        return -1;
+    }
     if (g_font_mode == 0) {
         // BIOS default font: 1-bit 8x16 bitmap, no anti-aliasing, no vector
         // rasterizer.  Skip loading the (large) AA Latin + TrueType sources to
@@ -8478,6 +8967,11 @@ int gui_init(void) {
         serial_puts("[GUI] font_la16 (AA Latin) loaded\n");
     else
         serial_puts("[GUI] font_la16 not present (ASCII falls back to bitmap)\n");
+    // Full GB2312 CJK bitmap (24x24 8-bit alpha) from SFS.
+    if (load_zfont())
+        serial_puts("[GUI] zfont.bin (GB2312 24x24 alpha) loaded\n");
+    else
+        serial_puts("[GUI] zfont.bin missing (CJK falls back to embedded 16x16)\n");
     }
 
 #ifdef FONT_BAKE_DUMP
@@ -8516,23 +9010,22 @@ int gui_init(void) {
     // Skipped in BIOS font mode (g_font_mode == 0) to save RAM and CPU.
     if (g_font_mode != 0 && g_cb.read_file) {
         int vr = vec_init(g_cb.read_file);
-        if (vr == 0) diag_step(318, "vec_init ok (msyh.ttf)");
+        if (vr == 0) { serial_puts("[GUI] vec_init OK: msyh.ttf vector font active\n"); diag_step(318, "vec_init ok (msyh.ttf)"); }
         else {
+            serial_puts("[GUI] vec_init FAILED (text falls back to bitmap)\n");
             diag_step(319, "vec_init failed");
-#ifdef __x86_64__
-            // X-stage diagnostic: report WHY vec_init failed.  vec_last_err
-            // is defined in font_vec.c (64-bit only; 32-bit links the stub).
+            // X-stage diagnostic: report WHY vec_init failed.  vec_last_err is
+            // now defined for both 32-bit and 64-bit (both link font_vec.o).
             extern void vec_last_err(int* code, int* got, int* stb);
             int vc=0, vg=0, vs=0;
             vec_last_err(&vc, &vg, &vs);
             diag_step(0x32300000u | ((uint32_t)(uint8_t)vc & 0xFFu), "vec-code");
             diag_step(0x32400000u | ((uint32_t)(uint8_t)vs & 0xFFu), "vec-stb");
             diag_step(0x32500000u | ((uint32_t)vg & 0xFFFFFFu), "vec-got");
-#endif
         }
     }
-    g_wm.init();
-    return g_wm.gfx.initialized ? 0 : -1;
+    g_font_round = 1;   // enable rounded vector font (vector path + baked AA Latin)
+    return 0;
 }
 
 extern "C" void gui_set_startup_app(int id) { g_startup_app_id = id; }
@@ -8932,6 +9425,9 @@ void gui_enter(void) {
 #endif
     *(volatile uint8_t*)0x5101 = 8;   // milestone: gui_enter reached
     diag_step(333, "gui_enter starting");
+    // The framebuffer is up by now: pick how the pointer will be presented
+    // (GPU cursor plane / hypervisor cursor / painted arrow).
+    select_cursor_backend();
 #if defined(__x86_64__)
     // The GUI must draw to the address the Address Management Registry says is
     // the framebuffer virtual address (FB_VIRT).  In 64-bit that is the REAL
@@ -9007,6 +9503,19 @@ int gui_handle_key(char ch) {
 
 void gui_handle_ctrl(int code) {
     g_wm.handle_ctrl(code);
+}
+
+// Keyboard-driven UI control: Win key toggles the Start menu; the arrow keys /
+// Tab move the keyboard focus (or navigate an open Start menu).
+void gui_toggle_start_menu(void) {
+    serial_puts("[GUI] key: Win -> toggle Start menu\n");
+    g_wm.toggle_start_menu();
+}
+void gui_desktop_nav(int code) {
+    const char* n = (code == 1) ? "up" : (code == 2) ? "down"
+                  : (code == 3) ? "left" : (code == 4) ? "right" : "tab";
+    serial_puts("[GUI] key: nav "); serial_puts(n); serial_puts("\n");
+    g_wm.desktop_nav(code);
 }
 
 // Toggle Chinese/English input mode (bound to the Shift key).
@@ -9379,6 +9888,23 @@ static uint8_t  fb_bpp = 0;
 static uint8_t  fb_pixel_format = 0;  // 0=BGRX32, 1=RGBX32, 2=RGB24, 3=RGB565
 static bool     fb_console_active = false;
 
+// ---- Early boot splash hand-off -------------------------------------
+// The 32-bit kernel paints an animated boot screen (bootsplash.cpp) straight
+// into the LFB from the first addressable moment until the desktop starts.
+// While it owns the screen the 80x25 framebuffer console must stay quiet, or
+// its text output would scribble over the animation.  The flag and the glyph
+// accessor live here because gui.cpp is built into BOTH kernels: the shared
+// gui.cpp must not reference a symbol the 64-bit kernel would have to supply
+// (the 64-bit kernel simply never turns the splash on).
+static bool g_boot_splash_owns = false;
+extern "C" void nexos_boot_splash_own(int on) { g_boot_splash_owns = (on != 0); }
+
+// One-line accessor for the CP437 8x16 glyph rows.  `font8x16` has internal
+// linkage in C++, so bootsplash.cpp cannot reference the array directly.
+extern "C" const unsigned char* nexos_glyph8x16(int ch) {
+    return font8x16[(unsigned)ch & 0xFFu];
+}
+
 // VGA 16-color palette -> 32-bit RGB
 static uint32_t vga_palette[16] = {
     0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
@@ -9503,6 +10029,8 @@ extern "C" void fb_console_render(void) {
     // clear the whole LFB to black and draw the text prompt over the fresh
     // desktop, leaving a black screen until the next GUI repaint.
     if (g_wm.gui_mode) return;
+    // The early boot splash owns the screen until the desktop starts.
+    if (g_boot_splash_owns) return;
     if (!fb_console_active || !fb_lfb) return;
 
     // Terminal is 80x25 characters, each char is 8x16 pixels
@@ -9563,6 +10091,8 @@ extern "C" void fb_console_render(void) {
 extern "C" void fb_console_clear(void) {
     // Never wipe the framebuffer while the GUI is active (see render()).
     if (g_wm.gui_mode) return;
+    // Nor while the early boot splash owns the screen.
+    if (g_boot_splash_owns) return;
     if (!fb_console_active || !fb_lfb) return;
     // Clear entire framebuffer to black
     int total_bytes = fb_height * fb_pitch;

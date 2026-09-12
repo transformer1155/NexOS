@@ -116,6 +116,13 @@ struct __attribute__((packed)) VbeInfo {
 #define PXF_RGB565  3   /* 16-bit RGB565 */
 #define PXF_BLT_ONLY 4  /* No linear framebuffer, only Blt() available (unsupported) */
 
+/* Upper bound on the linear framebuffer's pixel count.  The 32-bit kernel
+ * double-buffers in RAM (width*height*4) out of a ~11 MiB heap, so a
+ * 1080p/1440p/4K panel makes that kmalloc fail and the screen stays black.
+ * Cap the GOP mode at this many pixels (1920x1080 -> 8.3 MiB backbuffer);
+ * larger panels fall back to the largest smaller mode the firmware offers. */
+#define MAX_FB_PIXELS (1920u * 1080u)
+
 /* RIP-relative functions to get embedded kernel address (see get_embedded.S).
  * These avoid the GOT and work without PE32+ base relocations. */
 extern const unsigned char *get_embedded_kernel_start(void);
@@ -430,6 +437,38 @@ EFI_STATUS efi_main(EFI_HANDLE Image, EFI_SYSTEM_TABLE *SystemTable)
             EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *ginfo = gop->Mode->Info;
             UINT32 pxformat = PXF_BGRX32;
             UINT8  bpp_val = 32;
+
+            /* ---- Cap the framebuffer size for the 32-bit kernel's heap ----
+             * If the firmware's CURRENT mode is larger than the kernel can
+             * double-buffer, switch to the largest enumerated mode that fits.
+             * OVMF's ramfb already reports a small mode, so this is a no-op
+             * there; on real hardware SetMode selects a sane size.  We only
+             * ever DOWNGRADE, and never below MAX_FB_PIXELS, so a small mode
+             * the firmware already picked is left untouched. */
+            {
+                UINT32 cur_px = (UINT32)ginfo->HorizontalResolution * ginfo->VerticalResolution;
+                if (cur_px > MAX_FB_PIXELS && gop->Mode->MaxMode > 0) {
+                    UINTN best = (UINTN)-1;
+                    UINT32 best_px = 0;
+                    for (UINT32 mi = 0; mi < gop->Mode->MaxMode; mi++) {
+                        UINTN isz = 0;
+                        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mii = NULL;
+                        if (EFI_ERROR(gop->QueryMode(gop, mi, &isz, &mii)) || mii == NULL) continue;
+                        UINT32 p = (UINT32)mii->HorizontalResolution * mii->VerticalResolution;
+                        if (p <= MAX_FB_PIXELS && p > best_px) { best_px = p; best = mi; }
+                    }
+                    if (best != (UINTN)-1) {
+                        if (!EFI_ERROR(gop->SetMode(gop, best))) {
+                            Print(L"      Capped GOP mode to fit the 32-bit heap\r\n");
+                            ginfo = gop->Mode->Info;
+                        } else {
+                            Print(L"      GOP SetMode failed; keeping current mode\r\n");
+                        }
+                    } else {
+                        Print(L"      No GOP mode fits the heap; keeping current mode\r\n");
+                    }
+                }
+            }
 
             /* ---- Determine pixel format and bpp from the CURRENT mode ---- */
             switch (ginfo->PixelFormat) {

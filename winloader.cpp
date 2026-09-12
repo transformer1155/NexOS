@@ -168,7 +168,7 @@ static void wl_env_expand(char* out, int outsize, const char* in) {
 }
 
 // BAT 执行器 (递归支持 goto)
-static int wl_exec_bat_lines(const uint8_t* data, int size, int start_line, int* last_line);
+static int wl_exec_bat_lines(const uint8_t* data, int size, int start_line, int* last_line, int depth = 0);
 
 static void wl_bat_exec_command(const char* cmd, const uint8_t* data, int size, int* cur) {
     char expanded[512];
@@ -179,7 +179,10 @@ static void wl_bat_exec_command(const char* cmd, const uint8_t* data, int size, 
     wl_print("\n");
 }
 
-static int wl_exec_bat_lines(const uint8_t* data, int size, int start_line, int* last_line) {
+static int wl_exec_bat_lines(const uint8_t* data, int size, int start_line, int* last_line, int depth) {
+    // `goto` is implemented by re-entering this function, so two labels that
+    // jump to each other recurse without bound and exhaust the kernel stack.
+    if (depth > 32) { wl_println("goto/batch nesting too deep"); return 1; }
     int line = 0;
     int pos = 0;
     while (pos < size && line < start_line) {
@@ -269,7 +272,7 @@ static int wl_exec_bat_lines(const uint8_t* data, int size, int start_line, int*
             }
             if (found) {
                 int dummy = 0;
-                return wl_exec_bat_lines(data, size, lnum + 1, &dummy);
+                return wl_exec_bat_lines(data, size, lnum + 1, &dummy, depth + 1);
             }
             wl_println("Label not found");
             return 1;
@@ -449,7 +452,12 @@ static int wl_pe_info(const uint8_t* data, int size) {
     if (e_magic != 0x5A4D) { wl_println("  Bad MZ magic"); return 1; }
     uint32_t e_lfanew = (uint32_t)data[0x3C] | ((uint32_t)data[0x3D] << 8) |
                         ((uint32_t)data[0x3E] << 16) | ((uint32_t)data[0x3F] << 24);
-    if (e_lfanew + 4 > (uint32_t)size) { wl_println("  PE header out of range"); return 1; }
+    // e_lfanew comes from the file: `e_lfanew + 4` wraps (e.g. 0xFFFFFFFC + 4
+    // == 0) and sails past the old check.  It must also cover the reads up to
+    // e_lfanew+7 just below (machine / nsects).
+    if (e_lfanew > (uint32_t)size || (uint32_t)size - e_lfanew < 8) {
+        wl_println("  PE header out of range"); return 1;
+    }
     if (data[e_lfanew] != 'P' || data[e_lfanew + 1] != 'E' ||
         data[e_lfanew + 2] != 0 || data[e_lfanew + 3] != 0) {
         wl_println("  Invalid PE signature (DOS/MZ only?)");

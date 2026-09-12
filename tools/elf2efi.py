@@ -208,7 +208,12 @@ def main():
 
     size_of_image = (reloc_rva + reloc_vsize + SECT_ALIGN - 1) & ~(SECT_ALIGN - 1)
 
-    IMAGE_BASE = 0x400000
+    # Preferred ImageBase.  The image is fully position-independent (0 base
+    # relocations), so the firmware can place it anywhere -- but a firmware
+    # that insists on the preferred base and finds it busy has no relocs to
+    # fall back on and reports EFI_LOAD_ERROR.  0x400000 sits in commonly-used
+    # space, so pick a high, rarely-occupied window (256 MiB) instead.
+    IMAGE_BASE = 0x10000000
 
     # ---- Assemble the file ----
     out = bytearray(cur)

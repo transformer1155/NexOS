@@ -1,0 +1,26 @@
+﻿diff --git a/csharp/apps/Shell/Apps.cs b/csharp/apps/Shell/Apps.cs
+index 922a66f..8717560 100644
+--- a/csharp/apps/Shell/Apps.cs
++++ b/csharp/apps/Shell/Apps.cs
+@@ -784,6 +784,11 @@ namespace NexOS.Forms
+             Gfx.Text(pad, ty, "Terminal", C.Text);
+             W.Button(pad,      ty + 22, 200, 38, U.Cat("Font: ", U.I(Theme.TermCellH)));
+             W.Button(pad + 236, ty + 22, 220, 38, Theme.TermBgMode != 0 ? "Background: Tint" : "Background: Solid");
++
++            int ey = ty + 70;
++            Gfx.Text(pad, ey, "Performance", C.Text);
++            Gfx.Text(pad, ey + 20, "Partial redraw (caches the desktop) — on by default", C.TextSub);
++            W.Toggle(pad + 200, ey + 16, 56, 30, Theme.PerfOpt != 0 ? 1 : 0, 0x13);
+         }
+ 
+         // ---- Network & Internet ---------------------------------------
+@@ -1024,6 +1029,9 @@ namespace NexOS.Forms
+                     { Theme.TermCellH = TerminalApp.ZoomStep(Theme.TermCellH, 1); Theme.Save(); return; }
+                     if (U.In(mx, my, pad + 236, ty + 22, 220, 38))
+                     { Theme.TermBgMode = Theme.TermBgMode != 0 ? 0 : 1; Theme.Save(); return; }
++                    int ey = ty + 70;
++                    if (U.In(mx, my, pad + 200, ey + 16, 56, 30))
++                    { Theme.PerfOpt = Theme.PerfOpt != 0 ? 0 : 1; Theme.ApplyPerf(); Theme.Save(); return; }
+                     return;
+                 }
+                 else if (page == 3)   // Network

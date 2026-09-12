@@ -1,0 +1,61 @@
+﻿diff --git a/csharp/NexOS.Forms/Forms.cs b/csharp/NexOS.Forms/Forms.cs
+index f712bbf..b775643 100644
+--- a/csharp/NexOS.Forms/Forms.cs
++++ b/csharp/NexOS.Forms/Forms.cs
+@@ -166,6 +166,9 @@ namespace NexOS.Forms
+         // Push the retro "pixel / CRT monitor" settings down to the kernel
+         // framebuffer post-process: mode (on/off), scale (block size), scan (scanlines).
+         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void   SetPixel(int mode, int scale, int scan);
++        // Toggle the experimental dirty-rect / desktop caching performance
++        // optimization.  0 = off (full repaint every frame, default), 1 = on.
++        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void   SetPerf(int on);
+     }
+ #endif // !WINHOST
+ 
+@@ -379,6 +382,13 @@ namespace NexOS.Forms
+         public static int    TermCellH  = 18;   // 12..28, default 18
+         public static int    TermBgMode = 0;    // 0 solid, 1 wallpaper-tint
+ 
++        // Partial-redraw compositing (dirty-rect + desktop-layer caching).
++        // 1 = ON by default: the managed desktop costs ~95 ms/frame, so caching
++        //     it is what keeps the shell smooth (~5 fps -> interactive).
++        // 0 = OFF: repaint the managed desktop in full every frame (debug path).
++        // Toggled from Settings > Display > Performance.
++        public static int    PerfOpt    = 1;
++
+         // A small Fluent accent ramp, indexed by the Settings swatches.
+         public static uint[] Accents()
+         {
+@@ -441,6 +451,9 @@ namespace NexOS.Forms
+             cfg = NexOS.Sys.StrConcat(cfg, "termbgmode=");
+             cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(TermBgMode));
+             cfg = NexOS.Sys.StrConcat(cfg, "\n");
++            cfg = NexOS.Sys.StrConcat(cfg, "predraw=");
++            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(PerfOpt));
++            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+             Host.WriteText(0, CfgName, cfg);
+         }
+ 
+@@ -475,6 +488,7 @@ namespace NexOS.Forms
+                 else if (NexOS.Sys.StrEq(key, "pixelscan"))   PixelScan  = v;
+                 else if (NexOS.Sys.StrEq(key, "termcellh"))   { TermCellH = v; if (TermCellH < 12) TermCellH = 12; if (TermCellH > 28) TermCellH = 28; }
+                 else if (NexOS.Sys.StrEq(key, "termbgmode"))  TermBgMode = v;
++                else if (NexOS.Sys.StrEq(key, "predraw"))     PerfOpt    = v;
+             }
+         }
+ 
+@@ -485,6 +499,14 @@ namespace NexOS.Forms
+             Host.SetPixel(PixelMode, PixelScale, PixelScan);
+         }
+ 
++        // Push the experimental performance-optimization flag to the kernel.
++        // Call after Load() and after any Settings change (the toggle in
++        // Settings > Display > "Performance (experimental)").
++        public static void ApplyPerf()
++        {
++            Host.SetPerf(PerfOpt);
++        }
++
+         // Decimal (optionally signed) integer parse.  No BCL int.Parse in
+         // MiniCLR, so this is a hand-rolled scanner over the managed string
+         // API.  Stops at the first non-digit.

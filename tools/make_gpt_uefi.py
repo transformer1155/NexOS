@@ -8,8 +8,8 @@ The disk layout (128 MB total):
   LBA 2-33:     GPT partition entry array
   LBA 34-2047:  Unused (gap before kernel64 LBA)
   LBA 2048:     kernel64.bin (raw; matches KERNEL64_LBA in kernel.cpp)
-  LBA 3368:     SFS image  (raw; matches SFS_LBA probed by Sfs::init)
-  LBA 8192+:    ESP partition (FAT16, contains BOOTX64.EFI)
+  LBA 4096:     SFS image  (raw; UEFI also stages SFS in RAM, this is a fallback)
+  LBA 16384+:   ESP partition (FAT16, contains BOOTX64.EFI)
 
 The raw LBAs deliberately mirror the BIOS image (kernel.cpp:750 KERNEL64_LBA
 2048, Sfs::init probes LBA 3368) so `switch64` and the SFS mount behave the
@@ -43,8 +43,9 @@ PART_GUID = b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' 
 # Disk layout
 DISK_SECTORS = 262144  # 128 MB
 KERNEL64_LBA = 2048    # same LBA the 32-bit kernel's `switch64` reads from
-SFS_LBA = 3368         # same LBA Sfs::init probes
-ESP_LBA_START = 8192   # ESP starts well past kernel64 + SFS (see HISTORY above)
+SFS_LBA = 4096         # past kernel64 (2048 + ~1600 sectors); the UEFI path also
+                       # stages SFS in RAM (0x0900 handoff) so this raw copy is a fallback
+ESP_LBA_START = 16384  # past kernel64 + SFS (see HISTORY above)
 
 
 def create_protective_mbr():

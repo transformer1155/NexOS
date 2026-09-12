@@ -32,6 +32,13 @@ extern "C" {
     int   net_init(void);   // defined below (~line 2909); needed by net_guest_connect
 }
 
+// ---- Optional idle hook -------------------------------------------------
+// Pumped from net_http_get's blocking poll loop below.  The 32-bit kernel
+// installs its early boot animation here (see bootsplash.cpp) so the spinner
+// keeps moving through the multi-second DNS/TCP wait; the 64-bit kernel, and
+// every caller that does not opt in, leave it NULL.
+extern "C" void (*g_net_idle_hook)(void) = 0;
+
 // ---- Remote-desktop accessors ----
 // nexos_fb_query is defined in gui.cpp (built into both 32-bit & 64-bit kernels).
 // The shared input state + accessors live here (net.cpp is built into BOTH
@@ -785,7 +792,11 @@ static void send_icmp_echo(uint32_t dst_ip, uint16_t id, uint16_t seq){
     pkt[4] = (uint8_t)(id >> 8); pkt[5] = (uint8_t)(id & 0xFF);
     pkt[6] = (uint8_t)(seq >> 8); pkt[7] = (uint8_t)(seq & 0xFF);
     uint16_t cksum = ip_checksum(pkt, 8);
-    pkt[2] = (uint8_t)(cksum >> 8); pkt[3] = (uint8_t)(cksum & 0xFF);
+    // ip_checksum() returns a HOST-order uint16.  The wire value must be stored
+    // little-endian (low byte first) so the receiver's network-order re-sum
+    // validates -- exactly as handle_icmp() does below.  Storing it big-endian
+    // made every outgoing echo request fail its checksum, so ping never worked.
+    pkt[2] = (uint8_t)(cksum & 0xFF); pkt[3] = (uint8_t)(cksum >> 8);
     ip_send(dst_ip, IP_PROTO_ICMP, pkt, 8);
 }
 
@@ -904,6 +915,13 @@ static void tcp_send_raw(uint32_t dst_ip, uint16_t src_port, uint16_t dst_port,
     tcp->window = htons(0xFFFF);  // max window
     tcp->checksum = 0;
     tcp->urgent = 0;
+
+    // seg[] is 1514 bytes and the TCP header occupies the first 20, so a larger
+    // len overflows it on the stack.  Clamp here rather than per call site:
+    // net_guest_send() forwards a length supplied by the guest, and ip_send()
+    // has the same 1514-byte limit.
+    if (len < 0) len = 0;
+    if (len > (int)sizeof(seg) - 20) len = (int)sizeof(seg) - 20;
 
     // Copy data
     if (data && len > 0)
@@ -1035,6 +1053,11 @@ static void handle_tcp(const IpHeader* ip, const uint8_t* data, int len){
     uint8_t  flags = tcp->flags;
 
     int header_len = (tcp->data_off >> 4) * 4;
+    // The data offset comes from the wire: without this, a small value (even 0)
+    // treats the TCP header as payload, and a large one makes payload_len
+    // negative -- which corrupts the c->ack tracking below -- while payload
+    // points past the segment.
+    if (header_len < 20 || header_len > len) return;
     int payload_len = len - header_len;
     const uint8_t* payload = data + header_len;
 
@@ -1944,59 +1967,77 @@ static void httpc_poll(void){
                 // Build the request line + headers (GET or POST).
                 char request[1200];
                 int pos = 0;
+                // Every field appended below is at least partly client-
+                // controlled (path / host / API key / body), and the fixed
+                // headers alone are already several hundred bytes, so an
+                // unchecked append walks off the end of request[].
+                #define REQ_APPEND(src, n)                                    \
+                    do {                                                      \
+                        int _n = (int)(n);                                    \
+                        int _room = (int)sizeof(request) - 1 - pos;           \
+                        if (_n > _room) _n = _room;                           \
+                        if (_n < 0) _n = 0;                                   \
+                        if (_n) net_memcpy(request + pos,                     \
+                                           (const uint8_t*)(src), _n);         \
+                        pos += _n;                                            \
+                    } while (0)
+                #define REQ_PUTC(c)                                           \
+                    do { if (pos < (int)sizeof(request) - 1)                  \
+                             request[pos++] = (char)(c); } while (0)
 
                 // "GET /path HTTP/1.0\r\n"  or  "POST /path HTTP/1.0\r\n"
                 if (httpc_method == 1){
                     const char* m = "POST ";
-                    net_memcpy(request + pos, m, 5); pos += 5;
+                    REQ_APPEND(m, 5);
                 } else {
                     const char* m = "GET ";
-                    net_memcpy(request + pos, m, 4); pos += 4;
+                    REQ_APPEND(m, 4);
                 }
                 int pl = net_strlen(httpc_path);
-                net_memcpy(request + pos, httpc_path, pl); pos += pl;
+                REQ_APPEND(httpc_path, pl);
                 const char* http_ver = " HTTP/1.0\r\n";
-                net_memcpy(request + pos, http_ver, 11); pos += 11;
+                REQ_APPEND(http_ver, 11);
 
                 // "Host: hostname\r\n"
                 const char* host_hdr = "Host: ";
-                net_memcpy(request + pos, host_hdr, 6); pos += 6;
+                REQ_APPEND(host_hdr, 6);
                 int hl = net_strlen(httpc_host);
-                net_memcpy(request + pos, httpc_host, hl); pos += hl;
-                request[pos++] = '\r'; request[pos++] = '\n';
+                REQ_APPEND(httpc_host, hl);
+                REQ_PUTC('\r'); REQ_PUTC('\n');
 
                 // "Authorization: Bearer <key>\r\n" -- only when an API key
                 // is configured (needed for OpenAI / DeepSeek compatible hosts).
                 if (g_agent_api_key[0]){
                     const char* ah = "Authorization: Bearer ";
-                    net_memcpy(request + pos, ah, net_strlen(ah)); pos += net_strlen(ah);
+                    REQ_APPEND(ah, net_strlen(ah));
                     int kl = net_strlen(g_agent_api_key);
-                    net_memcpy(request + pos, g_agent_api_key, kl); pos += kl;
-                    request[pos++] = '\r'; request[pos++] = '\n';
+                    REQ_APPEND(g_agent_api_key, kl);
+                    REQ_PUTC('\r'); REQ_PUTC('\n');
                 }
 
                 // POST: declare JSON body + Content-Length
                 if (httpc_method == 1){
                     const char* ct = "Content-Type: application/json\r\n";
-                    net_memcpy(request + pos, ct, net_strlen(ct)); pos += net_strlen(ct);
+                    REQ_APPEND(ct, net_strlen(ct));
                     const char* clh = "Content-Length: ";
-                    net_memcpy(request + pos, clh, 16); pos += 16;
+                    REQ_APPEND(clh, 16);
                     int v = httpc_body_len; char num[12]; int nl = 0;
                     if (v == 0) num[nl++] = '0';
                     while (v > 0){ num[nl++] = '0' + v % 10; v /= 10; }
-                    while (nl > 0) request[pos++] = num[--nl];
-                    request[pos++] = '\r'; request[pos++] = '\n';
+                    while (nl > 0) REQ_PUTC(num[--nl]);
+                    REQ_PUTC('\r'); REQ_PUTC('\n');
                 }
 
                 // "Connection: close\r\n\r\n"
                 const char* conn_hdr = "Connection: close\r\nUser-Agent: NexOS-Browser/1.0\r\nAccept: text/html,text/plain,*/*\r\n\r\n";
-                net_memcpy(request + pos, conn_hdr, net_strlen(conn_hdr)); pos += net_strlen(conn_hdr);
+                REQ_APPEND(conn_hdr, net_strlen(conn_hdr));
 
                 // POST: append the JSON body after the header terminator.
                 if (httpc_method == 1 && httpc_body_len > 0){
-                    net_memcpy(request + pos, httpc_body, httpc_body_len);
-                    pos += httpc_body_len;
+                    REQ_APPEND(httpc_body, httpc_body_len);
                 }
+                #undef REQ_APPEND
+                #undef REQ_PUTC
 
                 tcp_client_send((const uint8_t*)request, pos);
                 httpc_state = HTTPC_REQUESTING;
@@ -2142,6 +2183,7 @@ extern "C" int net_http_get(const char* url, char* out, int outsize)
     int guard = 0;
     while (httpc_state != HTTPC_COMPLETE && httpc_state != HTTPC_ERROR) {
         net_poll();
+        if (g_net_idle_hook) g_net_idle_hook();   // keep the boot animation alive
         if (++guard > 2000000) { httpc_state = HTTPC_ERROR; break; }
     }
     int n = 0;
@@ -2160,6 +2202,7 @@ extern "C" int net_http_post(const char* url, const char* body, char* out, int o
     int guard = 0;
     while (httpc_state != HTTPC_COMPLETE && httpc_state != HTTPC_ERROR) {
         net_poll();
+        if (g_net_idle_hook) g_net_idle_hook();   // keep the boot animation alive
         if (++guard > 2000000) { httpc_state = HTTPC_ERROR; break; }
     }
     int n = 0;
@@ -3225,7 +3268,9 @@ int net_wifi_connect(const char* arg, char* out, int n){
     }
     // parse ssid (up to first space) and optional password (remainder)
     int si = 0;
-    while (arg[si] && arg[si] != ' ') { g_wifi_ssid[si] = arg[si]; si++; }
+    // Bound the SSID like the password below: an over-long argument walked
+    // straight past the end of g_wifi_ssid.
+    while (arg[si] && arg[si] != ' ' && si < 63) { g_wifi_ssid[si] = arg[si]; si++; }
     g_wifi_ssid[si] = 0;
     const char* r = arg; while (*r && *r != ' ') r++;
     while (*r == ' ') r++;
@@ -4122,8 +4167,15 @@ static void ssh_handle_auth(SshSession* s, const uint8_t* payload, int plen){
     net_memset(s->user, 0, sizeof(s->user));
     if (ulen >= (int)sizeof(s->user)) ulen = (int)sizeof(s->user) - 1;
     net_memcpy((uint8_t*)s->user, payload + off, ulen); off += ulen;
+    if (off + 4 > plen) return;
     int slen = (payload[off] << 24) | (payload[off+1] << 16) |
-               (payload[off+2] << 8) | payload[off+3]; off += 4 + slen;
+               (payload[off+2] << 8) | payload[off+3];
+    // slen is peer-controlled and was used to skip the service name with no
+    // check at all, so the following length field is read out of bounds.  This
+    // is reachable BEFORE authentication -- anyone completing the KEX can send
+    // it.  Leave room for the 4-byte field read next.
+    if (slen < 0 || slen > plen - off - 8) return;
+    off += 4 + slen;
     // method
     int mlen = (payload[off] << 24) | (payload[off+1] << 16) |
                (payload[off+2] << 8) | payload[off+3]; off += 4;
@@ -4166,8 +4218,12 @@ static void ssh_handle_auth(SshSession* s, const uint8_t* payload, int plen){
 // "session" || sender_channel(uint32) || initial_window(uint32) || max_pkt(uint32)
 static void ssh_handle_channel_open(SshSession* s, const uint8_t* payload, int plen){
     int off = 1;
+    if (off + 4 > plen) return;
     int tlen = (payload[off] << 24) | (payload[off+1] << 16) |
                (payload[off+2] << 8) | payload[off+3]; off += 4;
+    // tlen is peer-controlled: skipping the channel type by an unchecked amount
+    // makes the sender-channel read below go out of bounds.
+    if (tlen < 0 || tlen > plen - off - 4) return;
     // channel type
     off += tlen;
     int sender = (payload[off] << 24) | (payload[off+1] << 16) |

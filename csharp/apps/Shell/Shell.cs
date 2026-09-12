@@ -283,6 +283,14 @@ namespace NexOS.Forms
             return Desktop.Click(mx, my);
         }
 
+        // Keyboard control of the Start menu / desktop UI (Win key + arrows).
+        //   code 0 = toggle, 1 = up, 2 = down, 3 = activate, 4 = close.
+        public static int DesktopMenu(int code)
+        {
+            if (Login.IsActive() != 0) return -1;
+            return Desktop.Menu(code);
+        }
+
         // ---- voice engine bridge (called from the kernel via clr_call) --
         // These are the single, uniform ingestion points any interaction
         // backend uses: a recognised phrase (Say) or a master on/off (Set).

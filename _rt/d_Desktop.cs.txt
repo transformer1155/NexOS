@@ -1,0 +1,13 @@
+﻿diff --git a/csharp/apps/Shell/Desktop.cs b/csharp/apps/Shell/Desktop.cs
+index c958b2a..ede4328 100644
+--- a/csharp/apps/Shell/Desktop.cs
++++ b/csharp/apps/Shell/Desktop.cs
+@@ -1907,7 +1907,7 @@ namespace NexOS.Forms
+             }
+             if (code >= A_TASKS_BASE) { Host.OpenApp(code - A_TASKS_BASE); return; }
+             if (code >= A_JUMP_RECENT && code < A_JUMP_RECENT + 16) { JumpRecent(code - A_JUMP_RECENT); return; }
+-            if (c == A_DISPLAY)      Shell.OpenSettings(3);    // Display settings
++            if (c == A_DISPLAY)      Shell.OpenSettings(2);    // Display settings (page 2)
+             else if (c == A_VIEW_LRG){ deskViewMode = 0; Host.Log("[VIEW] large"); Refresh(); }
+             else if (c == A_VIEW_MED){ deskViewMode = 1; Host.Log("[VIEW] medium"); Refresh(); }
+             else if (c == A_VIEW_SM) { deskViewMode = 2; Host.Log("[VIEW] small"); Refresh(); }

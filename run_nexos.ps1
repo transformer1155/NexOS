@@ -2,8 +2,9 @@
 # Save as: run_nexos.ps1
 #
 # Usage:
-#   .\run_nexos.ps1            Launch with the software (std VGA) backend.
-#   .\run_nexos.ps1 -GL        Launch with the OpenGL-backed display.
+#   .\run_nexos.ps1            Launch in fullscreen (software std VGA backend).
+#   .\run_nexos.ps1 -Win       Launch in a window instead of fullscreen.
+#   .\run_nexos.ps1 -GL        Launch with the OpenGL-backed display (also fullscreen).
 #                              The guest still uses the standard VGA/BGA device
 #                              (so the OS framebuffer path stays unchanged and
 #                              compatible), while QEMU composites the window
@@ -23,11 +24,13 @@ $USE_GL      = $false
 $HEADLESS_GL = $false
 $OPS_MODE    = $false
 $FABRIC_MODE = $false
+$WINDOWED    = $false
 foreach ($a in $args) {
     if ($a -eq "-GL")        { $USE_GL = $true }
     if ($a -eq "-headless")  { $HEADLESS_GL = $true }
     if ($a -eq "-Ops")       { $OPS_MODE = $true }
     if ($a -eq "-Fabric")    { $FABRIC_MODE = $true }
+    if ($a -eq "-Win")       { $WINDOWED = $true }
 }
 if ($USE_GL -and $HEADLESS_GL) { $USE_GL = $true }
 
@@ -158,6 +161,13 @@ function Start-NexOS {
         [int]$Mem,
         [array]$SerialArg = @('-serial', 'mon:stdio')
     )
+    # The guest OS draws its own software cursor at its logical pointer position
+    # (the only way to keep "what you see" aligned with "where clicks land" while
+    # using a relative PS/2 mouse).  We therefore hide QEMU's host cursor so the
+    # two don't show side-by-side or drift apart.
+    if ($DisplayArg -like "*gtk*") { $DisplayArg = "$DisplayArg,show-cursor=off" }
+    # Default to fullscreen; pass -Win to launch in a window instead.
+    if ($DisplayArg -like "*gtk*" -and -not $WINDOWED) { $DisplayArg = "$DisplayArg,full-screen=on" }
     & $QEMU_EXE -drive format=raw,file="$IMG_PATH" -m $Mem -vga $VgaArg -display $DisplayArg -machine pc,mem-merge=off @SerialArg -accel tcg,tb-size=32 -no-reboot
     return $LASTEXITCODE
 }

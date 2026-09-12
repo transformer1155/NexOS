@@ -12,6 +12,10 @@
 
 static Process g_procs[16];
 static int     g_proc_count = 0;
+// Monotonic pid source.  Deriving the pid from the array index reused ids once
+// proc_kill() compacted the table (kill pid 1 of {1,2,3} -> {2,3}, next spawn
+// got 3 again), so `kill <pid>` could terminate the wrong process.
+static uint32_t g_next_pid = 1;
 
 // Kernel / system process (pid 0).
 static Process g_kernel_proc = { 0, "kernel", SYSTEM_UID, 0, "/", 0, 0x01800000 };
@@ -31,7 +35,7 @@ extern "C" int proc_spawn(const char* name, uint32_t uid, const char* root_path,
     while (name[n] && n < 63){ p->name[n] = name[n]; n++; }
     p->name[n] = 0;
 
-    p->pid   = (uint32_t)g_proc_count + 1;   // pids start at 1
+    p->pid   = g_next_pid++;                 // never reused, even after kill
     p->uid   = uid;
     p->ring  = 0;                            // enter_user() flips to 3
     p->entry = 0;
@@ -54,11 +58,22 @@ extern "C" int proc_spawn(const char* name, uint32_t uid, const char* root_path,
 static void proc_puts(char* buf, int& n, int bufsz, const char* s) {
     while (*s && n < bufsz - 1) buf[n++] = *s++;
 }
+// Render v into buf, never writing past bufsz-1.  Also handles negatives:
+// uid is uint32_t, so casting it to int made large uids negative and produced
+// non-digit characters (and overflowed outright on INT_MIN).
 static void proc_dec(char* buf, int& n, int bufsz, int v) {
-    if (v == 0) { buf[n++] = '0'; return; }
-    char rev[16]; int k = 0, t = v;
-    while (t) { rev[k++] = (char)('0' + (t % 10)); t /= 10; }
-    while (k) buf[n++] = rev[--k];
+    if (bufsz <= 0) return;
+    uint32_t u;
+    if (v < 0) {
+        if (n < bufsz - 1) buf[n++] = '-';
+        u = (uint32_t)0 - (uint32_t)v;   // -v without signed overflow
+    } else {
+        u = (uint32_t)v;
+    }
+    if (u == 0) { if (n < bufsz - 1) buf[n++] = '0'; return; }
+    char rev[16]; int k = 0;
+    while (u && k < 16) { rev[k++] = (char)('0' + (int)(u % 10)); u /= 10; }
+    while (k) { if (n >= bufsz - 1) break; buf[n++] = rev[--k]; }
 }
 
 extern "C" int proc_list(char* buf, int bufsz) {
@@ -75,6 +90,7 @@ extern "C" int proc_list(char* buf, int bufsz) {
         proc_dec(buf, n, bufsz, (int)g_procs[i].uid);  proc_puts(buf, n, bufsz, "    ");
         proc_dec(buf, n, bufsz, (int)g_procs[i].ring); proc_puts(buf, n, bufsz, "\n");
     }
+    if (n >= bufsz) n = bufsz - 1;   // keep the NUL terminator inside the buffer
     buf[n] = 0;
     return n;
 }

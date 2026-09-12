@@ -1,0 +1,141 @@
+M  $null
+A  70%%
+MM Makefile
+A  _applyfw.ps1
+M  _build.sh
+A  _build_result.txt
+A  _cc_test.txt
+A  _dbg.sh
+A  _diag.sh
+A  _diag2.ps1
+A  _diag3.ps1
+A  _hex.ps1
+A  _rt/build_sfs.ps1
+AM _rt/build_win.ps1
+A  _rt/clr.diff
+A  _rt/csbuild.txt
+A  _rt/csbuild2.txt
+A  _rt/d_Apps.cs.txt
+A  _rt/d_Backend.cs.txt
+A  _rt/d_Desktop.cs.txt
+A  _rt/d_Forms.cs.txt
+A  _rt/d_Shell.cs.txt
+A  _rt/gui.diff.txt
+A  _rt/gui.err
+A  _rt/k.diff.txt
+A  _rt/kernel.err
+A  _rt/link.err
+A  _rt/mforms.err
+A  _rt/oc.err
+A  _rt/qemu_err.txt
+A  _rt/run_boot.ps1
+A  _rt/shell_orig.mex
+A  _rt/stitch.ps1
+A  _showcursor_test.txt
+A  _verbose.sh
+A  _verbose.txt
+A  _verify2.ps1
+A  _verify3.ps1
+A  _verify_boot.ps1
+M  ai_engine.cpp
+M  clr.cpp
+M  csharp/NexOS.Forms/Anim.cs
+ M csharp/NexOS.Forms/Forms.cs
+ M csharp/apps/Shell/Apps.cs
+ M csharp/apps/Shell/Desktop.cs
+ M csharp/apps/Shell/Login.cs
+ M csharp/apps/Shell/Shell.cs
+ M csharp/winhost/Backend.cs
+M  distnet.cpp
+A  docs/gui_drawing_and_font.md
+M  font_vec.c
+M  gguf.cpp
+M  gguf_infer.cpp
+MM gui.cpp
+A  gui.cpp.MYOPT.bak
+MM kernel.cpp
+M  linux_compat.cpp
+M  linux_root/gnu_dynlink
+M  linux_root/libc.so
+M  linux_root/libgnu.so
+M  linux_root/linux_argv
+M  linux_root/linux_dynlink
+M  linux_root/linux_net
+M  linux_root/python
+MM mforms.cpp
+A  mforms.cpp.MYOPT.bak
+ M mforms.h
+MM net.cpp
+M  proc.cpp
+M  run_nexos.ps1
+A  run_nexos_vbox.ps1
+M  sfs_files/font_la16.bin
+M  sfs_files/hello.nex
+M  sfs_files/msyh.ttf
+A  sfs_files/msyh_regular_backup.ttf
+MM sfs_files/shell.mex
+ M sfs_files/zfont.bin
+M  skill.cpp
+A  tools/_check_menu.py
+A  tools/_fps_test.py
+A  tools/_key_test.py
+A  tools/_login_click_test.py
+A  tools/_menu_test.py
+A  tools/_shot.py
+A  tools/_smooth_verify.py
+A  tools/_start_menu_test.py
+A  tools/_startmenu_test.py
+A  tools/_vbox_headless_test.ps1
+A  tools/analyze_login.py
+A  tools/analyze_ppms.py
+A  tools/dl_gguf.py
+ M tools/elf2efi.py
+ M tools/make_gpt_uefi.py
+ M tools/sfs_gen.py
+A  tools/subset_light.py
+A  tools/verify_gui.py
+ M uefi/bootuefi.c
+M  win11-ui/bridge_dbg.txt
+M  win11-ui/nexos-desktop.html
+M  win32.cpp
+M  winloader.cpp
+?? _conv.py
+?? _rt/build_uefi_wsl.sh
+?? _rt/check_splash.sh
+?? _rt/check_uefi_splash.sh
+?? _rt/deps.sh
+?? _rt/desk_shot.py
+?? _rt/entry_disasm.txt
+?? _rt/entry_gas.S
+?? _rt/esp_check.sh
+?? _rt/final_check.sh
+?? _rt/gitstatus.txt
+?? _rt/gui_err.txt
+?? _rt/keys_probe.py
+?? _rt/pe_check.sh
+?? _rt/pe_check2.sh
+?? _rt/pe_check3.sh
+?? _rt/pilcheck.py
+?? _rt/ppm2png.py
+?? _rt/repack_uefi.sh
+?? _rt/run_ck.py
+?? _rt/splash_shot.py
+?? _rt/tztest.c
+?? _rt/u2.sh
+?? _rt/uefi_boot.ps1
+?? _rt/uefi_rebuild.sh
+?? _rt/vars.sh
+?? _rt/view_log.sh
+?? _rt/view_log2.sh
+?? afont_data.h
+?? bootsplash.cpp
+?? bootsplash.h
+?? tools/build_bootx64_efi.sh
+?? tools/gen_bitmap_fonts.c
+?? tools/gen_gb2312_list.py
+?? verify_gui.ps1
+e04a6c9 gui: P3 字体 LRU 缓存哈希化
+6fad985 gui: P2 毛玻璃 AVX2 加速
+9929cc3 ﻿gui: P4 缓动曲线预计算 - ease_out_cubic / ease_in_out_cubic 改为查 1001 点预计算常量表（首次调用惰性生成） - 用 g_ease_inited 普通标志而非 C++ 魔法静态，避免 freestanding -nostdlib 下 __cxa_guard 链接失败 - 数学与原始整型立方完全一致，动画观感不变
+origin	https://github.com/transformer1155/NexOS.git (fetch)
+origin	https://github.com/transformer1155/NexOS.git (push)
