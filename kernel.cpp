@@ -916,6 +916,23 @@ static bool ata_wait_bsy(){ return ata_wait_bsy_base(0x1F0); }
 static bool ata_wait_drq(){ return ata_wait_drq_base(0x1F0); }
 
 static void ata_read_sector_dev(int dev, uint32_t lba, uint16_t* buf){
+    // Pump the boot animation from the one place every slow boot step shares.
+    //
+    // Measuring the cadence rather than guessing at it showed the animation was
+    // not slow -- a frame costs ~73k cycles (29 us) -- it was FROZEN: the
+    // longest single gap between frames was 2.52 billion cycles (~1 s), inside
+    // the multi-MB font load, because the animation is driven by boot progress
+    // and nothing offered it a chance to draw in all that time.
+    //
+    // A PIO sector read is by far the most expensive operation here (256
+    // emulated port accesses per sector, thousands of sectors per font file),
+    // and SFS parsing, the font loads and the managed-shell image ALL go
+    // through this function -- so one call here keeps the spinner moving across
+    // every one of them.  boot_splash_tick() returns immediately when the
+    // splash is not running or the frame interval has not elapsed, so the cost
+    // is one rdtsc and a compare (negligible next to 256 port reads).
+    boot_splash_tick();
+
     uint16_t base = dev ? 0x170 : 0x1F0;
     if(!ata_wait_bsy_base(base)) return;
     outb(base+6, 0xE0 | ((lba>>24)&0x0F));
@@ -950,6 +967,7 @@ static void ata_write_sector(uint32_t lba, const uint16_t* buf){ ata_write_secto
 
 // ---- Read/write with explicit ATA base port + drive select ----
 static void ata_read_sector_disk(uint16_t base, uint8_t drv, uint32_t lba, uint16_t* buf){
+    boot_splash_tick();                  // same reason as ata_read_sector_dev
     if(!ata_wait_bsy_base(base)) return;
     outb(base+6, drv | ((lba>>24)&0x0F));
     outb(base+1, 0x00);

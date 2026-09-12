@@ -89,6 +89,28 @@ static const char*    sp_label   = "Starting";
 static unsigned int   sp_frames  = 0;   // frames painted (reported at hand-off)
 static short          sp_dot_x[12], sp_dot_y[12];  // dot centres drawn last frame
 static int            sp_dot_valid = 0;
+
+// Cadence probes.  The measured cost of a frame is small (~60 us), yet the
+// animation still looks stuttery -- because it is driven by BOOT PROGRESS, not
+// by time.  Between two boot_splash_tick() calls there is simply no chance to
+// draw, and the boot code can sit inside one long operation for a second or
+// more.  These record the longest such freeze and WHICH phase it spanned, so
+// the next fix goes where the time actually goes instead of everywhere.
+static unsigned int   sp_ticks     = 0;   // tick() calls offered by the boot
+static unsigned int   sp_gap_max   = 0;   // longest interval between frames
+static const char*    sp_gap_where = "?"; //   ... and the phase it spanned
+static const char*    sp_prev_lab  = "Starting";
+
+// Called immediately BEFORE each frame is drawn.  The gap is attributed to the
+// phase we are leaving (sp_prev_lab), because by the time a milestone renders
+// the label already names the phase we are entering.
+static void sp_frame_begin(void) {
+    unsigned int now = sp_rdtsc();
+    unsigned int dt  = (unsigned int)(now - sp_last);
+    if (dt > sp_gap_max) { sp_gap_max = dt; sp_gap_where = sp_prev_lab; }
+    sp_last     = now;
+    sp_prev_lab = sp_label;
+}
 // Render-cost probes (TSC cycles).  Reported at hand-off so the paint path can
 // be measured instead of guessed at.
 static unsigned int   sp_cy_static = 0; // cycles in the static layer (bg+logo+info)
@@ -665,6 +687,7 @@ void boot_splash_stage(int stage) {
         sp_cy_static += dt;
         sp_cy_info   += dt;
     }
+    sp_frame_begin();
     sp_phase = (sp_phase + 1) % 12;
     {
         unsigned int t0 = sp_rdtsc();
@@ -675,9 +698,9 @@ void boot_splash_stage(int stage) {
 
 void boot_splash_tick(void) {
     if (!sp_active) return;
-    unsigned int now = sp_rdtsc();
-    if ((unsigned int)(now - sp_last) < SP_FRAME_TSC) return;
-    sp_last = now;
+    sp_ticks++;
+    if ((unsigned int)(sp_rdtsc() - sp_last) < SP_FRAME_TSC) return;
+    sp_frame_begin();
     sp_phase = (sp_phase + 1) % 12;
     unsigned int t0 = sp_rdtsc();
     draw_ring();
@@ -709,5 +732,11 @@ void boot_splash_finish(void) {
     sp_serial_u32(sp_cy_logo);
     sp_serial(", info ");
     sp_serial_u32(sp_cy_info);
-    sp_serial(" cyc\n");
+    sp_serial(" cyc\n[SPLASH] cadence: ");
+    sp_serial_u32(sp_ticks);
+    sp_serial(" tick calls, longest freeze ");
+    sp_serial_u32(sp_gap_max);
+    sp_serial(" cyc during \"");
+    sp_serial(sp_gap_where);
+    sp_serial("\"\n");
 }
