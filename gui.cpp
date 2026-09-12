@@ -3284,6 +3284,17 @@ struct Win11Window {
     // client area, and dragging it pans the content into view.
     int scroll_cw, scroll_ch;   // measured content extent (client px)
     int scroll_x, scroll_y;     // current pan offset
+    // Last rect actually drawn (includes the shadow margin).  The compositor
+    // uses it to erase a moved/closed window from the cached desktop snapshot.
+    int last_rx, last_ry, last_rw, last_rh;
+    bool last_valid;
+    // Cached client bitmap of a managed window's content.  While the window is
+    // animating (open/close/minimize/restore) the content is not re-rendered
+    // through the (slow) C# OnPaint -- the cached bitmap is blitted at the new
+    // position instead, exactly like DWM moving a redirection surface.
+    uint32_t* cbmp;
+    int  cbw, cbh;
+    bool cvalid;
 
     // Animation state (Phase 2 visual polish)
     int anim_state;   // 0=none,1=opening,2=closing,3=minimizing,4=restoring
@@ -4098,6 +4109,18 @@ struct Win11Desktop {
     int scroll_drag_win;
     int scroll_drag_axis;
 
+    // Desktop snapshot: the composited background WITHOUT any window, so a
+    // window that moves / animates / closes can be erased by restoring its
+    // previous rect instead of re-running the ~95 ms managed desktop paint.
+    // This is the Windows-compositor model (each layer cached; motion is a
+    // blit, not a content redraw).
+    uint32_t* g_snap;
+    int       g_snap_cap;
+    // True while anything is moving (window animation / drag / scroll drag):
+    // the acrylic blur is skipped then -- it is invisible in motion and very
+    // expensive (Windows degrades acrylic the same way while moving).
+    bool      g_no_glass;
+
     DesktopIcon icons[MAX_ICONS];
     int icon_count;
     int selected_icon;
@@ -4164,6 +4187,7 @@ struct Win11Desktop {
         drag_window = -1;
         scroll_drag_win = -1;
         scroll_drag_axis = 0;
+        g_snap = nullptr; g_snap_cap = 0; g_no_glass = false;
         gui_mode = false;
         mouse_left = false;
         drag_counter = 0;
@@ -4298,6 +4322,9 @@ struct Win11Desktop {
         windows[id].sel_file[0] = 0;
         windows[id].sel_file_idx = -1;
         windows[id].file_scroll = 0;
+        windows[id].cbmp = nullptr; windows[id].cbw = 0; windows[id].cbh = 0;
+        windows[id].cvalid = false;
+        windows[id].last_valid = false;
         windows[id].browser_url[0] = 0;
         windows[id].browser_url_len = 0;
         windows[id].browser_page[0] = 0;
@@ -4581,7 +4608,10 @@ struct Win11Desktop {
 
         // Shadow + dark frosted-glass background
         gfx.blend_rounded_rect(mx + 3, my + 3, mw, mh, WIN_RADIUS + 2, 0x000000, 40);
-        glass_rounded_rect(gfx, mx, my, mw, mh, WIN_RADIUS, C_STARTMENU_BG, C_STARTMENU_GLASS_A, C_GLASS_BLUR_R);
+        if (g_no_glass)
+            gfx.blend_rounded_rect(mx, my, mw, mh, WIN_RADIUS, C_STARTMENU_BG, C_STARTMENU_GLASS_A);
+        else
+            glass_rounded_rect(gfx, mx, my, mw, mh, WIN_RADIUS, C_STARTMENU_BG, C_STARTMENU_GLASS_A, C_GLASS_BLUR_R);
         gfx.draw_rounded_rect(mx, my, mw, mh, WIN_RADIUS, C_STARTMENU_BORDER);
 
         // Header
@@ -4623,8 +4653,16 @@ struct Win11Desktop {
         Win11Window& win = windows[id];
         if (!win.visible || win.minimized) return;
         // Start menu: drawn as a frosted panel (no title bar / shadow / controls).
-        if (win.app == APP_START_MENU) { draw_start_menu(); return; }
+        if (win.app == APP_START_MENU) {
+            win.last_rx = 0; win.last_ry = TOPBAR_H;
+            win.last_rw = 412; win.last_rh = 296; win.last_valid = true;
+            draw_start_menu(); return;
+        }
         if (rx < 0) { rx = win.x; ry = win.y; rw = win.w; rh = win.h; }
+        // Record what this frame actually paints (incl. the shadow margin) so
+        // the compositor can erase exactly this rect next frame.
+        win.last_rx = rx - 16; win.last_ry = ry - 16;
+        win.last_rw = rw + 32; win.last_rh = rh + 32; win.last_valid = true;
 
         // ---- Win11-style soft drop shadow (acrylic float) ----
         // The gfx backend's fill_/put_pixel are hard-replace and ignore alpha,
@@ -4655,7 +4693,12 @@ struct Win11Desktop {
                           win.active ? C_GLASS_TINT_ACT : C_GLASS_TINT);
         } else {
             // Frosted translucent body: blurred desktop/wallpaper shows through.
-            glass_rounded_rect(gfx, rx, ry, rw, rh, WIN_RADIUS, glass, C_GLASS_ALPHA, C_GLASS_BLUR_R);
+            // While anything is moving, skip the (expensive) blur -- it is not
+            // perceptible in motion, exactly like Windows degrading acrylic.
+            if (g_no_glass)
+                gfx.blend_rounded_rect(rx, ry, rw, rh, WIN_RADIUS, glass, C_GLASS_ALPHA);
+            else
+                glass_rounded_rect(gfx, rx, ry, rw, rh, WIN_RADIUS, glass, C_GLASS_ALPHA, C_GLASS_BLUR_R);
             // Active-window accent glow across the title band.
             if (win.active)
                 gfx.blend_rect(rx + WIN_RADIUS, ry, rw - 2*WIN_RADIUS, TITLE_BAR_H,
@@ -4737,19 +4780,56 @@ struct Win11Desktop {
                 int oy = ry + TITLE_BAR_H;
                 int mw = rw - 2;
                 int mh = rh - TITLE_BAR_H;
-                // Clamp the scroll to the content measured last frame, then
-                // paint the content shifted by (-scroll_x,-scroll_y) so the
-                // off-screen part can be scrolled into view.
-                int maxx = win.scroll_cw - mw; if (maxx < 0) maxx = 0;
-                int maxy = win.scroll_ch - mh; if (maxy < 0) maxy = 0;
-                if (win.scroll_x > maxx) win.scroll_x = maxx;
-                if (win.scroll_x < 0)    win.scroll_x = 0;
-                if (win.scroll_y > maxy) win.scroll_y = maxy;
-                if (win.scroll_y < 0)    win.scroll_y = 0;
-                mforms_set_mouse(mouse_x, mouse_y);
-                mforms_paint_pan(win.managed_app, ox, oy, mw, mh, win.scroll_x, win.scroll_y);
-                win.scroll_cw = mforms_content_w();
-                win.scroll_ch = mforms_content_h();
+                // While the window is ANIMATING, blit the cached client bitmap
+                // instead of re-running the (slow) C# OnPaint: a moving window
+                // is a composite of its cached surface, never a content redraw
+                // (the DWM model).  Idle frames repaint AND refresh the cache,
+                // so carets / hover stay live whenever nothing is moving.
+                bool reuse = ((win.anim_state != 0) || (drag_window == id)) && win.cvalid &&
+                             win.cbmp && win.cbw == mw && win.cbh == mh;
+                if (reuse) {
+                    for (int yy = 0; yy < mh; yy++) {
+                        int sy = oy + yy;
+                        if (sy < 0 || sy >= gfx.height) continue;
+                        const uint32_t* src = win.cbmp + yy * mw;
+                        uint32_t* dst = gfx.backbuffer + sy * gfx.width;
+                        int x0 = ox, x1 = ox + mw;
+                        if (x0 < 0) x0 = 0;
+                        if (x1 > gfx.width) x1 = gfx.width;
+                        for (int xx = x0; xx < x1; xx++) dst[xx] = src[xx - ox];
+                    }
+                } else {
+                    // Clamp the scroll to the content measured last frame, then
+                    // paint the content shifted by (-scroll_x,-scroll_y) so the
+                    // off-screen part can be scrolled into view.
+                    int maxx = win.scroll_cw - mw; if (maxx < 0) maxx = 0;
+                    int maxy = win.scroll_ch - mh; if (maxy < 0) maxy = 0;
+                    if (win.scroll_x > maxx) win.scroll_x = maxx;
+                    if (win.scroll_x < 0)    win.scroll_x = 0;
+                    if (win.scroll_y > maxy) win.scroll_y = maxy;
+                    if (win.scroll_y < 0)    win.scroll_y = 0;
+                    mforms_set_mouse(mouse_x, mouse_y);
+                    mforms_paint_pan(win.managed_app, ox, oy, mw, mh, win.scroll_x, win.scroll_y);
+                    win.scroll_cw = mforms_content_w();
+                    win.scroll_ch = mforms_content_h();
+                    // Refresh the cache with exactly what was just painted.
+                    uint32_t* cb = content_buf(win, mw, mh);
+                    if (cb) {
+                        for (int yy = 0; yy < mh; yy++) {
+                            int sy = oy + yy;
+                            if (sy < 0 || sy >= gfx.height) continue;
+                            const uint32_t* src = gfx.backbuffer + sy * gfx.width;
+                            uint32_t* dst = cb + yy * mw;
+                            int x0 = ox, x1 = ox + mw;
+                            if (x0 < 0) x0 = 0;
+                            if (x1 > gfx.width) x1 = gfx.width;
+                            for (int xx = x0; xx < x1; xx++) dst[xx - ox] = src[xx];
+                        }
+                        win.cvalid = true;
+                    } else {
+                        win.cvalid = false;
+                    }
+                }
                 draw_managed_scrollbars(win, ox, oy, mw, mh);
                 break;
             }
@@ -4809,6 +4889,48 @@ struct Win11Desktop {
             if (py >= track_y && py < oy + mh && px >= ox && px < ox + mw) return 2;
         }
         return 0;
+    }
+
+    // Per-window client-bitmap cache (lazily allocated, freed on close).
+    uint32_t* content_buf(Win11Window& win, int mw, int mh) {
+        if (mw <= 0 || mh <= 0) return nullptr;
+        if (win.cbmp && win.cbw == mw && win.cbh == mh) return win.cbmp;
+        if (win.cbmp) { kfree(win.cbmp); win.cbmp = nullptr; }
+        win.cbw = 0; win.cbh = 0; win.cvalid = false;
+        uint32_t* b = (uint32_t*)kmalloc((uint32_t)(mw * mh) * 4u);
+        if (!b) return nullptr;
+        win.cbmp = b; win.cbw = mw; win.cbh = mh;
+        return b;
+    }
+
+    // ---- Desktop snapshot (cached background for window erase) ----------
+    // The compositor keeps the "background" (desktop layer) cached so a window
+    // that moves only needs its previous rect restored, never a C# repaint.
+    void snapshot_alloc() {
+        int n = gfx.width * gfx.height;
+        if (n <= 0 || !gfx.backbuffer) return;
+        if (g_snap && g_snap_cap >= n) return;
+        if (g_snap) { kfree(g_snap); g_snap = nullptr; g_snap_cap = 0; }
+        g_snap = (uint32_t*)kmalloc((uint32_t)n * 4u);
+        g_snap_cap = g_snap ? n : 0;
+    }
+    // Copy a rect between the backbuffer and the snapshot.
+    //   to_snap = true  : backbuffer -> snapshot (capture background)
+    //   to_snap = false : snapshot   -> backbuffer (restore background)
+    void snapshot_blit(int x, int y, int w, int h, bool to_snap) {
+        if (!g_snap || !gfx.backbuffer) return;
+        if (x < 0) { w += x; x = 0; }
+        if (y < 0) { h += y; y = 0; }
+        if (x + w > gfx.width)  w = gfx.width - x;
+        if (y + h > gfx.height) h = gfx.height - y;
+        if (w <= 0 || h <= 0) return;
+        int W = gfx.width;
+        for (int yy = 0; yy < h; yy++) {
+            uint32_t* a = gfx.backbuffer + (y + yy) * W + x;
+            uint32_t* b = g_snap        + (y + yy) * W + x;
+            if (to_snap) { for (int xx = 0; xx < w; xx++) b[xx] = a[xx]; }
+            else         { for (int xx = 0; xx < w; xx++) a[xx] = b[xx]; }
+        }
     }
 
     // ---- Control Panel ----
@@ -6041,6 +6163,8 @@ struct Win11Desktop {
             mforms_close(windows[id].managed_app);
             windows[id].managed_app = -1;
         }
+        if (windows[id].cbmp) { kfree(windows[id].cbmp); windows[id].cbmp = nullptr; }
+        windows[id].cbw = 0; windows[id].cbh = 0; windows[id].cvalid = false;
         windows[id].visible = false;
         if (active_window == id) {
             active_window = -1;
@@ -6510,6 +6634,14 @@ struct Win11Desktop {
         }
     }
 
+    // Draw a window and mark exactly the rect it painted as damaged (the
+    // compositor keeps the background cached, so no full-screen repaint).
+    void draw_window_damaged(int i) {
+        draw_window_animated(i);
+        Win11Window& w = windows[i];
+        if (w.last_valid) dirty_add(w.last_rx, w.last_ry, w.last_rw, w.last_rh);
+    }
+
     void render_all() {
         if (!gfx.initialized) return;
         if (!gui_mode) return;   // never paint after gui_exit() (e.g. "Terminal" shortcut)
@@ -6536,13 +6668,19 @@ struct Win11Desktop {
         // Hash the visible window set (id + geometry + minimize/active state) so
         // any change -- open/close, minimize/restore, focus, drag, resize -- is
         // detected automatically without touching every call site.
+        // IMPORTANT: the signature deliberately EXCLUDES window geometry.  A
+        // moving / animating window does not change the desktop behind it, so
+        // re-running the (~95 ms) C# desktop paint for every animation frame
+        // was the single biggest stall.  Window motion is handled by erasing
+        // the previous rect from the cached snapshot and redrawing the window
+        // (the Windows DWM model: motion is a composite, not a content redraw).
         uint32_t cur_sig = 0x9E3779B9u;
         for (int i = 0; i < window_count; i++) {
             if (!windows[i].visible) continue;
             Win11Window& w = windows[i];
-            cur_sig ^= (uint32_t)(i + 1) * 1009u + (uint32_t)w.x * 7u + (uint32_t)w.y * 13u
-                      + (uint32_t)w.w * 3u + (uint32_t)w.h * 5u
-                      + (w.minimized ? 31u : 0u) + (w.active ? 17u : 0u);
+            cur_sig ^= (uint32_t)(i + 1) * 1009u
+                      + (w.minimized ? 31u : 0u) + (w.active ? 17u : 0u)
+                      + (w.floating ? 7u : 0u);
         }
         // Pixelate (retro CRT) mode is pushed from C# Theme via Host.SetPixel
         // and changes the whole-frame post-process, so it needs a full repaint.
@@ -6566,6 +6704,10 @@ struct Win11Desktop {
                 g_desk_needs_full = false;
                 g_desk_sig = cur_sig;
                 dirty_add(0, 0, gfx.width, gfx.height);   // full-screen repaint
+                // Cache the freshly painted background (without windows) so a
+                // moving window can be erased by restoring its old rect.
+                snapshot_alloc();
+                snapshot_blit(0, 0, gfx.width, gfx.height, true);
             }
             // else: desktop layer retained from previous frame (no repaint)
         } else {
@@ -6587,23 +6729,37 @@ struct Win11Desktop {
             sm.x = 8; sm.y = TOPBAR_H + 2; sm.w = 380; sm.h = 248;
         }
 
-        // An animated window is drawn at an INTERPOLATED rect that can fall
-        // outside its target rect (slide-up while opening, collapse toward the
-        // taskbar while minimizing), so target-rect damage alone would let the
-        // moving window leave trails.  Damage the whole screen for the few
-        // frames of an animation -- transient, and it keeps the motion clean.
-        if (any_animating()) dirty_add(0, 0, gfx.width, gfx.height);
+        // Anything moving (window animation, drag, scrollbar drag) drops the
+        // acrylic blur for this frame.
+        g_no_glass = any_animating() || (drag_window >= 0) || (scroll_drag_win >= 0);
+
+        // Erase last frame's window pixels from the cached snapshot so a moving
+        // window leaves no trail.  This replaces the old "damage the whole
+        // screen while animating" hack (which also forced the C# repaint).
+        for (int i = 0; i < window_count; i++) {
+            Win11Window& w = windows[i];
+            if (!w.last_valid) continue;
+            if (!repaint_desk && g_snap) {
+                snapshot_blit(w.last_rx, w.last_ry, w.last_rw, w.last_rh, false);
+                dirty_add(w.last_rx, w.last_ry, w.last_rw, w.last_rh);
+            } else if (!g_snap) {
+                // No snapshot (allocation failed): fall back to the old
+                // full-desktop repaint so windows never leave trails.
+                g_desk_needs_full = true;
+            }
+            w.last_valid = false;
+        }
 
         // Draw windows with proper z-order:
         //  normal inactive -> normal active -> floating inactive -> floating active
         for (int i = 0; i < window_count; i++)
-            if (windows[i].visible && !windows[i].minimized && !windows[i].floating && !windows[i].active) { draw_window_animated(i); dirty_add(windows[i].x, windows[i].y, windows[i].w, windows[i].h); }
+            if (windows[i].visible && !windows[i].minimized && !windows[i].floating && !windows[i].active) draw_window_damaged(i);
         for (int i = 0; i < window_count; i++)
-            if (windows[i].visible && !windows[i].minimized && !windows[i].floating && windows[i].active) { draw_window_animated(i); dirty_add(windows[i].x, windows[i].y, windows[i].w, windows[i].h); }
+            if (windows[i].visible && !windows[i].minimized && !windows[i].floating && windows[i].active) draw_window_damaged(i);
         for (int i = 0; i < window_count; i++)
-            if (windows[i].visible && !windows[i].minimized && windows[i].floating && !windows[i].active) { draw_window_animated(i); dirty_add(windows[i].x, windows[i].y, windows[i].w, windows[i].h); }
+            if (windows[i].visible && !windows[i].minimized && windows[i].floating && !windows[i].active) draw_window_damaged(i);
         for (int i = 0; i < window_count; i++)
-            if (windows[i].visible && !windows[i].minimized && windows[i].floating && windows[i].active) { draw_window_animated(i); dirty_add(windows[i].x, windows[i].y, windows[i].w, windows[i].h); }
+            if (windows[i].visible && !windows[i].minimized && windows[i].floating && windows[i].active) draw_window_damaged(i);
 
         // Layer 2 of the managed shell: taskbar + Start menu, on top of
         // every window.  The native start menu only exists as a fallback.
@@ -6650,6 +6806,10 @@ struct Win11Desktop {
                 if (g_over_force_n > 0) g_over_force_n--;
             }
             g_over_idle++;
+            // Keep the taskbar strip in the snapshot so erasing a window that
+            // overlaps the bar restores the bar (not wallpaper).
+            if (g_snap)
+                snapshot_blit(0, gfx.height - MANAGED_TASKBAR_H, gfx.width, MANAGED_TASKBAR_H, true);
         }
         // NOTE: the Start menu is now a window in the DB and is drawn by the
         // window loop above (draw_window -> draw_start_menu).  It is no longer
@@ -9595,6 +9755,24 @@ void gui_tick(void) {
 void gui_animate_frame(void) {
     if (!g_wm.gui_mode) return;
     g_wm.animate_frame();
+}
+
+// Push the backbuffer to the LFB right now.
+//
+// This is what makes "semi-blocking" work: the managed shell draws a
+// placeholder ("正在打开 …") at the end of its paint, calls this, and only
+// THEN makes the long blocking host call (PE load / big file read / app
+// launch).  The frame that says what is going on is on screen for the whole
+// stall, so the work blocks but the UI in front of it never looks dead.
+//
+// DELIBERATELY present-only -- it must NOT re-render.  Re-rendering here would
+// call back into the managed paint while a managed call is still on the stack
+// (this is invoked from inside an i-call), and nesting MiniCLR calls corrupts
+// its context/heap.  Flipping the already-painted backbuffer is enough and is
+// safe from any context.
+extern "C" void gui_repaint_now(void) {
+    if (!g_wm.gui_mode || !g_wm.gfx.initialized) return;
+    g_wm.gfx.present();
 }
 
 // ---- Render VGA text buffer to framebuffer (for text mode overlay) ----

@@ -685,6 +685,14 @@ int32_t h_clip_get(int32_t*) {
 extern "C" { int g_mforms_anim = 0; }
 int32_t h_set_anim(int32_t* a) { g_mforms_anim = (a && a[0]) ? 1 : 0; return 0; }
 
+// Host.Repaint(): repaint the whole GUI synchronously, before a long blocking
+// host call.  The managed shell paints its "busy" placeholder, calls this, and
+// then runs the blocking call, so the placeholder frame is on screen for the
+// whole stall instead of the window appearing dead.  Cheap enough to call once
+// per user-visible operation (~one full managed frame).
+extern "C" void gui_repaint_now(void);
+int32_t h_repaint(int32_t*) { gui_repaint_now(); return 0; }
+
 extern "C" void gui_win_action(int id, int code);
 int32_t h_win_action(int32_t* a) {
     int id  = (a && a[0]) ? a[0] : -1;
@@ -787,6 +795,7 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::Ticks",        h_ticks       },
     { "NexOS.Forms.Host::TickMs",       h_tick_ms     },
     { "NexOS.Forms.Host::SetAnim",      h_set_anim    },
+    { "NexOS.Forms.Host::Repaint",      h_repaint     },
     { "NexOS.Forms.Host::RunningMask",  h_run_mask    },
     { "NexOS.Forms.Host::FileCount",    h_file_count  },
     { "NexOS.Forms.Host::FileName",     h_file_name   },

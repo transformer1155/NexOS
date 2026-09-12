@@ -106,6 +106,12 @@ namespace NexOS.Forms
         // (AI desktop thinking dots / typewriter reveal) can progress.
         // The GUI loop throttles render_all() to ~30 fps while set.
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void SetAnim(int on);
+        // Push the already-painted backbuffer to the screen right now.  Used by
+        // the "semi-blocking" pattern: draw a busy placeholder, Repaint() it,
+        // then run the long blocking call -- the placeholder stays visible for
+        // the whole stall instead of the window looking frozen.
+        // Present-only by design: it must be callable from inside a paint.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void Repaint();
         // Bit i is set when a window of Kind i is open; drives the
         // running-app indicators under the taskbar buttons.
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int RunningMask();
