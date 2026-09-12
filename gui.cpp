@@ -14,6 +14,8 @@
 // =====================================================================
 
 #include <stdint.h>
+#define _MM_MALLOC_H_INCLUDED   // freestanding: skip <stdlib.h> pull-in from mm_malloc.h
+#include <immintrin.h>       // AVX2 intrinsics (P2 glass-blur acceleration)
 #include "remote_desktop.h"  // remote-desktop ABI (nexos_fb_query)
 #include "zfont_data.h"   // embedded GB2312 16x16 CJK font (387 glyphs)
 #include "ime_dict.h"     // pinyin -> Hanzi dictionary for IME
@@ -2639,8 +2641,166 @@ static inline uint32_t mix_colors(uint32_t dst, uint32_t src, int a) {
 // Separable box blur over a screen rectangle, writing the blurred result back
 // into the backbuffer.  O(area) via sliding-window sums (no per-pixel inner
 // loop).  tmp must hold bw*bh uint32s.
+// ---- AVX2 glass-blur acceleration (P2) -----------------------------------
+// Sliding-window box blur, vectorized 8 pixels wide.  The scalar body later in
+// glass_blur_rect() is the always-correct fallback; this path engages only when
+// the CPU/OS expose AVX2 state (see entry.asm: CR4.OSXSAVE + XCR0 setup) and
+// the rect is large enough to amortize the ramp.  The integer math is identical
+// to the scalar version (same per-channel running sums, same /(2r+1) truncation),
+// so the frosted-glass look is unchanged.  We run with interrupts off so no
+// context switch can clobber the YMM state between the AVX2 stores.
+static bool g_glass_avx2_init = false;
+static bool g_glass_avx2_on   = false;
+static bool glass_avx2_supported(void) {
+    if (g_glass_avx2_init) return g_glass_avx2_on;
+    g_glass_avx2_init = true;
+    uint32_t a, b, c, d;
+    __asm__ __volatile__("cpuid" : "=a"(a),"=b"(b),"=c"(c),"=d"(d) : "a"(1u),"c"(0u));
+    if (!(c & (1u << 27))) return false;   // OSXSAVE not enabled by OS
+    if (!(c & (1u << 28))) return false;   // AVX unsupported
+    __asm__ __volatile__("cpuid" : "=a"(a),"=b"(b),"=c"(c),"=d"(d) : "a"(7u),"c"(0u));
+    if (!(b & (1u << 5)))  return false;   // AVX2 unsupported
+    uint32_t x0 = 0, x1 = 0;
+    __asm__ __volatile__("xgetbv" : "=a"(x0),"=d"(x1) : "c"(0u));
+    if (!(x0 & (1u << 2))) return false;   // XCR0 AVX state not enabled
+    g_glass_avx2_on = true;
+    return true;
+}
+
+__attribute__((target("avx2")))
+static void glass_blur_h_avx2(const uint32_t* bb, uint32_t* tmp, int W, int x, int y, int w, int h, int r) {
+    const __m256i M = _mm256_set1_epi32(0xFF);
+    int s1 = r; if (s1 > w - 1) s1 = w - 1;
+    int full = 2 * r + 1;
+    for (int yy = 0; yy < h; yy++) {
+        int base = (y + yy) * W + x;
+        int sr = 0, sg = 0, sb = 0, cnt = 0;
+        for (int k = 0; k <= s1; k++) { uint32_t p = bb[base + k]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; }
+        cnt = s1 + 1;
+        int xx = 0;
+        for (; xx < r; xx++) {
+            tmp[yy*w+xx] = (((uint32_t)(sr/cnt))<<16) | (((uint32_t)(sg/cnt))<<8) | ((uint32_t)(sb/cnt));
+            int addx = xx + r + 1;
+            if (addx < w) { uint32_t p = bb[base + addx]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; cnt++; }
+        }
+        // prime 8 lanes for outputs r..r+7 from the running sum carried out of ramp-up
+        int lsr[8], lsg[8], lsb[8], cs = sr, cg = sg, cb = sb;
+        for (int j = 0; j < 8; j++) {
+            lsr[j] = cs; lsg[j] = cg; lsb[j] = cb;
+            int oo = r + j; int addx = oo + r + 1;
+            if (addx < w) { uint32_t p = bb[base + addx]; cs += (p>>16)&255; cg += (p>>8)&255; cb += p&255; }
+            int remx = oo - r;
+            if (remx >= 0) { uint32_t p = bb[base + remx]; cs -= (p>>16)&255; cg -= (p>>8)&255; cb -= p&255; }
+        }
+        __m256i vsr = _mm256_loadu_si256((const __m256i*)lsr);
+        __m256i vsg = _mm256_loadu_si256((const __m256i*)lsg);
+        __m256i vsb = _mm256_loadu_si256((const __m256i*)lsb);
+        int xx0 = r;
+        for (; xx0 + 7 <= w - r - 2; xx0 += 8) {
+            int ar[8], ag[8], ab[8];
+            _mm256_storeu_si256((__m256i*)ar, vsr);
+            _mm256_storeu_si256((__m256i*)ag, vsg);
+            _mm256_storeu_si256((__m256i*)ab, vsb);
+            for (int j = 0; j < 8; j++)
+                tmp[yy*w+xx0+j] = (((uint32_t)(ar[j]/full))<<16) | (((uint32_t)(ag[j]/full))<<8) | ((uint32_t)(ab[j]/full));
+            __m256i addv = _mm256_loadu_si256((const __m256i*)&bb[base + xx0 + r + 1]);
+            __m256i ra = _mm256_and_si256(_mm256_srli_epi32(addv,16), M);
+            __m256i ga = _mm256_and_si256(_mm256_srli_epi32(addv, 8), M);
+            __m256i ba = _mm256_and_si256(addv, M);
+            vsr = _mm256_add_epi32(vsr, ra); vsg = _mm256_add_epi32(vsg, ga); vsb = _mm256_add_epi32(vsb, ba);
+            __m256i remv = _mm256_loadu_si256((const __m256i*)&bb[base + xx0 - r]);
+            __m256i rr = _mm256_and_si256(_mm256_srli_epi32(remv,16), M);
+            __m256i gr = _mm256_and_si256(_mm256_srli_epi32(remv, 8), M);
+            __m256i br = _mm256_and_si256(remv, M);
+            vsr = _mm256_sub_epi32(vsr, rr); vsg = _mm256_sub_epi32(vsg, gr); vsb = _mm256_sub_epi32(vsb, br);
+        }
+        sr = _mm256_extract_epi32(vsr, 0);
+        sg = _mm256_extract_epi32(vsg, 0);
+        sb = _mm256_extract_epi32(vsb, 0);
+        cnt = full;
+        for (; xx0 < w; xx0++) {
+            tmp[yy*w+xx0] = (((uint32_t)(sr/cnt))<<16) | (((uint32_t)(sg/cnt))<<8) | ((uint32_t)(sb/cnt));
+            int addx = xx0 + r + 1;
+            if (addx < w) { uint32_t p = bb[base + addx]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; cnt++; }
+            int remx = xx0 - r;
+            if (remx >= 0) { uint32_t p = bb[base + remx]; sr -= (p>>16)&255; sg -= (p>>8)&255; sb -= p&255; cnt--; }
+        }
+    }
+}
+
+__attribute__((target("avx2")))
+static void glass_blur_v_avx2(const uint32_t* tmp, uint32_t* bb, int W, int x, int y, int w, int h, int r) {
+    const __m256i M = _mm256_set1_epi32(0xFF);
+    int s1 = r; if (s1 > h - 1) s1 = h - 1;
+    int full = 2 * r + 1;
+    for (int xx = 0; xx < w; xx++) {
+        int dbase = y * W + (x + xx);
+        int sbase = xx;
+        int sr = 0, sg = 0, sb = 0, cnt = 0;
+        for (int k = 0; k <= s1; k++) { uint32_t p = tmp[sbase + k*w]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; }
+        cnt = s1 + 1;
+        int yy = 0;
+        for (; yy < r; yy++) {
+            bb[dbase + yy*W] = (((uint32_t)(sr/cnt))<<16) | (((uint32_t)(sg/cnt))<<8) | ((uint32_t)(sb/cnt));
+            int addy = yy + r + 1;
+            if (addy < h) { uint32_t p = tmp[sbase + addy*w]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; cnt++; }
+        }
+        int lsr[8], lsg[8], lsb[8], cs = sr, cg = sg, cb = sb;
+        for (int j = 0; j < 8; j++) {
+            lsr[j] = cs; lsg[j] = cg; lsb[j] = cb;
+            int oo = r + j; int addy = oo + r + 1;
+            if (addy < h) { uint32_t p = tmp[sbase + addy*w]; cs += (p>>16)&255; cg += (p>>8)&255; cb += p&255; }
+            int remy = oo - r;
+            if (remy >= 0) { uint32_t p = tmp[sbase + remy*w]; cs -= (p>>16)&255; cg -= (p>>8)&255; cb -= p&255; }
+        }
+        __m256i vsr = _mm256_loadu_si256((const __m256i*)lsr);
+        __m256i vsg = _mm256_loadu_si256((const __m256i*)lsg);
+        __m256i vsb = _mm256_loadu_si256((const __m256i*)lsb);
+        int yy0 = r;
+        for (; yy0 + 7 <= h - r - 2; yy0 += 8) {
+            int ar[8], ag[8], ab[8];
+            _mm256_storeu_si256((__m256i*)ar, vsr);
+            _mm256_storeu_si256((__m256i*)ag, vsg);
+            _mm256_storeu_si256((__m256i*)ab, vsb);
+            for (int j = 0; j < 8; j++)
+                bb[dbase + (yy0+j)*W] = (((uint32_t)(ar[j]/full))<<16) | (((uint32_t)(ag[j]/full))<<8) | ((uint32_t)(ab[j]/full));
+            __m256i addv = _mm256_loadu_si256((const __m256i*)&tmp[sbase + (yy0 + r + 1)*w]);
+            __m256i ra = _mm256_and_si256(_mm256_srli_epi32(addv,16), M);
+            __m256i ga = _mm256_and_si256(_mm256_srli_epi32(addv, 8), M);
+            __m256i ba = _mm256_and_si256(addv, M);
+            vsr = _mm256_add_epi32(vsr, ra); vsg = _mm256_add_epi32(vsg, ga); vsb = _mm256_add_epi32(vsb, ba);
+            __m256i remv = _mm256_loadu_si256((const __m256i*)&tmp[sbase + (yy0 - r)*w]);
+            __m256i rr = _mm256_and_si256(_mm256_srli_epi32(remv,16), M);
+            __m256i gr = _mm256_and_si256(_mm256_srli_epi32(remv, 8), M);
+            __m256i br = _mm256_and_si256(remv, M);
+            vsr = _mm256_sub_epi32(vsr, rr); vsg = _mm256_sub_epi32(vsg, gr); vsb = _mm256_sub_epi32(vsb, br);
+        }
+        sr = _mm256_extract_epi32(vsr, 0);
+        sg = _mm256_extract_epi32(vsg, 0);
+        sb = _mm256_extract_epi32(vsb, 0);
+        cnt = full;
+        for (; yy0 < h; yy0++) {
+            bb[dbase + yy0*W] = (((uint32_t)(sr/cnt))<<16) | (((uint32_t)(sg/cnt))<<8) | ((uint32_t)(sb/cnt));
+            int addy = yy0 + r + 1;
+            if (addy < h) { uint32_t p = tmp[sbase + addy*w]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; cnt++; }
+            int remy = yy0 - r;
+            if (remy >= 0) { uint32_t p = tmp[sbase + remy*w]; sr -= (p>>16)&255; sg -= (p>>8)&255; sb -= p&255; cnt--; }
+        }
+    }
+}
+
 static void glass_blur_rect(Graphics& g, int x, int y, int w, int h, int r, uint32_t* tmp) {
     if (r <= 0 || w <= 0 || h <= 0) return;
+    // P2: AVX2 sliding-window blur.  Engages only when the CPU/OS expose AVX2
+    // state and the rect is big enough to amortize the ramp; otherwise we fall
+    // through to the scalar body below (identical math, always correct).
+    if (glass_avx2_supported() && w >= 16 && h >= 16) {
+        __asm__ __volatile__("cli");   // no context switch mid-blur (YMM save/restore safety)
+        glass_blur_h_avx2(g.backbuffer, tmp, g.width, x, y, w, h, r);
+        glass_blur_v_avx2(tmp, g.backbuffer, g.width, x, y, w, h, r);
+        __asm__ __volatile__("sti");
+        return;
+    }
     uint32_t* bb = g.backbuffer;
     int W = g.width;
     // horizontal pass: backbuffer -> tmp

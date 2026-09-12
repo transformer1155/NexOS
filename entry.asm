@@ -52,6 +52,28 @@ _start:
     or   eax, (1 << 10)           ; OSXMMEXCPT - enable SSE exceptions
     mov  cr4, eax
 
+    ; ---- Enable AVX/AVX2 state (for gui.cpp glass-blur acceleration, P2) ----
+    ; AVX2 instructions #UD unless the OS has enabled XSAVE (CR4.OSXSAVE) and
+    ; programmed XCR0 to save AVX state.  Only do this on CPUs that actually
+    ; support AVX2, otherwise xsetbv would #GP.
+    mov  eax, 1
+    cpuid
+    test ecx, (1 << 28)           ; CPUID.1:ECX.AVX
+    jz   .no_avx
+    mov  eax, 7
+    xor  ecx, ecx
+    cpuid
+    test ebx, (1 << 5)            ; CPUID.7:EBX.AVX2
+    jz   .no_avx
+    mov  eax, cr4
+    or   eax, (1 << 18)           ; CR4.OSXSAVE - enable XSAVE/XRESTORE
+    mov  cr4, eax
+    xor  edx, edx
+    mov  eax, 7                   ; XCR0 = x87 | SSE | AVX  (bits 0,1,2)
+    xor  ecx, ecx                 ; XCR index 0
+    xsetbv
+.no_avx:
+
     ; Initialize the FPU
     fninit
 
