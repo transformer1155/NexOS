@@ -1590,14 +1590,21 @@ struct Graphics {
                 }
             }
         } else {
-            // BGRX32 (most common) and fallback
+            // BGRX32 (most common) and fallback: the LFB byte order already
+            // matches the internal 0x00RRGGBB layout, so copy verbatim.  Use a
+            // per-row __builtin_memcpy instead of a scalar per-pixel loop -- a
+            // large win for window-drag / cursor damage (no conversion needed).
+            // pitch may exceed width*4, so step the destination per row.
             for (int ry = 0; ry < h; ry++) {
                 int by = y + ry;
-                volatile uint32_t* dst = (volatile uint32_t*)((volatile uint8_t*)lfb + (uint32_t)by * pitch);
-                uint32_t* src = backbuffer + by * width + x;
-                for (int i = 0; i < w; i++) dst[x + i] = src[i];
+                uint8_t* dst = (uint8_t*)lfb + (uint32_t)by * pitch + (uint32_t)x * 4u;
+                uint8_t* src = (uint8_t*)(backbuffer + by * width + x);
+                __builtin_memcpy(dst, src, (uint32_t)w * 4u);
             }
         }
+        // Drain the store buffer so the scanout reads the freshest LFB pixels.
+        // sfence orders all preceding framebuffer stores (WC/UC mapping).
+        asm volatile("sfence" ::: "memory");
     }
 
     void enable_vbe_mode() {
