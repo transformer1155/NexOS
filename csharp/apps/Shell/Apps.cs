@@ -367,6 +367,30 @@ namespace NexOS.Forms
                 }
                 Gfx.Text(px + 12, py + ph - 20, "选择后该后缀以后都用此应用打开（Esc 取消）", C.TextSub);
             }
+
+            // ---- semi-blocking tail -------------------------------------
+            // Double-clicking a file used to run the loader straight from the
+            // click handler, so a slow open (PE load, big text file, app
+            // launch) froze the shell on the previous frame with no
+            // explanation.  The click now only RECORDS the request; here, at
+            // the very end of the paint, we draw a scrim naming what is being
+            // opened, flip that frame to the screen with Host.Repaint()
+            // (present-only, so it is safe to call from inside a paint), and
+            // only THEN run the blocking call -- the same shape as the AI
+            // desktop's deferred agent run.  The work still blocks; the window
+            // in front of it never looks dead.
+            if (pendKind != 0)
+            {
+                int sx = navW + pad, sy = pad + 48;
+                int sw = w - navW - 2 * pad, sh2 = h - sy - pad;
+                if (sw > 40 && sh2 > 40)
+                {
+                    Gfx.FillRound(sx, sy, sw, sh2, 10, 0xF2FFFFFFu);
+                    Gfx.TextCenter(sx, sy + sh2 / 2 - 8, sw, pendWhat, C.Text);
+                }
+                Host.Repaint();
+                RunPending();
+            }
         }
 
         static void Nav(int x, int y, int w, string label, bool active)
@@ -756,6 +780,42 @@ namespace NexOS.Forms
             else if (code == Desktop.A_F_SHARE) Host.Log("[FILE] share (no-op)");
         }
 
+        // ---- semi-blocking: record the request, paint, then block --------
+        // Kind: 0 none, 1 open file, 2 run .exe, 3 notepad, 4 open-with(kind).
+        int    pendKind = 0;
+        int    pendArg2 = 0;
+        string pendName = null;
+        string pendWhat = "";
+
+        void RequestOpen(string nm, int kind, string what)
+        {
+            RequestOpen2(nm, kind, 0, what);
+        }
+        void RequestOpen2(string nm, int kind, int arg2, string what)
+        {
+            pendKind = kind; pendName = nm; pendArg2 = arg2; pendWhat = what;
+            Host.SetAnim(1);        // guarantee another frame to paint the scrim
+            // Serial trace: proves the request was queued (painted) before the
+            // blocking call, which is the whole point of the pattern.
+            Host.Log(U.Cat("[FILES] defer kind=", U.I(kind), " ", nm));
+        }
+
+        // Executes the queued blocking call.  Called from the end of OnPaint,
+        // AFTER the scrim has been painted and flipped, so the scrim is what
+        // stays on screen for the whole stall.
+        void RunPending()
+        {
+            int k = pendKind, k2 = pendArg2;
+            string nm = pendName;
+            pendKind = 0; pendName = null; pendArg2 = 0;
+            Host.Log(U.Cat("[FILES] run queued kind=", U.I(k)));
+            if (k == 1)      DoOpenFile(nm);
+            else if (k == 2) DoRunExe(nm);
+            else if (k == 3) Shell.OpenNotepad(nm);
+            else if (k == 4) OpenWith(k2, nm);
+            Host.SetAnim(0);
+        }
+
         // Default action for a double-click / "Open".
         //   1. .mex -> run the managed app directly (no viewer).
         //   2. .exe -> run through the kernel PE loader.
@@ -765,15 +825,18 @@ namespace NexOS.Forms
         {
             if (sel < 0 || sel >= Host.FileCount(fs)) return;
             if (Host.FileIsDir(fs, sel) != 0) return;     // dirs: no viewer
-            OpenFile(Host.FileName(fs, sel));
+            string nm = Host.FileName(fs, sel);
+            RequestOpen(nm, 1, U.Cat("正在打开 ", nm));
         }
 
-        void OpenFile(string nm)
+        // The actual (blocking) open.  Runs from RunPending(), i.e. once the
+        // "正在打开 …" scrim is already on screen.
+        void DoOpenFile(string nm)
         {
             if (nm == null || nm == "") return;
             string ext = ExtOf(nm);
             if (ext == "mex") { RunMex(nm); return; }
-            if (U.IsExe(nm))  { RunExe(nm); return; }
+            if (U.IsExe(nm))  { DoRunExe(nm); return; }
             int k = AssocOf(ext);
             if (k >= 0) { OpenWith(k, nm); return; }
             OpenWithChooser(nm, ext);
@@ -836,13 +899,13 @@ namespace NexOS.Forms
             SetAssoc(owExt, kind);
             string nm = owFile;
             openWith = false; owFile = ""; owExt = "";
-            OpenWith(kind, nm);
+            RequestOpen2(nm, 4, kind, "正在启动应用…");
         }
 
         // Execute a .exe through the PE loader.  On failure we report the
         // loader's error code in a message box rather than silently falling
         // back to Notepad -- an executable is not text.
-        void RunExe(string nm)
+        void DoRunExe(string nm)
         {
             Host.Log(U.Cat("[FILES] running PE image ", nm));
             int rc = Host.RunExe(nm);
@@ -867,7 +930,8 @@ namespace NexOS.Forms
         {
             if (sel < 0 || sel >= Host.FileCount(fs)) return;
             if (Host.FileIsDir(fs, sel) != 0) return;
-            Shell.OpenNotepad(Host.FileName(fs, sel));
+            string nm = Host.FileName(fs, sel);
+            RequestOpen(nm, 3, U.Cat("正在读取 ", nm));
         }
         void CopySelected()
         {

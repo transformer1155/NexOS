@@ -6528,9 +6528,13 @@ extern "C" void switch_to_64bit(uint32_t stage_phys);
 // fill_rect / blend_rect honour the clip mask) pushed it to ~754912 bytes,
 // so SFS_LBA moved 3520 -> 3536 (gap = (3536-2048)*512 = 762368 and
 // KERNEL64_SECTORS=1475 => 755200 bytes still fits with margin).
-#define KERNEL64_SECTORS    1610    // raised: kernel64.bin hit 821400 B > 1600*512; the
-                                    // LBA 2048..3664 gap still holds 1616 sectors, so
-                                    // SFS_LBA/SFS_ALT_LBA stay put (2048+1610 <= 3664)
+#define KERNEL64_SECTORS    1614    // raised: kernel64.bin hit 825080 B > 1610*512.  The
+                                    // LBA 2048..3664 gap holds 1616 sectors, so
+                                    // SFS_LBA/SFS_ALT_LBA still stay put (2048+1614 <= 3664).
+                                    // NOTE: this limit has been raised four times now; the
+                                    // 64-bit kernel keeps growing into a hard-coded gap.
+                                    // Next step when it overflows: give kernel64 its own
+                                    // region instead of the LBA 2048 hole.
 
 // Load kernel64.bin from the disk into a staging buffer and jump to long
 // mode.  Shared by `switch` and `ask64`; never returns on success.

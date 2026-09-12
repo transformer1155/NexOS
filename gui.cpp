@@ -1199,6 +1199,10 @@ extern "C" void gui_set_perf_opt(int on) { g_perf_opt = on ? 1 : 0; }
 // Frame-rate instrumentation (render_all prints at most once per second).
 static uint32_t fps_t0 = 0;
 static uint32_t fps_frames = 0;
+// Per-stage timing accumulators, averaged and printed with [FPS] once per
+// second so the compositor can be profiled from the serial console.
+static uint32_t perf_desk_ms = 0, perf_win_ms = 0, perf_over_ms = 0, perf_pres_ms = 0;
+static uint32_t perf_deskfull = 0, perf_cpaint = 0, perf_cblit = 0, perf_dmgpx = 0;
 
 
 
@@ -4788,6 +4792,7 @@ struct Win11Desktop {
                 bool reuse = ((win.anim_state != 0) || (drag_window == id)) && win.cvalid &&
                              win.cbmp && win.cbw == mw && win.cbh == mh;
                 if (reuse) {
+                    perf_cblit++;
                     for (int yy = 0; yy < mh; yy++) {
                         int sy = oy + yy;
                         if (sy < 0 || sy >= gfx.height) continue;
@@ -4799,6 +4804,7 @@ struct Win11Desktop {
                         for (int xx = x0; xx < x1; xx++) dst[xx] = src[xx - ox];
                     }
                 } else {
+                    perf_cpaint++;
                     // Clamp the scroll to the content measured last frame, then
                     // paint the content shifted by (-scroll_x,-scroll_y) so the
                     // off-screen part can be scrolled into view.
@@ -6647,6 +6653,7 @@ struct Win11Desktop {
         if (!gui_mode) return;   // never paint after gui_exit() (e.g. "Terminal" shortcut)
         frame_counter++;
         dirty_reset(gfx.width, gfx.height);   // begin damage tracking for this frame
+        uint32_t tS = tick_ms_now();          // per-stage timing clock
         // DIAG markers moved to AFTER the managed (C#) paint (see cyan/
         // yellow/magenta below) so they survive on screen -- the managed
         // desktop fills the whole framebuffer and would otherwise erase a
@@ -6716,6 +6723,9 @@ struct Win11Desktop {
             draw_portal_desktop();
             dirty_add(0, 0, gfx.width, gfx.height);
         }
+        perf_desk_ms += tick_ms_now() - tS;   // stage 1: managed desktop layer
+        if (repaint_desk) perf_deskfull++;
+        tS = tick_ms_now();
 
         // Start menu lives in the window DB: sync its state/geometry from the
         // open flag so it is composited (and dirty-tracked) like any other
@@ -6760,6 +6770,8 @@ struct Win11Desktop {
             if (windows[i].visible && !windows[i].minimized && windows[i].floating && !windows[i].active) draw_window_damaged(i);
         for (int i = 0; i < window_count; i++)
             if (windows[i].visible && !windows[i].minimized && windows[i].floating && windows[i].active) draw_window_damaged(i);
+        perf_win_ms += tick_ms_now() - tS;    // stage 2: window compositing
+        tS = tick_ms_now();
 
         // Layer 2 of the managed shell: taskbar + Start menu, on top of
         // every window.  The native start menu only exists as a fallback.
@@ -6811,6 +6823,8 @@ struct Win11Desktop {
             if (g_snap)
                 snapshot_blit(0, gfx.height - MANAGED_TASKBAR_H, gfx.width, MANAGED_TASKBAR_H, true);
         }
+        perf_over_ms += tick_ms_now() - tS;   // stage 3: taskbar / Start overlay
+        tS = tick_ms_now();
         // NOTE: the Start menu is now a window in the DB and is drawn by the
         // window loop above (draw_window -> draw_start_menu).  It is no longer
         // drawn here.
@@ -6900,6 +6914,7 @@ struct Win11Desktop {
             int total = 0;
             for (int n = g_dmg_head; n >= 0; n = g_dnode[n].next)
                 total += g_dnode[n].w * g_dnode[n].h;
+            perf_dmgpx += (uint32_t)total;
             if (total > (g_sw * g_sh * 7) / 10) {
                 pixelate_framebuffer();
                 gfx.present();
@@ -6914,6 +6929,7 @@ struct Win11Desktop {
             pixelate_framebuffer();
             gfx.present();
         }
+        perf_pres_ms += tick_ms_now() - tS;   // stage 4: post-process + flip
 
         // ---------------------------------------------------------------
         // Frame-rate instrumentation.  Prints AT MOST once per second, so it
@@ -6931,6 +6947,31 @@ struct Win11Desktop {
             serial_puts("[FPS] ");
             serial_putdec((int)fps);
             serial_puts(" fps\n");
+            // Per-stage averages (ms/frame): desk = managed desktop layer,
+            // win = window compositing, over = taskbar/Start overlay,
+            // pres = post-process + flip.  dfull = full desktop repaints,
+            // cpaint/cblit = managed content re-rendered vs cached-blitted,
+            // dmgkpx = damaged kilopixels/frame.
+            uint32_t pf = fps_frames ? fps_frames : 1u;
+            serial_puts("[PERF] desk=");
+            serial_putdec((int)(perf_desk_ms / pf));
+            serial_puts(" win=");
+            serial_putdec((int)(perf_win_ms / pf));
+            serial_puts(" over=");
+            serial_putdec((int)(perf_over_ms / pf));
+            serial_puts(" pres=");
+            serial_putdec((int)(perf_pres_ms / pf));
+            serial_puts(" dfull=");
+            serial_putdec((int)perf_deskfull);
+            serial_puts(" cpaint=");
+            serial_putdec((int)perf_cpaint);
+            serial_puts(" cblit=");
+            serial_putdec((int)perf_cblit);
+            serial_puts(" dmgkpx=");
+            serial_putdec((int)(perf_dmgpx / 1000));
+            serial_puts("\n");
+            perf_desk_ms = 0; perf_win_ms = 0; perf_over_ms = 0; perf_pres_ms = 0;
+            perf_deskfull = 0; perf_cpaint = 0; perf_cblit = 0; perf_dmgpx = 0;
             fps_t0 = now_ms;
             fps_frames = 0;
         }
