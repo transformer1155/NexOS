@@ -297,12 +297,12 @@ namespace NexOS.Forms
                      C.TextSub);
 
             int ly = ay + 48;
-            int rows = (h - ly - pad) / W.RowH;
-            for (int i = 0; i < rows; i++)
+            // Draw EVERY file.  When the list is taller than the window the
+            // native layer raises a scrollbar (drag it, or use the wheel) to
+            // pan the list into view -- no in-app clipping.
+            for (int idx = 0; idx < n; idx++)
             {
-                int idx = scroll + i;
-                if (idx >= n) break;
-                int y = ly + i * W.RowH;
+                int y = ly + idx * W.RowH;
                 bool isDir = Host.FileIsDir(fs, idx) != 0;
                 string nm = Host.FileName(fs, idx);
                 if (idx == sel) Gfx.FillRound(ax, y, aw, W.RowH - 2, 6, C.Sel);
@@ -315,11 +315,7 @@ namespace NexOS.Forms
             if (editMode != 0)
             {
                 int inputY = ly;
-                if (editMode == 1 && sel >= 0)
-                {
-                    int ri = sel - scroll;
-                    if (ri >= 0 && ri < rows) inputY = ly + ri * W.RowH;
-                }
+                if (editMode == 1 && sel >= 0) inputY = ly + sel * W.RowH;
                 int bx = ax + 4, bw = aw - 8, ebh = W.RowH - 2;
                 Gfx.FillRound(bx, inputY, bw, ebh, 4, 0xFFFFFFFF);
                 Gfx.DrawRound(bx, inputY, bw, ebh, 4, C.Accent);
@@ -592,13 +588,10 @@ namespace NexOS.Forms
             int navW = 150, pad = 12;
             int ax = navW + pad, ay = pad, aw = Gfx.Width() - ax - pad;
             int ly = ay + 48;
-            int rows = (Gfx.Height() - ly - pad) / W.RowH;
             int n = Host.FileCount(fs);
-            for (int i = 0; i < rows; i++)
+            for (int idx = 0; idx < n; idx++)
             {
-                int idx = scroll + i;
-                if (idx >= n) break;
-                int y = ly + i * W.RowH;
+                int y = ly + idx * W.RowH;
                 if (U.In(mx, my, ax, y, aw, W.RowH - 2)) { sel = idx; return; }
             }
         }
@@ -646,13 +639,8 @@ namespace NexOS.Forms
                 int enavW = 150, epad = 12;
                 int eax = enavW + epad, eay = epad, eaw = Gfx.Width() - eax - epad;
                 int ely = eay + 48;
-                int erows = (Gfx.Height() - ely - epad) / W.RowH;
                 int inputY = ely;
-                if (editMode == 1 && sel >= 0)
-                {
-                    int ri = sel - scroll;
-                    if (ri >= 0 && ri < erows) inputY = ely + ri * W.RowH;
-                }
+                if (editMode == 1 && sel >= 0) inputY = ely + sel * W.RowH;
                 if (U.In(mx, my, eax + 4, inputY, eaw - 8, W.RowH - 2)) return;
                 CommitEdit();
             }
@@ -662,13 +650,10 @@ namespace NexOS.Forms
 
             int ax = navW2 + pad2, ay = pad2, aw = Gfx.Width() - ax - pad2;
             int ly = ay + 48;
-            int rows = (Gfx.Height() - ly - pad2) / W.RowH;
             int n = Host.FileCount(fs);
-            for (int i = 0; i < rows; i++)
+            for (int idx = 0; idx < n; idx++)
             {
-                int idx = scroll + i;
-                if (idx >= n) break;
-                int y = ly + i * W.RowH;
+                int y = ly + idx * W.RowH;
                 if (U.In(mx, my, ax, y, aw, W.RowH - 2))
                 {
                     // Single click selects; a second click on the same row

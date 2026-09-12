@@ -1769,6 +1769,7 @@ extern "C" {
     void gui_mouse_position(uint32_t raw_x, uint32_t raw_y);
     void gui_mouse_down(void);
     void gui_mouse_up(void);
+    void gui_mouse_wheel(int dz);
     void gui_mouse_down_right(void);
     int  gui_handle_key(char ch);
     void gui_handle_ctrl(int code);   // 1=Ctrl+C 2=Ctrl+V 3=Ctrl+Z 4=Ctrl+A
@@ -8777,6 +8778,9 @@ extern "C" void kmain(){
                             }
                             if(me.right && !gui_prev_right){
                                 gui_mouse_down_right();
+                            }
+                            if(me.dz != 0){
+                                gui_mouse_wheel(me.dz);
                             }
                             gui_prev_left = me.left;
                             gui_prev_right = me.right;

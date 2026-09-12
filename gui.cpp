@@ -7311,12 +7311,33 @@ struct Win11Desktop {
         w.fullscreen = false;
     }
 
+    // Mouse-wheel scroll: pan the managed window under the pointer when its
+    // content overflows vertically.  dz > 0 = wheel up.
+    void handle_mouse_wheel(int dz) {
+        if (!gui_mode || dz == 0) return;
+        for (int i = window_count - 1; i >= 0; i--) {
+            Win11Window& w = windows[i];
+            if (!w.visible || w.minimized) continue;
+            if (w.app != APP_MANAGED) continue;
+            if (!w.contains(mouse_x, mouse_y)) continue;
+            int mh = w.h - TITLE_BAR_H;
+            int maxy = w.scroll_ch - mh;
+            if (maxy <= 0) return;                 // nothing overflows
+            w.scroll_y -= dz * 28;
+            if (w.scroll_y < 0) w.scroll_y = 0;
+            if (w.scroll_y > maxy) w.scroll_y = maxy;
+            render_all();
+            return;
+        }
+    }
+
     void handle_mouse_up() {
         mouse_left = false;
         scroll_drag_win = -1;
         scroll_drag_axis = 0;
         int dw = drag_window;
         drag_window = -1;
+
         if (dw >= 0 && gui_mode) {
             apply_snap(dw);
             render_all();
@@ -9491,6 +9512,10 @@ void gui_mouse_down(void) {
 
 void gui_mouse_up(void) {
     g_wm.handle_mouse_up();
+}
+
+void gui_mouse_wheel(int dz) {
+    g_wm.handle_mouse_wheel(dz);
 }
 
 void gui_mouse_down_right(void) {

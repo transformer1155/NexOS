@@ -128,20 +128,33 @@ Qmp-Type "s"; Start-Sleep -Milliseconds 150
 Qmp-Key "ret"; Start-Sleep -Milliseconds 700
 Qmp-Shot "f07_sfs" | Out-Null
 
-# ---- Phase 2: file-open behaviour (SFS list, first row) ----
-#   .mex -> runs directly (no viewer)
-#   document with no association -> the in-window "open with" chooser
-Write-Host "[open] double-click row 0" -ForegroundColor Yellow
-Qmp-MoveAbs 700 331; Start-Sleep -Milliseconds 80
-Qmp-Click; Start-Sleep -Milliseconds 130; Qmp-Click
-Start-Sleep -Milliseconds 900
-Qmp-Shot "f08_open_row0" | Out-Null
-
-# Click away from the chooser panel to cancel it (if it appeared).
-Write-Host "[open] cancel/return" -ForegroundColor Yellow
-Qmp-MoveAbs 860 560; Start-Sleep -Milliseconds 60; Qmp-Click
+# ---- Phase 2: file-list scrolling (many files on SFS) ----
+# The explorer now draws EVERY file, so the list overflows and the native
+# scrollbar appears on the right edge; drag it, or use the wheel.
+Write-Host "[scroll] list with scrollbar" -ForegroundColor Yellow
 Start-Sleep -Milliseconds 400
-Qmp-Shot "f09_after" | Out-Null
+Qmp-Shot "f08_list" | Out-Null
+
+# Drag the vertical scrollbar thumb down (FE window: client x 381..899, y 254..582;
+# scrollbar strip at x ~889..899).  Press near the top, drag toward the bottom.
+Write-Host "[scroll] drag scrollbar down" -ForegroundColor Yellow
+Qmp-MoveAbs 894 262; Start-Sleep -Milliseconds 80
+Qmp-Btn $true
+for ($s = 1; $s -le 10; $s++) { Qmp-MoveAbs 894 (262 + $s * 28); Start-Sleep -Milliseconds 30 }
+Qmp-Btn $false
+Start-Sleep -Milliseconds 400
+Qmp-Shot "f09_dragged" | Out-Null
+
+# Mouse wheel over the list (wheel-down a few notches).
+Write-Host "[scroll] mouse wheel down" -ForegroundColor Yellow
+Qmp-MoveAbs 640 400; Start-Sleep -Milliseconds 60
+for ($i = 0; $i -lt 4; $i++) {
+    [void](Qmp-Send '{"execute":"input-send-event","arguments":{"events":[{"type":"btn","data":{"button":"wheel-down","down":true}}]}}')
+    [void](Qmp-Send '{"execute":"input-send-event","arguments":{"events":[{"type":"btn","data":{"button":"wheel-down","down":false}}]}}')
+    Start-Sleep -Milliseconds 70
+}
+Start-Sleep -Milliseconds 400
+Qmp-Shot "f10_wheel" | Out-Null
 
 [void](Qmp-Send '{"execute":"quit"}'); Start-Sleep -Seconds 2
 if(-not $p.HasExited){ $p.Kill() }; $p.WaitForExit(5000)|Out-Null

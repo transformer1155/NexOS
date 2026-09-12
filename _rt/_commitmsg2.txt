@@ -1,0 +1,10 @@
+feat(shell): 文件列表全量绘制 + 原生滚动条平移
+
+- csharp/apps/Shell/Apps.cs：文件列表不再按窗口高度截断可见行
+  （去掉 rows = (h - ly - pad) / W.RowH 的裁剪），改为绘制全部条目，
+  由原生层滚动条 / 滚轮负责平移视图；重命名输入框的 Y 坐标改为
+  按绝对索引 sel * W.RowH 计算，与新的绘制方式一致
+- gui.cpp / kernel.cpp：配套调整
+- sfs_files/shell.mex：随 C# 重新编译
+
+验证：make 通过（32/64 位均无 error）。

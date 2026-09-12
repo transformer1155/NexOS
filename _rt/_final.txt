@@ -1,0 +1,7 @@
+ M csharp/apps/Shell/Apps.cs
+ M gui.cpp
+ M kernel.cpp
+?? _rt/_final.txt
+?? _rt/tail_log.sh
+37936d3 feat: 开机动画渲染专项优化 + 光标后端抽象 + UEFI 镜像修复
+e04a6c9 gui: P3 字体 LRU 缓存哈希化
