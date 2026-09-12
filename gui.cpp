@@ -1318,11 +1318,17 @@ struct CachedGlyph {
     int      px;
     int      w, h, xo, yo;
     uint8_t* bmp;
-    int      used;
+    int      hnext;     // next slot in the same hash bucket, -1
+    int      lru_prev;  // -1 = none
+    int      lru_next;  // -1 = none
 };
-static const int GC_N = 256;
+static const int GC_N    = 256;
+static const int GC_HTAB = 256;   // hash buckets (>= GC_N)
 static CachedGlyph g_gc[GC_N];
-static int         g_gc_seq = 0;
+static int g_gc_tab[GC_HTAB];     // bucket head slot index, -1 = empty
+static int g_gc_lru_head = -1;    // most-recently-used slot
+static int g_gc_lru_tail = -1;    // least-recently-used slot
+static bool g_gc_inited = false;
 
 struct Graphics {
     volatile uint32_t* lfb;      // frontbuffer (VBE LFB)
@@ -1916,30 +1922,92 @@ struct Graphics {
     // size per session — the standard performance technique of modern text
     // renderers (FreeType glyph cache / atlas).
 
-    static const uint8_t* gc_get(int cp, int px, int* w, int* h, int* xo, int* yo) {
+    // ---- LRU bookkeeping for the glyph cache (P3) ----
+    // Hash table (g_gc_tab) gives O(1) lookup by (cp,px); a doubly-linked LRU
+    // list (lru_prev/lru_next over g_gc[]) makes eviction O(1).  Replaces the old
+    // linear 256-entry scan + lru-seq counter.  Behaviour to callers is identical.
+    static int gc_hash(int cp, int px) {
+        unsigned h = (unsigned)((cp * 2654435761u) ^ (px * 40503u));
+        return (int)(h % (unsigned)GC_HTAB);
+    }
+    static void gc_ensure_init(void) {
+        if (g_gc_inited) return;
+        for (int i = 0; i < GC_HTAB; i++) g_gc_tab[i] = -1;
         for (int i = 0; i < GC_N; i++) {
-            if (g_gc[i].bmp && g_gc[i].cp == cp && g_gc[i].px == px) {
-                g_gc[i].used = ++g_gc_seq;
-                *w = g_gc[i].w; *h = g_gc[i].h; *xo = g_gc[i].xo; *yo = g_gc[i].yo;
-                return g_gc[i].bmp;
+            g_gc[i].bmp = nullptr;
+            g_gc[i].hnext = -1;
+            g_gc[i].lru_prev = -1;
+            g_gc[i].lru_next = -1;
+        }
+        g_gc_lru_head = g_gc_lru_tail = -1;
+        g_gc_inited = true;
+    }
+    static void gc_lru_remove(int s) {
+        int p = g_gc[s].lru_prev, n = g_gc[s].lru_next;
+        if (p >= 0) g_gc[p].lru_next = n; else g_gc_lru_head = n;
+        if (n >= 0) g_gc[n].lru_prev = p; else g_gc_lru_tail = p;
+        g_gc[s].lru_prev = g_gc[s].lru_next = -1;
+    }
+    static void gc_lru_push_mru(int s) {
+        g_gc[s].lru_prev = -1;
+        g_gc[s].lru_next = g_gc_lru_head;
+        if (g_gc_lru_head >= 0) g_gc[g_gc_lru_head].lru_prev = s;
+        else g_gc_lru_tail = s;
+        g_gc_lru_head = s;
+    }
+    static void gc_hash_remove(int s) {
+        int h = gc_hash(g_gc[s].cp, g_gc[s].px);
+        int cur = g_gc_tab[h], prev = -1;
+        while (cur >= 0) {
+            if (cur == s) {
+                if (prev >= 0) g_gc[prev].hnext = g_gc[s].hnext;
+                else g_gc_tab[h] = g_gc[s].hnext;
+                g_gc[s].hnext = -1;
+                return;
+            }
+            prev = cur; cur = g_gc[cur].hnext;
+        }
+    }
+    static void gc_hash_insert(int s) {
+        int h = gc_hash(g_gc[s].cp, g_gc[s].px);
+        g_gc[s].hnext = g_gc_tab[h];
+        g_gc_tab[h] = s;
+    }
+
+    static const uint8_t* gc_get(int cp, int px, int* w, int* h, int* xo, int* yo) {
+        gc_ensure_init();
+        int idx = gc_hash(cp, px);
+        for (int s = g_gc_tab[idx]; s >= 0; s = g_gc[s].hnext) {
+            if (g_gc[s].bmp && g_gc[s].cp == cp && g_gc[s].px == px) {
+                gc_lru_remove(s);
+                gc_lru_push_mru(s);
+                *w = g_gc[s].w; *h = g_gc[s].h; *xo = g_gc[s].xo; *yo = g_gc[s].yo;
+                return g_gc[s].bmp;
             }
         }
         return nullptr;
     }
     static const uint8_t* gc_put(int cp, int px, int w, int h, int xo, int yo, const uint8_t* src) {
-        int slot = -1, best = 0x7fffffff;
-        for (int i = 0; i < GC_N; i++) {
+        gc_ensure_init();
+        int slot = -1;
+        for (int i = 0; i < GC_N; i++) {        // prefer a free slot
             if (!g_gc[i].bmp) { slot = i; break; }
-            if (g_gc[i].used < best) { best = g_gc[i].used; slot = i; }
         }
-        if (slot < 0) return nullptr;
-        if (g_gc[slot].bmp) kfree(g_gc[slot].bmp);
+        if (slot < 0) {                          // none free: evict LRU
+            slot = g_gc_lru_tail;
+            if (slot < 0) return nullptr;
+            gc_hash_remove(slot);
+            gc_lru_remove(slot);
+            if (g_gc[slot].bmp) kfree(g_gc[slot].bmp);
+        }
         uint8_t* b = (uint8_t*)kmalloc((uint32_t)(3 * w * h));
         if (!b) return nullptr;
         for (int i = 0; i < 3 * w * h; i++) b[i] = src[i];
         g_gc[slot].cp = cp; g_gc[slot].px = px;
         g_gc[slot].w = w; g_gc[slot].h = h; g_gc[slot].xo = xo; g_gc[slot].yo = yo;
-        g_gc[slot].bmp = b; g_gc[slot].used = ++g_gc_seq;
+        g_gc[slot].bmp = b;
+        gc_hash_insert(slot);
+        gc_lru_push_mru(slot);
         return b;
     }
 
