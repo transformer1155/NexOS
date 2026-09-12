@@ -879,6 +879,15 @@ extern "C" {
     int  net_http_get(const char* url, char* out, int outsize);
     // Ask a question through the host-side LLM bridge (10.0.2.2:18080).
     int  net_ask_host(const char* question, char* out, int outsize);
+    // Configured OpenAI-compatible chat endpoint (set by the AI Setup GUI and
+    // persisted in mkfs ai.cfg).  net_agent_remote() POSTs the goal as
+    // {"model":..,"messages":[{"role":"user",...}]} with the `Authorization:
+    // Bearer <key>` header and returns the assistant content.
+    void net_set_agent_remote_url(const char* url);
+    void net_set_agent_api_key(const char* key);
+    void net_set_agent_model(const char* m);
+    const char* net_get_agent_remote_url(void);
+    int  net_agent_remote(const char* prompt, const char* url, char* out, int outsize);
     // ICMP ping client: returns 1 if any attempt got a reply, 0 on timeout.
     int  net_ping(const char* host, int attempts);
     // WiFi manager (control plane) + time-server client (net.cpp)
@@ -5832,6 +5841,18 @@ static void cmd_agent(const char* args){
             term.put_char('\n');
             return;
         }
+        // Next, an OpenAI-compatible endpoint the user configured from the
+        // GUI (AI Setup: provider + API key + model, saved to mkfs ai.cfg).
+        // Without this, `agent run` silently fell back to the tiny local
+        // Markov engine even when a remote model had been enabled.
+        if (net_get_agent_remote_url()[0]){
+            char rr[4096];
+            if (net_agent_remote(args, nullptr, rr, (int)sizeof(rr)) > 0){
+                term.write(rr);
+                term.put_char('\n');
+                return;
+            }
+        }
         char output[4096];
         int n = agent_run(args, output, sizeof(output));
         if(n > 0){
@@ -6528,13 +6549,14 @@ extern "C" void switch_to_64bit(uint32_t stage_phys);
 // fill_rect / blend_rect honour the clip mask) pushed it to ~754912 bytes,
 // so SFS_LBA moved 3520 -> 3536 (gap = (3536-2048)*512 = 762368 and
 // KERNEL64_SECTORS=1475 => 755200 bytes still fits with margin).
-#define KERNEL64_SECTORS    1614    // raised: kernel64.bin hit 825080 B > 1610*512.  The
-                                    // LBA 2048..3664 gap holds 1616 sectors, so
-                                    // SFS_LBA/SFS_ALT_LBA still stay put (2048+1614 <= 3664).
-                                    // NOTE: this limit has been raised four times now; the
-                                    // 64-bit kernel keeps growing into a hard-coded gap.
-                                    // Next step when it overflows: give kernel64 its own
-                                    // region instead of the LBA 2048 hole.
+#define KERNEL64_SECTORS    1615    // raised (5th time): kernel64.bin hit 826520 B.
+                                    // This is the LAST sector the LBA 2048..3664 gap can
+                                    // give (2048+1615 = 3663 <= 3664): exactly one sector
+                                    // of slack left.  The next growth MUST restructure the
+                                    // layout -- SFS_LBA/SFS_ALT_LBA and the stage2/boot_cd
+                                    // constants all have to move together (see RULES.md) and
+                                    // kernel64 needs a region of its own.  Bumping this
+                                    // constant again is no longer possible.
 
 // Load kernel64.bin from the disk into a staging buffer and jump to long
 // mode.  Shared by `switch` and `ask64`; never returns on success.

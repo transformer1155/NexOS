@@ -20,6 +20,7 @@
 #include "zfont_data.h"   // embedded GB2312 16x16 CJK font (387 glyphs)
 #include "afont_data.h"   // 16x16 8-bit-alpha ASCII bitmap (baked from msyh.ttf)
 #include "intel_cursor.h" // GPU cursor-plane backend (Intel iGPU, 32-bit kernel)
+#include "svga.h"         // GPU cursor-plane + 2D accel (VMware SVGA-II)
 #include "ime_dict.h"     // pinyin -> Hanzi dictionary for IME
 #include "win32.h"        // Win32 subsystem: registry, PE32 loader, GDI display list
 #include "addrman.h"       // Address Management Registry (single source of truth)
@@ -146,10 +147,30 @@ static int           g_cursor_backend_chosen = 0;
 // (serial_puts is declared further down this file; forward-declare it here.)
 static void serial_puts(const char* s);
 
+// Which driver is currently owning the cursor plane.  Both look identical to
+// the rest of the GUI; only the "move" call behind cursor_backend_sync differs.
+static int g_cursor_hw_svga = 0;
+
 static void select_cursor_backend(void) {
     if (g_cursor_backend_chosen) return;
     g_cursor_backend_chosen = 1;
 #if !defined(__x86_64__)
+    // VMware SVGA-II first: a real GPU cursor plane, and the only accelerated
+    // device available here that can actually be exercised under QEMU (the
+    // Intel path needs real silicon to verify, so it stays second).
+    if (svga_init()) {
+        if (svga_cursor_selftest()) {    // must be acknowledged, not assumed
+            g_cursor_hw_svga = 1;
+            g_cursor_backend = CURSOR_HW;
+            serial_puts("[CURSOR] backend = SVGA-II hardware cursor\n");
+            return;
+        }
+        // The accelerator is up but the device never acknowledged a cursor
+        // command.  Switching to the hardware cursor here would delete the
+        // only pointer the user has, so fall through to the normal chain and
+        // keep painting the arrow.
+        serial_puts("[CURSOR] SVGA-II cursor unverified; keeping the painted arrow\n");
+    }
     if (intel_cursor_probe()) {          // GPU cursor plane (real hardware)
         g_cursor_backend = CURSOR_HW;
         serial_puts("[CURSOR] backend = GPU hardware cursor\n");
@@ -169,7 +190,10 @@ static void select_cursor_backend(void) {
 // other backends (SOFT repaints the arrow, HOST is driven by the hypervisor).
 static inline void cursor_backend_sync(int x, int y) {
 #if !defined(__x86_64__)
-    if (g_cursor_backend == CURSOR_HW) intel_cursor_move(x, y);
+    if (g_cursor_backend == CURSOR_HW) {
+        if (g_cursor_hw_svga) svga_cursor_move(x, y);
+        else                  intel_cursor_move(x, y);
+    }
 #else
     (void)x; (void)y;
 #endif
@@ -1323,6 +1347,26 @@ static int      g_fla16_count = 96;
 static int      g_fla16_h = 16;
 static uint32_t g_fla16_off[128];
 static int      g_fla16_adv[128];   // per-glyph horizontal advance (px)
+// Pre-baked ROUNDED variant of the same font: the 1px morphological dilation
+// (the "rounded sans" look) is computed ONCE here instead of per glyph per
+// frame in the hot text loop.  Same layout/offsets as g_fla16.
+static uint8_t* g_fla16_round = nullptr;
+
+// 1px morphological dilation of an 8-bit coverage bitmap (row-major, stride w),
+// neighbourhood clamped to [0,w)x[0,h).  Mirrors Graphics::cov_dil1 so the
+// pre-baked rounded font is pixel-identical to the inline path.
+static int dil1_cov(const uint8_t* src, int w, int h, int row, int col) {
+    int m = 0;
+    for (int dy = -1; dy <= 1; dy++) {
+        int yy = row + dy; if (yy < 0 || yy >= h) continue;
+        const uint8_t* p = src + yy * w;
+        for (int dx = -1; dx <= 1; dx++) {
+            int xx = col + dx; if (xx < 0 || xx >= w) continue;
+            if (p[xx] > m) m = p[xx];
+        }
+    }
+    return m;
+}
 
 static bool load_font_la16(void) {
     if (g_fla16) return true;
@@ -1345,6 +1389,27 @@ static bool load_font_la16(void) {
         if (cp >= 0 && cp < 128) {
             g_fla16_off[cp] = o;
             g_fla16_adv[cp] = (int)buf[o + 1];   // advance is the 2nd byte
+        }
+    }
+    // Pre-bake the rounded (1px dilated) coverage: the hot text loop then just
+    // samples it instead of running cov_dil1 per glyph per frame.
+    if (!g_fla16_round) {
+        uint8_t* rb = (uint8_t*)kmalloc((uint32_t)n + 8);
+        if (rb) {
+            int cell = g_fla16_h * g_fla16_h;
+            for (int i = 0; i < g_fla16_count; i++) {
+                uint32_t o = 8u + (uint32_t)i * (2u + (uint32_t)cell);
+                rb[o] = buf[o]; rb[o + 1] = buf[o + 1];
+                int gw = (int)buf[o];
+                int gh = g_fla16_h;
+                if (gw <= 0 || gw * gh > cell) continue;   // layout guard
+                const uint8_t* src = buf + o + 2;
+                uint8_t* dst = rb + o + 2;
+                for (int ry = 0; ry < gh; ry++)
+                    for (int rx = 0; rx < gw; rx++)
+                        dst[ry * gw + rx] = (uint8_t)dil1_cov(src, gw, gh, ry, rx);
+            }
+            g_fla16_round = rb;
         }
     }
     g_fla16 = buf;
@@ -2243,11 +2308,16 @@ struct Graphics {
             const uint8_t* g = fla16_glyph(c, &w, &h);
             if (g) {
                 const int rounding = g_font_round && w <= RD_MAXW && h <= RD_MAXW;
+                // Pre-baked rounded copy (identical offsets): when present the
+                // per-glyph dilation is a plain sample, not a 3x3 max.
+                const uint8_t* rg = (rounding && g_fla16_round)
+                                    ? (g_fla16_round + (int)(g - g_fla16)) : nullptr;
                 if (bg != (Color)-1) fill_rect(x, y, w, h, bg);
                 for (int row = 0; row < h; row++) {
                     const uint8_t* src = g + row * w;
                     for (int col = 0; col < w; col++) {
-                        int a = rounding ? cov_dil1(g, w, h, row, col) : sample_cov(src, w, col);
+                        int a = rg ? rg[row * w + col]
+                                   : (rounding ? cov_dil1(g, w, h, row, col) : sample_cov(src, w, col));
                         if (a > 4)
                             blend_subpixel(x + col, y + row, fg, a, a, a);
                     }
@@ -9647,6 +9717,10 @@ void gui_enter(void) {
 #endif
     *(volatile uint8_t*)0x5101 = 8;   // milestone: gui_enter reached
     diag_step(333, "gui_enter starting");
+    // Tell the GPU driver which mode it has to scan out before it enables the
+    // device -- an enabled SVGA device takes the surface size from its own
+    // registers, so it must be told what the kernel is actually drawing.
+    svga_mode_hint(g_wm.gfx.width, g_wm.gfx.height, g_wm.gfx.bpp, g_wm.gfx.pitch);
     // The framebuffer is up by now: pick how the pointer will be presented
     // (GPU cursor plane / hypervisor cursor / painted arrow).
     select_cursor_backend();
