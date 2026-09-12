@@ -89,6 +89,8 @@ static inline int         mforms_key(int, int) { return 0; }
 static inline void        mforms_set_mouse(int, int) {}
 static inline int         mforms_has_desktop(void) { return 0; }
 static inline void        mforms_paint_desktop(int, int) {}
+static inline void        mforms_paint_wall(int, int) {}
+static inline void        mforms_paint_desk_icons(int, int) {}
 static inline int         g_mforms_anim = 0;   // 64-bit build: no managed shell
 static inline void        mforms_paint_overlay(int, int) {}
 static inline int         mforms_desktop_click(int, int) { return -2; }
@@ -146,6 +148,26 @@ static int           g_cursor_backend_chosen = 0;
 // GPU hardware cursor -> hypervisor cursor -> our own painted arrow.
 // (serial_puts is declared further down this file; forward-declare it here.)
 static void serial_puts(const char* s);
+
+// Unsigned decimal over serial (serial_puts only takes strings).
+static void serial_u32(unsigned int v) {
+    char b[12];
+    int n = 0;
+    if (!v) b[n++] = '0';
+    while (v && n < 11) { b[n++] = (char)('0' + (v % 10u)); v /= 10u; }
+    char out[12];
+    int k = 0;
+    while (n > 0) out[k++] = b[--n];
+    out[k] = 0;
+    serial_puts(out);
+}
+
+// Low 32 bits of the TSC, for timing a boot phase rather than guessing at it.
+static inline unsigned int boot_rdtsc(void) {
+    unsigned int lo;
+    __asm__ __volatile__("rdtsc" : "=a"(lo) : : "edx");
+    return lo;
+}
 
 // Which driver is currently owning the cursor plane.  Both look identical to
 // the rest of the GUI; only the "move" call behind cursor_backend_sync differs.
@@ -1189,13 +1211,30 @@ static inline void dirty_add(int x, int y, int w, int h) {
 // is detected automatically without touching every call site.
 static bool g_desk_needs_full = true;   // first frame must paint the desktop
 static uint32_t g_desk_sig = 0;
+
+// Cached WALLPAPER layer.  The Win11 bloom (full-screen gradient + four big
+// filled circles) measures ~200 ms to paint -- roughly 5x everything else in
+// a desktop repaint -- yet it only changes when the theme, the accent or the
+// desktop mode does.  So it is painted once, captured here, and re-blitted on
+// every later desktop repaint while only the cheap icons layer is redrawn.
+// Host.WallInvalid() (called from C# ShellTheme) drops the cache, and the
+// animated AI desktop calls it every frame so it is never served stale.
+static uint32_t* g_wall = nullptr;
+static uint32_t  g_wall_cap = 0;        // capacity in pixels
+static uint32_t  g_wall_w = 0, g_wall_h = 0;
+static bool      g_wall_ok = false;
+
+extern "C" void gui_wall_invalid(void) { g_wall_ok = false; }
 // Forced overlay repaint, as a short frame countdown (set by
 // gui_invalidate_managed).  The overlay paints the Start menu too, and the
 // menu runs a multi-frame open animation / layout pass: one repaint is not
 // enough, so the shell keeps re-issuing it for a few frames after any managed
 // input.  While the countdown is running the whole screen is flushed, because
 // the menu covers an area above the taskbar that only C# knows about.
-enum { OVER_FORCE_FRAMES = 16 };
+enum { OVER_FORCE_FRAMES = 6,
+       // Only the first few settling frames flush the whole screen; the rest
+       // dirty just the taskbar strip (+ the Start-menu rect).  See render_all().
+       OVER_FORCE_WIDE = 2 };
 static int g_over_force_n = 0;
 
 // Invalidate the cached managed layers.  The desktop and overlay layers are
@@ -1694,12 +1733,17 @@ struct Graphics {
                 }
             }
         } else {
-            // BGRX32 (most common UEFI): direct copy is correct on x86 LE
-            // Also used as fallback for unknown formats
+            // BGRX32 (most common UEFI): the backbuffer byte order (B,G,R,X)
+            // already matches the LFB, so this is a verbatim row copy.  Use
+            // __builtin_memcpy like present_rect() instead of a per-pixel
+            // volatile loop -- a full-screen flip sits on the critical path of
+            // every animation frame, and `volatile` defeated any vectorisation
+            // so the scalar loop dominated the frame cost.  Also the fallback
+            // for unknown formats.
             for (int ry = 0; ry < height; ry++) {
-                volatile uint32_t* dst = (volatile uint32_t*)((volatile uint8_t*)lfb + (uint32_t)ry * pitch);
-                uint32_t* src = backbuffer + (uint32_t)ry * width;
-                for (int i = 0; i < width; i++) dst[i] = src[i];
+                uint8_t* dst = (uint8_t*)lfb + (uint32_t)ry * pitch;
+                uint8_t* src = (uint8_t*)backbuffer + (uint32_t)ry * width * 4u;
+                __builtin_memcpy(dst, src, (uint32_t)width * 4u);
             }
         }
     }
@@ -6775,9 +6819,43 @@ struct Win11Desktop {
             if (repaint_desk) {
                 mforms_set_mouse(mouse_x, mouse_y);
                 mforms_set_running(running_mask());
-                diag_step(101, "render_all before mforms_paint_desktop");
-                mforms_paint_desktop(gfx.width, gfx.height);
-                diag_step(102, "render_all after mforms_paint_desktop");
+                diag_step(101, "render_all before desktop layer");
+                int npix = gfx.width * gfx.height;
+                if (g_wall_ok && g_wall &&
+                    g_wall_w == (uint32_t)gfx.width && g_wall_h == (uint32_t)gfx.height) {
+                    // Wallpaper unchanged: re-blit the cached copy (a few ms)
+                    // instead of re-running the ~200 ms C# bloom paint, then
+                    // redraw the cheap icons/tiles layer on top.
+                    for (int ry = 0; ry < gfx.height; ry++)
+                        __builtin_memcpy(gfx.backbuffer + (size_t)ry * gfx.width,
+                                         g_wall + (size_t)ry * gfx.width,
+                                         (size_t)gfx.width * 4u);
+                    mforms_paint_desk_icons(gfx.width, gfx.height);
+                } else {
+                    // Optimistically mark the cache valid BEFORE the paint:
+                    // C# raises WallInvalid() from inside PaintWall for the
+                    // animated AI desktop, and that must leave the cache
+                    // disabled (it repaints every frame by design).
+                    g_wall_ok = true;
+                    mforms_paint_wall(gfx.width, gfx.height);
+                    if (!g_wall || g_wall_cap < (uint32_t)npix) {
+                        if (g_wall) { kfree(g_wall); g_wall = nullptr; g_wall_cap = 0; }
+                        g_wall = (uint32_t*)kmalloc((uint32_t)npix * 4u);
+                        g_wall_cap = g_wall ? (uint32_t)npix : 0;
+                    }
+                    if (g_wall) {
+                        for (int ry = 0; ry < gfx.height; ry++)
+                            __builtin_memcpy(g_wall + (size_t)ry * gfx.width,
+                                             gfx.backbuffer + (size_t)ry * gfx.width,
+                                             (size_t)gfx.width * 4u);
+                        g_wall_w = (uint32_t)gfx.width;
+                        g_wall_h = (uint32_t)gfx.height;
+                    } else {
+                        g_wall_ok = false;
+                    }
+                    mforms_paint_desk_icons(gfx.width, gfx.height);
+                }
+                diag_step(102, "render_all after desktop layer");
                 g_desk_needs_full = false;
                 g_desk_sig = cur_sig;
                 dirty_add(0, 0, gfx.width, gfx.height);   // full-screen repaint
@@ -6860,7 +6938,13 @@ struct Win11Desktop {
             static int      g_over_idle = 0;
             uint32_t osig = running_mask();
             osig ^= start_menu_open ? 0x5A5A5A5Au : 0u;
-            if (mouse_y >= gfx.height - MANAGED_TASKBAR_H)
+            // Taskbar hover highlight.  Deliberately skipped while a window is
+            // animating: the pointer position feeding this hash changes as the
+            // mouse moves, which forced a full C# taskbar repaint (~20-30 ms)
+            // on every animation frame.  A hover state cannot change without a
+            // new mouse event, and that event invalidates the overlay itself,
+            // so nothing is lost by ignoring the position mid-animation.
+            if (!any_animating() && mouse_y >= gfx.height - MANAGED_TASKBAR_H)
                 osig ^= (uint32_t)mouse_x * 31u + (uint32_t)mouse_y * 17u;
             // With an animation pending (toasts, AI dots, the Start menu's
             // open transition) the overlay has to be repainted EVERY frame:
@@ -6876,15 +6960,23 @@ struct Win11Desktop {
                 mforms_paint_overlay(gfx.width, gfx.height);
                 g_over_sig  = osig;
                 g_over_idle = 0;
-                // The overlay owns the Start menu, whose rect is known only to
-                // C# and reaches well above the taskbar.  Marking just the
-                // strip dirty would leave the menu painted into the backbuffer
-                // but never presented.  So flush everything while the menu /
-                // a managed animation is on screen, and only the strip otherwise.
-                if (g_over_force_n > 0 || g_mforms_anim != 0)
+                // The overlay owns the Start menu, whose rect reaches well above
+                // the taskbar.  A blanket full-screen flush here costs ~921k px
+                // of extra flip on EVERY settling frame -- the single largest
+                // per-frame cost during window animation.  So: flush everything
+                // only for the first couple of settling frames (managed popups
+                // can live anywhere, and we cannot see their rect), then dirty
+                // exactly the taskbar strip plus the Start-menu rect, which is
+                // known because the menu is a window in the DB.
+                if (g_over_force_n > OVER_FORCE_WIDE)
                     dirty_add(0, 0, gfx.width, gfx.height);
-                else
+                else {
                     dirty_add(0, gfx.height - MANAGED_TASKBAR_H, gfx.width, MANAGED_TASKBAR_H);
+                    if (start_menu_open && start_menu_id >= 0) {
+                        Win11Window& sm = windows[start_menu_id];
+                        dirty_add(sm.x, sm.y, sm.w, sm.h);
+                    }
+                }
                 if (g_over_force_n > 0) g_over_force_n--;
             }
             g_over_idle++;
@@ -7039,6 +7131,13 @@ struct Win11Desktop {
             serial_putdec((int)perf_cblit);
             serial_puts(" dmgkpx=");
             serial_putdec((int)(perf_dmgpx / 1000));
+            // wall=1 when the cached wallpaper layer was usable (blit path),
+            // 0 when the expensive C# bloom had to be repainted.  sn=1 when the
+            // desktop snapshot buffer is present (window-erase path).
+            serial_puts(" wall=");
+            serial_putdec(g_wall_ok ? 1 : 0);
+            serial_puts(" sn=");
+            serial_putdec(g_snap ? 1 : 0);
             serial_puts("\n");
             perf_desk_ms = 0; perf_win_ms = 0; perf_over_ms = 0; perf_pres_ms = 0;
             perf_deskfull = 0; perf_cpaint = 0; perf_cblit = 0; perf_dmgpx = 0;
@@ -9754,7 +9853,17 @@ void gui_enter(void) {
     gui_show_splash_animated(120, 50);
     serial_puts("[SPLASH] model load begins\n");
 #endif
-    mforms_boot();          // bring the managed (C#) shell online before drawing
+    // Time the managed-shell bring-up: the boot animation currently hands the
+    // screen over BEFORE this, so whatever it costs is a period with a frozen
+    // picture.  Measure it before deciding how much machinery to spend on it.
+    {
+        unsigned int mt0 = boot_rdtsc();
+        mforms_boot();      // bring the managed (C#) shell online before drawing
+        unsigned int mt1 = boot_rdtsc();
+        serial_puts("[BOOT] mforms_boot cycles=");
+        serial_u32(mt1 - mt0);
+        serial_puts("\n");
+    }
     // Enter the GUI and paint the desktop unconditionally.  The old
     // g_skip_enter_gui guard (a temporary voice-test workaround for a
     // supposed enter_gui() return-hang) was skipping the ENTIRE native

@@ -97,6 +97,15 @@ static int            sp_dot_valid = 0;
 // more.  These record the longest such freeze and WHICH phase it spanned, so
 // the next fix goes where the time actually goes instead of everywhere.
 static unsigned int   sp_ticks     = 0;   // tick() calls offered by the boot
+// Lifetime, accumulated per frame rather than measured start-to-end: sp_rdtsc()
+// returns only the low 32 bits, so a start-to-end subtraction silently loses
+// 2^32 cycles every ~1.3 s.  Summing per-frame deltas is wrap-free only if the
+// SUM is wide enough, which is why this is 64-bit -- the first two versions of
+// this probe both reported an average BELOW the frame floor (5.0 M and 4.8 M
+// against a 14 M floor), which is arithmetically impossible and was the clue
+// that the accumulator itself was wrapping.  64-bit add/shift need no libgcc
+// in this kernel; only 64-bit DIVISION does, and that is avoided below.
+static unsigned long long sp_t_total = 0;
 static unsigned int   sp_gap_max   = 0;   // longest interval between frames
 static const char*    sp_gap_where = "?"; //   ... and the phase it spanned
 static const char*    sp_prev_lab  = "Starting";
@@ -108,6 +117,7 @@ static void sp_frame_begin(void) {
     unsigned int now = sp_rdtsc();
     unsigned int dt  = (unsigned int)(now - sp_last);
     if (dt > sp_gap_max) { sp_gap_max = dt; sp_gap_where = sp_prev_lab; }
+    sp_t_total += dt;
     sp_last     = now;
     sp_prev_lab = sp_label;
 }
@@ -628,6 +638,7 @@ int boot_splash_init(void) {
     sp_r_valid = 0;
     sp_dot_valid = 0;
     sp_last = sp_rdtsc();
+    sp_t_total = 0;
     sp_active = 1;
 
     // Build the colour caches before the first paint: the scanline gradient,
@@ -738,5 +749,24 @@ void boot_splash_finish(void) {
     sp_serial_u32(sp_gap_max);
     sp_serial(" cyc during \"");
     sp_serial(sp_gap_where);
-    sp_serial("\"\n");
+    // Average cycles/frame.  Both a 64-bit divide and a naive
+    // (total>>16)*65536 are unusable here -- the kernel has no __udivdi3, and
+    // the multiply overflows 32 bits for any lifetime over ~4.3 G cycles
+    // (it reported 1.2 M/frame against a 14 M floor, which is what exposed
+    // it).  Split into high/low parts instead: every step stays 32-bit.
+    unsigned int t16 = (unsigned int)(sp_t_total >> 16);   // units of 65536 cyc
+    unsigned int avg = 0;
+    if (sp_frames) {
+        avg = (t16 / sp_frames) * 65536u
+            + ((t16 % sp_frames) * 65536u) / sp_frames;
+    }
+    sp_serial("\"\n[SPLASH] lifetime ");
+    sp_serial_u32((unsigned int)(sp_t_total >> 20));      // Mi-cycles
+    sp_serial(" Mi-cyc for ");
+    sp_serial_u32(sp_frames);
+    sp_serial(" frames = ");
+    sp_serial_u32(avg);
+    sp_serial(" cyc/frame average (floor is ");
+    sp_serial_u32(SP_FRAME_TSC);
+    sp_serial(")\n");
 }

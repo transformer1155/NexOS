@@ -123,7 +123,14 @@ EFI_LDFLAGS := -nostdlib -znocombreloc -T $(EFI_LDS) -shared -Bsymbolic \
 # entry64.asm, linker64.ld, switch32to64.asm, switch64to32.asm) and the
 # PE32+/amd64 browser were retired to .attic64/ -- nothing in the build,
 # the disk layout or the shell references them any more.
-SFS_LBA      := 3664
+# SFS starts at LBA 6144, not 3664: kernel64.bin outgrew the small gap that
+# used to sit immediately after it (LBA 2048..3664).  That gap is 1616 sectors
+# and kernel64 had reached it exactly, so every further byte failed the build.
+# Moving SFS forward gives kernel64 a 4096-sector (2 MiB) region with ~1.2 MiB
+# of headroom.  SFS is 18338 sectors, so it now spans 6144..24482, still clear
+# of LINUX_SFS_LBA (25600) with 1118 sectors to spare.
+# KEEP IN SYNC: kernel.cpp SFS_ALT_LBA, and the build guard below.
+SFS_LBA      := 6144
 SFS_BYTE_OFF := $(shell echo $$(( $(SFS_LBA) * 512 )))
 
 # Real GGUF weights bypass SFS entirely (768-sector cap) and are appended to

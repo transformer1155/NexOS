@@ -1891,7 +1891,11 @@ static bool g_fb_console_mode = false;
 #define SFS_DATA_LBA      817
 // The BIOS os.img build places the same SFS image further out on the disk so
 // it does not collide with the 64-bit kernel payload.  Probe both locations.
-#define SFS_ALT_LBA       3664   // must match Makefile SFS_LBA (kernel64 payload ends at 2048+1600=3648, SFS at 3664)
+#define SFS_ALT_LBA       6144   // must match Makefile SFS_LBA.  Moved 3664 -> 6144
+                                 // because kernel64.bin had grown into the whole
+                                 // LBA 2048..3664 gap (1616 sectors, zero slack);
+                                 // the kernel probes this as one of its SFS
+                                 // candidates, so the two MUST agree.
 #define SFS_LINUX_LBA     25600  // independent Linux user-space partition (after main SFS vol; matches Makefile LINUX_SFS_LBA)
 
 // CD/ISO-boot RAM-SFS handoff.  boot_cd.asm streams the (texture-free) SFS
@@ -6567,14 +6571,13 @@ extern "C" void switch_to_64bit(uint32_t stage_phys);
 // fill_rect / blend_rect honour the clip mask) pushed it to ~754912 bytes,
 // so SFS_LBA moved 3520 -> 3536 (gap = (3536-2048)*512 = 762368 and
 // KERNEL64_SECTORS=1475 => 755200 bytes still fits with margin).
-#define KERNEL64_SECTORS    1615    // raised (5th time): kernel64.bin hit 826520 B.
-                                    // This is the LAST sector the LBA 2048..3664 gap can
-                                    // give (2048+1615 = 3663 <= 3664): exactly one sector
-                                    // of slack left.  The next growth MUST restructure the
-                                    // layout -- SFS_LBA/SFS_ALT_LBA and the stage2/boot_cd
-                                    // constants all have to move together (see RULES.md) and
-                                    // kernel64 needs a region of its own.  Bumping this
-                                    // constant again is no longer possible.
+#define KERNEL64_SECTORS    4096    // 2 MiB region at LBA 2048..6144, matching the new
+                                    // SFS_LBA (2048 + 4096 = 6144 exactly).  The old
+                                    // 1616 was the whole LBA 2048..3664 gap and had been
+                                    // hit exactly, so the layout was changed instead of
+                                    // the number bumped again.  kernel64.bin is ~0.83 MiB,
+                                    // leaving ~1.2 MiB of headroom for future growth.
+                                    // The Makefile guard verifies it fits.
 
 // Load kernel64.bin from the disk into a staging buffer and jump to long
 // mode.  Shared by `switch` and `ask64`; never returns on success.
