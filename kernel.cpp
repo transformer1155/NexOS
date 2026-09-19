@@ -7206,22 +7206,36 @@ static void cmd_linux(const char* args){
 
 // All targets live in the 64-256 MiB identity-mapped (PSE) window so the
 // trampoline can run with paging off and still address everything linearly.
+//
 // Layout (no overlaps, all inside the 256 MB e820 we hand to Linux):
 //   kernel image   0x04000000 .. 0x062BD000   (init_size = 0x22BD000)
-//   initrd         0x06400000 .. 0x08400000   (max 32 MiB, OUTSIDE init_size!)
-//   raw bzImage    0x08800000 .. 0x09800000   (max 16 MiB)
-//   boot_params    0x09A00000 .. 0x09A04000
-//   cmdline        0x09A10000
-//   tramp stack    below   0x09A80000
-// The initrd MUST NOT sit inside the kernel's init_size window or the
-// decompressor overwrites it while unpacking (which corrupts the ramdisk and
-// makes the kernel oops on bogus pointers during early boot).
+//   initrd         0x07000000 .. 0x088CEC86   (max 32 MiB)
+//   raw bzImage    0x09000000 .. 0x0A000000   (max 16 MiB)
+//   boot_params    0x0A000000 .. 0x0A004000
+//   cmdline        0x0A010000
+//   tramp stack    below   0x0A080000
+//
+// The initrd MUST NOT sit inside the kernel's init_size window, and it is kept
+// well clear of it: init_size is the scratch area the decompressor may use,
+// measured from the load address, and the DECOMPRESSED vmlinux can be larger
+// than init_size, so the decompressor relocates itself upward as it grows.
+//
+// The initrd used to sit at 0x06400000, only 1292 KB past the end of the
+// init_size window (0x04000000+0x22BD000).  It was moved to 0x07000000 for a
+// 13580 KB margin.  NOTE: this move did NOT fix the "rootfs image is not
+// initramfs (uncompression error)" failure -- that error persists with the new
+// address, so initrd corruption by the decompressor is NOT the cause.  The
+// move is kept because the larger margin is safer regardless.  Verified at the
+// time of the move: the initrd lands in guest memory byte-identical to
+// sfs_files/initrd.img (first 8 = 1F 8B 08 00 00 00 00 00, last 8 =
+// 2C F0 3A 8B 5C A5 6E 06, a valid gzip stream), so the data handed to the
+// kernel is correct and the failure is downstream of the load.
 #define KEXEC_LINUX_LOAD   0x04000000u   // protected-mode kernel image (64 MiB)
-#define KEXEC_INITRD       0x06400000u   // initrd (100 MiB)
-#define KEXEC_VMLINUZ_RAW  0x08800000u   // raw bzImage buffer (136 MiB)
-#define KEXEC_BP           0x09A00000u   // boot_params / zero page (154 MiB)
-#define KEXEC_CMDLINE      0x09A10000u   // command line string
-#define KEXEC_STACK_TOP    0x09A80000u   // boot stack top
+#define KEXEC_INITRD       0x07000000u   // initrd (112 MiB)
+#define KEXEC_VMLINUZ_RAW  0x09000000u   // raw bzImage buffer (144 MiB)
+#define KEXEC_BP           0x0A000000u   // boot_params / zero page (160 MiB)
+#define KEXEC_CMDLINE      0x0A010000u   // command line string
+#define KEXEC_STACK_TOP    0x0A080000u   // boot stack top
 
 // Flat 32-bit GDT for the trampoline: base 0, limit 4 GiB.
 static uint64_t kexec_gdt[3] = {
@@ -7426,24 +7440,47 @@ extern "C" int kern_linux_boot(const char* cmdline_extra, int skip_initrd){
     cmd[cli] = 0;
     serial_puts("[KEXEC] cmdline: "); serial_puts(cmd); serial_puts("\n");
 
-    // Patch boot_params fields.  Offsets are boot_params-absolute (the setup
-    // header lives at 0x1F1, so a setup_header field at hdr offset X is at
-    // bp + 0x1F1 + X).
-    *(uint32_t*)(bp + 0x212) = KEXEC_LINUX_LOAD;       // code32_start = entry (hdr+0x21)
-    *(uint8_t *)(bp + 0x20E) = 0xFF;                   // type_of_loader = unknown (hdr+0x1D)
-    *(uint8_t *)(bp + 0x20F) |= 0x41;                   // loadflags: LOADED_HIGH | KEEP_SEGMENTS
+    // Patch boot_params fields.  All offsets below are boot_params-ABSOLUTE.
+    //
+    // struct setup_header begins at boot_params+0x1F1, so a field at
+    // setup_header offset X lives at bp + 0x1F1 + X.  The authoritative
+    // offsets were verified empirically against the bundled vmlinuz (read the
+    // file at 0x1F1 and check the values: setup_sects=0x27, 'HdrS' at 0x202,
+    // code32_start=0x100000 at 0x214, initrd_addr_max=0x7fffffff at 0x22C,
+    // xloadflags=0x3f at 0x236, init_size=0x22bd000 at 0x260 -- all consistent
+    // with the table below):
+    //
+    //   setup_header field   hdr off   boot_params off   bp +
+    //   type_of_loader        0x1F        0x210          0x210
+    //   loadflags             0x20        0x211          0x211
+    //   code32_start          0x23        0x214          0x214
+    //   ramdisk_image         0x27        0x218          0x218
+    //   ramdisk_size          0x2B        0x21C          0x21C
+    //   cmd_line_ptr          0x37        0x228          0x228
+    //
+    // NOTE: these were previously off by a few bytes each (0x212/0x20E/0x20F/
+    // 0x229/0x216/0x21A), so the decompressor read a garbage code32_start and
+    // bogus cmdline/initrd pointers.  That was the cause of the silent death
+    // right after the trampoline handed control to Linux: with the offsets
+    // corrected the same QEMU run goes from zero Linux output to a full boot
+    // (Linux 6.6.134 prints 25.7 KB of console log; E820/APIC/SMP/scheduler
+    // all come up).  Boot params offsets are load-bearing -- verify against a
+    // real bzImage rather than deriving them by hand.
+    *(uint32_t*)(bp + 0x214) = KEXEC_LINUX_LOAD;       // code32_start = entry (hdr+0x23)
+    *(uint8_t *)(bp + 0x210) = 0xFF;                   // type_of_loader = unknown (hdr+0x1F)
+    *(uint8_t *)(bp + 0x211) |= 0x41;                  // loadflags: LOADED_HIGH | KEEP_SEGMENTS
                                         // KEEP_SEGMENTS keeps startup_32 from reloading
                                         // DS/ES/SS with its own __BOOT_DS (0x18), which
                                         // would #GP against our 3-entry trampoline GDT.
-    *(uint32_t*)(bp + 0x229) = (uint32_t)KEXEC_CMDLINE; // cmd_line_ptr (hdr+0x38)
+    *(uint32_t*)(bp + 0x228) = (uint32_t)KEXEC_CMDLINE; // cmd_line_ptr (hdr+0x37)
 
     // Optional initrd.
     if (!noinitrd){
         unsigned char* initrd = (unsigned char*)KEXEC_INITRD;
         int initrd_size = linux_read_file_all("initrd.img", initrd, 32 * 1024 * 1024);
         if (initrd_size > 0){
-            *(uint32_t*)(bp + 0x216) = KEXEC_INITRD;           // ramdisk_image (hdr+0x25)
-            *(uint32_t*)(bp + 0x21A) = (uint32_t)initrd_size;  // ramdisk_size (hdr+0x29)
+            *(uint32_t*)(bp + 0x218) = KEXEC_INITRD;           // ramdisk_image (hdr+0x27)
+            *(uint32_t*)(bp + 0x21C) = (uint32_t)initrd_size;  // ramdisk_size (hdr+0x2B)
             serial_puts("[KEXEC] initrd @ ");
             serial_hex(KEXEC_INITRD);
             serial_puts(" size=");
