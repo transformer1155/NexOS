@@ -82,6 +82,21 @@ SECTIONS
         __bss_end = .;
     }
 
+    /* -----------------------------------------------------------------
+     *  Kernel heap must sit clear of live globals  (added 2026-09-19)
+     *
+     *  HEAP_START is a compile-time constant in kernel.cpp, so the linker
+     *  cannot read it; keep the 0x9A0000 below in sync with that source
+     *  file (and shrink HEAP_SIZE by the same amount so HEAP_END stays at
+     *  0x13F0000, below the RAM-SFS reserve at 0x1400000).  Linking the
+     *  plugin objects grew .bss past the old HEAP_START (0x900000) and the
+     *  heap began overwriting the kernel's own globals -- only a runtime
+     *  [HEAP] FATAL warned about it.  This ASSERT turns that into a build
+     *  failure instead.
+     * ----------------------------------------------------------------- */
+    ASSERT(__bss_end <= 0x9A0000,
+        "kernel .bss runs into HEAP_START (kernel.cpp) -- raise HEAP_START and shrink HEAP_SIZE by the same amount")
+
     /* =================================================================
      *  Boot-critical scratch region  (added 2026-08-19)
      * -----------------------------------------------------------------

@@ -2986,15 +2986,17 @@ constexpr uint32_t PAGE_SIZE       = 4096;
 constexpr uint32_t PAGE_SHIFT      = 12;
 constexpr uint32_t PMM_BASE_ADDR   = 0x100000;     // 1 MiB – managed start
 constexpr uint32_t PMM_MAX_PAGES   = 65536;        // 256 MB / 4 KiB
-// The relocated .bss lives at 0x120000 and now ends at 0x0087AE74 (verified
-// via i686-elf-readelf on kernel_textboot.elf: __bss_end = 0x0087AE74).  A
-// previous edit bumped HEAP_START to 0x500000, which sits INSIDE .bss and made
-// the 64-bit staging kmalloc overlap .bss -> "switch" aborted.  Start the heap
-// just past __bss_end and keep HEAP_END below the RAM-SFS reserve at 0x1400000
-// (and well clear of .lmboot @ 0x1800000).  The 64-bit staging buffer (720 KiB
-// kmalloc) therefore lands in 0x880000..0xF20000, clear of both.
-constexpr uint32_t HEAP_START      = 0x900000;     // 9 MiB (must stay > __bss_end; CLR globals enlarged .bss)
-constexpr uint32_t HEAP_SIZE       = 0xAF0000;     // ~11 MiB (HEAP_END = 0x13F0000 < RAM-SFS @ 0x1400000; must also hold the ~4 MiB GB2312 24x24 CJK bitmap)
+// The relocated .bss lives at 0x120000 and now ends at 0x009961E0 (verified via
+// nm on kernel.elf: __bss_end = 0x009961E0).  Linking the plugin objects grew
+// .bss substantially -- app_calculator's static SkillVM alone is ~530 KiB and
+// plugin_manager's service table ~68 KiB -- so HEAP_START had to move up to
+// 0x9A0000 to stay clear of live globals.  HEAP_SIZE was reduced by the same
+// amount to keep HEAP_END at 0x13F0000, just below the RAM-SFS reserve at
+// 0x1400000 (and well clear of .lmboot @ 0x1800000).  linker.ld now ASSERTs
+// HEAP_START > __bss_end so a future .bss growth fails the build instead of
+// silently producing a heap that overwrites the kernel's own globals.
+constexpr uint32_t HEAP_START      = 0x9A0000;     // 10 MiB (must stay > __bss_end; plugins grew .bss to 0x9961E0)
+constexpr uint32_t HEAP_SIZE       = 0xA50000;     // ~10.3 MiB (HEAP_END = 0x13F0000 < RAM-SFS @ 0x1400000; must also hold the ~4 MiB GB2312 24x24 CJK bitmap)
 constexpr uint32_t HEAP_END        = HEAP_START + HEAP_SIZE;
 
 // Page-table / PDE flags
