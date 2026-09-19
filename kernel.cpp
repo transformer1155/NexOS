@@ -5839,10 +5839,15 @@ static void cmd_skill(const char* args) {
     char fname[32];
     int ki = 0; const char* p = "src_"; while (*p && ki < 24) fname[ki++] = *p++;
     const char* n = args; while (*n && ki < 24) fname[ki++] = *n++;
-    /* ensure .skill suffix */
-    if (ki < 6 || fname[ki-6] != '.' || fname[ki-5] != 's' || fname[ki-4] != 'k' || fname[ki-3] != 'i' || fname[ki-2] != 'l') {
-        fname[ki++] = '.'; fname[ki++] = 's'; fname[ki++] = 'k'; fname[ki++] = 'i'; fname[ki++] = 'l';
+    /* ensure a .skill suffix (6 chars: '.' 's' 'k' 'i' 'l' 'l') */
+    if (ki < 6 || fname[ki-6] != '.' || fname[ki-5] != 's' || fname[ki-4] != 'k' || fname[ki-3] != 'i' || fname[ki-2] != 'l' || fname[ki-1] != 'l') {
+        fname[ki++] = '.'; fname[ki++] = 's'; fname[ki++] = 'k'; fname[ki++] = 'i'; fname[ki++] = 'l'; fname[ki++] = 'l';
     }
+    /* SFS stores names in a 20-byte field (FS_NAME_LEN), so anything longer is
+     * truncated on disk -- e.g. src_app_calculator.skill is packed as
+     * "src_app_calculator." and could never be opened by its full name.  Cap
+     * here so we look up exactly the name the packer wrote. */
+    if (ki > FS_NAME_LEN - 1) ki = FS_NAME_LEN - 1;
     fname[ki] = 0;
 
     if (!strcmp_(sub, "view") || !strcmp_(sub, "cat")) {
