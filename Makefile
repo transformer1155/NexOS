@@ -209,7 +209,8 @@ PLUGIN_SRCS := plugins/plugin_manager.cpp plugins/plugins_boot.cpp \
                plugins/wm_anim.cpp plugins/input_keyboard.cpp plugins/input_mouse.cpp \
                plugins/app_control_panel.cpp plugins/app_file_explorer.cpp \
                plugins/app_task_manager.cpp plugins/app_calculator.cpp \
-               plugins/app_terminal.cpp plugins/app_browser.cpp plugins/theme_default.cpp
+               plugins/app_terminal.cpp plugins/app_browser.cpp plugins/theme_default.cpp \
+               plugins/linux_loader.cpp
 # All plugin objects live flat under $(BUILD)/ (no subdirs) so no mkdir needed.
 PLUGIN_OBJS := $(BUILD)/plugin_manager.o $(BUILD)/plugins_boot.o $(BUILD)/hello_world.o \
                $(BUILD)/src_view.o $(BUILD)/gfx_core.o $(BUILD)/gfx_glass.o \
@@ -218,7 +219,8 @@ PLUGIN_OBJS := $(BUILD)/plugin_manager.o $(BUILD)/plugins_boot.o $(BUILD)/hello_
                $(BUILD)/input_mouse.o $(BUILD)/app_control_panel.o \
                $(BUILD)/app_file_explorer.o $(BUILD)/app_task_manager.o \
                $(BUILD)/app_calculator.o $(BUILD)/app_terminal.o \
-               $(BUILD)/app_browser.o $(BUILD)/theme_default.o
+               $(BUILD)/app_browser.o $(BUILD)/theme_default.o \
+               $(BUILD)/linux_loader.o
 
 # compile each plugin .cpp in place (header "plugin_manager.h" sits next to it)
 $(BUILD)/plugin_manager.o: plugins/plugin_manager.cpp plugins/plugin_manager.h | $(BUILD)
@@ -260,6 +262,8 @@ $(BUILD)/app_terminal.o: plugins/app_terminal.cpp plugins/plugin_manager.h | $(B
 $(BUILD)/app_browser.o: plugins/app_browser.cpp plugins/plugin_manager.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c $< -o $@
 $(BUILD)/theme_default.o: plugins/theme_default.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/linux_loader.o: plugins/linux_loader.cpp plugins/plugin_manager.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/gguf.o: gguf.cpp gguf.h | $(BUILD)

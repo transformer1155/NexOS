@@ -3540,7 +3540,11 @@ static void heap_init(){
     heap_free_count  = 0;
     heap_bytes_alloc = 0;
     heap_bytes_freed = 0;
-    serial_puts("[HEAP] Initialised: 14 MiB at 0x500000\n");
+    serial_puts("[HEAP] Initialised: ");
+    { char kb[16]; uint_to_str(HEAP_SIZE / 1024, kb); serial_puts(kb); }
+    serial_puts(" KiB at ");
+    serial_hex(HEAP_START);
+    serial_puts("\n");
 }
 
 extern "C" void* kmalloc(uint32_t size){
@@ -5822,6 +5826,8 @@ typedef int (*pm_svc_t)(void*, void*, int);
 extern "C" int      pm_call(const char* plugin, const char* method, void* args, void* out, int outcap);
 extern "C" pm_svc_t svc_lookup(const char* name);
 extern "C" int      pm_reload(const char* name);
+extern "C" int      pm_count(void);
+extern "C" const char* pm_name_at(int idx);
 static void cmd_plugin_mgr(const char* args);
 extern "C" int kern_fs_read(const char* name, unsigned char* buf, int bufsize);
 
@@ -5939,7 +5945,17 @@ static void cmd_plugin_mgr(const char* args){
     while (*args == ' ') args++;
 
     if (!strcmp_(sub, "list")) {
-        term.write("[PM] PluginManager registered (see serial boot log for 17 plugins)\n");
+        /* Enumerate the manager's actual registry instead of a hardcoded
+         * count, so this can never go stale as plugins are added. */
+        int n = pm_count();
+        term.write("[PM] "); term_write_int(n); term.write(" plugins registered:\n");
+        for (int i = 0; i < n; i++) {
+            const char* nm = pm_name_at(i);
+            if (!nm) continue;
+            term.write("      ");
+            term.write(nm);
+            term.put_char('\n');
+        }
         term.write("      use `plugin pm call gfx_core fill_rect` to test a service\n");
         return;
     }
@@ -7278,42 +7294,105 @@ extern "C" void kexec_enter(uint32_t entry, uint32_t bp){
     );
 }
 
-// `linuxboot [noinitrd]` -- chain-load the Linux bzImage ("vmlinuz") and
-// optionally "initrd.img", both bundled in the SFS volume, as a second kernel.
-static void cmd_linuxboot(const char* args){
-    while (*args == ' ') args++;
-    bool noinitrd = startswith_(args, "noinitrd");
+// ---------------------------------------------------------------------
+//  Kernel primitives for the linux_loader plugin.
+//
+//  The plugin owns the policy (which files, whether an initrd is wanted,
+//  extra kernel parameters); these three functions own the mechanism so
+//  there is exactly ONE implementation of the bzImage parse + trampoline,
+//  shared by the `linuxboot` shell command and the plugin service.
+// ---------------------------------------------------------------------
+
+/* Can Linux's 32-bit entry be entered right now?  It requires protected
+ * mode with paging OFF; in long mode the trampoline cannot comply. */
+extern "C" int kern_linux_can_boot(void){
+    return vmm_long_mode ? 0 : 1;
+}
+
+/* The default kernel command line (serial console so the guest log lands in
+ * the same -serial stream, no ACPI/APIC so it does not fight our PIC setup). */
+extern "C" const char* kern_linux_default_cmdline(void){
+    return "console=ttyS0,115200n8 "
+           "earlycon=uart8250,io,0x3f8,115200 "
+           "ignore_loglevel loglevel=8 "
+           "acpi=off maxcpus=1 noapic "
+           "nokaslr";
+}
+
+/* Probe for vmlinuz/initrd.img without booting.
+ *   vmlinuz_size : >0 when a valid bzImage is present (the value is the
+ *                  number of header bytes actually inspected, NOT the file
+ *                  size -- see the note below), -1 when absent/not a bzImage
+ *   initrd_size  : >0 when present, -1 when absent
+ *   can_boot     : 1 when Linux's 32-bit entry can be entered right now
+ *   is_long_mode : 1 when the CPU is in 64-bit long mode
+ * Always returns 0.
+ *
+ * NOTE ON THE SIZE: SFS/MKFS read() caps the copy at the caller's buffer and
+ * returns the TRUNCATED length, so a small probe buffer cannot report the
+ * real file size.  Loading the whole 16 MiB image just to print a number
+ * would defeat the point of a probe, so this reports presence and lets
+ * kern_linux_boot() log the true size (it has the full buffer anyway). */
+extern "C" int kern_linux_probe(int* vmlinuz_size, int* initrd_size,
+                                int* can_boot, int* is_long_mode){
+    if (vmlinuz_size) *vmlinuz_size = 0;
+    if (initrd_size)  *initrd_size  = 0;
+    if (can_boot)     *can_boot     = kern_linux_can_boot();
+    if (is_long_mode) *is_long_mode = vmm_long_mode ? 1 : 0;
+
+    /* Read only the setup header and look for the "HdrS" magic at 0x202, so
+     * the probe costs one sector read instead of a 16 MiB copy. */
+    if (vmlinuz_size){
+        static uint8_t hdr[0x210];
+        int n = linux_read_file_all("vmlinuz", hdr, (int)sizeof(hdr));
+        if (n < 0x206) *vmlinuz_size = -1;          /* absent or too short  */
+        else if (hdr[0x202] != 'H' || hdr[0x203] != 'd' ||
+                 hdr[0x204] != 'r' || hdr[0x205] != 'S') *vmlinuz_size = -1;
+        else *vmlinuz_size = n;                     /* present + valid      */
+    }
+    if (initrd_size){
+        static uint8_t ih[4];
+        int n = linux_read_file_all("initrd.img", ih, (int)sizeof(ih));
+        *initrd_size = (n > 0) ? n : -1;
+    }
+    return 0;
+}
+
+/* Chain-load a Linux bzImage.  Shared by the `linuxboot` shell command and
+ * the linux_loader plugin's `linux.boot` service (via pm_call), so the
+ * bzImage parse + trampoline has exactly one implementation.
+ *   cmdline_extra : appended to the default command line (may be null/empty)
+ *   skip_initrd   : non-zero to ignore initrd.img even when present
+ * Returns 0 if the handoff was refused; never returns on success. */
+extern "C" int kern_linux_boot(const char* cmdline_extra, int skip_initrd){
+    bool noinitrd = skip_initrd ? true : false;
 
     if (vmm_long_mode){
-        term.set_color(make_color(RED, BLACK));
-        term.write("linuxboot requires 32-bit mode (BIOS path).\n");
-        term.write("Switch back from long mode before chain-loading Linux.\n");
-        return;
+        serial_puts("[KEXEC] refused: requires 32-bit mode (BIOS path)\n");
+        return -1;
     }
-    term.set_color(make_color(CYAN, BLACK));
-    term.write("Dual-kernel boot: loading Linux bzImage (vmlinuz)...\n");
     serial_puts("[KEXEC] loading vmlinuz from SFS\n");
 
     unsigned char* raw = (unsigned char*)KEXEC_VMLINUZ_RAW;
     int vmlen = linux_read_file_all("vmlinuz", raw, 16 * 1024 * 1024);
-    if (vmlen <= 0){ term.set_color(make_color(RED, BLACK));
-                     term.write("ERROR: cannot load vmlinuz from SFS\n"); return; }
+    if (vmlen <= 0){ serial_puts("[KEXEC] ERROR: cannot load vmlinuz from SFS\n"); return -1; }
     serial_puts("[KEXEC] vmlinuz loaded bytes=");
     serial_hex((uint32_t)vmlen); serial_puts("\n");
 
     // Sanity-check the bzImage header magic ("HdrS" at file offset 0x202).
     if (raw[0x202] != 'H' || raw[0x203] != 'd' ||
         raw[0x204] != 'r' || raw[0x205] != 'S'){
-        term.set_color(make_color(RED, BLACK));
-        term.write("ERROR: vmlinuz is not a bzImage (HdrS magic missing)\n");
-        return;
+        serial_puts("[KEXEC] ERROR: vmlinuz is not a bzImage (HdrS missing)\n");
+        return -1;
     }
     int setup_sects = raw[0x1F1];
     if (setup_sects == 0) setup_sects = 4;            // legacy default
     int rmsize    = (setup_sects + 1) * 512;          // real-mode part size
     int prot_size = vmlen - rmsize;                   // protected-mode part
-    if (prot_size <= 0){ term.set_color(make_color(RED, BLACK));
-                         term.write("ERROR: bad bzImage size\n"); return; }
+    if (prot_size <= 0){
+        serial_puts("[KEXEC] ERROR: bad bzImage size\n");
+        return -1;
+    }
 
     // Build boot_params (zero page).  The real-mode part of the bzImage IS a
     // valid boot_params structure (hdr at offset 0x1F1, plus screen_info/apm
@@ -7333,16 +7412,19 @@ static void cmd_linuxboot(const char* args){
     serial_hex((uint32_t)prot_size);
     serial_puts("\n");
 
-    // Command line (Linux parses this via cmd_line_ptr).
+    // Command line (Linux parses this via cmd_line_ptr).  Start from the
+    // shared default, then append whatever the caller asked for.
     char* cmd = (char*)KEXEC_CMDLINE;
-    const char* cl = "console=ttyS0,115200n8 "
-                     "earlycon=uart8250,io,0x3f8,115200 "
-                     "ignore_loglevel loglevel=8 "
-                     "acpi=off maxcpus=1 noapic "
-                     "nokaslr";
+    const char* cl = kern_linux_default_cmdline();
     int cli = 0;
-    while (cl[cli]){ cmd[cli] = cl[cli]; cli++; }
+    while (cl[cli] && cli < 1024){ cmd[cli] = cl[cli]; cli++; }
+    if (cmdline_extra && *cmdline_extra && cli < 1020){
+        cmd[cli++] = ' ';
+        const char* x = cmdline_extra;
+        while (*x && cli < 1020) cmd[cli++] = *x++;
+    }
     cmd[cli] = 0;
+    serial_puts("[KEXEC] cmdline: "); serial_puts(cmd); serial_puts("\n");
 
     // Patch boot_params fields.  Offsets are boot_params-absolute (the setup
     // header lives at 0x1F1, so a setup_header field at hdr offset X is at
@@ -7383,11 +7465,36 @@ static void cmd_linuxboot(const char* args){
     serial_puts("  boot_params @ ");
     serial_hex(KEXEC_BP);
     serial_puts("\n");
-    term.write("Handing control to the Linux kernel (kexec)...\n");
     serial_puts("[KEXEC] --- transfer to Linux ---\n");
 
     kexec_enter(KEXEC_LINUX_LOAD, KEXEC_BP);
-    // never returns
+    return 0;   // unreachable: the CPU is running Linux now
+}
+
+/* `linuxboot [noinitrd] [extra kernel params...]` -- shell front end for the
+ * shared chain-loader above.  The linux_loader plugin reaches the same code
+ * through its `linux.boot` service, so both paths stay in sync. */
+static void cmd_linuxboot(const char* args){
+    while (*args == ' ') args++;
+    bool noinitrd = startswith_(args, "noinitrd");
+    if (noinitrd) { while (*args && *args != ' ') args++; while (*args == ' ') args++; }
+
+    if (vmm_long_mode){
+        term.set_color(make_color(RED, BLACK));
+        term.write("linuxboot requires 32-bit mode (BIOS path).\n");
+        term.write("Switch back from long mode before chain-loading Linux.\n");
+        return;
+    }
+    term.set_color(make_color(CYAN, BLACK));
+    term.write("Dual-kernel boot: loading Linux bzImage (vmlinuz)...\n");
+    term.write("Handing control to the Linux kernel (kexec)...\n");
+
+    int r = kern_linux_boot(args, noinitrd ? 1 : 0);
+    if (r != 0){
+        term.set_color(make_color(RED, BLACK));
+        term.write("ERROR: Linux handoff refused (see serial log)\n");
+        term.set_color(make_color(WHITE, BLACK));
+    }
 }
 
 // ---------------------------------------------------------------------

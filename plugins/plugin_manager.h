@@ -67,6 +67,8 @@ int  pm_resolve(void);                    /* topo-sort deps, detect cycles    */
 int  pm_load_all(void);                   /* init() in dependency order       */
 void pm_unload_all(void);                 /* exit() in reverse order          */
 const Plugin* pm_find(const char* name);  /* find a registered plugin         */
+int  pm_count(void);                      /* number of registered plugins     */
+const char* pm_name_at(int idx);          /* name of plugin idx, or nullptr   */
 int  pm_call(const char* plugin, const char* method,
              void* args, void* out, int outcap);
 

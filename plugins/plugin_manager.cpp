@@ -137,6 +137,18 @@ const Plugin* pm_find(const char* name) {
     return i >= 0 ? g_plugins[i] : nullptr;
 }
 
+/* Introspection for the shell's `plugin pm list`: enumerate what is actually
+ * registered instead of printing a number that goes stale every time a plugin
+ * is added.  Both return 0/nullptr for an out-of-range index. */
+int pm_count(void) {
+    return g_nplugins;
+}
+
+const char* pm_name_at(int idx) {
+    if (idx < 0 || idx >= g_nplugins) return nullptr;
+    return g_plugins[idx] ? g_plugins[idx]->name : nullptr;
+}
+
 /* DFS topological sort: dependencies first. Detects cycles (gray back-edge). */
 static int dfs(int u) {
     g_color[u] = 1;                 /* gray: in progress */
