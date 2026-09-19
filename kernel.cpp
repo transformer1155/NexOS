@@ -7231,6 +7231,16 @@ static void cmd_linux(const char* args){
 // 2C F0 3A 8B 5C A5 6E 06, a valid gzip stream), so the data handed to the
 // kernel is correct and the failure is downstream of the load.
 #define KEXEC_LINUX_LOAD   0x04000000u   // protected-mode kernel image (64 MiB)
+// The initrd sits at 0x07000000: 13580 KB clear of the kernel's init_size
+// window (0x04000000+0x022BD000), which matters because the decompressed
+// vmlinux is 34.1 MB and the decompressor relocates itself upward as it grows.
+//
+// Tried 0x02000000 too (7364 KB margin, bit 26 clear) to test whether the
+// initramfs "uncompression error" depends on the start value: it does not.
+// The kernel's stored initrd_start changed (0x02000000 vs 0x07000000) but the
+// adjacent slot stayed 0x018CF000 in both runs, so that slot is NOT
+// initrd_start+size and the address is not the trigger.  0x07000000 is kept
+// because its margin past init_size is nearly twice as large.
 #define KEXEC_INITRD       0x07000000u   // initrd (112 MiB)
 #define KEXEC_VMLINUZ_RAW  0x09000000u   // raw bzImage buffer (144 MiB)
 #define KEXEC_BP           0x0A000000u   // boot_params / zero page (160 MiB)
