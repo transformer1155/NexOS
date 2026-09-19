@@ -1,0 +1,17 @@
+// ============================================================
+// src/font_bitmap.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// font_bitmap.skill - bitmap glyph blit
+int font8x16_base = 0x3000;
+void draw_char_bmp(int x, int y, int ch, int fg) {
+    int row = 0;
+    while (row < 16) {
+        int bit = 0;
+        while (bit < 8) {
+            if ((font8x16_base + row) & (1 << bit)) put_pixel(x + bit, y + row, fg);
+            bit = bit + 1;
+        }
+        row = row + 1;
+    }
+}

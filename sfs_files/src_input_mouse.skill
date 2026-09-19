@@ -1,0 +1,8 @@
+// ============================================================
+// src/input_mouse.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// input_mouse.skill - mouse handlers
+void handle_mouse_down(int x, int y) { create_window(x, y, 400, 300); }
+void handle_mouse_move(int x, int y) { }
+void handle_mouse_wheel(int d) { }

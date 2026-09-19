@@ -1,0 +1,9 @@
+{
+  "name": "input_mouse",
+  "version": "1.0",
+  "provides": ["input.handle_mouse_down","input.handle_mouse_move","input.handle_mouse_wheel"],
+  "requires": ["wm_core"],
+  "entry": "g_input_mouse",
+  "author": "NexOS",
+  "desc": "Phase 2 plugin module (facade over gui.cpp)"
+}

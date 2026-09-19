@@ -1,0 +1,9 @@
+{
+  "name": "app_calculator",
+  "version": "1.0",
+  "provides": ["app.calculator"],
+  "requires": ["wm_core"],
+  "entry": "g_app_calculator",
+  "author": "NexOS",
+  "desc": "Phase 2 plugin module (facade over gui.cpp)"
+}

@@ -1,0 +1,8 @@
+// ============================================================
+// src/wm_core.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// wm_core.skill - window management
+int g_win_count = 0;
+void create_window(int x, int y, int w, int h) { g_win_count = g_win_count + 1; }
+void draw_window(int id, int x, int y, int w, int h) { fill_rect(x, y, w, h, 0x2B2B2B); }

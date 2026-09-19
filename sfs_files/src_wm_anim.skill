@@ -1,0 +1,14 @@
+// ============================================================
+// src/wm_anim.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// wm_anim.skill - easing
+int ease_out_cubic(int p) {
+    int c = 256 - p;
+    return 256 - (c * c * c) / (256 * 256);
+}
+int ease_in_out_cubic(int p) {
+    if (p < 128) return (p * p * 4) / 256;
+    int c = 256 - p; return 256 - (c * c * 4) / 256;
+}
+int anim_state = 0;

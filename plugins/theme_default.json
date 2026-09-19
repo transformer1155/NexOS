@@ -1,0 +1,9 @@
+{
+  "name": "theme_default",
+  "version": "1.0",
+  "provides": ["theme.colors"],
+  "requires": [],
+  "entry": "g_theme_default",
+  "author": "NexOS",
+  "desc": "Phase 2 plugin module (facade over gui.cpp)"
+}

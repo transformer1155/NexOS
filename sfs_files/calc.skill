@@ -1,0 +1,16 @@
+// calc.skill - Phase 5 reloadable calculator.  SFS name: calc.skill
+// func 0 is `calc(a, b, op)`; op: 0=add 1=sub 2=mul 3=div.
+// After `plugin pm reload app_calculator`, calls run this bytecode instead of
+// the built-in switch, so editing this file changes the calculator live.
+int calc(int a, int b, int op) {
+    if (op == 0) return a + b;
+    if (op == 1) return a - b;
+    if (op == 2) return a * b;
+    if (op == 3) return a / b;
+    return 0;
+}
+
+int main() {
+    int r = calc(2, 3, 0);
+    return r;
+}

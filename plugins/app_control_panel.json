@@ -1,0 +1,9 @@
+{
+  "name": "app_control_panel",
+  "version": "1.0",
+  "provides": ["app.control_panel"],
+  "requires": ["wm_core"],
+  "entry": "g_app_control_panel",
+  "author": "NexOS",
+  "desc": "Phase 2 plugin module (facade over gui.cpp)"
+}

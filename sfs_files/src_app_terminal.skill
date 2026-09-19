@@ -1,0 +1,6 @@
+// ============================================================
+// src/app_terminal.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// app_terminal.skill
+void app_terminal() { create_window(40, 40, 640, 400); }

@@ -1,0 +1,24 @@
+// theme_default.skill - Phase 5 hot-swap target.  SFS name: theme_default.skill
+// Declares the 16 window palette entries as globals c0..c15 IN ORDER, so a
+// `plugin pm reload theme_default` copies globals[0..15] straight into the
+// plugin's runtime palette.  Edit a hex value, save to MKFS, reload -> live.
+int c0  = 0x1F1F1F;
+int c1  = 0x2B2B2B;
+int c2  = 0x323232;
+int c3  = 0x0078D4;
+int c4  = 0x0E639C;
+int c5  = 0x1E1E1E;
+int c6  = 0xF3F3F3;
+int c7  = 0xFFFFFF;
+int c8  = 0xCCCCCC;
+int c9  = 0x888888;
+int c10 = 0x2D2D2D;
+int c11 = 0x3A3A3A;
+int c12 = 0x005A9E;
+int c13 = 0x2D7D46;
+int c14 = 0xC50F1F;
+int c15 = 0xE8A33D;
+
+void main() {
+    // palette is already materialised from the global initialisers
+}

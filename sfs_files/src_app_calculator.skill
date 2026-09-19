@@ -1,0 +1,16 @@
+// ============================================================
+// src/app_calculator.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// app_calculator.skill - Phase 4 demo target
+int calc(int a, int b, int op) {
+    if (op == 0) return a + b;
+    if (op == 1) return a - b;
+    if (op == 2) return a * b;
+    if (op == 3) return a / b;
+    return 0;
+}
+int main() {
+    int r = calc(2, 3, 0);
+    return r;
+}

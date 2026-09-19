@@ -1,0 +1,2 @@
+// undef.skill - must FAIL to compile: call to an undefined function.
+int main() { return nosuchfn(1); }

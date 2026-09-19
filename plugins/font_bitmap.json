@@ -1,0 +1,9 @@
+{
+  "name": "font_bitmap",
+  "version": "1.0",
+  "provides": ["font.draw_char_bmp"],
+  "requires": [],
+  "entry": "g_font_bitmap",
+  "author": "NexOS",
+  "desc": "Phase 2 plugin module (facade over gui.cpp)"
+}

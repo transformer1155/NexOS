@@ -1,0 +1,9 @@
+{
+  "name": "wm_anim",
+  "version": "1.0",
+  "provides": ["wm.ease_out_cubic","wm.ease_in_out_cubic","wm.anim_state"],
+  "requires": ["wm_core"],
+  "entry": "g_wm_anim",
+  "author": "NexOS",
+  "desc": "Phase 2 plugin module (facade over gui.cpp)"
+}

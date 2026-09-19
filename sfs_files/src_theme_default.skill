@@ -1,0 +1,11 @@
+// ============================================================
+// src/theme_default.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// theme_default.skill - colour constants (Phase 5 hot-swap target)
+int C_BG        = 0x1F1F1F;
+int C_PANEL     = 0x2B2B2B;
+int C_ACCENT    = 0x0078D4;
+int C_TEXT      = 0xF3F3F3;
+int C_BORDER    = 0x323232;
+int C_STARTMENU = 0x2D2D2D;

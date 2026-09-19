@@ -1,0 +1,6 @@
+// ============================================================
+// src/app_file_explorer.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// app_file_explorer.skill
+void app_file_explorer() { create_window(40, 40, 600, 400); }

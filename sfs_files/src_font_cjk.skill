@@ -1,0 +1,9 @@
+// ============================================================
+// src/font_cjk.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// font_cjk.skill - CJK drawing
+int draw_cjk(int x, int y, int cp, int fg, int bg) {
+    if (vec_ready()) { draw_char_bmp(x, y, cp, fg); return 16; }
+    return 16;
+}

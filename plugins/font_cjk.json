@@ -1,0 +1,9 @@
+{
+  "name": "font_cjk",
+  "version": "1.0",
+  "provides": ["font.draw_cjk"],
+  "requires": ["font_bitmap","font_vector"],
+  "entry": "g_font_cjk",
+  "author": "NexOS",
+  "desc": "Phase 2 plugin module (facade over gui.cpp)"
+}

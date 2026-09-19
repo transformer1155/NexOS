@@ -1,0 +1,21 @@
+// ============================================================
+// src/gfx_core.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// gfx_core.skill - graphics primitives (C++ subset)
+int g_width = 1024;
+int g_height = 768;
+int g_backbuffer[1024 * 768];
+void put_pixel(int x, int y, int c) {
+    if (x < 0 || y < 0 || x >= g_width || y >= g_height) return;
+    g_backbuffer[y * g_width + x] = c;
+}
+void fill_rect(int x, int y, int w, int h, int c) {
+    int j = 0;
+    while (j < h) {
+        int i = 0;
+        while (i < w) { put_pixel(x + i, y + j, c); i = i + 1; }
+        j = j + 1;
+    }
+}
+int main() { fill_rect(0, 0, g_width, g_height, 0x1F1F1F); return 0; }

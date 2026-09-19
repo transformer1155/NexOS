@@ -1,0 +1,6 @@
+// ============================================================
+// src/app_browser.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// app_browser.skill
+void app_browser() { create_window(40, 40, 800, 500); }

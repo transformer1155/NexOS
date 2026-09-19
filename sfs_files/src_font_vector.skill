@@ -1,0 +1,8 @@
+// ============================================================
+// src/font_vector.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// font_vector.skill - vector glyph stub
+int vec_ready() { return 1; }
+int vec_glyph(int cp, int px, int w, int h) { w = px; h = px; return 0; }
+int vec_advance(int cp, int px) { return px; }

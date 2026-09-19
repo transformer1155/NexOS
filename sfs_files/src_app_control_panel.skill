@@ -1,0 +1,6 @@
+// ============================================================
+// src/app_control_panel.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// app_control_panel.skill
+void app_control_panel() { create_window(40, 40, 500, 400); }

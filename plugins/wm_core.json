@@ -1,0 +1,9 @@
+{
+  "name": "wm_core",
+  "version": "1.0",
+  "provides": ["wm.create_window","wm.draw_window"],
+  "requires": ["gfx_core","font_cjk"],
+  "entry": "g_wm_core",
+  "author": "NexOS",
+  "desc": "Phase 2 plugin module (facade over gui.cpp)"
+}

@@ -1,0 +1,25 @@
+// p4test.skill - Phase 4 verification: structs, string literals, calls.
+// Exercises the three defects skillc was fixed for:
+//   1. struct member offsets (previously always 0)
+//   2. string literals (previously compiled to 0)
+//   3. calls to undefined functions (previously a 0xFFFF sentinel)
+struct Point {
+    int x, y;
+}
+
+Point p;
+int g_tag = 7;
+
+int add(int a, int b) { return a + b; }
+
+int main() {
+    // struct field access -> distinct global slots (base + field index)
+    p.x = 11;
+    p.y = 22;
+    // string literal -> address into mem[] (NBC_STR_BASE)
+    int msg = "hello";
+    // call a defined function
+    int s = add(3, 4);
+    g_tag = s;
+    return s;
+}

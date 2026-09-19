@@ -1,0 +1,15 @@
+// ============================================================
+// src/gfx_glass.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// gfx_glass.skill - frosted glass
+void glass_rounded_rect(int x, int y, int w, int h, int r, int c, int a) {
+    if (a <= 0) return;
+    fill_rect(x, y, w, h, c);
+}
+void glass_rect(int x, int y, int w, int h, int c, int a) {
+    glass_rounded_rect(x, y, w, h, 0, c, a);
+}
+void glow_ellipse(int cx, int cy, int rx, int ry, int c) {
+    fill_rect(cx - rx, cy - ry, rx * 2, ry * 2, c);
+}

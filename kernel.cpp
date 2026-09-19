@@ -5821,6 +5821,47 @@ extern "C" int      pm_call(const char* plugin, const char* method, void* args, 
 extern "C" pm_svc_t svc_lookup(const char* name);
 extern "C" int      pm_reload(const char* name);
 static void cmd_plugin_mgr(const char* args);
+extern "C" int kern_fs_read(const char* name, unsigned char* buf, int bufsize);
+
+/* Phase 3: view / edit / save plugin .skill source inside NexOS.
+ * `skill view <name>` prints src_<name>.skill (from SFS or MKFS).
+ * `skill edit <name>` shows it then drops into the existing line-input write
+ * mode (MODE_WRITE) targeting that .skill file, so replacement lines are saved
+ * to the writable MKFS data disk on a blank line.  gui.cpp is untouched. */
+static void cmd_skill(const char* args) {
+    if (!*args) { term.write("Usage: skill view <name> | skill edit <name>\n"); return; }
+    char sub[8]; int si = 0;
+    while (*args && *args != ' ' && si < 7) sub[si++] = *args++;
+    sub[si] = 0; while (*args == ' ') args++;
+
+    char fname[32];
+    int ki = 0; const char* p = "src_"; while (*p && ki < 24) fname[ki++] = *p++;
+    const char* n = args; while (*n && ki < 24) fname[ki++] = *n++;
+    /* ensure .skill suffix */
+    if (ki < 6 || fname[ki-6] != '.' || fname[ki-5] != 's' || fname[ki-4] != 'k' || fname[ki-3] != 'i' || fname[ki-2] != 'l') {
+        fname[ki++] = '.'; fname[ki++] = 's'; fname[ki++] = 'k'; fname[ki++] = 'i'; fname[ki++] = 'l';
+    }
+    fname[ki] = 0;
+
+    if (!strcmp_(sub, "view") || !strcmp_(sub, "cat")) {
+        unsigned char buf[8192];
+        int nn = kern_fs_read(fname, buf, (int)sizeof(buf));
+        if (nn < 0) { term.write("Not found: "); term.write(fname); term.put_char('\n'); return; }
+        term.write("--- "); term.write(fname); term.write(" ("); term_write_int(nn); term.write(" bytes) ---\n");
+        for (int i = 0; i < nn; i++) term.put_char((char)buf[i]);
+        term.write("\n--- end ---\n");
+    } else if (!strcmp_(sub, "edit")) {
+        unsigned char buf[8192];
+        int nn = kern_fs_read(fname, buf, (int)sizeof(buf));
+        if (nn >= 0) { term.write("--- current "); term.write(fname); term.write(" ---\n"); for (int i = 0; i < nn; i++) term.put_char((char)buf[i]); term.write("\n"); }
+        else term.write("(new file)\n");
+        int i = 0; while (fname[i] && i < FS_NAME_LEN - 1) { g_write_name[i] = fname[i]; i++; } g_write_name[i] = 0;
+        g_write_len = 0; g_mode = MODE_WRITE;
+        term.write("Enter replacement lines (empty line to save, max 8KB):\n");
+    } else {
+        term.write("Usage: skill view <name> | skill edit <name>\n");
+    }
+}
 
 static void cmd_plugin(const char* args){
     if (!g_plugin_inited) { ai_plugin_init(); g_plugin_inited = true; }
@@ -7729,6 +7770,7 @@ static void run_command(const char* line){
     else if(!strcmp_(cmd,"disk"))  cmd_disk(args);
     // Script execution
     else if(!strcmp_(cmd,"run"))   cmd_run(args);
+    else if(!strcmp_(cmd,"skill")) cmd_skill(args);
     else if(!strcmp_(cmd,"runfs")) cmd_runfs(args);
     // Win32 subsystem
     else if(!strcmp_(cmd,"winapp")||!strcmp_(cmd,"start")) cmd_winapp(args);

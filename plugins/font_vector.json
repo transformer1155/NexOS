@@ -1,0 +1,9 @@
+{
+  "name": "font_vector",
+  "version": "1.0",
+  "provides": ["font.vec_glyph","font.vec_advance","font.vec_ready"],
+  "requires": [],
+  "entry": "g_font_vector",
+  "author": "NexOS",
+  "desc": "Phase 2 plugin module (facade over gui.cpp)"
+}

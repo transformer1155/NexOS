@@ -1,0 +1,9 @@
+{
+  "name": "input_keyboard",
+  "version": "1.0",
+  "provides": ["input.handle_key"],
+  "requires": ["wm_core"],
+  "entry": "g_input_keyboard",
+  "author": "NexOS",
+  "desc": "Phase 2 plugin module (facade over gui.cpp)"
+}

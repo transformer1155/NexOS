@@ -1,0 +1,9 @@
+{
+  "name": "gfx_core",
+  "version": "1.0",
+  "provides": ["gfx.put_pixel","gfx.fill_rect","gfx.draw_rect","gfx.draw_line","gfx.blend_pixel"],
+  "requires": [],
+  "entry": "g_gfx_core",
+  "author": "NexOS",
+  "desc": "Phase 2 plugin module (facade over gui.cpp)"
+}

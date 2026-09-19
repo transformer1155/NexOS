@@ -1,0 +1,6 @@
+// ============================================================
+// src/input_keyboard.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// input_keyboard.skill - key handler
+void handle_key(int ch) { if (ch == 27) anim_state = 0; }

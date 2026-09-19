@@ -1,0 +1,6 @@
+// ============================================================
+// src/app_task_manager.skill  (NexOS plugin source, C++ subset)
+// ============================================================
+
+// app_task_manager.skill
+void app_task_manager() { create_window(40, 40, 500, 300); }

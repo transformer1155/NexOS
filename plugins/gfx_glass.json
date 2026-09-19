@@ -1,0 +1,9 @@
+{
+  "name": "gfx_glass",
+  "version": "1.0",
+  "provides": ["gfx.glass_rounded_rect","gfx.glass_rect","gfx.glow_ellipse"],
+  "requires": ["gfx_core"],
+  "entry": "g_gfx_glass",
+  "author": "NexOS",
+  "desc": "Phase 2 plugin module (facade over gui.cpp)"
+}
