@@ -109,7 +109,7 @@ constexpr int MANAGED_TASKBAR_H = 48;
 
 // =====================================================================
 //  Remote-control security guard  (kernel-native -- no Python dependency)
-//  Full-screen "NexOS 安全卫士" overlay shown whenever a command arrives
+//  Full-screen "NexOS 瀹夊叏鍗＋" overlay shown whenever a command arrives
 //  over a remote channel (COM1 bridge / SSH).  State + forward decls live
 //  here (file scope, before the Win11Desktop class) so class methods such
 //  as render_all() and handle_mouse_down() can reach them.
@@ -398,7 +398,7 @@ static bool bga_detect(void) {
 static bool g_bga_available = false;  // true if Bochs VBE ports detected
 
 // =====================================================================
-//  Pinyin IME (中文输入法)
+//  Pinyin IME (涓枃杈撳叆娉?
 //  Global state bound to the active Terminal window. Typing a-z composes
 //  pinyin; digits pick a candidate; space picks #1; ESC cancels.
 // =====================================================================
@@ -407,7 +407,7 @@ static int    g_ime_len = 0;
 static bool   g_ime_active = false;
 static int    g_ime_cands[9];       // candidate unicode codepoints
 static int    g_ime_cand_count = 0;
-static bool   g_ime_cn = false;     // language mode: true=中文, false=英文
+static bool   g_ime_cn = false;     // language mode: true=涓枃, false=鑻辨枃
 
 static void ime_reset(){
     g_ime_len = 0;
@@ -589,22 +589,22 @@ constexpr Color C_ACCENT_LIGHT = 0x5AA9F0;  // Light blue hover
 constexpr Color C_ACCENT_DARK  = 0x1B5FB0;  // Dark blue pressed
 constexpr Color C_ACCENT_ORANGE = 0xFF8C00; // Orange accent for start menu icon
 
-// Aero frosted-glass material constants (Windows 7 "毛玻璃")
+// Aero frosted-glass material constants (Windows 7 "姣涚幓鐠?)
 constexpr Color C_GLASS_TINT        = 0xF2F6FB;  // neutral window glass (light frost)
 constexpr Color C_GLASS_TINT_ACT    = 0xD4E7F8;  // active window: accent-tinted glass
-constexpr int   C_GLASS_ALPHA       = 180;       // body glass opacity (lower = more blur shows)
+constexpr int   C_GLASS_ALPHA       = 140;       // body glass opacity (lower = more backdrop shows)
 constexpr int   C_GLASS_BLUR_R      = 6;         // frosted-glass blur radius (px)
 // Iterations of the separable box blur.  A single box pass looks blocky/boxy;
 // repeating it 2-3 times converges to a Gaussian, which is what makes acrylic
-// look smooth ("丝滑").  2 passes is the quality/perf sweet spot under TCG.
+// look smooth ("涓濇粦").  2 passes is the quality/perf sweet spot under TCG.
 constexpr int   C_GLASS_BLUR_PASSES = 2;
-constexpr int   C_GLASS_TITLE_ALPHA = 200;       // extra title-band opacity
+constexpr int   C_GLASS_TITLE_ALPHA = 110;       // extra title-band opacity (kept near body so it stays clearly translucent)
 constexpr Color C_GLASS_EDGE        = 0xFFFFFF;  // 1px top glass highlight
 constexpr int   C_GLASS_EDGE_ALPHA  = 60;
 constexpr Color C_GLASS_GLOW        = 0x2A82DA;  // active-window accent glow
 constexpr int   C_GLASS_GLOW_ALPHA  = 38;
 
-// Desktop wallpaper — deep dark Mica gradient with a soft accent bloom
+// Desktop wallpaper 鈥?deep dark Mica gradient with a soft accent bloom
 constexpr Color C_WALLPAPER_TOP    = 0x0B0F16;  // Near-black navy
 constexpr Color C_WALLPAPER_BOT    = 0x16202E;  // Dark slate
 constexpr Color C_WALLPAPER_GLOW    = 0x1E3A5F; // Accent bloom focal
@@ -635,6 +635,21 @@ constexpr Color C_WIN_BORDER_ACT   = 0x0067C0;  // Active border = accent
 constexpr Color C_WIN_SHADOW       = 0x80000000;
 constexpr Color C_WIN_TEXT         = 0x1A1A1A;
 constexpr Color C_WIN_TEXT_SEC     = 0x616161;
+
+// Phase 5: window colours can be supplied by the theme_default plugin through
+// the service registry, so `plugin pm reload theme_default` recolours the
+// desktop live.  When the plugin is absent (or returns nothing) we fall back to
+// the compile-time constants, so GUI behaviour is unchanged by default.
+typedef int (*nexos_colors_fn)(void*, void*, int);
+extern "C" nexos_colors_fn svc_lookup(const char* name);
+static Color theme_color(int idx, Color fallback) {
+    nexos_colors_fn f = svc_lookup("theme.colors");
+    if (!f) return fallback;
+    const uint32_t* pal = 0;
+    int n = f(0, (void*)&pal, (int)sizeof(pal));
+    if (!pal || n <= idx || idx < 0) return fallback;
+    return (Color)pal[idx];
+}
 
 // Buttons
 constexpr Color C_BTN_BG           = 0xF5F5F5;
@@ -1211,6 +1226,18 @@ static inline void dirty_add(int x, int y, int w, int h) {
 // is detected automatically without touching every call site.
 static bool g_desk_needs_full = true;   // first frame must paint the desktop
 static uint32_t g_desk_sig = 0;
+// Throttle for the continuous "repaint every frame" pattern.  The animated AI
+// desktop calls gui_invalidate_managed()/gui_wall_invalid() every frame, and the
+// combined desktop-layer + wallpaper paint is ~300 ms -- honouring it every
+// frame caps the whole shell at a few fps.  Requests are remembered here and the
+// real repaint happens at most every MANAGED_REFRESH_MS (~5 Hz); the desktop
+// layer is retained between refreshes (only windows/overlay re-composite), which
+// is exactly the Windows DWM model.  Discrete events (IME, key, window activate)
+// call gui_invalidate_managed() and then render_all() immediately, so they
+// consume their own pending request within the same frame and stay crisp.
+static const uint32_t MANAGED_REFRESH_MS = 200;
+static uint32_t g_desk_refresh_last = 0;
+static int      g_desk_refresh_pending = 0;
 
 // Cached WALLPAPER layer.  The Win11 bloom (full-screen gradient + four big
 // filled circles) measures ~200 ms to paint -- roughly 5x everything else in
@@ -1224,7 +1251,19 @@ static uint32_t  g_wall_cap = 0;        // capacity in pixels
 static uint32_t  g_wall_w = 0, g_wall_h = 0;
 static bool      g_wall_ok = false;
 
-extern "C" void gui_wall_invalid(void) { g_wall_ok = false; }
+extern "C" void gui_wall_invalid(void) {
+    // Drop the cached wallpaper so the next (throttled) desktop repaint actually
+    // re-captures it instead of re-blitting the stale cache.  Without this, a
+    // theme/accent/desktop-mode change (or the animated AI desktop) would set
+    // pending but the repaint would take the "wall_usable" fast path and keep
+    // showing the old wallpaper forever.
+    g_wall_ok = false;
+    // Throttled in render_all(): per-frame invalidation would force a ~300 ms
+    // desktop+wallpaper repaint every frame (the animated AI desktop does this,
+    // which is what made the whole shell stutter).  Remember the request; the
+    // real repaint is collapsed to ~5 Hz.
+    g_desk_refresh_pending = 1;
+}
 // Forced overlay repaint, as a short frame countdown (set by
 // gui_invalidate_managed).  The overlay paints the Start menu too, and the
 // menu runs a multi-frame open animation / layout pass: one repaint is not
@@ -1245,7 +1284,12 @@ static int g_over_force_n = 0;
 // the retained layer keeps painting the old frame.  Any managed input event
 // may change that state, so the managed entry points call this.
 extern "C" void gui_invalidate_managed(void) {
-    g_desk_needs_full = true;
+    // Throttled in render_all() (see MANAGED_REFRESH_MS): the animated AI desktop
+    // issues this every frame, and painting the desktop layer ~300 ms that often
+    // is what made window/desktop animations stutter.  Keep the overlay force
+    // countdown (the Start menu's multi-frame open animation needs it), but defer
+    // the actual desktop repaint to the frame driver.
+    g_desk_refresh_pending = 1;
     g_over_force_n = OVER_FORCE_FRAMES;
 }
 // Partial-redraw compositing (dirty-rect + desktop-layer caching).
@@ -1908,7 +1952,7 @@ struct Graphics {
 
     // Alpha-blend a single pixel over whatever is already in the backbuffer.
     // (put_pixel is hard-replace and ignores alpha, so translucent effects
-    //  must composite manually — this is what gives windows a real glass
+    //  must composite manually 鈥?this is what gives windows a real glass
     //  edge that lets the desktop / window behind show through.)
     inline void blend_pixel(int x, int y, Color c, int alpha) {
         if (alpha <= 0) return;
@@ -1982,7 +2026,7 @@ struct Graphics {
     // glass body).  A signed-distance field to the rounded-rect outline drives
     // coverage: pixels well inside blend at full `alpha`, pixels within ~1px of
     // an edge get partial coverage, pixels outside are skipped.  The result is
-    // smooth, *truly* rounded corners with no aliasing and no libm — gfx_isqrt
+    // smooth, *truly* rounded corners with no aliasing and no libm 鈥?gfx_isqrt
     // only fires for the thin boundary ring, so large interior fills stay fast.
     void blend_rounded_rect(int x, int y, int w, int h, int r, Color c, int alpha) {
         if (alpha <= 0) return;
@@ -2008,7 +2052,7 @@ struct Graphics {
                 int d;
                 if (qx == 0 && qy == 0) d = -r;                 // deep inside
                 else d = gfx_isqrt(qx * qx + qy * qy) - r;      // SDF (px)
-                int t = 128 - d * 256;                          // (0.5 - d) · 256
+                int t = 128 - d * 256;                          // (0.5 - d) 路 256
                 if (t <= 0) continue;                           // outside shape
                 if (t > 256) t = 256;                           // full coverage
                 blend_pixel(px, py, c, (t * alpha) >> 8);
@@ -2078,7 +2122,7 @@ struct Graphics {
     }
 
     // Anti-aliased rounded rectangle outline (1px stroke, SDF-driven so the
-    // corners are smooth — no more staircase arcs).  Straight edges stay crisp
+    // corners are smooth 鈥?no more staircase arcs).  Straight edges stay crisp
     // (axis-aligned, no jaggies); only the corner transition gets partial
     // coverage.  blend_pixel() at alpha 255 is an opaque replace, so the stroke
     // reads as solid except at the AA boundary ring.
@@ -2112,7 +2156,7 @@ struct Graphics {
         }
     }
 
-    // ---- Inverse (XOR) rectangle — "反矩形" -----------------------------
+    // ---- Inverse (XOR) rectangle 鈥?"鍙嶇煩褰? -----------------------------
     // Flips every pixel's RGB (keeps the high byte).  Re-drawing the same rect
     // restores the original, so it is ideal for selection / drag / focus
     // rectangles that must stand out over any background without a backing
@@ -2143,7 +2187,7 @@ struct Graphics {
     // ---- Modern glyph cache -------------------------------------------
     // Caches rasterized coverage bitmaps (vec or baked AA) keyed by
     // (codepoint, pixel-height) so we rasterize each glyph at most once per
-    // size per session — the standard performance technique of modern text
+    // size per session 鈥?the standard performance technique of modern text
     // renderers (FreeType glyph cache / atlas).
 
     // ---- LRU bookkeeping for the glyph cache (P3) ----
@@ -2300,7 +2344,7 @@ struct Graphics {
                     } else if (a >= 250) {
                         put_pixel(x + col, y + row, fg);
                     } else {
-                        blend_pixel(x + col, y + row, fg, a);
+                        blend_pixel_lin(x + col, y + row, fg, a);
                     }
                 }
             }
@@ -2321,11 +2365,11 @@ struct Graphics {
             }
             if (g) {
                 int gx = x + xo;
-                int gy = y + g_font_px + yo;
+                int gy = y;   // top-align inside the 16px cell to match ASCII (afont/fla16 draw at y)
                 if (bg != (Color)-1) fill_rect(gx, gy, w, h, bg);
                 // Grayscale (not ClearType) antialiasing: average the 3
                 // subpixel coverages into one alpha so glyph edges are smooth
-                // and ROUNDED with no coloured fringe (the "花" artefact that
+                // and ROUNDED with no coloured fringe (the "鑺? artefact that
                 // per-R/G/B subpixel compositing produces on a BGRX LFB).
                 // When rounding is on, dilate the coverage by 1px (cov_dil3)
                 // to round the sharp glyph corners -- bounds-safe (reads only
@@ -2337,7 +2381,7 @@ struct Graphics {
                         int a = rounding ? cov_dil3(g, w, h, row, col)
                                          : (src[3*col] + src[3*col+1] + src[3*col+2]) / 3;
                         if (a > 4)
-                            blend_pixel(gx + col, gy + row, fg, a);
+                            blend_pixel_lin(gx + col, gy + row, fg, a);
                     }
                 }
                 int adv = vec_advance(c, g_font_px);
@@ -2371,7 +2415,7 @@ struct Graphics {
         }
 
         // (3) Legacy 1-bit 8x16 bitmap (BIOS default size) fallback.
-        //    Kept as a thin 1-bit render (no膨胀 AA) -- the baked AA Latin
+        //    Kept as a thin 1-bit render (no鑶ㄨ儉 AA) -- the baked AA Latin
         //    font (font_la16.bin) is the real high-quality path.
         const uint8_t* glyph = font8x16[c];
         for (int row = 0; row < 16; row++) {
@@ -2466,24 +2510,31 @@ struct Graphics {
         int idx = zfont_runtime_lookup(cp);
         if (idx < 0) return 0;
         const uint8_t* g = g_zf_alpha + (uint32_t)idx * (uint32_t)g_zf_px * (uint32_t)g_zf_px;
-        int px = g_zf_px;
-        int oy = y - (px - g_font_h) / 2;      // centre 24px cell on the 16px line
-        for (int row = 0; row < px; row++) {
-            const uint8_t* s = g + row * px;
-            for (int col = 0; col < px; col++) {
-                int a = s[col];
+        int px = g_zf_px;                  // source glyph size (e.g. 24)
+        int dh = g_font_h;                 // target line height (e.g. 16)
+        if (dh > px) dh = px;              // never upscale
+        // Downsample (nearest) the px*px glyph into a dh*dh cell so CJK shares
+        // the same pixel height as ASCII.  The old code merely centred the 24px
+        // glyph on the 16px line, which drew Chinese ~50% taller than English.
+        for (int row = 0; row < dh; row++) {
+            int sy = (row * px + dh / 2) / dh;
+            const uint8_t* s = g + (uint32_t)sy * px;
+            int oy = y + row;
+            for (int col = 0; col < dh; col++) {
+                int sx = (col * px + dh / 2) / dh;
+                int a = s[sx];
                 if (a == 0) {
-                    if (!transparent && bg != (Color)-1) put_pixel(x + col, oy + row, bg);
+                    if (!transparent && bg != (Color)-1) put_pixel(x + col, oy, bg);
                 } else if (a >= 250) {
-                    put_pixel(x + col, oy + row, fg);
+                    put_pixel(x + col, oy, fg);
                 } else if (transparent) {
-                    blend_pixel_lin(x + col, oy + row, fg, a);
+                    blend_pixel_lin(x + col, oy, fg, a);
                 } else {
-                    blend_pixel(x + col, oy + row, fg, a);
+                    blend_pixel_lin(x + col, oy, fg, a);
                 }
             }
         }
-        return px;
+        return dh;
     }
 
     // Draw one CJK glyph by Unicode codepoint (with background).
@@ -2491,32 +2542,49 @@ struct Graphics {
     // crisp at any size). Falls back to the 16x16 bitmap (zfont.bin).
     // Returns the horizontal advance (pixels).
     int draw_cjk(int x, int y, uint32_t cp, Color fg, Color bg) {
-        // (A) Full GB2312 24x24 8-bit-alpha bitmap from SFS (preferred: shares
-        //     the grayscale-blended look of the ASCII 16x16 bitmap).
-        {
-            int adv = blit_cjk_alpha(x, y, cp, fg, bg, false);
-            if (adv) return adv;
-        }
+        // (1) Vector outline via stb_truetype (msyh.ttf) 鈥?the SAME smooth path
+        //     used by Latin draw_char, so Chinese glyphs match the English ones
+        //     in quality (true outlines, anti-aliased at any size).
         if (g_font_mode != 0 && vec_ready()) {
             int w = 0, h = 0, xo = 0, yo = 0;
             const uint8_t* g = vec_glyph(cp, g_font_px, &w, &h, &xo, &yo);
+            // msyh.ttf's very tall ascent/descent make stbtt_ScaleForPixelHeight
+            // rasterize CJK at only ~75-80% of the requested size (11-13px for a
+            // 16px request), which turns dense hanzi into unreadable mush.
+            // Re-request at a compensated size so the glyph fills the 16px cell.
+            if (g && h > 0 && h * 8 < g_font_px * 7) {
+                int px2 = g_font_px * g_font_px / h;
+                if (px2 > g_font_px && px2 <= 64) {
+                    int w2 = 0, h2 = 0, xo2 = 0, yo2 = 0;
+                    const uint8_t* g2 = vec_glyph(cp, px2, &w2, &h2, &xo2, &yo2);
+                    if (g2) { g = g2; w = w2; h = h2; xo = xo2; yo = yo2; }
+                }
+            }
             if (g) {
                 int gx = x + xo;
-                int gy = y + g_font_px + yo;
-                if (bg != (Color)-1) fill_rect(gx, gy, w, h, bg);
-                const int rounding = g_font_round && w <= RD_MAXW && h <= RD_MAXW;
-                for (int row = 0; row < h; row++) {
+                int gy = y;   // top-align inside the 16px cell to match ASCII (afont/fla16 draw at y)
+                const int CW = w > g_font_px ? g_font_px : w;   // never spill out of the cell
+                const int CH = h > g_font_px ? g_font_px : h;
+                if (bg != (Color)-1) fill_rect(gx, gy, CW, CH, bg);
+                const int rounding = g_font_round && CW <= RD_MAXW && CH <= RD_MAXW;
+                for (int row = 0; row < CH; row++) {
                     const uint8_t* src = g + row * (3 * w);
-                    for (int col = 0; col < w; col++) {
+                    for (int col = 0; col < CW; col++) {
                         int a = rounding ? cov_dil3(g, w, h, row, col)
                                          : (src[3*col] + src[3*col+1] + src[3*col+2]) / 3;
                         if (a > 4)
-                            blend_pixel(gx + col, gy + row, fg, a);
+                            blend_pixel_lin(gx + col, gy + row, fg, a);
                     }
                 }
                 int adv = vec_advance(cp, g_font_px);
                 return adv > g_font_px ? adv : g_font_px;
             }
+        }
+        // (2) Full GB2312 24x24 8-bit-alpha bitmap from SFS (fallback when the
+        //     vector font is unavailable 鈥?keeps a readable CJK instead of boxes).
+        {
+            int adv = blit_cjk_alpha(x, y, cp, fg, bg, false);
+            if (adv) return adv;
         }
         int idx = zfont_find_unicode(cp);
         if (idx < 0) {                      // glyph not in embedded set: box
@@ -2543,19 +2611,29 @@ struct Graphics {
 
     // Draw CJK glyph transparent (only fg pixels). Returns advance.
     int draw_cjk_transparent(int x, int y, uint32_t cp, Color fg) {
-        {
-            int adv = blit_cjk_alpha(x, y, cp, fg, (Color)-1, true);
-            if (adv) return adv;
-        }
+        // (1) Vector outline via stb_truetype (msyh.ttf) 鈥?same smooth path as
+        //     Latin draw_char, so Chinese matches the English glyph quality.
         if (g_font_mode != 0 && vec_ready()) {
             int w = 0, h = 0, xo = 0, yo = 0;
             const uint8_t* g = vec_glyph(cp, g_font_px, &w, &h, &xo, &yo);
+            // Same size compensation as draw_cjk(): msyh's tall metrics render
+            // CJK undersized (~12px at a 16px request) and illegible.
+            if (g && h > 0 && h * 8 < g_font_px * 7) {
+                int px2 = g_font_px * g_font_px / h;
+                if (px2 > g_font_px && px2 <= 64) {
+                    int w2 = 0, h2 = 0, xo2 = 0, yo2 = 0;
+                    const uint8_t* g2 = vec_glyph(cp, px2, &w2, &h2, &xo2, &yo2);
+                    if (g2) { g = g2; w = w2; h = h2; xo = xo2; yo = yo2; }
+                }
+            }
             if (g) {
                 int gx = x + xo;
-                int gy = y + g_font_px + yo;
-                const int rounding = g_font_round && w <= RD_MAXW && h <= RD_MAXW;
-                for (int row = 0; row < h; row++)
-                    for (int col = 0; col < w; col++) {
+                int gy = y;   // top-align inside the 16px cell to match ASCII (afont/fla16 draw at y)
+                const int CW = w > g_font_px ? g_font_px : w;   // never spill out of the cell
+                const int CH = h > g_font_px ? g_font_px : h;
+                const int rounding = g_font_round && CW <= RD_MAXW && CH <= RD_MAXW;
+                for (int row = 0; row < CH; row++)
+                    for (int col = 0; col < CW; col++) {
                         int a = rounding ? cov_dil3(g, w, h, row, col)
                                          : (g[row * (3 * w) + col * 3] +
                                             g[row * (3 * w) + col * 3 + 1] +
@@ -2565,6 +2643,12 @@ struct Graphics {
                 int adv = vec_advance(cp, g_font_px);
                 return adv > g_font_px ? adv : g_font_px;
             }
+        }
+        // (2) Full GB2312 24x24 8-bit-alpha bitmap from SFS (fallback when the
+        //     vector font is unavailable).
+        {
+            int adv = blit_cjk_alpha(x, y, cp, fg, (Color)-1, true);
+            if (adv) return adv;
         }
         int idx = zfont_find_unicode(cp);
         if (idx < 0) return 16;
@@ -2827,7 +2911,7 @@ struct Graphics {
                 p++;
             } else if ((c & 0xE0) == 0xC0) { total += g_font_h; p += 2; }
             else if ((c & 0xF0) == 0xE0) {
-                total += (g_zf_loaded && g_font_px == AFONT_H) ? g_zf_px : g_font_h;
+                total += g_font_h;
                 p += 3;
             }
             else { total += g_font_w; p++; }
@@ -2989,7 +3073,26 @@ struct MouseCursor {
             saved_valid = false;
         }
     }
+    // 鐢绘暣涓澶磋疆寤擄紙鎻忚竟+濉厖鍚堝苟锛夋垚鍗曡壊锛屽彲甯﹀亸绉烩€斺€旂敤浜庣敾楂樹寒鍏夋檿銆?
+    void draw_sil(Graphics& g, uint32_t col, int ox, int oy) {
+        uint32_t mask = 0x80000000;
+        for (int dy = 0; dy < CURSOR_SIZE; dy++) {
+            uint32_t ob = cursor_outline[dy];
+            uint32_t fb = cursor_fill[dy];
+            uint32_t bits = ob | fb;
+            if (bits == 0) continue;
+            for (int dx = 0; dx < CURSOR_SIZE; dx++) {
+                if (dx + ox >= CURSOR_SIZE || dy + oy >= CURSOR_SIZE) continue; // 闄愬湪 32x32 鍐咃紝閬垮厤绉诲姩鏃剁暀涓嬫畫褰?
+                if (bits & (mask >> dx))
+                    g.put_pixel(x + dx + ox, y + dy + oy, col);
+            }
+        }
+    }
     void draw(Graphics& g) {
+        // 楂樹寒鍏夋檿锛氬湪绠ご涓嬫柟鍋忕Щ澶勭敾涓ゅ眰闈掕壊锛岀‘淇濅换浣曡儗鏅笅鎸囬拡閮介啋鐩?
+        // 锛堝浼犲綍灞忛噷瑙備紬鑳戒竴鐪肩湅鍒扳€滄寚閽堝湪鍝€佺偣鍦ㄥ摢鈥濓級銆?
+        draw_sil(g, 0x000088C0, 3, 3);
+        draw_sil(g, 0x0000C8FF, 2, 2);
         uint32_t mask = 0x80000000;
         for (int dy = 0; dy < CURSOR_SIZE; dy++) {
             uint32_t ob = cursor_outline[dy];
@@ -3036,7 +3139,7 @@ enum AppType {
     APP_NOTEPAD,        // managed-only; no legacy native drawer
     APP_AISETUP,        // one-tap AI enablement wizard (managed)
     APP_AIAGENT,        // AI Agent runner (managed): Planner/Actor/Critic
-    APP_DEMO,           // button-shrink + reply "啊" demo window (managed)
+    APP_DEMO,           // button-shrink + reply "鍟? demo window (managed)
     APP_START_MENU,      // Start menu: loaded into the window DB so it is
                          // composited & dirty-tracked like any other window
 };
@@ -3046,7 +3149,7 @@ constexpr int TITLE_BAR_H = 32;
 constexpr int MAX_ICONS = 8;
 constexpr int MAX_START_ITEMS = 8;
 
-// ---- Frosted-glass (毛玻璃) blur helpers (file scope, not class members) ----
+// ---- Frosted-glass (姣涚幓鐠? blur helpers (file scope, not class members) ----
 // One reusable scratch buffer for the separable box blur; grown on demand.
 static uint32_t* g_glass_tmp = nullptr;
 static int       g_glass_tmp_n = 0;
@@ -3171,61 +3274,26 @@ static void glass_blur_h_avx2(const uint32_t* bb, uint32_t* tmp, int W, int x, i
 
 __attribute__((target("avx2")))
 static void glass_blur_v_avx2(const uint32_t* tmp, uint32_t* bb, int W, int x, int y, int w, int h, int r) {
-    const __m256i M = _mm256_set1_epi32(0xFF);
-    int s1 = r; if (s1 > h - 1) s1 = h - 1;
-    int full = 2 * r + 1;
+    // Vertical separable box blur, processed ONE COLUMN AT A TIME.
+    // The previous AVX2 version loaded 8 *consecutive pixels of a single row*
+    // (i.e. neighbouring columns) into the 8 SIMD lanes and called it a "column
+    // gather". That smeared each column's left/right neighbours into its vertical
+    // blur, producing the diagonal / yellow-green streaks on frosted-glass cards.
+    // Vertical samples are non-contiguous in memory, so this pass stays scalar
+    // (the horizontal pass remains vectorised and is correct). Result is clean.
     for (int xx = 0; xx < w; xx++) {
         int dbase = y * W + (x + xx);
         int sbase = xx;
         int sr = 0, sg = 0, sb = 0, cnt = 0;
-        for (int k = 0; k <= s1; k++) { uint32_t p = tmp[sbase + k*w]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; }
+        int s1 = r; if (s1 > h - 1) s1 = h - 1;
+        for (int k = 0; k <= s1; k++) { uint32_t p = tmp[sbase + k * w]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; }
         cnt = s1 + 1;
-        int yy = 0;
-        for (; yy < r; yy++) {
-            bb[dbase + yy*W] = (((uint32_t)(sr/cnt))<<16) | (((uint32_t)(sg/cnt))<<8) | ((uint32_t)(sb/cnt));
+        for (int yy = 0; yy < h; yy++) {
+            bb[dbase + yy * W] = (((uint32_t)(sr / cnt))<<16) | (((uint32_t)(sg / cnt))<<8) | ((uint32_t)(sb / cnt));
             int addy = yy + r + 1;
-            if (addy < h) { uint32_t p = tmp[sbase + addy*w]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; cnt++; }
-        }
-        int lsr[8], lsg[8], lsb[8], cs = sr, cg = sg, cb = sb;
-        for (int j = 0; j < 8; j++) {
-            lsr[j] = cs; lsg[j] = cg; lsb[j] = cb;
-            int oo = r + j; int addy = oo + r + 1;
-            if (addy < h) { uint32_t p = tmp[sbase + addy*w]; cs += (p>>16)&255; cg += (p>>8)&255; cb += p&255; }
-            int remy = oo - r;
-            if (remy >= 0) { uint32_t p = tmp[sbase + remy*w]; cs -= (p>>16)&255; cg -= (p>>8)&255; cb -= p&255; }
-        }
-        __m256i vsr = _mm256_loadu_si256((const __m256i*)lsr);
-        __m256i vsg = _mm256_loadu_si256((const __m256i*)lsg);
-        __m256i vsb = _mm256_loadu_si256((const __m256i*)lsb);
-        int yy0 = r;
-        for (; yy0 + 7 <= h - r - 2; yy0 += 8) {
-            int ar[8], ag[8], ab[8];
-            _mm256_storeu_si256((__m256i*)ar, vsr);
-            _mm256_storeu_si256((__m256i*)ag, vsg);
-            _mm256_storeu_si256((__m256i*)ab, vsb);
-            for (int j = 0; j < 8; j++)
-                bb[dbase + (yy0+j)*W] = (((uint32_t)(ar[j]/full))<<16) | (((uint32_t)(ag[j]/full))<<8) | ((uint32_t)(ab[j]/full));
-            __m256i addv = _mm256_loadu_si256((const __m256i*)&tmp[sbase + (yy0 + r + 1)*w]);
-            __m256i ra = _mm256_and_si256(_mm256_srli_epi32(addv,16), M);
-            __m256i ga = _mm256_and_si256(_mm256_srli_epi32(addv, 8), M);
-            __m256i ba = _mm256_and_si256(addv, M);
-            vsr = _mm256_add_epi32(vsr, ra); vsg = _mm256_add_epi32(vsg, ga); vsb = _mm256_add_epi32(vsb, ba);
-            __m256i remv = _mm256_loadu_si256((const __m256i*)&tmp[sbase + (yy0 - r)*w]);
-            __m256i rr = _mm256_and_si256(_mm256_srli_epi32(remv,16), M);
-            __m256i gr = _mm256_and_si256(_mm256_srli_epi32(remv, 8), M);
-            __m256i br = _mm256_and_si256(remv, M);
-            vsr = _mm256_sub_epi32(vsr, rr); vsg = _mm256_sub_epi32(vsg, gr); vsb = _mm256_sub_epi32(vsb, br);
-        }
-        sr = _mm256_extract_epi32(vsr, 0);
-        sg = _mm256_extract_epi32(vsg, 0);
-        sb = _mm256_extract_epi32(vsb, 0);
-        cnt = full;
-        for (; yy0 < h; yy0++) {
-            bb[dbase + yy0*W] = (((uint32_t)(sr/cnt))<<16) | (((uint32_t)(sg/cnt))<<8) | ((uint32_t)(sb/cnt));
-            int addy = yy0 + r + 1;
-            if (addy < h) { uint32_t p = tmp[sbase + addy*w]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; cnt++; }
-            int remy = yy0 - r;
-            if (remy >= 0) { uint32_t p = tmp[sbase + remy*w]; sr -= (p>>16)&255; sg -= (p>>8)&255; sb -= p&255; cnt--; }
+            int remy = yy - r;
+            if (addy < h) { uint32_t p = tmp[sbase + addy * w]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; cnt++; }
+            if (remy >= 0) { uint32_t p = tmp[sbase + remy * w]; sr -= (p>>16)&255; sg -= (p>>8)&255; sb -= p&255; cnt--; }
         }
     }
 }
@@ -3283,7 +3351,7 @@ static void glass_rounded_rect(Graphics& g, int x, int y, int w, int h, int r,
     if (r < 0) r = 0;
     if (r > h / 2) r = h / 2;
     if (r > w / 2) r = w / 2;
-    int x0 = x - 1, y0 = y - 1, x1 = x + w + 1, y1 = y + h + 1;
+    int x0 = x, y0 = y, x1 = x + w, y1 = y + h;
     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
     if (x1 > g.width)  x1 = g.width;
     if (y1 > g.height) y1 = g.height;
@@ -3330,6 +3398,35 @@ static void glass_rect(Graphics& g, int x, int y, int w, int h, Color c, int alp
             uint32_t blurred = g.backbuffer[py * g.width + px];
             g.backbuffer[py * g.width + px] = mix_colors(blurred, c, alpha);
         }
+}
+
+// Soft radial bloom: blend `color` over the backdrop with a quadratic-alpha
+// falloff to zero at the ellipse edge.  Used for the Win11 lock-screen light
+// source and the focus halo on the active input field.  Pure int math, no
+// libm; elliptical normalisation uses a 4096 fixed-point scale (avoids the
+// 65536^2 overflow and stays well inside uint32_t).
+static void glow_ellipse(Graphics& g, int cx, int cy, int rx, int ry, Color color, int alpha) {
+    if (alpha <= 0 || rx <= 0 || ry <= 0) return;
+    if (alpha > 255) alpha = 255;
+    int x0 = cx - rx, y0 = cy - ry, x1 = cx + rx, y1 = cy + ry;
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > g.width)  x1 = g.width;
+    if (y1 > g.height) y1 = g.height;
+    if (x1 <= x0 || y1 <= y0) return;
+    for (int py = y0; py < y1; py++) {
+        int64_t dy = (int64_t)(py - cy) * 4096 / ry;
+        for (int px = x0; px < x1; px++) {
+            int64_t dx = (int64_t)(px - cx) * 4096 / rx;
+            int64_t d2 = dx * dx + dy * dy;          // 0 centre .. ~2*4096^2 edge
+            if (d2 >= (int64_t)4096 * 4096) continue; // outside the ellipse
+            int64_t fall = 4096 - glass_isqrt((uint32_t)d2);   // 4096 centre -> 0 edge
+            int a = (int)((alpha * fall * fall) >> 24);      // alpha * (fall/4096)^2
+            if (a <= 0) continue;
+            if (a > 255) a = 255;
+            int bi = py * g.width + px;
+            g.backbuffer[bi] = mix_colors(g.backbuffer[bi], color, a);
+        }
+    }
 }
 
 struct Win11Window {
@@ -3382,7 +3479,7 @@ struct Win11Window {
     bool fullscreen;        // covers whole screen (floats over taskbar)
     bool floating;          // always-on-top
     int restore_x, restore_y, restore_w, restore_h; // pre-fullscreen rect
-    int snap;               // 0=free-floating, 1=tiled/snap (磁贴窗口)
+    int snap;               // 0=free-floating, 1=tiled/snap (纾佽创绐楀彛)
     int snap_rx, snap_ry, snap_rw, snap_rh; // pre-snap rect, for un-snapping
     // Portal desktop state
     int portal_tab;         // selected navigation tab (0=home,1=apps,2=system,3=tools)
@@ -4641,7 +4738,7 @@ struct Win11Desktop {
     }
 
     void draw_topbar() {
-        // Top status bar — dark frosted glass over the Mica wallpaper.
+        // Top status bar 鈥?dark frosted glass over the Mica wallpaper.
         glass_rect(gfx, 0, 0, gfx.width, TOPBAR_H, C_TOPBAR_BG, C_TOPBAR_GLASS_A, C_GLASS_BLUR_R);
         // 1px bottom glass hairline (highlight + border sandwich)
         gfx.blend_rect(0, TOPBAR_H - 1, gfx.width, 1, C_GLASS_EDGE, 40);
@@ -4796,17 +4893,17 @@ struct Win11Desktop {
 
         // ---- Frosted translucent rim (glass edge) ----
         // A thin band just outside the frame, alpha-blended so the surface
-        // behind shows through — the Windows 11 acrylic edge.  Neutral light
+        // behind shows through 鈥?the Windows 11 acrylic edge.  Neutral light
         // gray for both states: the accent belongs on the title bar, not on
         // the edge (the old blue glow was what the user rejected).
         if (!win.fullscreen) {
             gfx.blend_rounded_rect(rx - 3, ry - 3, rw + 6, rh + 6, 9, 0xD2D2D2, 55);
         }
 
-        // ---- Aero frosted-glass window (Windows 7 "毛玻璃" over dark Mica) ----
+        // ---- Aero frosted-glass window (Windows 7 "姣涚幓鐠? over dark Mica) ----
         Color glass = win.active ? C_GLASS_TINT_ACT : C_GLASS_TINT;
         if (win.fullscreen) {
-            gfx.fill_rect(rx, ry, rw, rh, C_WIN_BG);
+            gfx.fill_rect(rx, ry, rw, rh, theme_color(6, C_WIN_BG));
             gfx.fill_rect(rx, ry, rw, TITLE_BAR_H,
                           win.active ? C_GLASS_TINT_ACT : C_GLASS_TINT);
         } else {
@@ -4831,7 +4928,7 @@ struct Win11Desktop {
                            0x000000, 40);
         }
 
-        // Title text (centered) — uses the same 16x16/24x24 alpha bitmap font as
+        // Title text (centered) 鈥?uses the same 16x16/24x24 alpha bitmap font as
         // the rest of the UI (no faux-bold smear) so it matches body text.
         gfx.draw_text_centered(rx, ry + 8, rw, win.title, C_WIN_TEXT);
 
@@ -4853,7 +4950,7 @@ struct Win11Desktop {
             gfx.draw_text_transparent(bx + 8, by + 4, g, gcol);
         }
 
-        // Border — 1px hairline.  Active window gets a soft accent hairline.
+        // Border 鈥?1px hairline.  Active window gets a soft accent hairline.
         Color border = win.active ? C_ACCENT : C_WIN_BORDER;
         if (win.fullscreen)
             gfx.draw_rect(rx, ry, rw, rh, border);
@@ -5461,7 +5558,7 @@ struct Win11Desktop {
         if (file_count <= 0) {
             gfx.draw_text_transparent(x + 8, y + 8, "(no files or FS not mounted)", C_WIN_TEXT_SEC);
             // Preview pane placeholder
-            gfx.fill_rect(preview_x, y, preview_w, list_h, C_WIN_BG);
+            gfx.fill_rect(preview_x, y, preview_w, list_h, theme_color(6, C_WIN_BG));
             gfx.draw_text_transparent(preview_x + 8, y + 8, "Preview", C_WIN_TEXT_SEC);
             return;
         }
@@ -6345,7 +6442,7 @@ struct Win11Desktop {
         anim_active_prev = any_animating();
     }
 
-    // ---- Smooth easing curves (丝滑动画) --------------------------------
+    // ---- Smooth easing curves (涓濇粦鍔ㄧ敾) --------------------------------
     // p is 0..1000 (per-mille); returns eased 0..1000.  Cubic easing removes
     // the robotic constant-speed feel of the old linear ramp.
     // All math stays in int32: 1000^3 = 1e9 < INT32_MAX, so no 64-bit helpers.
@@ -6808,6 +6905,30 @@ struct Win11Desktop {
         static int g_pixel_prev = -1;
         if (g_pixel_prev < 0) g_pixel_prev = g_pixel_mode;
         if (g_pixel_mode != g_pixel_prev) { g_desk_needs_full = true; g_pixel_prev = g_pixel_mode; }
+        // Collapse the continuous "repaint every frame" requests to ~5 Hz.  The
+        // animated AI desktop calls gui_invalidate_managed()/gui_wall_invalid()
+        // every frame; painting the desktop layer (~95 ms) + wallpaper (~200 ms)
+        // that often caps the whole shell at a few fps.  Remember the request and
+        // honour it at most every MANAGED_REFRESH_MS, retaining the desktop layer
+        // between refreshes.  When the TSC clock is NOT calibrated
+        // (anim_tsc_per_ms == 0, tick_ms_now falls back to a frame counter) we
+        // CANNOT measure a real interval, so we honour the request immediately --
+        // this restores the old "repaint every frame" behaviour and avoids the
+        // regression where the desktop would freeze after the first frame (the
+        // pending flag would otherwise never convert to g_desk_needs_full).
+        if (g_desk_refresh_pending) {
+            if (anim_tsc_per_ms > 0) {
+                uint32_t nd = tick_ms_now();
+                if (nd - g_desk_refresh_last >= MANAGED_REFRESH_MS) {
+                    g_desk_needs_full = true;
+                    g_desk_refresh_pending = 0;
+                    g_desk_refresh_last = nd;
+                }
+            } else {
+                g_desk_needs_full = true;
+                g_desk_refresh_pending = 0;
+            }
+        }
         bool repaint_desk = false;
         if (managed_desk) {
             // Partial-redraw compositing: only repaint the managed desktop when
@@ -6821,8 +6942,13 @@ struct Win11Desktop {
                 mforms_set_running(running_mask());
                 diag_step(101, "render_all before desktop layer");
                 int npix = gfx.width * gfx.height;
-                if (g_wall_ok && g_wall &&
-                    g_wall_w == (uint32_t)gfx.width && g_wall_h == (uint32_t)gfx.height) {
+                // Never trust the cache unless the managed shell is actually
+                // up: if shell.mex failed to load, the "paint" calls are
+                // no-ops and we would capture a black framebuffer as the
+                // wallpaper and then happily re-blit it forever.
+                bool wall_usable = g_wall_ok && g_wall && (mforms_ready() != 0) &&
+                    g_wall_w == (uint32_t)gfx.width && g_wall_h == (uint32_t)gfx.height;
+                if (wall_usable) {
                     // Wallpaper unchanged: re-blit the cached copy (a few ms)
                     // instead of re-running the ~200 ms C# bloom paint, then
                     // redraw the cheap icons/tiles layer on top.
@@ -6836,7 +6962,7 @@ struct Win11Desktop {
                     // C# raises WallInvalid() from inside PaintWall for the
                     // animated AI desktop, and that must leave the cache
                     // disabled (it repaints every frame by design).
-                    g_wall_ok = true;
+                    g_wall_ok = (mforms_ready() != 0);
                     mforms_paint_wall(gfx.width, gfx.height);
                     if (!g_wall || g_wall_cap < (uint32_t)npix) {
                         if (g_wall) { kfree(g_wall); g_wall = nullptr; g_wall_cap = 0; }
@@ -6857,6 +6983,7 @@ struct Win11Desktop {
                 }
                 diag_step(102, "render_all after desktop layer");
                 g_desk_needs_full = false;
+                g_desk_refresh_pending = 0;   // consumed: next refresh waits a full interval
                 g_desk_sig = cur_sig;
                 dirty_add(0, 0, gfx.width, gfx.height);   // full-screen repaint
                 // Cache the freshly painted background (without windows) so a
@@ -7013,7 +7140,7 @@ struct Win11Desktop {
             }
         }
 
-        // Top-right language indicator: 中 = Chinese IME, EN = English.
+        // Top-right language indicator: 涓?= Chinese IME, EN = English.
         // Drawn here so it overlays the managed C# desktop wallpaper/taskbar,
         // but the managed Win11 shell doesn't have a top status bar, so we
         // only paint the strip when the native Portal topbar is in use.
@@ -7046,16 +7173,35 @@ struct Win11Desktop {
         // real (cursor-free) pixels.
         if (g_cursor_backend == CURSOR_SOFT && cursor.visible) {
             int cw = MouseCursor::CURSOR_SIZE, ch = MouseCursor::CURSOR_SIZE;
-            // Clear the PREVIOUS cursor pixels in the backbuffer and mark that
-            // rectangle dirty, so the flip re-copies the now-cursor-free
-            // background to the LFB.  Without this, the old position leaves a
-            // square ghost while the desktop layer is retained (not repainted).
-            if (cursor.saved_valid) {
-                int ox = cursor.x, oy = cursor.y;
-                cursor.restore_bg(gfx);
-                dirty_add(ox, oy, cw, ch);
-            }
             int cx0 = cursor.x, cy0 = cursor.y;   // hotspot at (0,0): top-left = (x,y)
+
+            // Only peel off the PREVIOUS cursor pixels when this frame did NOT
+            // repaint the area under the pointer.  If a dirty rectangle covered
+            // the cursor this frame (e.g. a click changed the UI there, or a
+            // window / animation drew fresh content underneath), the backbuffer
+            // already holds the NEW pixels and the saved background is stale;
+            // restoring it would overwrite the new pixels, so the change never
+            // appears and only the cursor's own rect ends up correct -- that is
+            // exactly the "interface change not cleared at the pointer" (Bug 1)
+            // and "animation only shows one dirty rect" (Bug 2) symptom.  In that
+            // case we skip restore_bg and simply re-capture the fresh content as
+            // the new background.
+            bool under_covered = false;
+            for (int n = g_dmg_head; n >= 0; n = g_dnode[n].next) {
+                DmgNode& r = g_dnode[n];
+                if (cx0 < r.x + r.w && cx0 + cw > r.x &&
+                    cy0 < r.y + r.h && cy0 + ch > r.y) {
+                    under_covered = true;
+                    break;
+                }
+            }
+            if (cursor.saved_valid && !under_covered) {
+                // Desktop layer retained: old cursor pixels may still linger in
+                // the backbuffer.  Restore the saved (cursor-free) background so
+                // save_bg captures the real pixels and no square ghost is left.
+                cursor.restore_bg(gfx);
+                dirty_add(cx0, cy0, cw, ch);
+            }
             cursor.saved_valid = false;
             cursor.save_bg(gfx);
             cursor.draw(gfx);
@@ -7102,9 +7248,23 @@ struct Win11Desktop {
         // ---------------------------------------------------------------
         fps_frames++;
         uint32_t now_ms = tick_ms_now();
-        if (fps_t0 == 0) fps_t0 = now_ms;
+        // Reset the window whenever we are NOT in a burst, so a burst always
+        // measures only its own frames: idle frames accrue dt without raising
+        // fps_frames past the gate, so drop them and start fresh next burst.
+        if (fps_t0 == 0 || (now_ms - fps_t0) - (uint32_t)fps_frames * 32u > 500u) {
+            fps_t0 = now_ms; fps_frames = 1;
+        }
         uint32_t dt = now_ms - fps_t0;
-        if (dt >= 1000) {
+        // Print every ~1 s when the TSC clock is calibrated (dt is real ms).
+        // When it is NOT (dt is a frame count), also print once we've drawn
+        // ~120 frames so a slow shell still reports its (low) fps instead of
+        // never printing -- that was the exact reason the old "stutter" felt
+        // invisible: the probe only fired at 1000 frames and never did.
+        // Print on a real animation burst (>=8 frames spanning >=80 ms) so a
+        // single ~160 ms window open/close is enough to report, instead of only
+        // firing at 1000 frames (which a short animation never reaches).  Idle
+        // frames are 1/sec so they never satisfy fps_frames>=8 and stay silent.
+        if ((fps_frames >= 8 && dt >= 80) || dt >= 4000) {
             uint32_t fps = (uint32_t)(((uint64_t)fps_frames * 1000u) / (dt ? dt : 1u));
             serial_puts("[FPS] ");
             serial_putdec((int)fps);
@@ -7194,7 +7354,7 @@ struct Win11Desktop {
         int oldx = cursor.x, oldy = cursor.y;
         bool was_drag = (drag_window >= 0 && drag_window < window_count);
 
-        // When we own the cursor (no hardware sprite — QEMU / headless / VMMDev
+        // When we own the cursor (no hardware sprite 鈥?QEMU / headless / VMMDev
         // absent) we must erase the previous soft-cursor pixels *before* moving,
         // otherwise a stale cursor is left pinned where the pointer last was.
         if (g_cursor_backend == CURSOR_SOFT && cursor.visible && cursor.saved_valid) {
@@ -7237,7 +7397,7 @@ struct Win11Desktop {
         }
 
         // Dragging a window is a real UI state change (the window itself moves),
-        // so it legitimately needs a full redraw — render_all repaints the cursor.
+        // so it legitimately needs a full redraw 鈥?render_all repaints the cursor.
         if (was_drag) {
             windows[drag_window].x = mouse_x - drag_off_x;
             windows[drag_window].y = mouse_y - drag_off_y;
@@ -7253,7 +7413,7 @@ struct Win11Desktop {
 
         // No hardware cursor: repaint the soft cursor at its new position and
         // flip just its rect (the cursor-move fast path).  With a hardware
-        // cursor this branch is skipped — the GPU owns the sprite.
+        // cursor this branch is skipped 鈥?the GPU owns the sprite.
         if (g_cursor_backend == CURSOR_SOFT && cursor.visible) {
             cursor.save_bg(gfx);
             cursor.draw(gfx);
@@ -7351,7 +7511,7 @@ struct Win11Desktop {
         if (!gui_mode) return;
         // ---- Remote-control security guard: modal overlay ----
         // While the machine is being remotely controlled, the only interactive
-        // element is the "结束控制" button; every other click is swallowed.
+        // element is the "缁撴潫鎺у埗" button; every other click is swallowed.
         if (g_remote_active) {
             if (mouse_x >= g_remote_btn_x && mouse_x < g_remote_btn_x + g_remote_btn_w &&
                 mouse_y >= g_remote_btn_y && mouse_y < g_remote_btn_y + g_remote_btn_h) {
@@ -7630,7 +7790,7 @@ struct Win11Desktop {
         active_window = ex;
     }
 
-    // ---- Snap layouts (磁贴窗口) ----------------------------------------
+    // ---- Snap layouts (纾佽创绐楀彛) ----------------------------------------
     // Dragging a window's title bar into a screen edge or corner tiles it to a
     // half / quarter of the desktop (Windows 11 snap layouts).
     void apply_snap(int id) {
@@ -8276,7 +8436,7 @@ struct Win11Desktop {
     void launch_app(AppType app) {
         // The Terminal is opened as a managed C# GUI window (just like
         // Notepad/Browser) so it gets the same Chinese-IME support on every
-        // keypress (Shift toggles 中文/EN, pinyin commits via mforms_key).
+        // keypress (Shift toggles 涓枃/EN, pinyin commits via mforms_key).
         // The text-mode shell remains reachable by exiting the GUI (Esc on
         // the desktop); this entry point no longer drops out of the GUI.
 
@@ -8319,7 +8479,7 @@ struct Win11Desktop {
             case APP_AIAGENT:
                 ww = 420; wh = 440; title = "AI Agent"; break;
             case APP_DEMO:
-                ww = 360; wh = 320; title = "Demo"; break;
+                ww = 600; wh = 660; title = "Demo"; break;
             default: return;
         }
 
@@ -8391,14 +8551,14 @@ struct Win11Desktop {
     // output is shown inside the GUI window.
     void open_file_in_gui(const char* filename, const char* args) {
         if (!filename) return;
-        // 创建窗口
+        // 鍒涘缓绐楀彛
         int gw = gfx.width, gh = gfx.height;
         int ww = 460, wh = 320;
         int wx = (gw - ww) / 2, wy = TOPBAR_H + 40;
         int id = create_window(wx, wy, ww, wh, filename, APP_FILE_EXPLORER);
         if (id < 0) return;
         Win11Window& win = windows[id];
-        // 先显示文件头信息
+        // 鍏堟樉绀烘枃浠跺ご淇℃伅
         char* dst = win.term_buf;
         int   len = 0;
         const char* hdr = "=== NexOS Windows App Launcher ===\n\nFile: ";
@@ -8414,17 +8574,17 @@ struct Win11Desktop {
         dst[len++] = '\n';
         dst[len] = 0;
         win.term_len = len;
-        // 实际执行 winloader (BAT/PS1 引擎执行, PE/COM 检测) 捕获输出
+        // 瀹為檯鎵ц winloader (BAT/PS1 寮曟搸鎵ц, PE/COM 妫€娴? 鎹曡幏杈撳嚭
         if (g_cb.read_file) {
-            // 先确认文件存在
+            // 鍏堢‘璁ゆ枃浠跺瓨鍦?
             static uint8_t probe[4];
             int rd = g_cb.read_file(0, filename, probe, sizeof(probe));
             if (rd < 0) rd = g_cb.read_file(1, filename, probe, sizeof(probe));
             if (rd >= 0) {
-                // winloader_capture_run 输出到窗口缓冲
+                // winloader_capture_run 杈撳嚭鍒扮獥鍙ｇ紦鍐?
                 static char wl_out[1800];
                 winloader_capture_run(filename, args ? args : "", wl_out, sizeof(wl_out));
-                // 追加输出到窗口
+                // 杩藉姞杈撳嚭鍒扮獥鍙?
                 int o = 0;
                 while (wl_out[o] && len < 1023) dst[len++] = wl_out[o++];
                 dst[len] = 0;
@@ -8593,7 +8753,7 @@ struct Win11Desktop {
     void gui_toggle_ime() {
         g_ime_cn = !g_ime_cn;
         ime_reset();
-        if (g_ime_cn) serial_puts("[GUI] IME mode -> Chinese (中文)\n");
+        if (g_ime_cn) serial_puts("[GUI] IME mode -> Chinese (涓枃)\n");
         else          serial_puts("[GUI] IME mode -> English (EN)\n");
         if (gui_mode) { g_desk_needs_full = true; render_all(); }
     }
@@ -9052,7 +9212,19 @@ void mh_progress   (int x,int y,int w,int h,int pct,uint32_t c){ diag_step(311, 
 // Frosted-glass rounded panel (Win11 Mica/Acrylic sign-in card look).
 void mh_glass(int x,int y,int w,int h,int r,uint32_t tint,int alpha,int blur){
     diag_step(312, "mh_glass");
-    glass_rounded_rect(g_wm.gfx, x, y, w, h, r, (Color)tint, alpha, blur);
+    // r <= 0 => rectangular (no corner rounding) frosted panel.  This is what a
+    // full-width strip (taskbar) wants: a sharp translucent bar that preserves
+    // its base colour while the wallpaper shows through.  r > 0 keeps the
+    // rounded SDF path used by windows / the start menu.
+    if (r <= 0)
+        glass_rect(g_wm.gfx, x, y, w, h, (Color)tint, alpha, blur);
+    else
+        glass_rounded_rect(g_wm.gfx, x, y, w, h, r, (Color)tint, alpha, blur);
+}
+// Soft radial bloom / focus halo (Win11 lock-screen light source).
+void mh_glow(int cx,int cy,int rx,int ry,uint32_t color,int alpha){
+    diag_step(318, "mh_glow");
+    glow_ellipse(g_wm.gfx, cx, cy, rx, ry, (Color)color, alpha);
 }
 // UTF-8 text at an explicit glyph height (the default Gfx.Text uses g_font_px).
 void mh_text_px(int x,int y,const char* s,uint32_t fg,int px){
@@ -9224,6 +9396,7 @@ static void mforms_boot(void) {
     h.icon         = mh_icon;
     h.progress     = mh_progress;
     h.glass        = mh_glass;
+    h.glow         = mh_glow;
     h.text_px      = mh_text_px;
     h.measure_px   = mh_measure_px;
     h.has_image    = mh_has_image;
@@ -9538,7 +9711,7 @@ static void fb_hex8(uint8_t v) {
 // Format-agnostic LFB write-after-read coherence probe. Writes four known
 // bytes at three probe pixels and reads them back.  If the bytes do NOT read
 // back identical, the framebuffer mapping is NOT coherent/writable at that
-// location -> category ① (fb_base invalid / >4GB page-table mapping broken).
+// location -> category 鈶?(fb_base invalid / >4GB page-table mapping broken).
 // This is decisive from the serial log alone; no photograph required.
 static void fb_diag_probe(void) {
     Graphics& g = g_wm.gfx;
@@ -9592,7 +9765,7 @@ static void gui_fb_diag(void) {
         serial_puts("[DIAG] variant=0 (default) vertical rainbow bars\n");
     }
 
-    fb_diag_probe();          // write-after-read coherence check (category ①)
+    fb_diag_probe();          // write-after-read coherence check (category 鈶?
 
     /* Clear to black first. */
     for (uint32_t y = 0; y < g.height; y++)
@@ -9952,7 +10125,7 @@ void gui_fill_rect(int x, int y, int w, int h, uint32_t color) {
 
 // ---- Tick: update internal time but no longer draw the top-bar clock ----
 // The clock was removed from the top-right corner by request; the language
-// indicator (中 / EN) is drawn by draw_topbar() and refreshed on IME toggle.
+// indicator (涓?/ EN) is drawn by draw_topbar() and refreshed on IME toggle.
 void gui_tick(void) {
     if (!g_wm.gui_mode) return;
     g_wm.update_clock();
@@ -9984,7 +10157,7 @@ void gui_animate_frame(void) {
 // Push the backbuffer to the LFB right now.
 //
 // This is what makes "semi-blocking" work: the managed shell draws a
-// placeholder ("正在打开 …") at the end of its paint, calls this, and only
+// placeholder ("姝ｅ湪鎵撳紑 鈥?) at the end of its paint, calls this, and only
 // THEN makes the long blocking host call (PE load / big file read / app
 // launch).  The frame that says what is going on is on screen for the whole
 // stall, so the work blocks but the UI in front of it never looks dead.
@@ -10110,7 +10283,7 @@ void gui_exit(void) {
 }
 
 // ---- Remote-control security guard: implementation ----
-// Full-screen "NexOS 安全卫士" overlay.  Triggered by kernel.cpp's remote
+// Full-screen "NexOS 瀹夊叏鍗＋" overlay.  Triggered by kernel.cpp's remote
 // command entry points (COM1 bridge / SSH) via gui_remote_begin()/cmd().
 
 static void remote_log_push(const char* cmd) {
@@ -10160,14 +10333,14 @@ void draw_remote_guard(void) {
     // Opaque full-screen backdrop
     g_wm.gfx.fill_rect(0, 0, W, H, 0x0B0E14);
 
-    // Top status bar: "NexOS 安全卫士"
+    // Top status bar: "NexOS 瀹夊叏鍗＋"
     const int BAR_H = 46;
     g_wm.gfx.fill_rect(0, 0, W, BAR_H, 0x123A6B);
     g_wm.gfx.draw_line(0, BAR_H, W, BAR_H, 0x2E6FB5);
-    g_wm.gfx.draw_text_utf8(16, 14, "NexOS 安全卫士", 0xFFFFFF, 0x123A6B);
-    g_wm.gfx.draw_text_utf8(W - 64, 16, "安全中心", 0x9FC7EF, 0x123A6B);
+    g_wm.gfx.draw_text_utf8(16, 14, "NexOS 瀹夊叏鍗＋", 0xFFFFFF, 0x123A6B);
+    g_wm.gfx.draw_text_utf8(W - 64, 16, "瀹夊叏涓績", 0x9FC7EF, 0x123A6B);
 
-    // Alert strip: "正在被远程控制" + controller identity
+    // Alert strip: "姝ｅ湪琚繙绋嬫帶鍒? + controller identity
     const int ALERT_H = 70;
     int ay = BAR_H;
     g_wm.gfx.fill_rect(0, ay, W, ALERT_H, 0x7A1020);
@@ -10206,7 +10379,7 @@ void draw_remote_guard(void) {
         ly += lh;
     }
 
-    // "结束控制" button (centered, bottom)
+    // "缁撴潫鎺у埗" button (centered, bottom)
     g_remote_btn_w = 180; g_remote_btn_h = 46;
     g_remote_btn_x = (W - g_remote_btn_w) / 2;
     g_remote_btn_y = H - 90;
@@ -10234,7 +10407,7 @@ void gui_open_file(const char* filename, const char* args) {
         g_wm.enter_gui();
         g_wm.render_all();
     }
-    // 在 GUI 桌面中打开文件: 用 winloader 检测类型并创建信息窗口
+    // 鍦?GUI 妗岄潰涓墦寮€鏂囦欢: 鐢?winloader 妫€娴嬬被鍨嬪苟鍒涘缓淇℃伅绐楀彛
     g_wm.open_file_in_gui(filename, args);
 }
 

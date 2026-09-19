@@ -24,7 +24,9 @@ static int       g_calc_fid = -1;
 
 static int calc_reload(const uint8_t* bc, int len) {
     if (skill_load(&g_calc_vm, bc, len) != 0) { pm_serial("[CALC] reload: bad .bc\n"); return -1; }
-    g_calc_fid = 0;
+    /* look the entry point up by name rather than assuming func 0 */
+    g_calc_fid = skill_find(&g_calc_vm, "calc");
+    if (g_calc_fid < 0) g_calc_fid = 0;
     pm_serial("[CALC] reload: bytecode loaded\n");
     return 0;
 }

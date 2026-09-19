@@ -27,14 +27,17 @@ static int theme_colors(void* args, void* out, int outcap) {
 }
 
 /* Phase 5 reload: the .bc exposes the 16 palette entries as its first 16
- * globals.  Load it, run func 0 (init), and copy globals[0..15] into g_theme_rt. */
+ * globals.  Load it, run main() (which materialises the global initialisers),
+ * then copy globals[0..15] into g_theme_rt so gui.cpp picks up the new colours
+ * on its next frame. */
 static int theme_reload(const uint8_t* bc, int len) {
     SkillVM vm;
     if (skill_load(&vm, bc, len) != 0) {
         pm_serial("[THEME] reload: bad .bc\n"); return -1;
     }
+    int fid = skill_find(&vm, "main");
     int out = 0;
-    if (skill_run(&vm, 0, &out) != 0) {
+    if (skill_run(&vm, fid >= 0 ? fid : 0, &out) != 0) {
         pm_serial("[THEME] reload: run failed\n"); return -1;
     }
     for (int i = 0; i < 16; i++) g_theme_rt[i] = (uint32_t)vm.globals[i];

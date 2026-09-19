@@ -379,7 +379,18 @@ $(BUILD)/kernel.bin: $(BUILD)/kernel.elf | $(BUILD)
 #  detailed textures.  The UEFI disk keeps a texture-free SFS because
 #  its SFS slot (LBA 800) is only ~224 sectors before the ESP (LBA 1024).
 # =====================================================================
-$(SFS_IMG): $(wildcard $(SFS_DIR)/*) tools/sfs_gen.py tools/tex_pack.py $(SFS_DIR)/userdemo $(SFS_DIR)/hello.mex $(SFS_DIR)/shell.mex $(SFS_DIR)/hello.nex | $(BUILD)
+# Phase 5: compile the hot-swap plugin sources to NBC1 bytecode so the kernel
+# can `plugin pm reload <name>` them straight out of the SFS volume.
+# Names must stay <= 19 chars (SFS name[20]).
+SKILL_SRCS := $(SFS_DIR)/theme_default.skill $(SFS_DIR)/calc.skill
+SKILL_BCS  := $(patsubst $(SFS_DIR)/%.skill,$(SFS_DIR)/%.bc,$(SKILL_SRCS))
+
+$(SFS_DIR)/%.bc: $(SFS_DIR)/%.skill tools/skillc.py | $(BUILD)
+	$(PYTHON) tools/skillc.py $< $@
+
+skillbc: $(SKILL_BCS)
+
+$(SFS_IMG): $(wildcard $(SFS_DIR)/*) tools/sfs_gen.py tools/tex_pack.py $(SKILL_BCS) $(SFS_DIR)/userdemo $(SFS_DIR)/hello.mex $(SFS_DIR)/shell.mex $(SFS_DIR)/hello.nex | $(BUILD)
 	$(PYTHON) tools/tex_pack.py
 	$(PYTHON) tools/sfs_gen.py $(SFS_DIR) $@
 
