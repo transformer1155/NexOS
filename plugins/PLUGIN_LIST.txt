@@ -1,0 +1,1 @@
+app_browser app_calculator app_control_panel app_file_explorer app_task_manager app_terminal font_bitmap font_cjk font_vector gfx_core gfx_glass input_keyboard input_mouse theme_default wm_anim wm_core

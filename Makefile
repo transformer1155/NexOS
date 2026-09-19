@@ -200,6 +200,68 @@ $(BUILD)/ai_plugin.o: ai_plugin.cpp ai_plugin.h | $(BUILD)
 $(BUILD)/skill.o: skill.cpp skill.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c skill.cpp -o $@
 
+# ----- Plugin subsystem (Phase 1-5): statically linked plugin objects -----
+# Each plugin is a freestanding .o exporting a const Plugin descriptor.
+PLUGIN_SRCS := plugins/plugin_manager.cpp plugins/plugins_boot.cpp \
+               plugins/hello_world/hello_world.cpp plugins/src_view.cpp \
+               plugins/gfx_core.cpp plugins/gfx_glass.cpp plugins/font_bitmap.cpp \
+               plugins/font_vector.cpp plugins/font_cjk.cpp plugins/wm_core.cpp \
+               plugins/wm_anim.cpp plugins/input_keyboard.cpp plugins/input_mouse.cpp \
+               plugins/app_control_panel.cpp plugins/app_file_explorer.cpp \
+               plugins/app_task_manager.cpp plugins/app_calculator.cpp \
+               plugins/app_terminal.cpp plugins/app_browser.cpp plugins/theme_default.cpp
+# All plugin objects live flat under $(BUILD)/ (no subdirs) so no mkdir needed.
+PLUGIN_OBJS := $(BUILD)/plugin_manager.o $(BUILD)/plugins_boot.o $(BUILD)/hello_world.o \
+               $(BUILD)/src_view.o $(BUILD)/gfx_core.o $(BUILD)/gfx_glass.o \
+               $(BUILD)/font_bitmap.o $(BUILD)/font_vector.o $(BUILD)/font_cjk.o \
+               $(BUILD)/wm_core.o $(BUILD)/wm_anim.o $(BUILD)/input_keyboard.o \
+               $(BUILD)/input_mouse.o $(BUILD)/app_control_panel.o \
+               $(BUILD)/app_file_explorer.o $(BUILD)/app_task_manager.o \
+               $(BUILD)/app_calculator.o $(BUILD)/app_terminal.o \
+               $(BUILD)/app_browser.o $(BUILD)/theme_default.o
+
+# compile each plugin .cpp in place (header "plugin_manager.h" sits next to it)
+$(BUILD)/plugin_manager.o: plugins/plugin_manager.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/plugins_boot.o: plugins/plugins_boot.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/hello_world.o: plugins/hello_world/hello_world.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/src_view.o: plugins/src_view.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/gfx_core.o: plugins/gfx_core.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/gfx_glass.o: plugins/gfx_glass.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/font_bitmap.o: plugins/font_bitmap.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/font_vector.o: plugins/font_vector.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/font_cjk.o: plugins/font_cjk.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/wm_core.o: plugins/wm_core.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/wm_anim.o: plugins/wm_anim.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/input_keyboard.o: plugins/input_keyboard.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/input_mouse.o: plugins/input_mouse.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/app_control_panel.o: plugins/app_control_panel.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/app_file_explorer.o: plugins/app_file_explorer.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/app_task_manager.o: plugins/app_task_manager.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/app_calculator.o: plugins/app_calculator.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/app_terminal.o: plugins/app_terminal.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/app_browser.o: plugins/app_browser.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/theme_default.o: plugins/theme_default.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+
 $(BUILD)/gguf.o: gguf.cpp gguf.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c gguf.cpp -o $@
 
@@ -292,8 +354,8 @@ $(BUILD)/svga.o: svga.cpp svga.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c svga.cpp -o $@
 
 # ----- Link kernel ELF (entry.o first => _start at image offset 0) -----
-$(BUILD)/kernel.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o linker.ld | $(BUILD)
-	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o
+$(BUILD)/kernel.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(PLUGIN_OBJS) linker.ld | $(BUILD)
+	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(PLUGIN_OBJS)
 
 # ----- Extract flat kernel binary -----
 $(BUILD)/kernel.bin: $(BUILD)/kernel.elf | $(BUILD)

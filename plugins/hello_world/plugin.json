@@ -1,0 +1,9 @@
+{
+  "name": "hello_world",
+  "version": "1.0",
+  "provides": ["hello_world.greet"],
+  "requires": [],
+  "entry": "g_helloworld",
+  "author": "NexOS",
+  "desc": "Phase 1 smoke-test plugin. Prints to COM1 on init."
+}

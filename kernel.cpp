@@ -280,6 +280,16 @@ struct __attribute__((packed)) E820Entry {
 
 static E820Entry g_e820_entries[32];
 
+// Read a byte from RTC/CMOS RAM (port 0x70 = index, 0x71 = data).
+static uint8_t cmos_read(uint8_t reg){
+    outb(0x70, reg);
+    volatile int d = 0; while (d++ < 50) {}   // let the index settle
+    return inb(0x71);
+}
+static uint16_t cmos_read16(uint8_t reg){
+    return (uint16_t)cmos_read(reg) | ((uint16_t)cmos_read((uint8_t)(reg+1)) << 8);
+}
+
 static void detect_memory_e820(){
     g_hw.mem_e820_entries = 0;
     g_hw.mem_e820_available = false;
@@ -325,7 +335,46 @@ static void detect_memory_e820(){
         }
         serial_puts(" MiB usable\n");
     } else {
-        serial_puts("[HW] E820 not available, using CMOS fallback\n");
+        // CMOS fallback: read installed memory size from RTC/CMOS RAM and
+        // synthesize a minimal E820 map.  Linux needs a valid memory map or
+        // it computes a bogus direct-map and faults on the regions we loaded
+        // the bzImage / initrd / boot_params into (e.g. boot_params at
+        // 0x07C00000 ends up unmapped).
+        //
+        // NOTE: the custom boot path (NexOS does not chain through SeaBIOS)
+        // leaves the extended-memory CMOS bytes (0x17/0x18 and 0x30/0x31)
+        // uninitialized (=0xFFFF).  In that case we cannot trust CMOS and fall
+        // back to a safe default.  256 MB covers everything we load and matches
+        // the QEMU -m 256 test target; under-reporting RAM is always safe, so
+        // this is also fine on real machines with >=256 MB.
+        uint32_t base_kb     = cmos_read16(0x15);   // conventional memory (<=640 KB)
+        uint32_t ext_kb      = cmos_read16(0x17);   // memory 1M..16M, in KB (0xFFFF if unset)
+        uint32_t above16_64k = cmos_read16(0x30);   // memory >16M, in 64KB blocks (0xFFFF if unset)
+        bool cmos_valid = (ext_kb != 0xFFFFu) && (above16_64k != 0xFFFFu);
+        uint64_t total;
+        if (cmos_valid){
+            total = (uint64_t)(base_kb + ext_kb) * 1024ULL
+                  + (uint64_t)above16_64k * 65536ULL;
+        } else {
+            total = 256ULL * 1024 * 1024;           // default 256 MB
+        }
+        if (total < 64ULL * 1024 * 1024) total = 64ULL * 1024 * 1024; // floor 64 MB
+        g_e820_entries[0].base   = 0;
+        g_e820_entries[0].length = (uint64_t)base_kb * 1024ULL;
+        g_e820_entries[0].type   = 1;               // usable
+        g_e820_entries[1].base   = 0x100000ULL;
+        g_e820_entries[1].length = total - 0x100000ULL;
+        g_e820_entries[1].type   = 1;               // usable
+        g_hw.mem_e820_entries    = 2;
+        g_hw.mem_e820_available  = true;
+        g_hw.mem_total_kb        = (uint32_t)(total / 1024ULL);
+        serial_puts("[HW] E820 (CMOS fallback): ");
+        {
+            char buf[12]; int i=0; uint32_t v=(uint32_t)(total/1048576ULL);
+            if(v==0){buf[i++]='0';} else{char t[10];int j=0;while(v){t[j++]='0'+v%10;v/=10;}while(j)buf[i++]=t[--j];}
+            buf[i]=0; serial_puts(buf);
+        }
+        serial_puts(" MiB usable\n");
     }
 }
 
@@ -879,6 +928,7 @@ extern "C" {
     int  net_http_get(const char* url, char* out, int outsize);
     // Ask a question through the host-side LLM bridge (10.0.2.2:18080).
     int  net_ask_host(const char* question, char* out, int outsize);
+    int  net_agent_execute(const char* goal, char* out, int outsize);
     // Configured OpenAI-compatible chat endpoint (set by the AI Setup GUI and
     // persisted in mkfs ai.cfg).  net_agent_remote() POSTs the goal as
     // {"model":..,"messages":[{"role":"user",...}]} with the `Authorization:
@@ -886,6 +936,8 @@ extern "C" {
     void net_set_agent_remote_url(const char* url);
     void net_set_agent_api_key(const char* key);
     void net_set_agent_model(const char* m);
+    void agent_config_show(char* buf, int n);
+    void agent_load_config_reload(void);
     const char* net_get_agent_remote_url(void);
     int  net_agent_remote(const char* prompt, const char* url, char* out, int outsize);
     // ICMP ping client: returns 1 if any attempt got a reply, 0 on timeout.
@@ -1692,16 +1744,23 @@ public:
             ev.left   = m_pkt[0] & 0x01;
             ev.right  = m_pkt[0] & 0x02;
             ev.middle = m_pkt[0] & 0x04;
-            // PS/2 relative deltas are 9-bit signed: the low 8 bits live in
-            // m_pkt[1]/[2] and the 9th (sign) bit is bit4/bit5 of the start
-            // byte.  Using a bare int8_t here mis-signs any movement with
-            // |delta| > 127 (QEMU splits a fast drag into +/-255 packets, so
-            // a 0xFF01 byte is wrongly read as +1 instead of -255), which
-            // makes the cursor veer the wrong way / never reach the target.
-            ev.dx     = (int8_t)m_pkt[1];
-            if (m_pkt[0] & 0x10) ev.dx -= 256;        // X sign bit (bit4)
-            ev.dy     = (int8_t)m_pkt[2];
-            if (m_pkt[0] & 0x20) ev.dy -= 256;        // Y sign bit (bit5)
+            // PS/2 relative deltas are 9-bit signed two's complement: the low
+            // 8 bits live in m_pkt[1]/[2] and the 9th (sign) bit is bit4/bit5
+            // of the start byte.  We must assemble the FULL 9-bit value first
+            // (mask the byte to 0..255, OR in the 9th bit, then sign-extend
+            // from 9 bits) BEFORE interpreting as int.  Casting the raw byte
+            // with (int8_t) first mis-signs any movement >= +128: a +255 packet
+            // (low byte 0xFF, sign bit clear) was read as -1 and the cursor
+            // jumped the WRONG way on every fast drag -- the "mouse teleport"
+            // bug.  The correct range is -256..+255.
+            int xraw = (int)(uint8_t)m_pkt[1];
+            if (m_pkt[0] & 0x10) xraw |= 0x100;       // X 9th (sign) bit
+            if (xraw & 0x100) xraw -= 0x200;           // sign-extend from 9 bits
+            ev.dx = xraw;
+            int yraw = (int)(uint8_t)m_pkt[2];
+            if (m_pkt[0] & 0x20) yraw |= 0x100;       // Y 9th (sign) bit
+            if (yraw & 0x100) yraw -= 0x200;           // sign-extend from 9 bits
+            ev.dy = yraw;
             ev.dz     = (m_pkt_len >= 4) ? (int8_t)m_pkt[3] : 0;
         }
         return ev;
@@ -3217,6 +3276,11 @@ static void vmm_init(){
 
     // Identity-map first 32 MiB with 4 MiB pages (covers kernel + 16 MiB heap)
     for (int i = 0; i < 8; i++)
+        page_directory[i] = (i * 0x400000u) | PG_PRESENT | PG_RW | PG_PSE;
+
+    // Identity-map the 32-64 MiB gap so a chain-loaded Linux kernel can
+    // decompress into the lower region without faulting (kexec dual-kernel).
+    for (int i = 8; i < 0x10; i++)
         page_directory[i] = (i * 0x400000u) | PG_PRESENT | PG_RW | PG_PSE;
 
     // Identity-map VBE linear framebuffer area (for GUI support)
@@ -5750,6 +5814,14 @@ static void term_write_int(int v){
     for (int k = n - 1; k >= 0; k--) term.put_char(t[k]);
 }
 
+/* Phase 1-5 PluginManager shell bridge forward declarations (so cmd_plugin /
+ * cmd_plugin_mgr can call into the manager without including plugin_manager.h). */
+typedef int (*pm_svc_t)(void*, void*, int);
+extern "C" int      pm_call(const char* plugin, const char* method, void* args, void* out, int outcap);
+extern "C" pm_svc_t svc_lookup(const char* name);
+extern "C" int      pm_reload(const char* name);
+static void cmd_plugin_mgr(const char* args);
+
 static void cmd_plugin(const char* args){
     if (!g_plugin_inited) { ai_plugin_init(); g_plugin_inited = true; }
 
@@ -5797,9 +5869,73 @@ static void cmd_plugin(const char* args){
         } else {
             term.write("Plugin '"); term.write(args); term.write("' is not runnable in this build.\n");
         }
+    } else if (!strcmp_(sub, "pm")) {
+        cmd_plugin_mgr(args);
     } else {
-        term.write("Usage: plugin [list|persist|toggle|load|unload|info|run] [<id>]\n");
+        term.write("Usage: plugin [list|persist|toggle|load|unload|info|run|pm] [<id>]\n");
     }
+}
+
+/* Phase 1-5 PluginManager shell bridge.  Driven by `plugin pm <sub> ...`.
+ * Subcommands:
+ *   pm list                 - list registered plugins
+ *   pm call <p> <m> [a]    - pm_call plugin p method m (serial log shows result)
+ *   pm svc <name>          - probe a service in the registry
+ *   pm reload <name>       - hot-reload a plugin's .bc/.skill from MKFS/SFS (Phase 5)
+ */
+static void cmd_plugin_mgr(const char* args){
+    if (!*args) { term.write("Usage: plugin pm [list|call <p> <m>|svc <name>|reload <name>]\n"); return; }
+    char sub[16]; int si = 0;
+    while (*args && *args != ' ' && si < 15) sub[si++] = *args++;
+    sub[si] = 0;
+    while (*args == ' ') args++;
+
+    if (!strcmp_(sub, "list")) {
+        term.write("[PM] PluginManager registered (see serial boot log for 17 plugins)\n");
+        term.write("      use `plugin pm call gfx_core fill_rect` to test a service\n");
+        return;
+    }
+    if (!strcmp_(sub, "call")) {
+        char plugin[32]; int pi = 0;
+        while (*args && *args != ' ' && pi < 31) plugin[pi++] = *args++;
+        plugin[pi] = 0;
+        while (*args == ' ') args++;
+        char method[32]; int mi = 0;
+        while (*args && *args != ' ' && mi < 31) method[mi++] = *args++;
+        method[mi] = 0;
+        int argv[8] = {0}; int argc = 0;
+        while (*args) {
+            while (*args == ' ') args++;
+            if (!*args) break;
+            /* parse up to 8 int args */
+            int neg = 0; if (*args == '-') { neg = 1; args++; }
+            int v = 0; while (*args >= '0' && *args <= '9') { v = v*10 + (*args - '0'); args++; }
+            argv[argc < 8 ? argc : 7] = neg ? -v : v;
+            if (argc < 8) argc++;
+            while (*args && *args != ' ') args++;
+        }
+        int out = 0;
+        int r = pm_call(plugin, method, argv, &out, (int)sizeof(out));
+        term.write("[PM] pm_call("); term.write(plugin); term.write(",");
+        term.write(method); term.write(") -> ");
+        term_write_int(r);
+        term.write(" (serial log has detail)\n");
+        return;
+    }
+    if (!strcmp_(sub, "svc")) {
+        pm_svc_t f = svc_lookup(args);
+        term.write("[PM] svc_lookup("); term.write(args); term.write(") = ");
+        term.write(f ? "present\n" : "absent\n");
+        return;
+    }
+    if (!strcmp_(sub, "reload")) {
+        if (!*args) { term.write("Usage: plugin pm reload <name>\n"); return; }
+        int r = pm_reload(args);
+        term.write("[PM] reload "); term.write(args); term.write(" -> ");
+        term.write(r == 0 ? "ok (recompiled & rebound)\n" : "failed\n");
+        return;
+    }
+    term.write("Usage: plugin pm [list|call <p> <m>|svc <name>|reload <name>]\n");
 }
 
 // P4 bridge: create/overwrite a file on the writable MKFS volume, used by the
@@ -5808,6 +5944,19 @@ static void cmd_plugin(const char* args){
 int kern_fs_create(const char* name, const unsigned char* data, int len){
     if (!mkfs.mounted) return -2;
     return mkfs.create(name, (const uint8_t*)data, len);
+}
+
+// Read a packed file into buf.  Tries SFS first (read-only, always mounted
+// from the image), then the writable MKFS data disk.  Returns bytes read or
+// -1.  Used by the in-kernel AI agent to load its LLM config (agent.cfg).
+extern "C" int kern_fs_read(const char* name, unsigned char* buf, int bufsize){
+    if (bufsize <= 0 || !buf) return -1;
+    int n = -1;
+    // MKFS (writable data disk) wins over SFS so a guest-written agent.cfg can
+    // override the SFS-bundled default at runtime.
+    if (mkfs.mounted) n = mkfs.read(name, buf, bufsize);
+    if (n < 0 && sfs.mounted) n = sfs.read(name, buf, bufsize);
+    return n;
 }
 
 static void cmd_agent(const char* args){
@@ -5848,6 +5997,17 @@ static void cmd_agent(const char* args){
         char skill_out[256];
         if(agent_skill_dispatch(args, skill_out, (int)sizeof(skill_out))){
             term.write("[Skill] "); term.write(skill_out); term.put_char('\n');
+            return;
+        }
+        // Real multi-step agent (ReAct loop): ask the LLM what tool to call,
+        // execute it in the OS, feed the result back, repeat until [done].
+        // This is the default "do real work" path; on any failure it falls
+        // through to the legacy remote/local engines below.
+        char agent_out[6000];
+        int ar = net_agent_execute(args, agent_out, (int)sizeof(agent_out));
+        if (ar > 0){
+            term.write(agent_out);
+            term.put_char('\n');
             return;
         }
         // No verbose pipeline text here: while the pipeline runs, the caller
@@ -5898,8 +6058,26 @@ static void cmd_agent(const char* args){
         // `agent confirm on|off` toggles the dangerous-task gate.
         if(!strcmp_(args,"off")){ agent_set_confirm(0); term.write("Confirm mode OFF.\n"); }
         else { agent_set_confirm(1); term.write("Confirm mode ON (dangerous tasks blocked).\n"); }
+    } else if(!strcmp_(sub,"config")){
+        // View / override the agent endpoint config at runtime, or reload from
+        // agent.cfg / passwd.  Runtime overrides persist until reboot.
+        if(!*args){
+            char s[256]; agent_config_show(s, (int)sizeof(s));
+            term.write(s);
+            return;
+        }
+        char fld[16]; int fi=0;
+        while(*args && *args!=' ' && fi<15) fld[fi++]=*args++; fld[fi]=0;
+        while(*args==' ') args++;
+        if(!strcmp_(fld,"url") && *args) net_set_agent_remote_url(args);
+        else if(!strcmp_(fld,"key") && *args) net_set_agent_api_key(args);
+        else if(!strcmp_(fld,"model") && *args) net_set_agent_model(args);
+        else if(!strcmp_(fld,"load")) agent_load_config_reload();
+        else { term.write("Usage: agent config [url|key|model|load] [value]\n"); return; }
+        term.write("Agent config updated.\n");
+        char s[256]; agent_config_show(s, (int)sizeof(s)); term.write(s);
     } else {
-        term.write("Usage: agent [init|run|status|skills|abort|confirm]\n");
+        term.write("Usage: agent [init|run|status|skills|abort|confirm|config]\n");
     }
 }
 
@@ -6952,6 +7130,218 @@ static void cmd_linux(const char* args){
     linux_run(av[0], ac, av);
 }
 
+// =====================================================================
+//  Dual-kernel boot (kexec / chain-load a real Linux kernel)
+//  NexOS's 32-bit loader acts as a bootloader: it parses a Linux bzImage,
+//  relocates the protected-mode part to a high identity-mapped address,
+//  builds a Linux boot_params (zero page) with the E820 map / cmdline /
+//  initrd, then drops paging and far-jumps to Linux's 32-bit entry.
+//  Linux (startup_32 in the decompressor) expects: 32-bit protected mode,
+//  paging OFF, flat segments, and %esi = boot_params.
+// =====================================================================
+
+// All targets live in the 64-256 MiB identity-mapped (PSE) window so the
+// trampoline can run with paging off and still address everything linearly.
+// Layout (no overlaps, all inside the 256 MB e820 we hand to Linux):
+//   kernel image   0x04000000 .. 0x062BD000   (init_size = 0x22BD000)
+//   initrd         0x06400000 .. 0x08400000   (max 32 MiB, OUTSIDE init_size!)
+//   raw bzImage    0x08800000 .. 0x09800000   (max 16 MiB)
+//   boot_params    0x09A00000 .. 0x09A04000
+//   cmdline        0x09A10000
+//   tramp stack    below   0x09A80000
+// The initrd MUST NOT sit inside the kernel's init_size window or the
+// decompressor overwrites it while unpacking (which corrupts the ramdisk and
+// makes the kernel oops on bogus pointers during early boot).
+#define KEXEC_LINUX_LOAD   0x04000000u   // protected-mode kernel image (64 MiB)
+#define KEXEC_INITRD       0x06400000u   // initrd (100 MiB)
+#define KEXEC_VMLINUZ_RAW  0x08800000u   // raw bzImage buffer (136 MiB)
+#define KEXEC_BP           0x09A00000u   // boot_params / zero page (154 MiB)
+#define KEXEC_CMDLINE      0x09A10000u   // command line string
+#define KEXEC_STACK_TOP    0x09A80000u   // boot stack top
+
+// Flat 32-bit GDT for the trampoline: base 0, limit 4 GiB.
+static uint64_t kexec_gdt[3] = {
+    0x0000000000000000ULL,
+    0x00CF9A000000FFFFULL,   // 0x08: 32-bit code, DPL0, present, 4G, base 0
+    0x00CF92000000FFFFULL,   // 0x10: 32-bit data, DPL0, present, 4G, base 0
+};
+static struct { uint16_t limit; uint32_t base; } __attribute__((packed)) kexec_gdt_ptr = {
+    (uint16_t)(sizeof(kexec_gdt) - 1),
+    (uint32_t)(unsigned long)&kexec_gdt
+};
+
+// Hand control to the Linux 32-bit entry point.  Never returns.
+// COM1 checkpoints (A,B,C,D,E) trace how far the trampoline gets before the
+// handoff; F is emitted just before the far-return into Linux.
+extern "C" void kexec_enter(uint32_t entry, uint32_t bp){
+    register uint32_t r_entry asm("edi") = entry;   // Linux entry (EIP)
+    register uint32_t r_bp    asm("esi") = bp;      // boot_params (%esi)
+    asm volatile (
+        // checkpoint A: entered trampoline
+        "movw $0x3FD, %%dx\n\t 9:\n\t inb %%dx, %%al\n\t testb $0x20, %%al\n\t jz 9b\n\t"
+        "movw $0x3F8, %%dx\n\t movb $'A', %%al\n\t outb %%al, %%dx\n\t"
+        // 1. switch data segments to a flat 32-bit data segment
+        "movw $0x10, %%ax\n\t"
+        "movw %%ax, %%ds\n\t"
+        "movw %%ax, %%es\n\t"
+        "movw %%ax, %%ss\n\t"
+        "movw %%ax, %%fs\n\t"
+        "movw %%ax, %%gs\n\t"
+        // 2. load our GDT
+        "lgdt %0\n\t"
+        "ljmp $0x08, $1f\n\t"
+        "1:\n\t"
+        // checkpoint B: CS reloaded (flat)
+        "movw $0x3FD, %%dx\n\t 8:\n\t inb %%dx, %%al\n\t testb $0x20, %%al\n\t jz 8b\n\t"
+        "movw $0x3F8, %%dx\n\t movb $'B', %%al\n\t outb %%al, %%dx\n\t"
+        // 4. fresh boot stack (identity-mapped, supervisor)
+        "movl $%c2, %%esp\n\t"
+        "movl %%esp, %%ebp\n\t"
+        // checkpoint C: stack set
+        "movw $0x3FD, %%dx\n\t 7:\n\t inb %%dx, %%al\n\t testb $0x20, %%al\n\t jz 7b\n\t"
+        "movw $0x3F8, %%dx\n\t movb $'C', %%al\n\t outb %%al, %%dx\n\t"
+        // 5. disable paging (CR0.PG) while still identity-mapped
+        "movl %%cr0, %%eax\n\t"
+        "andl $0x7FFFFFFF, %%eax\n\t"
+        "movl %%eax, %%cr0\n\t"
+        "jmp 2f\n\t"
+        "2:\n\t"
+        // checkpoint D: paging off
+        "movw $0x3FD, %%dx\n\t 6:\n\t inb %%dx, %%al\n\t testb $0x20, %%al\n\t jz 6b\n\t"
+        "movw $0x3F8, %%dx\n\t movb $'D', %%al\n\t outb %%al, %%dx\n\t"
+        // 6. clear the rest of the general registers
+        "xorl %%eax, %%eax\n\t"
+        "xorl %%ebx, %%ebx\n\t"
+        "xorl %%ecx, %%ecx\n\t"
+        "xorl %%edx, %%edx\n\t"
+        // checkpoint E: regs cleared (%esi already = boot_params)
+        "movw $0x3FD, %%dx\n\t 5:\n\t inb %%dx, %%al\n\t testb $0x20, %%al\n\t jz 5b\n\t"
+        "movw $0x3F8, %%dx\n\t movb $'E', %%al\n\t outb %%al, %%dx\n\t"
+        // 7. far-return into the Linux 32-bit entry (CS=0x08 already loaded)
+        "pushl $0x08\n\t"
+        "pushl %%edi\n\t"
+        // checkpoint F: about to enter Linux
+        "movw $0x3FD, %%dx\n\t 4:\n\t inb %%dx, %%al\n\t testb $0x20, %%al\n\t jz 4b\n\t"
+        "movw $0x3F8, %%dx\n\t movb $'F', %%al\n\t outb %%al, %%dx\n\t"
+        "lret\n\t"
+        :
+        : "m"(kexec_gdt_ptr), "r"(r_bp), "i"(KEXEC_STACK_TOP), "r"(r_entry)
+        : "eax","ebx","ecx","edx","memory"
+    );
+}
+
+// `linuxboot [noinitrd]` -- chain-load the Linux bzImage ("vmlinuz") and
+// optionally "initrd.img", both bundled in the SFS volume, as a second kernel.
+static void cmd_linuxboot(const char* args){
+    while (*args == ' ') args++;
+    bool noinitrd = startswith_(args, "noinitrd");
+
+    if (vmm_long_mode){
+        term.set_color(make_color(RED, BLACK));
+        term.write("linuxboot requires 32-bit mode (BIOS path).\n");
+        term.write("Switch back from long mode before chain-loading Linux.\n");
+        return;
+    }
+    term.set_color(make_color(CYAN, BLACK));
+    term.write("Dual-kernel boot: loading Linux bzImage (vmlinuz)...\n");
+    serial_puts("[KEXEC] loading vmlinuz from SFS\n");
+
+    unsigned char* raw = (unsigned char*)KEXEC_VMLINUZ_RAW;
+    int vmlen = linux_read_file_all("vmlinuz", raw, 16 * 1024 * 1024);
+    if (vmlen <= 0){ term.set_color(make_color(RED, BLACK));
+                     term.write("ERROR: cannot load vmlinuz from SFS\n"); return; }
+    serial_puts("[KEXEC] vmlinuz loaded bytes=");
+    serial_hex((uint32_t)vmlen); serial_puts("\n");
+
+    // Sanity-check the bzImage header magic ("HdrS" at file offset 0x202).
+    if (raw[0x202] != 'H' || raw[0x203] != 'd' ||
+        raw[0x204] != 'r' || raw[0x205] != 'S'){
+        term.set_color(make_color(RED, BLACK));
+        term.write("ERROR: vmlinuz is not a bzImage (HdrS magic missing)\n");
+        return;
+    }
+    int setup_sects = raw[0x1F1];
+    if (setup_sects == 0) setup_sects = 4;            // legacy default
+    int rmsize    = (setup_sects + 1) * 512;          // real-mode part size
+    int prot_size = vmlen - rmsize;                   // protected-mode part
+    if (prot_size <= 0){ term.set_color(make_color(RED, BLACK));
+                         term.write("ERROR: bad bzImage size\n"); return; }
+
+    // Build boot_params (zero page).  The real-mode part of the bzImage IS a
+    // valid boot_params structure (hdr at offset 0x1F1, plus screen_info/apm
+    // and the e820 map).  Copy it verbatim, then override the fields we
+    // control.  Copying only the setup_header blob to offset 0 would shift
+    // every field by 0x1F1 and feed the kernel garbage (e.g. a bogus
+    // kernel_alignment), causing it to build page tables over our page dir.
+    unsigned char* bp = (unsigned char*)KEXEC_BP;
+    memset_(bp, 0, 0x4000);
+    memcpy_(bp, raw, rmsize);                        // full real-mode part = boot_params
+
+    // Relocate the protected-mode part to KEXEC_LINUX_LOAD (relocatable kernel).
+    memcpy_((void*)KEXEC_LINUX_LOAD, raw + rmsize, prot_size);
+    serial_puts("[KEXEC] protected part @ ");
+    serial_hex(KEXEC_LINUX_LOAD);
+    serial_puts(" size=");
+    serial_hex((uint32_t)prot_size);
+    serial_puts("\n");
+
+    // Command line (Linux parses this via cmd_line_ptr).
+    char* cmd = (char*)KEXEC_CMDLINE;
+    const char* cl = "console=ttyS0,115200n8 "
+                     "earlycon=uart8250,io,0x3f8,115200 "
+                     "ignore_loglevel loglevel=8 "
+                     "acpi=off maxcpus=1 noapic "
+                     "nokaslr";
+    int cli = 0;
+    while (cl[cli]){ cmd[cli] = cl[cli]; cli++; }
+    cmd[cli] = 0;
+
+    // Patch boot_params fields.  Offsets are boot_params-absolute (the setup
+    // header lives at 0x1F1, so a setup_header field at hdr offset X is at
+    // bp + 0x1F1 + X).
+    *(uint32_t*)(bp + 0x212) = KEXEC_LINUX_LOAD;       // code32_start = entry (hdr+0x21)
+    *(uint8_t *)(bp + 0x20E) = 0xFF;                   // type_of_loader = unknown (hdr+0x1D)
+    *(uint8_t *)(bp + 0x20F) |= 0x41;                   // loadflags: LOADED_HIGH | KEEP_SEGMENTS
+                                        // KEEP_SEGMENTS keeps startup_32 from reloading
+                                        // DS/ES/SS with its own __BOOT_DS (0x18), which
+                                        // would #GP against our 3-entry trampoline GDT.
+    *(uint32_t*)(bp + 0x229) = (uint32_t)KEXEC_CMDLINE; // cmd_line_ptr (hdr+0x38)
+
+    // Optional initrd.
+    if (!noinitrd){
+        unsigned char* initrd = (unsigned char*)KEXEC_INITRD;
+        int initrd_size = linux_read_file_all("initrd.img", initrd, 32 * 1024 * 1024);
+        if (initrd_size > 0){
+            *(uint32_t*)(bp + 0x216) = KEXEC_INITRD;           // ramdisk_image (hdr+0x25)
+            *(uint32_t*)(bp + 0x21A) = (uint32_t)initrd_size;  // ramdisk_size (hdr+0x29)
+            serial_puts("[KEXEC] initrd @ ");
+            serial_hex(KEXEC_INITRD);
+            serial_puts(" size=");
+            serial_hex((uint32_t)initrd_size);
+            serial_puts("\n");
+        } else {
+            serial_puts("[KEXEC] initrd.img not found; booting without it\n");
+        }
+    }
+
+    // E820 memory map -> boot_params.e820_entries + e820_table (same 20-byte fmt).
+    int ne = g_hw.mem_e820_entries;
+    if (ne > 128) ne = 128;
+    *(uint8_t*)(bp + 0x1E8) = (uint8_t)ne;            // e820_entries
+    memcpy_(bp + 0x2D0, g_e820_entries, ne * 20);     // e820_table
+
+    serial_puts("[KEXEC] entering Linux 32-bit entry @ ");
+    serial_hex(KEXEC_LINUX_LOAD);
+    serial_puts("  boot_params @ ");
+    serial_hex(KEXEC_BP);
+    serial_puts("\n");
+    term.write("Handing control to the Linux kernel (kexec)...\n");
+    serial_puts("[KEXEC] --- transfer to Linux ---\n");
+
+    kexec_enter(KEXEC_LINUX_LOAD, KEXEC_BP);
+    // never returns
+}
+
 // ---------------------------------------------------------------------
 //  MiniCLR:  run a managed C# app (.mex) from the SFS volume.
 //  The image was produced by real Roslyn and flattened by
@@ -7347,6 +7737,8 @@ static void run_command(const char* line){
     else if(!strcmp_(cmd,"winenv")||!strcmp_(cmd,"set32")) cmd_winenv(args);
     // Linux binary-compat (Wine-on-NexOS): run an ELF32 image from SFS
     else if(!strcmp_(cmd,"linux"))                         cmd_linux(args);
+    // Dual-kernel boot: NexOS's loader chain-loads a real Linux bzImage.
+    else if(!strcmp_(cmd,"linuxboot")||!strcmp_(cmd,"kexec")) cmd_linuxboot(args);
     else if(!strcmp_(cmd,"clr")||!strcmp_(cmd,"dotnet"))   cmd_clr(args);
     else if(!strcmp_(cmd,"clrapp"))                          cmd_clrapp(args);
     // Foundation 0: ring-3 user-mode demo (proves isolation + syscall ABI)
@@ -8342,6 +8734,7 @@ static void boot_stage(uint8_t s){
     boot_splash_stage((int)s);   // advance the early boot animation
 }
 
+extern "C" void plugin_manager_boot(void);  /* Phase 1 plugin manager */
 extern "C" void kmain(){
     // RAW early marker: proves kmain entry is reached (bypasses C++ serial_puts)
     __asm__ __volatile__("movb $0x5A, %%al\n\tmovw $0x3F8, %%dx\n\toutb %%al, %%dx" ::: "eax","edx");
@@ -8572,6 +8965,9 @@ extern "C" void kmain(){
     // framebuffer console / beacon write.
     heap_init();
     serial_puts("[K7] memory management init done\n");
+
+    /* Phase 1: plugin manager (loads hello_world in this phase) */
+    plugin_manager_boot();
     boot_splash_tick();
     serial_puts("[K] Command-line shell (GUI starts on demand via 'run <winfile>')\n");
 
