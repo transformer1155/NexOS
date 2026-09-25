@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="description" content="NexOS —— 从零自研的 x86 操作系统：C++ 内核 · C# 托管桌面壳 · Web 控制台 · 本地大模型推理 · 分布式算力网络"/>
+<title>NexOS · 自研 x86 操作系统</title>
+<style>
+  :root{
+    --blue:#0078D4; --blue-d:#005a9e; --blue-grad:linear-gradient(135deg,#0067b8 0%,#0078d4 55%,#2b8ce0 100%);
+    --ink:#0f172a; --ink-2:#334155; --ink-3:#64748b;
+    --bg:#f6f8fb; --card:#ffffff; --line:#e2e8f0;
+    --radius:16px; --maxw:1120px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--bg);line-height:1.65;-webkit-font-smoothing:antialiased}
+  a{color:var(--blue);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+  section{padding:78px 0}
+  .eyebrow{display:inline-block;font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--blue);margin-bottom:10px}
+  h2{font-size:clamp(26px,3.5vw,36px);line-height:1.2;margin:0 0 12px;letter-spacing:-.01em}
+  .sub{font-size:17px;color:var(--ink-2);max-width:720px;margin:0 0 34px}
+  .center{text-align:center}
+  .center .sub{margin-left:auto;margin-right:auto}
+
+  /* ---------- nav ---------- */
+  header{position:sticky;top:0;z-index:50;backdrop-filter:saturate(180%) blur(14px);background:rgba(250,252,255,.82);border-bottom:1px solid rgba(15,23,42,.08)}
+  nav{display:flex;align-items:center;justify-content:space-between;height:64px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:19px;color:var(--ink);letter-spacing:-.01em}
+  .brand img{width:28px;height:28px;border-radius:7px}
+  .brand b{background:var(--blue-grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .links{display:flex;gap:26px;align-items:center}
+  .links a{color:var(--ink-2);font-weight:500;font-size:15px}
+  .links a:hover{color:var(--blue);text-decoration:none}
+  .btn{display:inline-flex;align-items:center;gap:8px;font-weight:700;font-size:15px;padding:12px 22px;border-radius:10px;transition:.18s}
+  .btn-primary{background:var(--blue-grad);color:#fff;box-shadow:0 8px 22px -8px rgba(0,120,212,.7)}
+  .btn-primary:hover{transform:translateY(-1px);box-shadow:0 12px 26px -8px rgba(0,120,212,.8);text-decoration:none}
+  .btn-ghost{background:#fff;color:var(--ink);border:1px solid var(--line)}
+  .btn-ghost:hover{border-color:var(--blue);color:var(--blue);text-decoration:none}
+
+  /* ---------- hero ---------- */
+  .hero{color:#fff;padding:92px 0 0;background:
+    radial-gradient(1000px 500px at 85% -10%,rgba(43,140,224,.55),transparent 60%),
+    radial-gradient(800px 400px at -10% 10%,rgba(0,120,212,.5),transparent 55%),
+    linear-gradient(160deg,#05223f 0%,#0b3a6b 55%,#0d4f9c 100%)}
+  .hero .grid{display:grid;grid-template-columns:1.05fr .95fr;gap:48px;align-items:center}
+  .hero h1{font-size:clamp(30px,4.6vw,52px);line-height:1.08;margin:14px 0 18px;letter-spacing:-.02em}
+  .hero h1 .accent{background:linear-gradient(90deg,#6cc3ff,#9ad1ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .hero p.lead{font-size:18px;color:#cfe3fa;max-width:560px;margin:0 0 30px}
+  .hero-cta{display:flex;gap:14px;flex-wrap:wrap}
+  .hero-cta .btn-primary{background:#fff;color:var(--blue-d);box-shadow:0 8px 24px -8px rgba(0,0,0,.4)}
+  .hero-cta .btn-primary:hover{background:#e8f4ff}
+  .hero-cta .btn-ghost{background:transparent;border-color:rgba(255,255,255,.35);color:#fff}
+  .hero-cta .btn-ghost:hover{border-color:#fff}
+  .chiprow{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+  .chip{font-size:12.5px;font-weight:600;padding:6px 12px;border:1px solid rgba(255,255,255,.25);border-radius:999px;background:rgba(255,255,255,.08);color:#e6f2fc}
+  .frame{background:#0b2a4a;border:1px solid rgba(255,255,255,.16);border-radius:16px;padding:12px 12px 0;box-shadow:0 40px 80px -30px rgba(0,0,0,.7);position:relative}
+  .frame .bar{display:flex;gap:7px;align-items:center;padding:2px 4px 12px}
+  .frame .bar i{width:11px;height:11px;border-radius:50%;display:block}
+  .frame .bar i:nth-child(1){background:#ff5f57}.frame .bar i:nth-child(2){background:#febc2e}.frame .bar i:nth-child(3){background:#28c840}
+  .frame img{width:100%;border-radius:9px;display:block}
+
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin-top:64px;padding:26px 0;border-top:1px solid rgba(255,255,255,.14)}
+  .stat b{font-size:28px;display:block;color:#fff}
+  .stat span{color:#a9c8ec;font-size:13.5px}
+
+  /* ---------- generic ---------- */
+  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:26px;transition:.18s}
+  .card:hover{transform:translateY(-3px);box-shadow:0 18px 40px -22px rgba(15,23,42,.25);border-color:#cdd9e8}
+  .card .ico{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;font-size:22px;color:#fff;margin-bottom:16px;background:var(--blue-grad)}
+  .card h3{margin:0 0 8px;font-size:18px}
+  .card p{margin:0;color:var(--ink-3);font-size:14.5px}
+
+  /* ---------- gallery ---------- */
+  .gallery{background:#0c2844;color:#fff}
+  .gallery h2{color:#fff}
+  .gallery .sub{color:#b7cfee}
+  .gallery .grid{display:grid;grid-template-columns:1fr 1fr;gap:22px;align-items:start}
+  .shot{border:1px solid rgba(255,255,255,.15);border-radius:14px;overflow:hidden;background:#08203a}
+  .shot img{width:100%;display:block}
+  .shot .cap{padding:14px 18px;color:#cfe3fa;font-size:13.5px;display:flex;justify-content:space-between;align-items:center}
+  .shot .cap b{color:#fff;font-size:15px}
+
+  /* ---------- download ---------- */
+  .dl{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:34px;display:grid;grid-template-columns:1fr 1fr;gap:34px;align-items:start;box-shadow:0 20px 50px -30px rgba(15,23,42,.35)}
+  .dl h3{margin:0 0 6px;font-size:22px}
+  .file{display:flex;align-items:center;gap:16px;background:#f0f6ff;border:1px dashed #b6d4f2;border-radius:13px;padding:20px;margin:20px 0}
+  .file .fi{width:52px;height:52px;border-radius:12px;background:var(--blue-grad);display:grid;place-items:center;color:#fff;font-weight:800;font-size:14px;flex:none}
+  .file .fn{font-weight:700;font-size:16px}
+  .file .fm{color:var(--ink-3);font-size:13.5px}
+  .actions{display:flex;gap:12px;flex-wrap:wrap}
+  .check{font-size:13.5px;color:var(--ink-3);background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:10px 14px;word-break:break-all;margin-top:14px}
+  .check code{color:var(--ink-2)}
+  .step{display:flex;gap:14px;margin-bottom:16px}
+  .step .n{width:26px;height:26px;border-radius:50%;background:var(--blue-grad);color:#fff;font-weight:800;font-size:14px;display:grid;place-items:center;flex:none;margin-top:2px}
+  .step h4{margin:0 0 3px;font-size:15.5px}
+  .step p{margin:0;color:var(--ink-3);font-size:14px}
+  .step pre{background:#0f172a;color:#d7e6ff;padding:10px 12px;border-radius:8px;font-size:13px;overflow-x:auto;margin:8px 0 0}
+
+  /* ---------- footer ---------- */
+  footer{background:#0a1b30;color:#9db8d8;padding:40px 0;font-size:14px}
+  .foot{display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap}
+  .foot .brand{color:#fff}
+  footer a{color:#6cc3ff}
+
+  @media(max-width:860px){
+    .hero .grid,.dl,.gallery .grid{grid-template-columns:1fr}
+    .cards,.stats{grid-template-columns:1fr 1fr}
+    .links{display:none}
+  }
+  @media(max-width:520px){.cards,.stats{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<!-- ============ NAV ============ -->
+<header>
+  <nav class="wrap">
+    <div class="brand"><img src="assets/logo.png" alt="NexOS logo"/><span>Nex<b>OS</b></span></div>
+    <div class="links">
+      <a href="#about">关于</a>
+      <a href="#features">特性</a>
+      <a href="#screens">截图</a>
+      <a href="#download">下载</a>
+      <a href="#run">运行</a>
+    </div>
+    <a class="btn btn-primary" href="#download" style="padding:9px 18px;font-size:14px">下载镜像</a>
+  </nav>
+</header>
+
+<!-- ============ HERO ============ -->
+<section class="hero" style="padding-top:40px">
+  <div class="wrap">
+    <div class="grid">
+      <div>
+        <span class="eyebrow" style="color:#6cc3ff">从零自研 · x86 · 全栈</span>
+        <h1>不只是一个内核，<br/>是一整块<b class="accent">自研操作系统</b></h1>
+        <p class="lead">NexOS 从空硬盘与 512 字节引导扇区起步，最终长成一个融合 <b>图形桌面、C# 托管壳、浏览器 Web 控制台、本地大模型推理与分布式算力网络</b> 的教学级全栈系统。</p>
+        <div class="hero-cta">
+          <a class="btn btn-primary" href="assets/os_v2.img" download>⬇ 下载镜像 (12.6 MB)</a>
+          <a class="btn btn-ghost" href="#run">如何运行</a>
+        </div>
+        <div class="chiprow">
+          <span class="chip">BIOS + UEFI 双引导</span>
+          <span class="chip">32/64 位双内核</span>
+          <span class="chip">Win11 风格桌面</span>
+          <span class="chip">内置 Qwen2 GGUF 推理</span>
+          <span class="chip">分布式算力网络</span>
+          <span class="chip">PE / Linux 兼容层</span>
+        </div>
+      </div>
+      <div class="frame">
+        <div class="bar"><i></i><i></i><i></i></div>
+        <img src="assets/desktop.png" alt="NexOS Win11 风格桌面" />
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat"><b>0x7c00</b><span>512B 引导扇区启程</span></div>
+      <div class="stat"><b>dual</b><span>BIOS / UEFI 同入口汇合</span></div>
+      <div class="stat"><b>Qwen2-0.5B</b><span>内置 GGUF Transformer</span></div>
+      <div class="stat"><b>2 主机</b><span>分布式算力分片推理</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ ABOUT ============ -->
+<section id="about">
+  <div class="wrap center">
+    <span class="eyebrow">About · 项目定位</span>
+    <h2>一句话看明白 NexOS</h2>
+    <p class="sub">以自研 C++ 内核为底座，融合 C# 托管桌面壳、浏览器端 Web 控制台、本地大模型推理与分布式算力网络的<strong>教学级全栈操作系统</strong>。起点是写一个能启动的引导扇区，如今已能跑起自己的桌面、自己的浏览器、自己的 AI 和由多台虚拟机组成的算力集群。</p>
+  </div>
+</section>
+
+<!-- ============ FEATURES ============ -->
+<section id="features" style="padding-top:0">
+  <div class="wrap center">
+    <span class="eyebrow">Features · 核心特性</span>
+    <h2>一整套自研能力</h2>
+    <p class="sub">从引导扇区到图形桌面，从文件系统到 AI 推理，几乎每一层都是自己写出来的。</p>
+  </div>
+  <div class="wrap">
+    <div class="cards">
+      <div class="card"><div class="ico">🖥️</div><h3>图形桌面 GUI</h3><p>帧缓冲自绘 Win11 风格桌面，叠加 C# 托管壳（NexOS.Forms）实现窗口管理器、菜单、托盘与登录。按需启动，兼容任意显卡。</p></div>
+      <div class="card"><div class="ico">🧠</div><h3>内置 AI 推理</h3><p>Markov + GPT 文本引擎，以及内置 Qwen2-0.5B（Q4_K_M）GGUF Transformer 推理引擎，支持 64 位流式输出与智能体 Agent。</p></div>
+      <div class="card"><div class="ico">🌐</div><h3>Web 控制台</h3><p>浏览器端 Win11 桌面 + 分布式网络面板 + Agent Forge，经 WebSocket 桥连真 QEMU 内核 —— 登录、命令、算力任务全部真实执行。</p></div>
+      <div class="card"><div class="ico">⚡</div><h3>分布式算力网络</h3><p>内核内 distnet（UDP 发现 + 调度 + 回收）+ 独立运行时 dcn，把推理/计算任务分片下发到多虚拟机合并推理。</p></div>
+      <div class="card"><div class="ico">🧩</div><h3>PE / Linux 兼容</h3><p>自研 PE/Win32 子系统（可跑自研 IE 浏览器）、Linux ELF/动态链接兼容层、以及移植的 Mono 运行时跑 .NET 托管代码。</p></div>
+      <div class="card"><div class="ico">🔐</div><h3>系统设施</h3><p>MKFS + SFS 双文件系统（数据盘跨重启持久化）、用户/权限/sudo、NE2000 网络栈 + HTTP、中文点阵字库 + 拼音 IME。</p></div>
+      <div class="card"><div class="ico">🚀</div><h3>BIOS + UEFI 引导</h3><p>Stage1→Stage2 二阶引导，32 位保护模式内核 + 64 位长模式内核，`switch64`/`switch32` 可互切，SMP 多核支持。</p></div>
+      <div class="card"><div class="ico">🐚</div><h3>终端与 Shell</h3><p>滚动回看 + 剪贴板（鼠标选择/中键粘贴/Ctrl+C/V），PS/2 键鼠驱动，PowerShell 风格 shell 内置 48+ 命令。</p></div>
+      <div class="card"><div class="ico">🗂️</div><h3>自动安装依赖</h3><p>WSL / 原生 Linux 下 `make` 自动探测并 apt 安装 gcc-multilib、qemu、gnu-efi、dotnet 等全部利器，开箱即编。</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ SCREENSHOTS ============ -->
+<section id="screens" class="gallery">
+  <div class="wrap">
+    <div class="center">
+      <span class="eyebrow" style="color:#6cc3ff">Screenshots · 实拍运行</span>
+      <h2>真实跑起来的界面</h2>
+      <p class="sub">以下截图取自 QEMU 虚拟机内真实启动的 NexOS。</p>
+    </div>
+    <div class="grid">
+      <div class="shot">
+        <img src="assets/desktop.png" alt="NexOS 桌面" />
+        <div class="cap"><b>Win11 风格桌面</b><span>应用网格 · 任务栏 · 托盘</span></div>
+      </div>
+      <div class="shot">
+        <img src="assets/login.png" alt="NexOS 登录界面" />
+        <div class="cap"><b>多用户登录</b><span>用户名 / 密码 / 快捷用户切换</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ DOWNLOAD ============ -->
+<section id="download">
+  <div class="wrap">
+    <div class="center">
+      <span class="eyebrow">Download · 下载镜像</span>
+      <h2>立刻跑起来一个自研系统</h2>
+      <p class="sub">直接下载自打包的启动镜像，用 QEMU 在任意 Linux / Windows 上几秒开机。</p>
+    </div>
+    <div class="dl">
+      <div>
+        <h3>启动镜像</h3>
+        <p style="margin:0;color:var(--ink-3)">自研 BIOS 双引导镜像，含 32/64 位内核、图形桌面、文件系统与演示数据。</p>
+        <div class="file">
+          <div class="fi">IMG</div>
+          <div>
+            <div class="fn">os_v2.img</div>
+            <div class="fm">12.6 MB · 单文件 · BIOS 引导</div>
+          </div>
+        </div>
+        <div class="actions">
+          <a class="btn btn-primary" href="assets/os_v2.img" download>⬇ 下载镜像</a>
+          <a class="btn btn-ghost" href="https://github.com/transformer1155/NexOS" target="_blank" rel="noopener">查看 GitHub 源码 →</a>
+        </div>
+        <div class="check">SHA-256 校验<br/><code>c057ed6e77c8915b21ba36c56b71d946e30ed4f28511680c73c790258bf24934</code></div>
+      </div>
+      <div id="run">
+        <span class="eyebrow">Quick Start · 快速运行</span>
+        <h3 style="font-size:19px;margin:6px 0 18px">用 QEMU 一键开机</h3>
+        <div class="step">
+          <div class="n">1</div>
+          <div><h4>尽享在线体验（推荐）</h4><p>使用前面“⬇ 下载镜像”按钮拿到 <code>os_v2.img</code>，然后：</p></div>
+        </div>
+        <div class="step">
+          <div class="n">2</div>
+          <div><h4>启动模拟器</h4>
+            <pre>$ qemu-system-x86_64 -m 1024 -drive file=os_v2.img,format=raw,if=ide -vga std</pre>
+          </div>
+        </div>
+        <div class="step">
+          <div class="n">3</div>
+          <div><h4>登录 &amp; 探索</h4>
+            <p>用户 <code>root</code> / 密码 <code>admin</code>（或 <code>guest</code> / <code>guest</code>）。终端里输入 <code>help</code> 查看 48+ 命令。</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FOOTER ============ -->
+<footer>
+  <div class="wrap foot">
+    <div class="brand"><img src="assets/logo.png" alt="NexOS logo"/><span style="color:#fff">Nex<b>OS</b></span></div>
+    <div>
+      <a href="https://github.com/transformer1155/NexOS" target="_blank" rel="noopener">GitHub</a> ·
+      <a href="assets/os_v2.img" download>下载镜像</a> ·
+      <span>教学级自研 x86 操作系统</span>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
