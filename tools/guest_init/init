@@ -1,0 +1,43 @@
+#!/bin/sh
+# Linux guest userspace /init
+# Starts a headless X server (Xvfb) with an xterm, and shares it over the
+# network using x11vnc (listening on port 5900) so NexOS can mirror it.
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sys /sys 2>/dev/null
+mount -t devtmpfs dev /dev 2>/dev/null || mknod -m 600 dev/console c 5 1 2>/dev/null
+
+# --- bring up lo ---
+ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null
+
+# --- bring up eth0 with SLIRP-friendly static config ---
+ip link set eth0 up 2>/dev/null
+ip addr add 10.0.2.15/24 dev eth0 2>/dev/null
+ip route add default via 10.0.2.2 dev eth0 2>/dev/null
+# fallback to udhcpc if we could not statically configure
+ip addr show dev eth0 2>/dev/null | grep -q 10.0.2.15 || udhcpc -q -i eth0 2>/dev/null
+
+echo "[guest] network up"
+echo 256 > /proc/sys/kernel/printk 2>/dev/null
+
+# --- start Xvfb on display :0 (1024x768x24) ---
+: > /tmp/xerr
+Xvfb :0 -screen 0 1024x768x24 -nolisten tcp > /tmp/xerr 2>&1 &
+XVFB_PID=$!
+sleep 1
+export DISPLAY=:0
+
+# --- sanity: start an xterm so the mirrored screen shows a terminal ---
+xterm -geometry 80x24+30+30 -title "Linux guest under NexOS" > /tmp/xterm_log 2>&1 &
+
+# --- share over VNC on port 5900 (no auth) ---
+x11vnc -display :0 -rfbport 5900 -forever -nopw -shared -q > /tmp/vncerr 2>&1 &
+VNC_PID=$!
+echo "[guest] VNC server (x11vnc p$VNC_PID) serving :0 on port 5900"
+echo "[guest] Xvfb p$XVFB_PID at 1024x768x24"
+
+# --- keep running on serial console ttyS0 for debugging ---
+echo "[guest] Linux guest ready. VNC port 5900 -> type Ctrl-A X or use nexos vnc client"
+echo "[guest] Device: $(cat /proc/cmdline)"
+
+# interactive console for debug
+exec setsid sh -c 'exec sh < /dev/ttyS0 > /dev/ttyS0 2>&1'
