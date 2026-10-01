@@ -1927,6 +1927,30 @@ struct Graphics {
         }
     }
 
+    // Bulk blit a w*h RGBX32 (0x00RRGGBB) pixel block into the backbuffer.
+    // Replaces the VNC client's per-pixel put_pixel() loop with a row-wise
+    // copy: no per-pixel virtual call, no per-pixel bounds check, no vtable
+    // indirection. On a 1024x768 full frame this removes ~786k function calls
+    // per frame and is the single biggest client-side speedup.  The source and
+    // backbuffer share the same Color layout (0x00RRGGBB), so no format
+    // conversion is needed -- a straight 32-bit copy is correct.
+    void blit_rect(int x, int y, int w, int h, const uint32_t* src) {
+        if (!src || w <= 0 || h <= 0) return;
+        int sx = 0, sy = 0;                       // left/top clipped columns/rows
+        if (x < 0) { sx = -x; w += x; x = 0; }     // w now = original_w - sx
+        if (y < 0) { sy = -y; h += y; y = 0; }     // h now = original_h - sy
+        if (x + w > (int)width)  w = (int)width  - x;
+        if (y + h > (int)height) h = (int)height - y;
+        if (w <= 0 || h <= 0) return;
+        int src_stride = w + sx;                    // original source row width
+        const uint32_t* row = src + (uint64_t)sy * src_stride + sx;
+        for (int r = 0; r < h; r++) {
+            uint32_t* dst = backbuffer + (uint64_t)(y + r) * width + x;
+            for (int c = 0; c < w; c++) dst[c] = row[c];
+            row += src_stride;
+        }
+    }
+
     // Alpha-blend a solid colour over a rectangle (used for fade animations)
     void blend_rect(int x, int y, int w, int h, Color c, int alpha) {
         if (alpha <= 0) return;
@@ -9662,6 +9686,14 @@ extern "C" void nexos_fb_query(struct NexosFBInfo* out) {
 
 int gui_available(void) {
     return g_wm.gfx.initialized ? 1 : 0;
+}
+
+// C entry point for the bulk-blit service used by the VNC client plugin.
+// Mirrors the nexos.gui.api vtable's put_pixel but copies a whole rectangle
+// at once instead of one pixel per call.
+extern "C" void gui_blit_pixels(int x, int y, int w, int h, const uint32_t* src) {
+    if (!g_wm.gfx.initialized) return;
+    g_wm.gfx.blit_rect(x, y, w, h, src);
 }
 
 #ifdef FB_DIAG

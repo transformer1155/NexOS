@@ -15,6 +15,19 @@ static const char* gfx_svc_name(const char* method) {
     if (!pm_strcmp(method, "draw_line"))   return "gfx.draw_line";
     if (!pm_strcmp(method, "put_pixel"))   return "gfx.put_pixel";
     if (!pm_strcmp(method, "blend_pixel")) return "gfx.blend_pixel";
+    if (!pm_strcmp(method, "blit_pixels")) return "gui.blit_pixels";
+    return 0;
+}
+
+// Bulk-blit service: copy a w*h RGBX32 pixel block into the GUI backbuffer.
+// args layout: struct { int x, y, w, h; const uint32_t* pixels; }
+struct BlitArgs { int x, y, w, h; const uint32_t* pixels; };
+extern "C" void gui_blit_pixels(int x, int y, int w, int h, const uint32_t* src);
+static int gfx_blit_svc(void* args, void* out, int outcap) {
+    (void)out; (void)outcap;
+    BlitArgs* a = (BlitArgs*)args;
+    if (!a || !a->pixels) return -1;
+    gui_blit_pixels(a->x, a->y, a->w, a->h, a->pixels);
     return 0;
 }
 
@@ -37,6 +50,7 @@ static int gfx_core_init(Plugin* self) {
     svc_register("gfx.draw_rect", gfx_draw_svc);
     svc_register("gfx.draw_line", gfx_draw_svc);
     svc_register("gfx.blend_pixel", gfx_draw_svc);
+    svc_register("gui.blit_pixels", gfx_blit_svc);
     return 0;
 }
 static void gfx_core_exit(Plugin* self) {
@@ -59,7 +73,7 @@ static int gfx_core_call(Plugin* self, const char* method, void* args, void* out
 }
 extern const Plugin g_gfx_core = {
     "gfx_core", 0x0100,
-    "gfx.put_pixel,gfx.fill_rect,gfx.draw_rect,gfx.draw_line,gfx.blend_pixel",
+    "gfx.put_pixel,gfx.fill_rect,gfx.draw_rect,gfx.draw_line,gfx.blend_pixel,gui.blit_pixels",
     "",
     gfx_core_init, gfx_core_exit, gfx_core_call
 };

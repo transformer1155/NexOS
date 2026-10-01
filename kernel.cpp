@@ -6618,12 +6618,13 @@ static void cmd_netstart(){
         term.set_color(make_color(GREEN, BLACK));
         term.write("Network UP! HTTP server on http://10.0.2.15:8080\n");
         term.set_color(make_color(CYAN, BLACK));
-        term.write("  (QEMU: use -net nic,model=ne2k_isa -net user,hostfwd=tcp::8080-:8080)\n");
+        term.write("  (QEMU: -net nic,model=ne2k_isa -net user,hostfwd=tcp::8080-:8080)\n");
+        term.write("  (faster: -netdev user,id=n0,hostfwd=tcp::8080-:8080 -device virtio-net-pci,netdev=n0)\n");
     } else {
         term.set_color(make_color(RED, BLACK));
-        term.write("Network init failed! (NE2000 NIC not detected)\n");
+        term.write("Network init failed! (no NIC detected)\n");
         term.set_color(make_color(CYAN, BLACK));
-        term.write("  Make sure QEMU has: -net nic,model=ne2k_isa\n");
+        term.write("  Make sure QEMU has: -net nic,model=ne2k_isa (or virtio-net-pci)\n");
     }
     term.set_color(make_color(WHITE, BLACK));
 }

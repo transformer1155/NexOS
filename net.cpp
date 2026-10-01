@@ -11,7 +11,10 @@
 //    * HTTP server (port 8080) with REST API
 //    * Web UI (embedded HTML/CSS/JS)
 //
-//  QEMU: -net nic,model=ne2k_isa -net user,hostfwd=tcp::8080-:8080
+//  QEMU (NE2000, default): -net nic,model=ne2k_isa -net user,hostfwd=tcp::8080-:8080
+//  QEMU (virtio, faster):  -netdev user,id=n0,hostfwd=tcp::8080-:8080 -device virtio-net-pci,netdev=n0
+//    -> net_init() auto-probes for a virtio-net PCI device (vendor 0x1AF4,
+//       device 0x1000) and switches to it; otherwise it keeps NE2000.
 //  Guest IP: 10.0.2.15  Gateway: 10.0.2.2
 //
 //  No external dependencies. Uses kernel's kmalloc/kfree.
@@ -31,6 +34,19 @@ extern "C" {
     void  net_poll(void);   // defined below; pumped by nexos_input_wait
     int   net_init(void);   // defined below (~line 2909); needed by net_guest_connect
 }
+
+// ---- Stage-1 transport: optional virtio-net PCI driver (net_virtio.cpp) ----
+// g_use_virtio is set by net_init() only after virtio_net_probe() finds a real
+// virtio-net PCI device.  With the default "-net nic,model=ne2k_isa" QEMU config
+// no such device exists, so the NE2000 ISA path below stays the active one.
+extern "C" {
+    int  virtio_net_probe(void);
+    int  virtio_net_active(void);
+    void virtio_net_send(const uint8_t* data, int len);
+    int  virtio_net_recv(uint8_t* buf, int maxlen);
+    const uint8_t* virtio_net_mac(void);
+}
+static bool g_use_virtio = false;
 
 // ---- Optional idle hook -------------------------------------------------
 // Pumped from net_http_get's blocking poll loop below.  The 32-bit kernel
@@ -278,6 +294,7 @@ static void nic_init(){
 }
 
 static void nic_send(const uint8_t* data, int len){
+    if (g_use_virtio){ virtio_net_send(data, len); return; }
     if (!nic_present || len <= 0) return;
     if (len > 1514) len = 1514;
     if (len < 60) len = 60;  // minimum Ethernet frame
@@ -365,6 +382,7 @@ static void tx_flush(void){
 }
 
 static int nic_receive(uint8_t* buf, int maxlen){
+    if (g_use_virtio) return virtio_net_recv(buf, maxlen);
     if (!nic_present) return 0;
 
     uint8_t bnry = ninb(NE_BASE + NE_BNRY);
@@ -2953,12 +2971,20 @@ void ssh_put_str(uint8_t* b, int* n, const uint8_t* str, int len);
 int net_init(void){
     net_serial("[NET] Initializing network...\n");
 
-    if (!nic_detect()){
+    // Stage-1 transport: prefer virtio-net PCI when present, else NE2000 ISA.
+    if (virtio_net_probe() != 0){
+        g_use_virtio = true;
+        const uint8_t* m = virtio_net_mac();
+        for (int i = 0; i < 6; i++) nic_mac[i] = m[i];
+        nic_present = true;
+        net_serial("[NET] Using virtio-net PCI driver\n");
+    } else if (!nic_detect()){
         net_serial("[NET] NE2000 not detected!\n");
         return -1;
+    } else {
+        nic_init();
     }
 
-    nic_init();
     arp_init();
     tcp_init();
     tcp_client_init();
@@ -4574,3 +4600,9 @@ extern "C" __attribute__((weak)) void term_set_ssh_sink(void (*fn)(const char*, 
 extern "C" __attribute__((weak)) void term_clear_ssh_sink(void){}
 
 }  // extern "C"
+
+// Stage-1 transport: pull in the optional virtio-net PCI driver so it links
+// into every image that already links net.o (no extra Makefile link edits).
+// Compiled as part of net.o; probe-gated in net_init() via g_use_virtio, so the
+// default "-net nic,model=ne2k_isa" build is completely unaffected.
+#include "net_virtio.cpp"
