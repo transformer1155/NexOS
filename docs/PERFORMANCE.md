@@ -144,4 +144,4 @@ NexOS 是自研宿主操作系统。它的核心用例是：**在自身托管的
 
 - 阶段②/③ 的解码算法（RRE + Hextile）已从 `vnc_client.cpp` 逐行抽出，写成独立离板测试 `rfb_decode_test.cpp`（用 mock 读取器替代 RFB 套接字、用测试帧缓冲替代 GUI backbuffer），覆盖：RRE（背景 + 2 子矩形）、Hextile（带色子矩形、纯背景瓦片、Raw 瓦片）。**全部用例 `ALL RFB DECODE TESTS PASSED`**。
 - 验证中发现并修复了一个**真实的 Hextile 渲染 bug**：原 `vnc_decode_hextile` 只在"无子矩形"分支里填充背景，导致当瓦片含子矩形时整块背景不被绘制，残留旧像素。按 RFB 3.8 §6.5.6，背景必须**先铺满整块瓦片**、再叠加子矩形（且 `BackgroundSpecified` 未置位时复用上一瓦片背景）。已改为"先 `fill_rect` 整瓦片、再画子矩形"，并同步修正测试桩。该修复同时消除了因背景缺失引起的错误填充。
-- 注：`rfb_decode_test.cpp` 是离线验证工具，不进入内核镜像；内核侧真实逻辑以 `plugins/vnc_client.cpp` 为准。
+- 离线验证桩已常驻仓库：`tools/rfb_decode_test.cpp`（不进入内核镜像，仅用于回归）。运行：`g++ -O2 -o rfb_decode_test tools/rfb_decode_test.cpp && ./rfb_decode_test`，期望输出 `ALL RFB DECODE TESTS PASSED`。内核侧真实逻辑以 `plugins/vnc_client.cpp` 为准。
