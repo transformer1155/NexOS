@@ -1066,6 +1066,109 @@ UEFI starts in long mode while the kernel is 32-bit code. The **compatibility mo
 
 ---
 
+
+## Linux 桌面镜像（方案1：VNC-over-TCP）
+
+NexOS 正在探索"让 Linux 作为访客跑在 NexOS 之上"的两条路线。
+**方案1**（本节已打通）：Linux 访客 initrd 内嵌 VNC server，NexOS 作为 VNC RFB 客户端在本机 TCP 上拉帧渲染到桌面。**方案2**（待实施）：VT-x hypervisor，NexOS 做 root mode 宿主，Linux 做 VM guest。
+
+### 组件清单
+
+| 路径 | 作用 |
+|------|------|
+| `plugins/vnc_client.cpp` | NexOS 内核侧 VNC RFB 3.8 客户端插件（TCP 传输用 `net_guest_*`） |
+| `plugins/plugins_boot.cpp` | 注册 `g_vnc_client` |
+| `net.cpp` | `net_guest_connect/send/recv/close` 内核 TCP API |
+| `linux_root/vmlinuz` | 访客内核（Alpine virt 或 Ubuntu generic） |
+| `tools/mk_initramfs.py` | 打包 gzip newc CPIO initramfs |
+| `tools/build_guest_initrd.sh` | 一键构建访客 rootfs + initrd |
+| `tools/guest_init/init` | 访客原始 `/init` 脚本（busybox init 场景下已替换为 `rc.start`） |
+
+### 访客 rootfs 构成（简化版）
+
+```
+/init                 busybox 二进制真实拷贝（argv[0]="init" 触发 init applet）
+/etc/inittab          ::sysinit:/bin/sh /etc/rc.start
+/etc/rc.start         挂载 proc/sys/dev → ifconfig lo/eth0 → Xvfb :0 → x11vnc :5900
+/bin/busybox          static busybox + applet symlinks (sh, mount, ifconfig, setsid, ...)
+/usr/bin/Xvfb
+/usr/bin/x11vnc
+/usr/bin/xterm
+/sbin/ip
+/lib/x86_64-linux-gnu/ 所有共享库 + soname symlink 链（ldd + dlopen 补漏）
+/lib64/ld-linux-x86-64.so.2 动态链接器（匹配 ELF .interp）
+/dev/{console,ttyS0,null,zero,random,urandom,tcp}
+/usr/share/X11/xkb    xkbcomp 需要
+```
+
+### QEMU 端到端测试
+
+```bash
+# 1) 构建访客 initrd (依赖 busybox-static/x11vnc/xvfb/xterm/iproute2)
+apt-get install -y busybox-static x11vnc xvfb xterm iproute2
+bash tools/build_guest_initrd.sh
+
+# 2) 启动（注意用内置所有网卡驱动的通用内核；Alpine virt 内核缺网卡驱动）
+qemu-system-x86_64 -m 512 -smp 1 \
+  -kernel /boot/vmlinuz \
+  -initrd linux_root/guest-initramfs.cpio.gz \
+  -append "console=ttyS0 panic=-1" \
+  -netdev user,id=n0,hostfwd=tcp::15900-:5900 \
+  -device virtio-net-pci,netdev=n0 \
+  -nographic
+
+# 3) 宿主侧 Python RFB 3.8 握手验证（已打通）
+python3 - <<EOF
+import socket, struct
+s = socket.create_connection(('127.0.0.1', 15900))
+s.recv(12); s.sendall(b'RFB 003.008\n')
+n = s.recv(1)[0]; [s.recv(1) for _ in range(n)]
+s.sendall(bytes([1]))   # None auth
+assert s.recv(4) == b'\x00\x00\x00\x00'
+s.sendall(b'\x01')      # shared
+si = s.recv(24)
+w, h = (si[0]<<8)|si[1], (si[2]<<8)|si[3]
+nl = struct.unpack('>I', s.recv(4))[0]; s.recv(nl)
+# SetPixelFormat + SetEncodings + FramebufferRequest
+s.sendall(bytes([0,0,0,0, 32,24,0,1, 0,0xff,0,0xff,0,0xff, 16,8,0, 0,0,0]))
+s.sendall(bytes([2,0,0,1, 0,0,0,5, 0,0,0,1, 0,0,0,0]))
+s.sendall(bytes([3,0,0,0,0,0, (w>>8)&0xff, w&0xff, (h>>8)&0xff, h&0xff]))
+r = s.recv(50000)
+assert r and r[0] == 0
+print(f"OK: FramebufferUpdate {w}x{h}")
+EOF
+```
+
+### NexOS 内核侧调用示例
+
+插件注册后，NexOS GUI 或 shell 侧可直接调用：
+
+```c
+// 连到访客 VNC (SLIRP 上 10.0.2.2:5900，或 hostfwd 到宿主)
+plugin_call("vnc", "connect", "10.0.2.2:5900", NULL, 0);
+plugin_call("vnc", "request_frame", NULL, NULL, 0);
+// poll 拉帧、input 转发键盘鼠标 —— 见 vnc_client.cpp 实现
+```
+
+### 踩坑清单（复现时别重踩）
+
+1. **argv[0] basename 路由**：`/init` 必须是 busybox 二进制**真实拷贝**且 basename 精确为 `init`，不能是 symlink（symlink 保留原 path，busybox 会走 ash applet 而不是 init applet）。
+2. **PID 1 stdio**：`devtmpfs` 必须先 mount，才能 `exec 0</dev/console 1>/dev/console 2>&1`，否则 rc.start 的 echo 全部丢弃。
+3. **网卡驱动**：访客内核必须有网卡驱动（virtio-net 最通用）。Alpine `linux-virt` 内核过度裁剪，连 virtio/e1000/rtl8139 都没编进去 —— 用 Ubuntu generic 内核解决。
+4. **动态库 dlopen 补漏**：`ldd` 看不到 dlopen 加载的库（Xvfb 隐依赖 `libbz2/liblz4/liblzo2` 等，x11vnc 需要 `libvncclient`），必须手动 cp 并重建 soname symlink 链。
+5. **soname symlink 三层**：host `libGL.so.1.7.0 → libGL.so.1 → libGL.so`；拷到 rootfs 后每一层都要重建，否则 ldd 会找到 dangling link。
+6. **dl 路径**：ELF `.interp` 通常是 `/lib64/ld-linux-x86-64.so.2`，rootfs 必须在该位置有真实 link 到 `/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2`。
+7. **RFB 3.8 SetEncodings 格式**：4B 头（type+pad+count16 大端）+ count×4B 编码，count 不是大端 32 位。
+8. **initrd cpio 魔数**：newc 格式开头 `070701`，每个 entry header 110B 后紧跟 name+NUL，data 前要对齐 4 字节。工具见 `tools/mk_initramfs.py`。
+
+### 方案2（VT-x hypervisor）待办
+
+- NexOS 启动时检测 CPUID VMX 和 MSR IA32_VMX_BASIC
+- 做 root mode：VMCS + VMON/VMLAUNCH/VMEXIT 指令路径
+- Linux 做 VM guest（CS 32 位、内存 EPT、MSR bitmap 让 hypervisor trap 到 NexOS）
+- 设备直通：或做 VMM emulation（PS/2、RTC、PIIX3 IDE、PCI）
+
+
 ## Future Roadmap
 
 NexOS is already a runnable, network-capable, AI-inferencing and distributed-compute teaching-grade full-stack OS. Next focuses (see [NEXOS_ROADMAP.md](NEXOS_ROADMAP.md)):
