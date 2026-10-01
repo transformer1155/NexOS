@@ -966,6 +966,7 @@ static void tcp_send_segment(TcpConn* c, uint8_t flags, const uint8_t* data, int
 
 // Forward declaration
 static void http_handle_request(TcpConn* conn);
+static void mcp_handle(TcpConn* conn, const char* body);  // MCP server (JSON-RPC)
 
 // SSH server (implemented below, in this file).  ssh_feed() is handed each
 // newly-arrived TCP segment's bytes for an SSH-bound connection; ssh_poll()
@@ -978,6 +979,8 @@ extern "C" int  nexos_auth(const char* user, const char* pw);   // returns 1 on 
 extern "C" void kernel_exec_line(const char* line);             // run a shell command
 extern "C" void term_set_ssh_sink(void (*fn)(const char*, int)); // arm output sink
 extern "C" void term_clear_ssh_sink(void);                       // disarm output sink
+extern "C" int  kern_fs_read(const char* name, unsigned char* buf, int bufsize);  // read data-disk file
+extern "C" int  kern_fs_create(const char* name, const unsigned char* data, int len); // write data-disk file
 
 // ---- SSH session state machine (needed by helper prototypes) ----
 enum SshState {
@@ -2931,9 +2934,323 @@ static void http_handle_request(TcpConn* conn){
         return;
     }
 
+    // Route: POST /mcp -> Model Context Protocol server (JSON-RPC 2.0).
+    // Exposes NexOS terminal/fs/plugin capabilities as standard MCP tools.
+    if (net_strcmp(method, "POST") == 0 && net_strcmp(path, "/mcp") == 0){
+        mcp_handle(conn, body);
+        return;
+    }
+
     // 404
     const char* not_found = "404 Not Found";
     http_send_response(conn, "404 Not Found", "text/plain", not_found, net_strlen(not_found));
+}
+
+// ===== MCP server (Model Context Protocol over HTTP, JSON-RPC 2.0) =====
+// Exposes NexOS terminal/file/plugin capabilities as standard MCP tools so any
+// MCP client (Claude Desktop, CodeBuddy, Cursor...) can drive the OS.  Reuses
+// the existing HTTP server + SSH output sink; no new network-stack code.
+#if !defined(__x86_64__)
+#include "plugins/plugin_manager.h"   // svc_lookup / svc_fn (32-bit only)
+#endif
+
+static char g_mcp_out[4096];
+static int  g_mcp_out_len = 0;
+
+static void mcp_sink(const char* s, int n){
+    for (int i = 0; i < n && g_mcp_out_len < (int)sizeof(g_mcp_out) - 1; i++)
+        g_mcp_out[g_mcp_out_len++] = s[i];
+}
+
+// Append a JSON string to dst, escaping ", \, newline.  Uses raw ASCII values
+// (34/92/10) so the source stays free of quote/backslash character literals.
+static int mcp_escape(char* dst, int dstcap, const char* src){
+    int p = 0;
+    for (int k = 0; src[k] && p < dstcap - 2; k++){
+        char c = src[k];
+        if (c == 34){ dst[p++] = 92; dst[p++] = 34; }
+        else if (c == 92){ dst[p++] = 92; dst[p++] = 92; }
+        else if (c == 10){ dst[p++] = 92; dst[p++] = 110; }
+        else if (c == 13){ }
+        else dst[p++] = c;
+    }
+    dst[p] = 0;
+    return p;
+}
+
+static void mcp_cat(char* dst, int* p, const char* s){
+    int l = net_strlen(s);
+    net_memcpy(dst + *p, s, l); *p += l;
+}
+
+static void mcp_write_id(char* dst, int* p, const char* idstr){
+    bool num = true;
+    for (int i = 0; idstr[i]; i++)
+        if (idstr[i] < '0' || idstr[i] > '9'){ num = false; break; }
+    if (num && idstr[0]) mcp_cat(dst, p, idstr);
+    else { dst[(*p)++] = 34; mcp_cat(dst, p, idstr); dst[(*p)++] = 34; }
+}
+
+// Execute a command and capture its terminal output through the SSH sink hook.
+static int mcp_exec_capture(const char* cmd, char* out, int outsz){
+    g_mcp_out_len = 0;
+    term_set_ssh_sink(mcp_sink);
+    kernel_exec_line(cmd);
+    term_clear_ssh_sink();
+    int n = g_mcp_out_len;
+    if (n > outsz - 1) n = outsz - 1;
+    net_memcpy(out, g_mcp_out, n); out[n] = 0;
+    return n;
+}
+
+// Emit a JSON double-quote (ASCII 34) into the response without using a
+// string literal that contains a quote, so the source stays escaper-free.
+static void mcp_q(char* dst, int* p){ dst[(*p)++] = 34; }
+
+// Minimal JSON value extractor for MCP request bodies.  Finds the first
+// occurrence of "key" and copies its scalar value (string or number) into
+// out.  Handles \" escapes inside strings.  Returns 1 on hit, 0 if absent.
+// The body is JSON-RPC, NOT the form-encoded format extract_value() expects,
+// so a dedicated parser is required here.
+static int mcp_json_value(const char* body, const char* key, char* out, int outsize){
+    int klen = net_strlen(key);
+    const char* p = body;
+    while (*p){
+        if (p[0] == 34 && net_strncmp(p + 1, key, klen) == 0 && p[1 + klen] == 34){
+            p += 1 + klen + 1; // skip "key"
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+            if (*p != ':'){ p -= (1 + klen); p++; continue; }
+            p++;
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+            int i = 0;
+            if (*p == 34){
+                p++;
+                while (*p && *p != 34 && i < outsize - 1){
+                    if (*p == 92 && p[1]) { p++; }  // skip escape backslash
+                    out[i++] = *p++;
+                }
+                if (*p == 34) p++;
+            } else {
+                while (*p && *p != ',' && *p != '}' && *p != ' ' &&
+                       *p != '\t' && *p != '\n' && *p != '\r' && i < outsize - 1)
+                    out[i++] = *p++;
+            }
+            out[i] = 0;
+            return 1;
+        }
+        p++;
+    }
+    out[0] = 0;
+    return 0;
+}
+
+static void mcp_handle(TcpConn* conn, const char* body){
+    char method[64];
+    mcp_json_value(body, "method", method, sizeof(method));
+    char id[32];
+    mcp_json_value(body, "id", id, sizeof(id));
+
+    char resp[6000];
+    int p = 0;
+    mcp_cat(resp, &p, "{");
+    mcp_q(resp, &p); mcp_cat(resp, &p, "jsonrpc"); mcp_q(resp, &p);
+    mcp_cat(resp, &p, ":");
+    mcp_q(resp, &p); mcp_cat(resp, &p, "2.0"); mcp_q(resp, &p);
+    mcp_cat(resp, &p, ",");
+    mcp_q(resp, &p); mcp_cat(resp, &p, "id"); mcp_q(resp, &p);
+    mcp_cat(resp, &p, ":");
+    mcp_write_id(resp, &p, id);
+    resp[p++] = ',';
+
+    if (net_strcmp(method, "initialize") == 0){
+        mcp_cat(resp, &p, "\"result\":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "protocolVersion"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "2024-11-05"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "capabilities"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "tools"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ":{}},");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "serverInfo"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "name"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "NexOS"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "version"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "2.0"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, "}}");
+    } else if (net_strcmp(method, "tools/list") == 0){
+        mcp_cat(resp, &p, "\"result\":{\"tools\":[");
+        mcp_cat(resp, &p, "{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "name"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "nexos_exec"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "description"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "Execute a shell command in the NexOS terminal and return its output"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "inputSchema"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "object"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "properties"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "command"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "string"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "description"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "command line to run"); mcp_q(resp, &p); mcp_cat(resp, &p, "}}}},");
+        mcp_cat(resp, &p, "{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "name"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "nexos_read_file"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "description"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "Read a file from the NexOS data disk"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "inputSchema"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "object"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "properties"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "path"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "string"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "description"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "file name"); mcp_q(resp, &p); mcp_cat(resp, &p, "}}}},");
+        mcp_cat(resp, &p, "{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "name"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "nexos_write_file"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "description"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "Write or create a file on the NexOS data disk"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "inputSchema"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "object"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "properties"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "path"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "string"); mcp_q(resp, &p); mcp_cat(resp, &p, "},");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "content"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "string"); mcp_q(resp, &p); mcp_cat(resp, &p, "}}}},");
+        mcp_cat(resp, &p, "{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "name"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "nexos_call_plugin"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "description"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "Call a registered plugin service by name"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "inputSchema"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "object"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "properties"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "service"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "string"); mcp_q(resp, &p); mcp_cat(resp, &p, "},");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "args"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "string"); mcp_q(resp, &p); mcp_cat(resp, &p, "}}}},");
+        if (p > 0 && resp[p - 1] == 44) p--;  // strip trailing comma before ]
+        mcp_cat(resp, &p, "]}");
+    } else if (net_strcmp(method, "tools/call") == 0){
+        char name[64];
+        mcp_json_value(body, "name", name, sizeof(name));
+        char tool_out[4400];
+        char raw[2048];
+        int rlen = 0;
+        bool is_error = false;
+        if (net_strcmp(name, "nexos_exec") == 0){
+            char cmd[256];
+            mcp_json_value(body, "command", cmd, sizeof(cmd));
+            mcp_exec_capture(cmd, raw, sizeof(raw));
+            mcp_escape(tool_out, sizeof(tool_out), raw);
+        } else if (net_strcmp(name, "nexos_read_file") == 0){
+            char path[128];
+            mcp_json_value(body, "path", path, sizeof(path));
+            unsigned char buf[2048];
+            int n = kern_fs_read(path, buf, sizeof(buf));
+            if (n >= 0){
+                int w = 0;
+                for (int k = 0; k < n && w < (int)sizeof(raw) - 1; k++) raw[w++] = (char)buf[k];
+                raw[w] = 0;
+                rlen = mcp_escape(tool_out, sizeof(tool_out), raw);
+            } else {
+                is_error = true;
+                rlen = mcp_escape(tool_out, sizeof(tool_out), "read failed: file not found or disk not mounted");
+            }
+        } else if (net_strcmp(name, "nexos_write_file") == 0){
+            char path[128];
+            mcp_json_value(body, "path", path, sizeof(path));
+            char content[2048];
+            mcp_json_value(body, "content", content, sizeof(content));
+            int n = kern_fs_create(path, (const unsigned char*)content, net_strlen(content));
+            if (n >= 0){
+                char tmp[64]; int tp = 0;
+                mcp_cat(tmp, &tp, "wrote ");
+                char num[12]; int q = 0; int v = n;
+                if (v == 0) num[q++] = '0';
+                while (v > 0){ num[q++] = (char)('0' + v % 10); v /= 10; }
+                while (q > 0) tmp[tp++] = num[--q];
+                tmp[tp] = 0;
+                rlen = mcp_escape(tool_out, sizeof(tool_out), tmp);
+            } else {
+                is_error = true;
+                rlen = mcp_escape(tool_out, sizeof(tool_out), "write failed: disk not mounted");
+            }
+        } else if (net_strcmp(name, "nexos_call_plugin") == 0){
+            char svc[64];
+            mcp_json_value(body, "service", svc, sizeof(svc));
+            char args[256];
+            mcp_json_value(body, "args", args, sizeof(args));
+#if !defined(__x86_64__)
+            svc_fn fn = svc_lookup(svc);
+            if (!fn){
+                is_error = true;
+                rlen = mcp_escape(tool_out, sizeof(tool_out), "service not found");
+            } else {
+                char out[256];
+                int r = fn((void*)args, out, (int)sizeof(out));
+                char tmp[320]; int tp = 0;
+                mcp_cat(tmp, &tp, "rc=");
+                char num[12]; int q = 0; int v = r;
+                if (v < 0) tmp[tp++] = '-';
+                if (v < 0) v = -v;
+                if (v == 0) num[q++] = '0';
+                while (v > 0){ num[q++] = (char)('0' + v % 10); v /= 10; }
+                while (q > 0) tmp[tp++] = num[--q];
+                tmp[tp++] = ' ';
+                for (int k = 0; out[k] && tp < 300; k++) tmp[tp++] = out[k];
+                tmp[tp] = 0;
+                rlen = mcp_escape(tool_out, sizeof(tool_out), tmp);
+            }
+#else
+            (void)svc; (void)args;
+            is_error = true;
+            rlen = mcp_escape(tool_out, sizeof(tool_out), "plugin registry not linked in 64-bit kernel");
+#endif
+        } else {
+            is_error = true;
+            rlen = mcp_escape(tool_out, sizeof(tool_out), "unknown tool");
+        }
+        (void)rlen;
+        mcp_cat(resp, &p, "\"result\":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "content"); mcp_q(resp, &p); mcp_cat(resp, &p, ":[");
+        mcp_cat(resp, &p, "{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "text"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "text"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p);
+        mcp_cat(resp, &p, tool_out);
+        mcp_q(resp, &p);
+        mcp_cat(resp, &p, "}]");
+        mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "isError"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_cat(resp, &p, is_error ? "true" : "false");
+        mcp_cat(resp, &p, "}");
+    } else if (net_strcmp(method, "ping") == 0){
+        mcp_cat(resp, &p, "\"result\":{}");
+    } else {
+        mcp_cat(resp, &p, "\"error\":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "code"); mcp_q(resp, &p); mcp_cat(resp, &p, ":-32601,");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "message"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "Method not found"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, "}");
+    }
+    resp[p++] = '}';
+    resp[p] = 0;
+    http_send_response(conn, "200 OK", "application/json", resp, p);
 }
 
 // =====================================================================

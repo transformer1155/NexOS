@@ -6015,7 +6015,7 @@ static void cmd_plugin_mgr(const char* args){
 // P4 bridge: create/overwrite a file on the writable MKFS volume, used by the
 // skill system (skill.cpp) so skills can call system FS APIs without reaching
 // into kernel internals. Returns >=0 bytes written, <0 on error.
-int kern_fs_create(const char* name, const unsigned char* data, int len){
+extern "C" int kern_fs_create(const char* name, const unsigned char* data, int len){
     if (!mkfs.mounted) return -2;
     return mkfs.create(name, (const uint8_t*)data, len);
 }
@@ -6070,7 +6070,20 @@ static void cmd_agent(const char* args){
         // P4: try the skill registry first (natural-language intent -> system API).
         char skill_out[256];
         if(agent_skill_dispatch(args, skill_out, (int)sizeof(skill_out))){
-            term.write("[Skill] "); term.write(skill_out); term.put_char('\n');
+            // A directive skill (shell:/plugin: prefix) is forwarded to the
+            // real agent tool layer so the OS actually executes the command or
+            // calls the plugin.  Anything else is a plain text result -> show it.
+            bool directive = false;
+            if (skill_out[0]=='s'&&skill_out[1]=='h'&&skill_out[2]=='e'&&skill_out[3]=='l'&&skill_out[4]==':') directive = true;
+            else if (skill_out[0]=='p'&&skill_out[1]=='l'&&skill_out[2]=='u'&&skill_out[3]=='g'&&skill_out[4]=='i'&&skill_out[5]=='n'&&skill_out[6]==':') directive = true;
+            if (directive){
+                char output[4096];
+                int n = agent_run(skill_out, output, (int)sizeof(output));
+                if (n > 0) term.write(output);
+                else term.write("Agent tool execution failed. Initialize first with 'agent init'.\n");
+            } else {
+                term.write("[Skill] "); term.write(skill_out); term.put_char('\n');
+            }
             return;
         }
         // Real multi-step agent (ReAct loop): ask the LLM what tool to call,

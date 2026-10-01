@@ -143,6 +143,71 @@ static char* skill_whoami(char* goal){
     return result;
 }
 
+// ---- skill: run_command (natural language -> shell: directive) ----
+// Turns "执行 ls -la" / "run cat readme.txt" into "shell:ls -la" so the
+// agent framework's real tool layer (agent_execute_tool -> linux_run for
+// 32-bit, or the GUI shell for observability) actually executes it instead
+// of generating text.  This is the natural-language -> OS-tool bridge the
+// agent was missing: previously only literal "shell:/plugin:" prefixes
+// triggered real execution.
+static const char* const RUN_VERBS[] = { "执行", "运行", "启动", "跑一下", "命令执行",
+                                         "execute", "run", "launch", "run command" };
+static char* skill_run_command(char* goal){
+    static char result[256];
+    int vlen = 0;
+    int vpos = find_any(goal, RUN_VERBS, 9, &vlen);
+    if (vpos < 0){
+        build_msg(result, sizeof(result), "技能错误: 未识别『执行命令』意图", (const char*)0, 0);
+        return result;
+    }
+    int p = vpos + vlen;
+    while (goal[p] == ' ' || goal[p] == '\t') p++;
+    int end = p;
+    while (goal[end] && goal[end] != '\n' && goal[end] != ';') end++;
+    int clen = end - p;
+    if (clen <= 0){
+        build_msg(result, sizeof(result), "技能错误: 未解析到命令", (const char*)0, 0);
+        return result;
+    }
+    int bi = 0;
+    const char* pre = "shell:";
+    for (int j = 0; pre[j] && bi < (int)sizeof(result) - 1; j++) result[bi++] = pre[j];
+    for (int j = 0; j < clen && bi < (int)sizeof(result) - 1; j++) result[bi++] = goal[p + j];
+    result[bi] = 0;
+    return result;
+}
+
+// ---- skill: call_plugin (natural language -> plugin: directive) ----
+// Turns "调用插件 gfx.fill_rect" / "call plugin wm.create_window" into
+// "plugin:gfx.fill_rect" so the agent's real tool layer (svc_lookup +
+// svc_call) invokes the registered service.
+static const char* const PLUGIN_VERBS[] = { "调用插件", "调用服务", "使用插件",
+                                            "call plugin", "use plugin" };
+static char* skill_call_plugin(char* goal){
+    static char result[256];
+    int vlen = 0;
+    int vpos = find_any(goal, PLUGIN_VERBS, 5, &vlen);
+    if (vpos < 0){
+        build_msg(result, sizeof(result), "技能错误: 未识别『调用插件』意图", (const char*)0, 0);
+        return result;
+    }
+    int p = vpos + vlen;
+    while (goal[p] == ' ' || goal[p] == '\t') p++;
+    int end = p;
+    while (goal[end] && goal[end] != '\n' && goal[end] != ';') end++;
+    int clen = end - p;
+    if (clen <= 0){
+        build_msg(result, sizeof(result), "技能错误: 未解析到插件服务名", (const char*)0, 0);
+        return result;
+    }
+    int bi = 0;
+    const char* pre = "plugin:";
+    for (int j = 0; pre[j] && bi < (int)sizeof(result) - 1; j++) result[bi++] = pre[j];
+    for (int j = 0; j < clen && bi < (int)sizeof(result) - 1; j++) result[bi++] = goal[p + j];
+    result[bi] = 0;
+    return result;
+}
+
 Skill g_skills[] = {
     {
         "create_file",
@@ -159,6 +224,20 @@ Skill g_skills[] = {
         "你是谁;你叫什么;你的名字;你是谁啊;介绍一下你自己;介绍一下自己;介绍下自己;"
         "自我介绍一下;你的身份;who are you;what is your name;your name;what are you;"
         "your identity;who r u"
+    },
+    {
+        "run_command",
+        "执行/运行系统命令: 执行 <命令> | run <command>",
+        skill_run_command,
+        0,
+        "执行;运行;启动;跑一下;命令执行;execute;run;launch;run command"
+    },
+    {
+        "call_plugin",
+        "调用已注册插件服务: 调用插件 <服务名> [参数] | call plugin <svc>",
+        skill_call_plugin,
+        0,
+        "调用插件;调用服务;使用插件;call plugin;use plugin"
     },
     // Extend here (P4 more skills): 读取/写入/删除/搜索, 启动进程, HTTP 请求...
 };

@@ -17,8 +17,8 @@ extern "C" void* kmalloc(uint32_t size);
 extern "C" void  kfree(void* ptr);
 // Kernel file-system write back (MKFS data FS) -- used to make CreateFileA/
 // WriteFile/CloseHandle actually persist a file written by a Win32 program.
-// Declared WITHOUT extern "C" to match the C++ mangled name in kernel.cpp.
-int kern_fs_create(const char* name, const unsigned char* data, int len);
+// extern "C" matches the C-linkage definition in kernel.cpp (and net.cpp MCP).
+extern "C" int kern_fs_create(const char* name, const unsigned char* data, int len);
 
 #if defined(__i386__)
 #  define WINAPI __attribute__((stdcall))
