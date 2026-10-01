@@ -94,7 +94,7 @@ SECTIONS
      *  [HEAP] FATAL warned about it.  This ASSERT turns that into a build
      *  failure instead.
      * ----------------------------------------------------------------- */
-    ASSERT(__bss_end <= 0x9A0000,
+    ASSERT(__bss_end <= 0xAE0000,
         "kernel .bss runs into HEAP_START (kernel.cpp) -- raise HEAP_START and shrink HEAP_SIZE by the same amount")
 
     /* =================================================================

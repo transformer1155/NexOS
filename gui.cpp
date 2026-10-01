@@ -102,6 +102,17 @@ static inline int         mforms_desktop_menu(int) { return -1; }
 static inline void        mforms_set_running(uint32_t) {}
 #endif
 
+// ---------------------------------------------------------------------
+//  MForms bridge gap (pre-existing, independent of the VNC work):
+//  mforms_paint_wall / mforms_paint_desk_icons are referenced by the Win11
+//  desktop renderer but were only declared inside the (dead) MForms-disabled
+//  stub branch, so under any real build they are undeclared AND undefined.
+//  Declared in mforms.h now; provided here as no-ops so the kernel links.
+//  The native drawers own the actual wallpaper / icon painting.
+// ---------------------------------------------------------------------
+extern "C" void mforms_paint_wall(int w, int h)      { (void)w; (void)h; }
+extern "C" void mforms_paint_desk_icons(int w, int h){ (void)w; (void)h; }
+
 // Height of the managed taskbar.  Mirrors NexOS.Forms.Desktop.TaskH:
 // the strip is reserved so a click on the bar is never eaten by a window
 // that reaches the bottom of the screen.

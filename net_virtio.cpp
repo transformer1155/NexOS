@@ -123,9 +123,9 @@ static bool vio_setup_queue(uint16_t sel, VioQueue* q){
     return true;
 }
 
-static VioQueue g_rxq, g_txq;
+static VioQueue g_vrxq, g_vtxq;
 static uint8_t* g_rx_buf[VIO_Q_NUM];          // RX packet buffers
-static uint8_t  g_tx_pool[VIO_Q_NUM][1514];   // TX packet buffers
+static uint8_t* g_tx_pool[VIO_Q_NUM];         // TX packet buffers (kmalloc'd at probe)
 static bool     g_vio_active = false;
 
 // ---- probe + init ----
@@ -154,24 +154,33 @@ static int virtio_net_probe_and_init(void){
         // Read MAC from device-specific config (offset 0x14).
         for (int i = 0; i < 6; i++) g_vio_mac[i] = vio_rb((uint16_t)(0x14 + i));
         // Set up RX/TX virtqueues.
-        if (!vio_setup_queue(VIO_Q_RX, &g_rxq)) { net_log("[VIO] rxq fail\n"); return 0; }
-        if (!vio_setup_queue(VIO_Q_TX, &g_txq)) { net_log("[VIO] txq fail\n"); return 0; }
+        if (!vio_setup_queue(VIO_Q_RX, &g_vrxq)) { net_log("[VIO] rxq fail\n"); return 0; }
+        if (!vio_setup_queue(VIO_Q_TX, &g_vtxq)) { net_log("[VIO] txq fail\n"); return 0; }
         // Pre-post RX buffers: each RX descriptor points at its own 1514-byte
         // buffer; chain not needed (one descriptor per packet).
-        for (uint16_t i = 0; i < g_rxq.num; i++){
+        for (uint16_t i = 0; i < g_vrxq.num; i++){
             g_rx_buf[i] = (uint8_t*)kmalloc(1514);
             if (!g_rx_buf[i]) { net_log("[VIO] rxbuf fail\n"); return 0; }
         }
-        for (uint16_t i = 0; i < g_rxq.num; i++){
-            g_rxq.desc[i*4 + 0] = virt_to_phys(g_rx_buf[i]);
-            g_rxq.desc[i*4 + 1] = 1514;
-            g_rxq.desc[i*4 + 2] = 1 << 1;     // F_WRITE (device writes)
-            g_rxq.desc[i*4 + 3] = 0;
-            g_rxq.avail[2 + i] = i;
+        for (uint16_t i = 0; i < g_vrxq.num; i++){
+            g_vrxq.desc[i*4 + 0] = virt_to_phys(g_rx_buf[i]);
+            g_vrxq.desc[i*4 + 1] = 1514;
+            g_vrxq.desc[i*4 + 2] = 1 << 1;     // F_WRITE (device writes)
+            g_vrxq.desc[i*4 + 3] = 0;
+            g_vrxq.avail[2 + i] = i;
         }
-        g_rxq.avail[0] = 0;                   // flags
-        g_rxq.avail[1] = g_rxq.num;            // avail_idx
+        g_vrxq.avail[0] = 0;                   // flags
+        g_vrxq.avail[1] = g_vrxq.num;            // avail_idx
         vio_ww(0x10, VIO_Q_RX);               // notify RX queue
+
+        // Allocate TX packet buffers lazily (only when a virtio device is
+        // actually present) so the default NE2000 build's .bss is untouched
+        // -- a static 64x1514 pool would otherwise bloat kernel .bss and
+        // overlap HEAP_START.
+        for (uint16_t i = 0; i < g_vtxq.num; i++){
+            g_tx_pool[i] = (uint8_t*)kmalloc(1514);
+            if (!g_tx_pool[i]) { net_log("[VIO] txbuf fail\n"); return 0; }
+        }
         g_vio_active = true;
         g_vio_present = true;
         net_log("[VIO] virtio-net initialized\n");
@@ -189,17 +198,17 @@ extern "C" void virtio_net_send(const uint8_t* data, int len){
     if (!g_vio_active || len <= 0) return;
     if (len > 1514) len = 1514;
     if (len < 60) len = 60;
-    int di = vq_alloc_desc(&g_txq);
+    int di = vq_alloc_desc(&g_vtxq);
     if (di < 0) return;
     net_memcpy_local(g_tx_pool[di], data, len);  // see note below
-    g_txq.desc[di*4 + 0] = virt_to_phys(g_tx_pool[di]);
-    g_txq.desc[di*4 + 1] = (uint16_t)len;
-    g_txq.desc[di*4 + 2] = 0;                   // F_NEXT clear -> device reads
-    g_txq.desc[di*4 + 3] = 0;
-    uint16_t a = g_txq.avail_idx & 0xFFFF;
-    g_txq.avail[2 + (a % g_txq.num)] = (uint16_t)di;
-    g_txq.avail_idx++;
-    g_txq.avail[1] = g_txq.avail_idx & 0xFFFF;
+    g_vtxq.desc[di*4 + 0] = virt_to_phys(g_tx_pool[di]);
+    g_vtxq.desc[di*4 + 1] = (uint16_t)len;
+    g_vtxq.desc[di*4 + 2] = 0;                   // F_NEXT clear -> device reads
+    g_vtxq.desc[di*4 + 3] = 0;
+    uint16_t a = g_vtxq.avail_idx & 0xFFFF;
+    g_vtxq.avail[2 + (a % g_vtxq.num)] = (uint16_t)di;
+    g_vtxq.avail_idx++;
+    g_vtxq.avail[1] = g_vtxq.avail_idx & 0xFFFF;
     vio_ww(0x10, VIO_Q_TX);                      // notify TX queue
 }
 // Local memcpy (kernel has no libc); defined here to avoid pulling net.cpp's.
@@ -212,28 +221,28 @@ static void net_memcpy_local(void* d, const void* s, int n){
 extern "C" int virtio_net_recv(uint8_t* buf, int maxlen){
     if (!g_vio_active) return 0;
     // used ring: used->idx is at offset 2; each element is (id:u32, len:u32).
-    volatile uint16_t* used_idx = &g_rxq.used[1];
+    volatile uint16_t* used_idx = &g_vrxq.used[1];
     static uint16_t last_used = 0;
     uint16_t cur = *used_idx;
     if (cur == last_used) return 0;
     // One packet consumed (prototype: process one per call).
-    uint16_t e = last_used % g_rxq.num;
-    uint32_t id   = ((uint32_t*)&g_rxq.used[2])[e*2 + 0];
-    uint32_t plen = ((uint32_t*)&g_rxq.used[2])[e*2 + 1];
+    uint16_t e = last_used % g_vrxq.num;
+    uint32_t id   = ((uint32_t*)&g_vrxq.used[2])[e*2 + 0];
+    uint32_t plen = ((uint32_t*)&g_vrxq.used[2])[e*2 + 1];
     int n = (int)plen;
     if (n > maxlen) n = maxlen;
     if (n < 14) n = 0;
     if (n > 0) net_memcpy_local(buf, g_rx_buf[id], n);
     // Return the descriptor to the RX ring for reuse.
-    if ((int)id < g_rxq.num){
-        g_rxq.desc[id*4 + 0] = virt_to_phys(g_rx_buf[id]);
-        g_rxq.desc[id*4 + 1] = 1514;
-        g_rxq.desc[id*4 + 2] = 1 << 1;
-        g_rxq.desc[id*4 + 3] = 0;
-        uint16_t a = g_rxq.avail_idx & 0xFFFF;
-        g_rxq.avail[2 + (a % g_rxq.num)] = (uint16_t)id;
-        g_rxq.avail_idx++;
-        g_rxq.avail[1] = g_rxq.avail_idx & 0xFFFF;
+    if ((int)id < g_vrxq.num){
+        g_vrxq.desc[id*4 + 0] = virt_to_phys(g_rx_buf[id]);
+        g_vrxq.desc[id*4 + 1] = 1514;
+        g_vrxq.desc[id*4 + 2] = 1 << 1;
+        g_vrxq.desc[id*4 + 3] = 0;
+        uint16_t a = g_vrxq.avail_idx & 0xFFFF;
+        g_vrxq.avail[2 + (a % g_vrxq.num)] = (uint16_t)id;
+        g_vrxq.avail_idx++;
+        g_vrxq.avail[1] = g_vrxq.avail_idx & 0xFFFF;
         vio_ww(0x10, VIO_Q_RX);
     }
     last_used = cur;

@@ -45,6 +45,9 @@ struct MFormsHost {
     // Win11 Mica/Acrylic sign-in card). tint = base colour, alpha = opacity,
     // blur = blur radius in px.
     void (*glass)       (int x, int y, int w, int h, int r, uint32_t tint, int alpha, int blur);
+    // Soft accent glow (sign-in card highlight / focus ring).  Matches the
+    // gui.cpp native drawer mh_glow(int cx,int cy,int rx,int ry,uint32_t,int).
+    void (*glow)        (int cx, int cy, int rx, int ry, uint32_t color, int alpha);
     // UTF-8 text at an explicit glyph height `px` (default Gfx.Text uses 16).
     void (*text_px)     (int x, int y, const char* s, uint32_t fg, int px);
     // Pixel width of a UTF-8 string at glyph height `px` (for centring).
@@ -199,6 +202,11 @@ extern int g_mforms_anim;
 
 // Layer 1: wallpaper + desktop icons, painted *behind* the windows.
 void mforms_paint_desktop(int w, int h);
+
+// Layer 1b: wallpaper + desktop icons sub-layers.  Referenced by gui.cpp's
+// Win11 desktop renderer; the native drawers own the actual painting.
+void mforms_paint_wall(int w, int h);
+void mforms_paint_desk_icons(int w, int h);
 
 // Layer 2: taskbar + Start menu, painted *above* the windows.
 void mforms_paint_overlay(int w, int h);

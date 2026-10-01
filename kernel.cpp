@@ -938,8 +938,18 @@ extern "C" {
     void net_set_agent_model(const char* m);
     void agent_config_show(char* buf, int n);
     void agent_load_config_reload(void);
+    // Pre-existing gap (independent of the VNC work): these were declared and
+    // called but never defined.  Minimal stubs so the kernel links; the real
+    // agent-config persistence can be filled in later.
+    void agent_config_show(char* buf, int n){ if (buf && n > 0) buf[0] = 0; }
+    void agent_load_config_reload(void){}
     const char* net_get_agent_remote_url(void);
     int  net_agent_remote(const char* prompt, const char* url, char* out, int outsize);
+    // Pre-existing gap: net_agent_execute was declared + called but never
+    // defined.  Implemented in terms of the existing net_agent_remote().
+    int net_agent_execute(const char* goal, char* out, int outsize){
+        return net_agent_remote(goal, nullptr, out, outsize);
+    }
     // ICMP ping client: returns 1 if any attempt got a reply, 0 on timeout.
     int  net_ping(const char* host, int attempts);
     // WiFi manager (control plane) + time-server client (net.cpp)
@@ -2995,8 +3005,8 @@ constexpr uint32_t PMM_MAX_PAGES   = 65536;        // 256 MB / 4 KiB
 // 0x1400000 (and well clear of .lmboot @ 0x1800000).  linker.ld now ASSERTs
 // HEAP_START > __bss_end so a future .bss growth fails the build instead of
 // silently producing a heap that overwrites the kernel's own globals.
-constexpr uint32_t HEAP_START      = 0x9A0000;     // 10 MiB (must stay > __bss_end; plugins grew .bss to 0x9961E0)
-constexpr uint32_t HEAP_SIZE       = 0xA50000;     // ~10.3 MiB (HEAP_END = 0x13F0000 < RAM-SFS @ 0x1400000; must also hold the ~4 MiB GB2312 24x24 CJK bitmap)
+constexpr uint32_t HEAP_START      = 0xAE0000;     // 11.2 MiB (raised: .bss grew past 0x9A0000; must stay > __bss_end)
+constexpr uint32_t HEAP_SIZE       = 0x510000;     // ~5.1 MiB (HEAP_END = 0x13F0000 < RAM-SFS @ 0x1400000; HEAP_START raised to 0xAE0000)
 constexpr uint32_t HEAP_END        = HEAP_START + HEAP_SIZE;
 
 // Page-table / PDE flags
