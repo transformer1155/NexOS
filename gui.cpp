@@ -134,6 +134,14 @@ static int    g_remote_btn_x = 0, g_remote_btn_y = 0, g_remote_btn_w = 0, g_remo
 extern "C" void gui_remote_end(void);                    // defined below, called by handle_mouse_down
 extern "C" void draw_remote_guard(void);                 // defined below (inside extern "C"), called by render_all
 
+// ---- AI Agent panel API (provided by ai_engine.cpp, C linkage) ----
+extern "C" int  agent_dispatch(const char* goal, char* output, int outsize, int use_cloud);
+extern "C" int  agent_trace_get(char* buf, int bufsize);
+extern "C" void agent_trace_reset(void);
+extern "C" void agent_trace_log(const char* tag, const char* msg);
+extern "C" void agent_abort(void);
+extern "C" int  agent_init(void);
+
 // Clipboard is owned by the kernel but shared with the GUI (terminal /
 // browser URL copy-paste) and the C# host bridge.
 extern char g_clipboard[256];
@@ -3496,6 +3504,9 @@ struct Win11Window {
     int browser_status;     // 0=idle,1=connecting,2=loading,3=done,-1=error
     bool browser_url_focused; // URL bar is focused for input
 
+    // AI Agent panel state
+    bool agent_cloud;       // use cloud API pipeline for the next run
+
     // Undo buffers for text input fields (Ctrl+Z).  -1 == nothing to undo.
     char term_undo[128];
     int  term_undo_len = -1;
@@ -5019,6 +5030,7 @@ struct Win11Desktop {
             case APP_TERMINAL:        draw_terminal(id, cx, cy, cw, ch); break;
             case APP_ABOUT:           draw_about(id, cx, cy, cw, ch); break;
             case APP_BROWSER:         draw_browser(id, cx, cy, cw, ch); break;
+            case APP_AIAGENT:         draw_agent(id, cx, cy, cw, ch); break;
             case APP_WIN32:           draw_win32_app(id, rx + 2, ry + TITLE_BAR_H + 2,
                                                      rw - 4, rh - TITLE_BAR_H - 4); break;
             case APP_MANAGED: {
@@ -6310,6 +6322,114 @@ struct Win11Desktop {
             gfx.draw_text_transparent(ccx, by + 6, num, 0xFFCC00);
             gfx.draw_cjk_transparent(ccx + 10, by + 5, (uint32_t)g_ime_cands[i], 0xFFFFFF);
             ccx += 34;
+        }
+    }
+
+
+    // ---- Helper: AI Agent panel button geometry (shared with click handler) ----
+    void agent_rects(int x, int y, int w, int h, int idx,
+                    int& bx, int& by, int& bw, int& bh) const {
+        int headH = 22, pad = 8;
+        int out_y = y + headH + 4;
+        int out_h = h - headH - 4 - 92;          // bottom strip reserved
+        if (out_h < 40) out_h = 40;
+        int bww = (w - pad * 5) / 4;
+        bx = x + pad + idx * (bww + pad);
+        by = out_y + out_h + 6;
+        bw = bww; bh = 26;
+    }
+
+    // ---- AI Agent output panel ----
+    // Renders the agent's activity trace (plan -> tool -> result), an input
+    // box, and Run / Cloud / Abort / Clear buttons.  The trace is fed by
+    // agent_trace_get() (ai_engine.cpp) so the panel shows exactly what the
+    // agent did, not just the final answer.
+    void draw_agent(int id, int x, int y, int w, int h) {
+        Win11Window& win = windows[id];
+        int pad = 8, headH = 22;
+        // Header
+        gfx.draw_text(x, y, "AI Agent  -  plan / tools / cloud", C_BTN_TEXT, COLOR_WHITE);
+        int out_y = y + headH + 4;
+        int out_h = h - headH - 4 - 92;
+        if (out_h < 40) out_h = 40;
+
+        // Output (trace) area
+        gfx.fill_rect(x, out_y, w, out_h, 0x0E0E16);
+        gfx.draw_rounded_rect(x, out_y, w, out_h, 4, C_BTN_BORDER);
+        static char trace[4096];
+        agent_trace_get(trace, (int)sizeof(trace));
+        // Count lines, then show the last `maxl` that fit (scroll to bottom).
+        int nlines = 1;
+        for (int i = 0; trace[i]; i++) if (trace[i] == '\n') nlines++;
+        const int lh = 16;
+        int maxl = out_h / lh;
+        int first = (nlines > maxl) ? nlines - maxl : 0;
+        int li = 0, ly = out_y + 4;
+        const char* p = trace;
+        int maxchars = (w - 12) / g_font_w;
+        while (*p) {
+            if (li < first) {
+                while (*p && *p != '\n') p++;
+                if (*p == '\n') p++;
+                li++;
+                continue;
+            }
+            char line[160]; int lc = 0;
+            while (*p && *p != '\n' && lc < maxchars && lc < 159) line[lc++] = *p++;
+            line[lc] = 0;
+            gfx.draw_text(x + 6, ly, line, COLOR_WHITE, 0x0E0E16);
+            if (*p == '\n') p++;
+            li++; ly += lh;
+            if (ly > out_y + out_h - lh) break;
+        }
+
+        // Buttons row (geometry mirrored in handle_app_click via agent_rects)
+        int by = out_y + out_h + 6;
+        int bw = (w - pad * 5) / 4;
+        draw_action_button(x + pad + 0 * (bw + pad), by, bw, 26, "Run", false, win);
+        draw_action_button(x + pad + 1 * (bw + pad), by, bw, 26,
+                          win.agent_cloud ? "Cloud:ON" : "Cloud:OFF", win.agent_cloud, win);
+        draw_action_button(x + pad + 2 * (bw + pad), by, bw, 26, "Abort", false, win);
+        draw_action_button(x + pad + 3 * (bw + pad), by, bw, 26, "Clear", false, win);
+
+        // Input box
+        int iy = by + 26 + 6;
+        gfx.fill_rect(x, iy, w, 24, 0x0A0A12);
+        gfx.draw_rounded_rect(x, iy, w, 24, 4, C_BTN_BORDER);
+        gfx.draw_text(x + 6, iy + 5, win.term_input, C_BTN_TEXT, 0x0A0A12);
+        // Solid caret at end of input
+        int cw = utf8_display_width(win.term_input) * g_font_w;
+        gfx.draw_rect(x + 6 + cw, iy + 4, 2, 16, COLOR_WHITE);
+        // Hint
+        gfx.draw_text(x, iy + 28,
+                      "!cmd=shell   goal=agent   plugin:/shell:=tools",
+                      C_BTN_TEXT, COLOR_WHITE);
+    }
+
+
+    // Submit the agent panel input.  A leading '!' runs a NexOS shell command
+    // through the kernel shell (g_cb.exec_command captures the output); any
+    // other text is a goal handed to agent_dispatch(), which uses the cloud
+    // pipeline when the Cloud toggle is on, otherwise the local ReAct agent
+    // (which may in turn call plugins / Linux commands).  All activity lands in
+    // the shared trace the panel renders.
+    void gui_agent_submit(Win11Window& win) {
+        if (win.term_input_len <= 0) return;
+        char goal[256]; int n = 0;
+        for (int i = 0; i < win.term_input_len && n < 255; i++) goal[n++] = win.term_input[i];
+        goal[n] = 0;
+        win.term_input_len = 0; win.term_input[0] = 0;
+        if (goal[0] == '!') {
+            const char* cmd = goal + 1;
+            while (*cmd == ' ') cmd++;
+            agent_trace_log("shell", cmd);
+            static char out[2048];
+            if (g_cb.exec_command) g_cb.exec_command(cmd, out, (int)sizeof(out));
+            else { out[0] = 0; }
+            agent_trace_log("out", out[0] ? out : "(no output)");
+        } else {
+            static char out[6000];
+            agent_dispatch(goal, out, (int)sizeof(out), win.agent_cloud ? 1 : 0);
         }
     }
 
@@ -8216,6 +8336,21 @@ struct Win11Desktop {
             char href[256];
             if (browser::hit_link(mouse_x, mouse_y, href)) { browser::navigate(browser::g_active, href); return; }
         }
+        else if (win.app == APP_AIAGENT) {
+            // Run / Cloud / Abort / Clear buttons (geometry from agent_rects).
+            int bx, by, bw, bh;
+            for (int i = 0; i < 4; i++) {
+                agent_rects(x, y, w, h, i, bx, by, bw, bh);
+                if (mouse_x >= bx && mouse_x < bx + bw &&
+                    mouse_y >= by && mouse_y < by + bh) {
+                    if      (i == 0) gui_agent_submit(win);          // Run
+                    else if (i == 1) win.agent_cloud = !win.agent_cloud; // Cloud toggle
+                    else if (i == 2) agent_abort();                   // Abort
+                    else             agent_trace_reset();             // Clear
+                    return;
+                }
+            }
+        }
     }
 
     void calc_button(int win_id, char ch) {
@@ -8975,6 +9110,35 @@ struct Win11Desktop {
                     win.term_input_len = 0;
                     win.term_input[0] = 0;
                 }
+                render_all();
+                return true;
+            } else if (ch == 0x08) { // Backspace
+                if (win.term_input_len > 0) {
+                    memcpy_(win.term_undo, win.term_input, 128);
+                    win.term_undo_len = win.term_input_len;
+                    win.term_input_len--;
+                    win.term_input[win.term_input_len] = 0;
+                    render_all();
+                }
+                return true;
+            } else if (ch >= 32 && ch < 127 && win.term_input_len < 126) {
+                memcpy_(win.term_undo, win.term_input, 128);
+                win.term_undo_len = win.term_input_len;
+                win.term_input[win.term_input_len++] = ch;
+                win.term_input[win.term_input_len] = 0;
+                render_all();
+                return true;
+            }
+        }
+        // Handle AI Agent panel input (reuses the window's term_input field).
+        else if (active_window >= 0 && windows[active_window].app == APP_AIAGENT) {
+            Win11Window& win = windows[active_window];
+            if (ime_route(ch, win.term_input, &win.term_input_len, 127)) {
+                render_all();
+                return true;
+            }
+            if (ch == '\n' || ch == 0x0D) { // Enter -> submit goal / command
+                gui_agent_submit(win);
                 render_all();
                 return true;
             } else if (ch == 0x08) { // Backspace
