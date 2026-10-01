@@ -15,6 +15,7 @@
  *   vnc.status           out: "connected"/"disconnected"
  */
 #include "plugin_manager.h"
+#include "nexos_api.h"
 
 /* ---- Kernel TCP API (extern from net.cpp) ------------------------------ */
 extern "C" int  net_guest_connect(uint32_t ip, uint16_t port);
@@ -22,6 +23,13 @@ extern "C" int  net_guest_send(const void* data, int len);
 extern "C" int  net_guest_recv(void* buf, int len);
 extern "C" void net_guest_close(void);
 extern "C" void net_log(const char* s);  /* serial output */
+
+/* ---- Kernel heap (extern from kernel.cpp) ----------------------------- */
+extern "C" void* kmalloc(uint32_t size);
+extern "C" void  kfree(void* ptr);
+
+/* ---- GUI backend (cached after vnc_init) ------------------------------ */
+static const NexosGuiAPI* g_gui_api = 0;
 
 /* ---- freestanding helpers (no libc) ----------------------------------- */
 static int my_strlen(const char* s){ int n=0; while(s[n]) n++; return n; }
@@ -258,14 +266,12 @@ static int vnc_send_prefs(void) {
     fmt[17] = fmt[18] = fmt[19] = 0;
     vnc_write_all(fmt, 20);
 
-    /* Set Encodings (16 bytes) */
-    uint8_t enc[16];
+    /* Set Encodings (only Raw — we blit pixel-for-pixel) */
+    uint8_t enc[8];
     enc[0] = VNC_SET_ENCODINGS;
-    enc[1] = enc[2] = 0; enc[3] = 3;  /* count = 3 */
-    enc[4]=0;enc[5]=0;enc[6]=0;enc[7]=VNC_ENC_HEXTILE;
-    enc[8]=0;enc[9]=0;enc[10]=0;enc[11]=VNC_ENC_COPYRECT;
-    enc[12]=0;enc[13]=0;enc[14]=0;enc[15]=VNC_ENC_RAW;
-    vnc_write_all(enc, 16);
+    enc[1] = enc[2] = 0; enc[3] = 1;  /* count = 1 (Raw) */
+    enc[4] = enc[5] = enc[6] = 0; enc[7] = VNC_ENC_RAW;
+    vnc_write_all(enc, 8);
 
     return 0;
 }
@@ -304,6 +310,24 @@ static int vnc_send_key(uint8_t down, uint32_t keysym) {
     return vnc_write_all(k, 8);
 }
 
+/* ---- Blit a pixel buffer into NexOS GUI --------------------------------
+ * buf layout: Raw RFB pixel data as configured by SetPixelFormat:
+ *   bpp=32, depth=24, big_endian=0, red_shift=16, green_shift=8, blue_shift=0
+ * => each pixel is 4 bytes little-endian, read as uint32 = 0x00RRGGBB,
+ *    which matches NexOS Color (ARGB, A=0 opaque). Direct put_pixel.      */
+static void vnc_blit_raw(uint16_t x_start, uint16_t y_start,
+                         uint16_t w, uint16_t h, const uint8_t* buf) {
+    if (!g_gui_api || !g_gui_api->put_pixel) return;
+    const Color* pixels = (const Color*)buf;
+    for (uint16_t yy = 0; yy < h; yy++) {
+        for (uint16_t xx = 0; xx < w; xx++) {
+            g_gui_api->put_pixel((int)(x_start + xx),
+                                 (int)(y_start + yy),
+                                 pixels[yy * w + xx]);
+        }
+    }
+}
+
 /* ---- Handle one Framebuffer Update ------------------------------------ */
 static int vnc_handle_fb_update(void) {
     uint8_t hdr[4];
@@ -321,20 +345,26 @@ static int vnc_handle_fb_update(void) {
                       ((int32_t)rh[10] << 8) | (int32_t)rh[11];
 
         if (enc == VNC_ENC_COPYRECT) {
+            /* Not decoded; server should not send it (we only ask Raw). */
             uint8_t src[4];
-            vnc_read_exact(src, 4);  /* skip src_x,src_y */
+            vnc_read_exact(src, 4);
         } else if (enc == VNC_ENC_RAW) {
-            int bytes = w * h * 4;
-            uint8_t scratch[2048];
+            int bytes = (int)w * (int)h * 4;
+            if (bytes <= 0) continue;
+            uint8_t* buf = (uint8_t*)kmalloc((uint32_t)bytes);
+            if (!buf) { log_str("error", "kmalloc failed"); return -1; }
             int remaining = bytes;
             while (remaining > 0) {
-                int to_read = remaining < (int)sizeof(scratch) ? remaining : (int)sizeof(scratch);
-                if (vnc_read_exact(scratch, to_read) != 0) return -1;
+                int to_read = remaining > 4096 ? 4096 : remaining;
+                if (vnc_read_exact(buf + (bytes - remaining), to_read) != 0) {
+                    kfree(buf); return -1;
+                }
                 remaining -= to_read;
             }
-            /* TODO: blit scratch to NexOS GUI window */
+            vnc_blit_raw(x, y, w, h, buf);
+            kfree(buf);
         } else {
-            log_hex("unknown encoding", (uint32_t)enc);
+            log_hex("skip enc", (uint32_t)enc);
             return -1;
         }
     }
@@ -434,6 +464,13 @@ static int vnc_call(Plugin* self, const char* method,
 static int vnc_init(Plugin* self) {
     (void)self;
     g_vnc.connected = 0;
+    /* Cache the GUI vtable (nexos.gui.api is published by gui.cpp at boot). */
+    g_gui_api = (const NexosGuiAPI*)svc_lookup(NEXOS_GUI_API_SVC);
+    if (!g_gui_api || !g_gui_api->put_pixel) {
+        log_str("WARN", "no nexos.gui.api — blit will no-op");
+    } else {
+        log_str("OK", "gui.api ready");
+    }
     log_str("OK", "init");
     return 0;
 }

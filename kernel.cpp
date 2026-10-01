@@ -7327,6 +7327,14 @@ extern "C" void kexec_enter(uint32_t entry, uint32_t bp){
 //  shared by the `linuxboot` shell command and the plugin service.
 // ---------------------------------------------------------------------
 
+/* Wrap kern_fs_read (SFS/MKFS) so the kexec block can call a single
+ * `linux_read_file_all(name, buf, bufsize)` helper.  Returns bytes read,
+ * or -1 when absent / IO error. */
+extern "C" int kern_fs_read(const char* name, unsigned char* buf, int bufsize);
+static int linux_read_file_all(const char* name, unsigned char* buf, int bufsize){
+    return kern_fs_read(name, buf, bufsize);
+}
+
 /* Can Linux's 32-bit entry be entered right now?  It requires protected
  * mode with paging OFF; in long mode the trampoline cannot comply. */
 extern "C" int kern_linux_can_boot(void){
