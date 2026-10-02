@@ -729,6 +729,15 @@ int32_t h_set_perf(int32_t* a) {
     return 0;
 }
 
+// Host.SetWindowTransparent(on): toggle "whole window fully transparent".
+// Forwards to the kernel compositor (gui.cpp); the kernel re-composites the
+// desktop so every window's glassy chrome drops to zero opacity.
+extern "C" void gui_set_window_transparent(int on);
+int32_t h_set_window_transparent(int32_t* a) {
+    gui_set_window_transparent((a && a[0]) ? 1 : 0);
+    return 0;
+}
+
 // Host.SetClipboard(text): copy a managed string into the shared clipboard.
 int32_t h_clip_set(int32_t* a) {
     const char* s = clr_str(a[0]);
@@ -826,6 +835,7 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::WinAction",     h_win_action  },
     { "NexOS.Forms.Host::SetPixel",     h_set_pixel   },
     { "NexOS.Forms.Host::SetPerf",      h_set_perf    },
+    { "NexOS.Forms.Host::SetWindowTransparent", h_set_window_transparent },
 };
 const int G_REG_COUNT = (int)(sizeof(g_regs) / sizeof(g_regs[0]));
 
@@ -1042,6 +1052,16 @@ extern "C" void mforms_paint_desktop(int w, int h) {
     else
         heap_recover();
     // g_clr_trace left ON intentionally for diagnosis (every frame traced).
+}
+
+// Finer-grained wallpaper / desktop-icon layers.  The managed Shell::PaintDesktop
+// paints the whole layer at once, so both simply re-run the full desktop paint.
+extern "C" void mforms_paint_wall(int w, int h) {
+    mforms_paint_desktop(w, h);
+}
+
+extern "C" void mforms_paint_desk_icons(int w, int h) {
+    mforms_paint_desktop(w, h);
 }
 
 // Taskbar and Start menu, painted after the windows so the shell chrome

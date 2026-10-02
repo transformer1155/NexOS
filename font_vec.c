@@ -85,15 +85,39 @@ int vec_init(int (*read_file)(int, const char*, uint8_t*, int)) {
     g_read_file = read_file;
     if (!g_read_file) { g_err_code = -1; return -1; }
 
+    /* DIAG/FIX: the 32-bit kernel boots with the x87 FPU in its reset-default
+     * 80-bit extended-precision mode.  stb_truetype assumes IEEE-754 double
+     * (53-bit) precision like every hosted C environment, so the extra 11 bits
+     * of x87 precision make its scanline rasterizer produce degenerate glyph
+     * geometry -- some CJK glyphs rasterize to solid ink blocks, others to a
+     * zero-size bitmap (NULL -> falls back to the bitmap font).  A hosted build
+     * never sees this because the C runtime's crt0 issues FLDCW first.  Set the
+     * FPU control word (53-bit, round-to-nearest, exceptions masked) and the
+     * SSE MXCSR to the IEEE defaults before any float math runs. */
+    {
+        static const uint16_t cw = 0x027F;   /* 53-bit, RN, all masked */
+        static const uint32_t mxcsr = 0x1F80; /* SSE IEEE defaults */
+        __asm__ volatile (
+            "fninit\n\t"
+            "fldcw %0\n\t"
+            "ldmxcsr %1\n\t"
+            : : "m"(cw), "m"(mxcsr) : "memory"
+        );
+    }
+
     /* Peek size first. */
     uint8_t hdr[16];
     int n = g_read_file(1, "msyh.ttf", hdr, sizeof(hdr));
     if (n < 4) { g_err_code = -2; return -2; }
 
-    /* Read whole file. 1.7MB worst case; our subset is ~380KB. */
-    unsigned char* buf = (unsigned char*)kmalloc(2 * 1024 * 1024);
+    /* Read whole file.  Allocate to the real font size plus a small margin
+     * instead of a blanket 2 MiB: the kernel heap is only ~10 MiB and the
+     * 2 MiB font buffer (the real subset is <1 MiB) starved the rasterizer's
+     * per-glyph edge/coverage allocations, which is why complex CJK glyphs
+     * rasterized to garbage / NULL while simple ASCII glyphs were fine. */
+    unsigned char* buf = (unsigned char*)kmalloc(1024 * 1024 + 256 * 1024);
     if (!buf) { g_err_code = -3; return -3; }
-    int got = g_read_file(1, "msyh.ttf", buf, 2 * 1024 * 1024);
+    int got = g_read_file(1, "msyh.ttf", buf, 1024 * 1024 + 256 * 1024);
     g_err_got = got;
     if (got < 100) { kfree(buf); g_err_code = -4; return -4; }
 
@@ -128,16 +152,18 @@ const uint8_t* vec_glyph(uint32_t cp, int px, int* w, int* h, int* xoff, int* yo
     (void)lsb; (void)advance;
 
     int rw = 0, rh = 0, rxo = 0, ryo = 0;
-    /* Subpixel (ClearType) rasterization: render at 3x horizontal resolution
-     * so every destination pixel yields independent R/G/B coverages.  The
-     * returned bitmap is cov_w (= 3 * pixel_w) wide, zero-padded to a multiple
-     * of 3; *w reports the destination (pixel) width for the caller's loop. */
-    unsigned char* bmp = stbtt_GetGlyphBitmap(&g_font, scale * 3.0f, scale, glyph,
+    /* Plain 1x grayscale AA: render at the requested pixel size (scaleX ==
+     * scaleY).  This yields a w=rw by h=rh single-channel (coverage 0..255)
+     * bitmap -- one byte per destination pixel, row-major with stride w.
+     * Averaging a 3x horizontal supersample back to grayscale (the old path)
+     * over-smoothed glyph edges and made CJK look blurry next to the crisp
+     * pre-baked ASCII bitmap; 1x grayscale keeps every edge sharp. */
+    unsigned char* bmp = stbtt_GetGlyphBitmap(&g_font, scale, scale, glyph,
                                               &rw, &rh, &rxo, &ryo);
     if (!bmp || rw <= 0 || rh <= 0) return NULL;
 
-    int pixel_w = (rw + 2) / 3;           /* ceil(rw/3): 3*pixel_w >= rw */
-    int cov_w   = pixel_w * 3;
+    int pixel_w = rw;                     /* 1x: stride == width */
+    int cov_w   = rw;
     if (cov_w * rh > VEC_BUFMAX) { STBTT_free(bmp, NULL); return NULL; }
 
     uint8_t* dst = g_buf[g_buf_idx];
@@ -146,11 +172,10 @@ const uint8_t* vec_glyph(uint32_t cp, int px, int* w, int* h, int* xoff, int* yo
         const uint8_t* s = bmp + (size_t)r * rw;
         uint8_t* d = dst + (size_t)r * cov_w;
         for (int c = 0; c < rw; c++) d[c] = s[c];
-        for (int c = rw; c < cov_w; c++) d[c] = 0;     /* pad to multiple of 3 */
     }
     STBTT_free(bmp, NULL);
 
-    *w = pixel_w; *h = rh; *xoff = rxo / 3; *yoff = ryo;
+    *w = pixel_w; *h = rh; *xoff = rxo; *yoff = ryo;
     return dst;
 }
 

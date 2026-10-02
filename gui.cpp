@@ -109,7 +109,7 @@ constexpr int MANAGED_TASKBAR_H = 48;
 
 // =====================================================================
 //  Remote-control security guard  (kernel-native -- no Python dependency)
-//  Full-screen "NexOS 瀹夊叏鍗＋" overlay shown whenever a command arrives
+//  Full-screen "NexOS 安全模式" overlay shown whenever a command arrives
 //  over a remote channel (COM1 bridge / SSH).  State + forward decls live
 //  here (file scope, before the Win11Desktop class) so class methods such
 //  as render_all() and handle_mouse_down() can reach them.
@@ -590,15 +590,23 @@ constexpr Color C_ACCENT_DARK  = 0x1B5FB0;  // Dark blue pressed
 constexpr Color C_ACCENT_ORANGE = 0xFF8C00; // Orange accent for start menu icon
 
 // Aero frosted-glass material constants (Windows 7 "姣涚幓鐠?)
-constexpr Color C_GLASS_TINT        = 0xF2F6FB;  // neutral window glass (light frost)
-constexpr Color C_GLASS_TINT_ACT    = 0xD4E7F8;  // active window: accent-tinted glass
-constexpr int   C_GLASS_ALPHA       = 140;       // body glass opacity (lower = more backdrop shows)
+// Default window glass is now WHITE translucent (the user asked for a clean
+// white frosted look).  Inactive windows are pure white; the active window
+// keeps a faint cool tint so focus still reads.
+constexpr Color C_GLASS_TINT        = 0xFFFFFF;  // window glass = white frost (default)
+constexpr Color C_GLASS_TINT_ACT    = 0xEFF4FB;  // active window: near-white, faint cool tint
+constexpr int   C_GLASS_ALPHA       = 90;        // DEFAULT body glass opacity (lower = more backdrop shows)
 constexpr int   C_GLASS_BLUR_R      = 6;         // frosted-glass blur radius (px)
 // Iterations of the separable box blur.  A single box pass looks blocky/boxy;
 // repeating it 2-3 times converges to a Gaussian, which is what makes acrylic
 // look smooth ("涓濇粦").  2 passes is the quality/perf sweet spot under TCG.
 constexpr int   C_GLASS_BLUR_PASSES = 2;
-constexpr int   C_GLASS_TITLE_ALPHA = 110;       // extra title-band opacity (kept near body so it stays clearly translucent)
+constexpr int   C_GLASS_TITLE_ALPHA = 70;        // extra title-band opacity (lowered so the whole window stays uniformly translucent)
+// Runtime-transparency slider range (window body alpha).  MIN = almost fully
+// transparent (backdrop dominates); MAX = fairly solid.  The top-bar slider
+// maps its thumb position onto this range.
+constexpr int   TRANSPARENT_MIN     = 25;
+constexpr int   TRANSPARENT_MAX     = 210;
 constexpr Color C_GLASS_EDGE        = 0xFFFFFF;  // 1px top glass highlight
 constexpr int   C_GLASS_EDGE_ALPHA  = 60;
 constexpr Color C_GLASS_GLOW        = 0x2A82DA;  // active-window accent glow
@@ -1303,6 +1311,15 @@ extern "C" void gui_invalidate_managed(void) {
 int g_perf_opt = 1;
 extern "C" void gui_set_perf_opt(int on) { g_perf_opt = on ? 1 : 0; }
 
+// "Whole window fully transparent" toggle, driven from the managed Control
+// Panel.  on != 0 drops every window's glassy chrome to zero opacity so the
+// desktop shows straight through it; on == 0 restores the normal frosted glass.
+int g_window_transparent = 0;
+extern "C" void gui_set_window_transparent(int on) {
+    g_window_transparent = on ? 1 : 0;
+    gui_invalidate_managed();   // force a desktop recomposite next frame
+}
+
 // Frame-rate instrumentation (render_all prints at most once per second).
 static uint32_t fps_t0 = 0;
 static uint32_t fps_frames = 0;
@@ -1517,7 +1534,8 @@ static int fla16_advance(int cp) {
 }
 
 // =====================================================================
-// Full GB2312 CJK bitmap (24x24, 8-bit alpha) loaded from SFS zfont.bin.
+// Full GB2312 CJK bitmap (16x16, 8-bit alpha) loaded from SFS zfont.bin.
+// Baked from Noto Sans CJK (open license) by tools/gen_bitmap_fonts.c.
 // File-scope so gui_init() can load it and Graphics member funcs can blit it.
 // ZFN3: "ZFN3" + u16 count + u16 px + u16 unicode[count] + u8 glyph[count][px*px]
 // The 8-bit coverage is what the blit grayscale-blends (anti-aliased edges);
@@ -1999,7 +2017,7 @@ struct Graphics {
     }
 
     // Vector glyphs are rendered as a 3x subpixel coverage bitmap and then
-    // rounded via cov_dil3() (a 1px morphological dilation, applied inline in
+    // rounded via cov_dil1() (a 1px morphological dilation, applied inline in
     // the draw loops) before being averaged to grayscale for compositing.  This
     // rounds the sharp glyph corners (the "rounded vector font" look) with no
     // coloured ClearType fringe on the BGRX LFB.  The dilation reads only within
@@ -2091,34 +2109,43 @@ struct Graphics {
         return res;
     }
 
-    // Filled rounded rectangle (Win11 style corners).
-    // The four corner squares keep the quarter-disc and cut the outer tip,
-    // so the corners are real circular arcs instead of a chunky approximation.
+    // Filled rounded rectangle (Win11 style corners) with full edge
+    // anti-aliasing.  A signed-distance field to the rounded-rect outline
+    // drives per-pixel coverage: the interior is opaque, the ~1px boundary
+    // ring gets partial coverage (smooth against whatever is behind it), and
+    // pixels outside the shape are skipped.  This replaces the old hard-edged
+    // disc-corner fill so cards / windows / buttons get truly rounded, jaggy-
+    // free corners.  gfx_isqrt only fires for the thin boundary ring, so the
+    // large interior stays a fast opaque fill.
     void fill_rounded_rect(int x, int y, int w, int h, int r, Color c) {
         if (r > h / 2) r = h / 2;
         if (r > w / 2) r = w / 2;
         if (r <= 0) { fill_rect(x, y, w, h, c); return; }
-        // Center full-height band + left/right middle bands
-        fill_rect(x + r, y, w - 2 * r, h, c);
-        fill_rect(x, y + r, r, h - 2 * r, c);
-        fill_rect(x + w - r, y + r, r, h - 2 * r, c);
-        int r2 = r * r;
-        // top-left
-        for (int py = y; py < y + r; py++)
-            for (int px = x; px < x + r; px++)
-                if ((px - (x + r)) * (px - (x + r)) + (py - (y + r)) * (py - (y + r)) <= r2) put_pixel(px, py, c);
-        // top-right
-        for (int py = y; py < y + r; py++)
-            for (int px = x + w - r; px < x + w; px++)
-                if ((px - (x + w - r)) * (px - (x + w - r)) + (py - (y + r)) * (py - (y + r)) <= r2) put_pixel(px, py, c);
-        // bottom-left
-        for (int py = y + h - r; py < y + h; py++)
-            for (int px = x; px < x + r; px++)
-                if ((px - (x + r)) * (px - (x + r)) + (py - (y + h - r)) * (py - (y + h - r)) <= r2) put_pixel(px, py, c);
-        // bottom-right
-        for (int py = y + h - r; py < y + h; py++)
-            for (int px = x + w - r; px < x + w; px++)
-                if ((px - (x + w - r)) * (px - (x + w - r)) + (py - (y + h - r)) * (py - (y + h - r)) <= r2) put_pixel(px, py, c);
+        int x0 = x, y0 = y, x1 = x + w, y1 = y + h;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > width)  x1 = width;
+        if (y1 > height) y1 = height;
+        if (x1 <= x0 || y1 <= y0) return;
+        int hw = w / 2, hh = h / 2;
+        int cx = x + w / 2, cy = y + h / 2;
+        for (int py = y0; py < y1; py++) {
+            int ay = ((py < cy) ? (cy - py) : (py - cy)) - (hh - r);
+            int qy = (ay > 0) ? ay : 0;
+            for (int px = x0; px < x1; px++) {
+                int ax = ((px < cx) ? (cx - px) : (px - cx)) - (hw - r);
+                int qx = (ax > 0) ? ax : 0;
+                if (qx == 0 && qy == 0) {            // deep inside: opaque
+                    put_pixel(px, py, c);
+                } else {
+                    int d = gfx_isqrt(qx * qx + qy * qy) - r;  // SDF (px)
+                    int t = 128 - d * 256;            // (0.5 - d) * 256
+                    if (t <= 0) continue;             // outside shape
+                    if (t >= 255) { put_pixel(px, py, c); continue; }
+                    blend_pixel(px, py, c, t);
+                }
+            }
+        }
     }
 
     // Anti-aliased rounded rectangle outline (1px stroke, SDF-driven so the
@@ -2268,9 +2295,9 @@ struct Graphics {
             gc_lru_remove(slot);
             if (g_gc[slot].bmp) kfree(g_gc[slot].bmp);
         }
-        uint8_t* b = (uint8_t*)kmalloc((uint32_t)(3 * w * h));
+        uint8_t* b = (uint8_t*)kmalloc((uint32_t)(w * h));
         if (!b) return nullptr;
-        for (int i = 0; i < 3 * w * h; i++) b[i] = src[i];
+        for (int i = 0; i < w * h; i++) b[i] = src[i];
         g_gc[slot].cp = cp; g_gc[slot].px = px;
         g_gc[slot].w = w; g_gc[slot].h = h; g_gc[slot].xo = xo; g_gc[slot].yo = yo;
         g_gc[slot].bmp = b;
@@ -2287,31 +2314,16 @@ struct Graphics {
     // Rounded vector font: a 1px morphological DILATION of the subpixel
     // coverage rounds the sharp corners of glyph strokes (a "rounded sans"
     // look) and softens edges. Coverage layout is 3 bytes/pixel (R,G,B)
-    // row-major, stride 3*w. We dilate each subpixel channel independently over
-    // a 3x3 neighborhood, applied INLINE in the draw loops via cov_dil3() /
-    // cov_dil1() (which read only within the glyph bitmap, neighbourhood
-    // clamped to [0,w)x[0,h)).  The dilation result is averaged to grayscale.
+    // row-major, stride w (1x grayscale: one coverage byte per pixel).  The
+    // rounded-corner dilation is applied inline via cov_dil1(), which reads
+    // only within src (neighbourhood clamped to [0,w)x[0,h)).
     #define RD_MAXW 160
-    // Inline rounded-corner ("sans" look) dilation helpers.  They read ONLY
-    // within src (neighbourhood clamped to [0,w)x[0,h)), so they can never
-    // overflow the glyph bitmap no matter what w/h are passed.  Returns an
-    // averaged (grayscale) coverage 0..255 for the 3-subpixel variant, or a
-    // raw 0..255 coverage for the 1-channel variant.  Replaces the old
+    // Inline rounded-corner ("sans" look) dilation helper for the 1-channel
+    // grayscale glyph bitmap.  Reads ONLY within src (neighbourhood clamped to
+    // [0,w)x[0,h)), so it can never overflow the glyph bitmap no matter what
+    // w/h are passed.  Returns a raw 0..255 coverage.  Replaces the old
     // separate static output buffer, which could be overrun for certain glyph
     // dimensions and triggered a guest triple-fault / reboot.
-    static int cov_dil3(const uint8_t* src, int w, int h, int row, int col) {
-        int m = 0;
-        for (int dy = -1; dy <= 1; dy++) {
-            int yy = row + dy; if (yy < 0 || yy >= h) continue;
-            const uint8_t* p = src + (size_t)yy * (3 * w);
-            for (int dx = -1; dx <= 1; dx++) {
-                int xx = col + dx; if (xx < 0 || xx >= w) continue;
-                int s = (int)p[xx * 3] + p[xx * 3 + 1] + p[xx * 3 + 2];
-                if (s > m) m = s;
-            }
-        }
-        return m / 3;
-    }
     static int cov_dil1(const uint8_t* src, int w, int h, int row, int col) {
         int m = 0;
         for (int dy = -1; dy <= 1; dy++) {
@@ -2367,19 +2379,17 @@ struct Graphics {
                 int gx = x + xo;
                 int gy = y;   // top-align inside the 16px cell to match ASCII (afont/fla16 draw at y)
                 if (bg != (Color)-1) fill_rect(gx, gy, w, h, bg);
-                // Grayscale (not ClearType) antialiasing: average the 3
-                // subpixel coverages into one alpha so glyph edges are smooth
-                // and ROUNDED with no coloured fringe (the "鑺? artefact that
-                // per-R/G/B subpixel compositing produces on a BGRX LFB).
-                // When rounding is on, dilate the coverage by 1px (cov_dil3)
-                // to round the sharp glyph corners -- bounds-safe (reads only
-                // within g, neighbourhood clamped to [0,w)x[0,h)).
+                // 1x grayscale antialiasing: one coverage byte per pixel, so
+                // glyph edges stay sharp (no over-smoothing).  When rounding is
+                // on, dilate the coverage by 1px (cov_dil1) to round the sharp
+                // glyph corners -- bounds-safe (reads only within g,
+                // neighbourhood clamped to [0,w)x[0,h)).
                 const int rounding = g_font_round && w <= RD_MAXW && h <= RD_MAXW;
                 for (int row = 0; row < h; row++) {
-                    const uint8_t* src = g + row * (3 * w);
+                    const uint8_t* src = g + row * w;
                     for (int col = 0; col < w; col++) {
-                        int a = rounding ? cov_dil3(g, w, h, row, col)
-                                         : (src[3*col] + src[3*col+1] + src[3*col+2]) / 3;
+                        int a = rounding ? cov_dil1(g, w, h, row, col)
+                                         : src[col];
                         if (a > 4)
                             blend_pixel_lin(gx + col, gy + row, fg, a);
                     }
@@ -2510,12 +2520,13 @@ struct Graphics {
         int idx = zfont_runtime_lookup(cp);
         if (idx < 0) return 0;
         const uint8_t* g = g_zf_alpha + (uint32_t)idx * (uint32_t)g_zf_px * (uint32_t)g_zf_px;
-        int px = g_zf_px;                  // source glyph size (e.g. 24)
-        int dh = g_font_h;                 // target line height (e.g. 16)
+        int px = g_zf_px;                  // source glyph size (16 = native)
+        int dh = g_font_h;                 // target line height (16)
         if (dh > px) dh = px;              // never upscale
-        // Downsample (nearest) the px*px glyph into a dh*dh cell so CJK shares
-        // the same pixel height as ASCII.  The old code merely centred the 24px
-        // glyph on the 16px line, which drew Chinese ~50% taller than English.
+        // Sample the px*px glyph into a dh*dh cell (box area-average when
+        // px > dh; identity 1:1 when px == dh, the native baked case).  The
+        // old code merely centred the glyph on the line, which drew Chinese
+        // ~50% taller than English.
         for (int row = 0; row < dh; row++) {
             int sy = (row * px + dh / 2) / dh;
             const uint8_t* s = g + (uint32_t)sy * px;
@@ -2538,40 +2549,33 @@ struct Graphics {
     }
 
     // Draw one CJK glyph by Unicode codepoint (with background).
-    // X-stage: rasterize the TrueType outline at g_font_px (true vector,
-    // crisp at any size). Falls back to the 16x16 bitmap (zfont.bin).
+    // Priority mirrors draw_char() (ASCII): (1) the pre-baked 16x16 8-bit
+    // alpha CJK bitmap (Noto Sans CJK, open license) at the native size --
+    // baked AA is crisper than runtime rasterization, exactly like English;
+    // (2) the stb_truetype vector path for sizes/pieces the baked font does
+    // not cover (g_font_px != 16 or a non-GB2312 glyph); (3) the embedded
+    // 16x16 1-bit font as the last-resort early-boot fallback.
     // Returns the horizontal advance (pixels).
     int draw_cjk(int x, int y, uint32_t cp, Color fg, Color bg) {
-        // (1) Vector outline via stb_truetype (msyh.ttf) 鈥?the SAME smooth path
-        //     used by Latin draw_char, so Chinese glyphs match the English ones
-        //     in quality (true outlines, anti-aliased at any size).
+        // (1) Pre-baked 16x16 8-bit-alpha bitmap from SFS (Noto Sans CJK).
+        {
+            int adv = blit_cjk_alpha(x, y, cp, fg, bg, false);
+            if (adv) return adv;
+        }
+        // (2) Vector outline path (stb_truetype), as in draw_char().
         if (g_font_mode != 0 && vec_ready()) {
             int w = 0, h = 0, xo = 0, yo = 0;
             const uint8_t* g = vec_glyph(cp, g_font_px, &w, &h, &xo, &yo);
-            // msyh.ttf's very tall ascent/descent make stbtt_ScaleForPixelHeight
-            // rasterize CJK at only ~75-80% of the requested size (11-13px for a
-            // 16px request), which turns dense hanzi into unreadable mush.
-            // Re-request at a compensated size so the glyph fills the 16px cell.
-            if (g && h > 0 && h * 8 < g_font_px * 7) {
-                int px2 = g_font_px * g_font_px / h;
-                if (px2 > g_font_px && px2 <= 64) {
-                    int w2 = 0, h2 = 0, xo2 = 0, yo2 = 0;
-                    const uint8_t* g2 = vec_glyph(cp, px2, &w2, &h2, &xo2, &yo2);
-                    if (g2) { g = g2; w = w2; h = h2; xo = xo2; yo = yo2; }
-                }
-            }
             if (g) {
                 int gx = x + xo;
-                int gy = y;   // top-align inside the 16px cell to match ASCII (afont/fla16 draw at y)
-                const int CW = w > g_font_px ? g_font_px : w;   // never spill out of the cell
-                const int CH = h > g_font_px ? g_font_px : h;
-                if (bg != (Color)-1) fill_rect(gx, gy, CW, CH, bg);
-                const int rounding = g_font_round && CW <= RD_MAXW && CH <= RD_MAXW;
-                for (int row = 0; row < CH; row++) {
-                    const uint8_t* src = g + row * (3 * w);
-                    for (int col = 0; col < CW; col++) {
-                        int a = rounding ? cov_dil3(g, w, h, row, col)
-                                         : (src[3*col] + src[3*col+1] + src[3*col+2]) / 3;
+                int gy = y;   // top-align inside the cell to match ASCII
+                if (bg != (Color)-1) fill_rect(gx, gy, w, h, bg);
+                const int rounding = g_font_round && w <= RD_MAXW && h <= RD_MAXW;
+                for (int row = 0; row < h; row++) {
+                    const uint8_t* src = g + row * w;
+                    for (int col = 0; col < w; col++) {
+                        int a = rounding ? cov_dil1(g, w, h, row, col)
+                                         : src[col];
                         if (a > 4)
                             blend_pixel_lin(gx + col, gy + row, fg, a);
                     }
@@ -2580,12 +2584,7 @@ struct Graphics {
                 return adv > g_font_px ? adv : g_font_px;
             }
         }
-        // (2) Full GB2312 24x24 8-bit-alpha bitmap from SFS (fallback when the
-        //     vector font is unavailable 鈥?keeps a readable CJK instead of boxes).
-        {
-            int adv = blit_cjk_alpha(x, y, cp, fg, bg, false);
-            if (adv) return adv;
-        }
+        // (3) Embedded 16x16 1-bit font: last-resort early-boot fallback.
         int idx = zfont_find_unicode(cp);
         if (idx < 0) {                      // glyph not in embedded set: box
             fill_rect(x, y, 16, 16, bg);
@@ -2610,46 +2609,34 @@ struct Graphics {
     }
 
     // Draw CJK glyph transparent (only fg pixels). Returns advance.
+    // Priority mirrors draw_cjk(): baked 16x16 Noto bitmap first, then the
+    // vector path, then the embedded 1-bit font.
     int draw_cjk_transparent(int x, int y, uint32_t cp, Color fg) {
-        // (1) Vector outline via stb_truetype (msyh.ttf) 鈥?same smooth path as
-        //     Latin draw_char, so Chinese matches the English glyph quality.
-        if (g_font_mode != 0 && vec_ready()) {
-            int w = 0, h = 0, xo = 0, yo = 0;
-            const uint8_t* g = vec_glyph(cp, g_font_px, &w, &h, &xo, &yo);
-            // Same size compensation as draw_cjk(): msyh's tall metrics render
-            // CJK undersized (~12px at a 16px request) and illegible.
-            if (g && h > 0 && h * 8 < g_font_px * 7) {
-                int px2 = g_font_px * g_font_px / h;
-                if (px2 > g_font_px && px2 <= 64) {
-                    int w2 = 0, h2 = 0, xo2 = 0, yo2 = 0;
-                    const uint8_t* g2 = vec_glyph(cp, px2, &w2, &h2, &xo2, &yo2);
-                    if (g2) { g = g2; w = w2; h = h2; xo = xo2; yo = yo2; }
-                }
-            }
-            if (g) {
-                int gx = x + xo;
-                int gy = y;   // top-align inside the 16px cell to match ASCII (afont/fla16 draw at y)
-                const int CW = w > g_font_px ? g_font_px : w;   // never spill out of the cell
-                const int CH = h > g_font_px ? g_font_px : h;
-                const int rounding = g_font_round && CW <= RD_MAXW && CH <= RD_MAXW;
-                for (int row = 0; row < CH; row++)
-                    for (int col = 0; col < CW; col++) {
-                        int a = rounding ? cov_dil3(g, w, h, row, col)
-                                         : (g[row * (3 * w) + col * 3] +
-                                            g[row * (3 * w) + col * 3 + 1] +
-                                            g[row * (3 * w) + col * 3 + 2]) / 3;
-                        if (a > 4) blend_pixel_lin(gx + col, gy + row, fg, a);
-                    }
-                int adv = vec_advance(cp, g_font_px);
-                return adv > g_font_px ? adv : g_font_px;
-            }
-        }
-        // (2) Full GB2312 24x24 8-bit-alpha bitmap from SFS (fallback when the
-        //     vector font is unavailable).
+        // (1) Pre-baked 16x16 8-bit-alpha bitmap from SFS (Noto Sans CJK).
         {
             int adv = blit_cjk_alpha(x, y, cp, fg, (Color)-1, true);
             if (adv) return adv;
         }
+        // (2) Vector outline path (stb_truetype), as in draw_char().
+        if (g_font_mode != 0 && vec_ready()) {
+            int w = 0, h = 0, xo = 0, yo = 0;
+            const uint8_t* g = vec_glyph(cp, g_font_px, &w, &h, &xo, &yo);
+            if (g) {
+                int gx = x + xo;
+                int gy = y;
+                const int rounding = g_font_round && w <= RD_MAXW && h <= RD_MAXW;
+                for (int row = 0; row < h; row++) {
+                    const uint8_t* src = g + row * w;
+                    for (int col = 0; col < w; col++) {
+                        int a = rounding ? cov_dil1(g, w, h, row, col) : src[col];
+                        if (a > 4) blend_pixel_lin(gx + col, gy + row, fg, a);
+                    }
+                }
+                int adv = vec_advance(cp, g_font_px);
+                return adv > g_font_px ? adv : g_font_px;
+            }
+        }
+        // (3) Embedded 16x16 1-bit font: last-resort early-boot fallback.
         int idx = zfont_find_unicode(cp);
         if (idx < 0) return 16;
         const uint8_t* g = zfont_glyphs + idx * 32;
@@ -3139,7 +3126,7 @@ enum AppType {
     APP_NOTEPAD,        // managed-only; no legacy native drawer
     APP_AISETUP,        // one-tap AI enablement wizard (managed)
     APP_AIAGENT,        // AI Agent runner (managed): Planner/Actor/Critic
-    APP_DEMO,           // button-shrink + reply "鍟? demo window (managed)
+    APP_DEMO,           // button-shrink + reply "啥" demo window (managed)
     APP_START_MENU,      // Start menu: loaded into the window DB so it is
                          // composited & dirty-tracked like any other window
 };
@@ -4336,6 +4323,15 @@ struct Win11Desktop {
     // expensive (Windows degrades acrylic the same way while moving).
     bool      g_no_glass;
 
+    // Window body glass opacity, controlled live by the top-bar transparency
+    // slider.  Lower = more transparent.  Defaults to C_GLASS_ALPHA (white
+    // frost, more transparent than the old 140 look).
+    int       glass_alpha;
+    int       slider_drag;          // 1 while the transparency slider thumb is grabbed
+    // Transparency-slider geometry on the top bar (filled in by draw_topbar so
+    // hit-testing and drag can reuse exactly the same rects).
+    int       tr_label_x, tr_x, tr_w, tr_y, tr_total;
+
     DesktopIcon icons[MAX_ICONS];
     int icon_count;
     int selected_icon;
@@ -4403,6 +4399,10 @@ struct Win11Desktop {
         scroll_drag_win = -1;
         scroll_drag_axis = 0;
         g_snap = nullptr; g_snap_cap = 0; g_no_glass = false;
+        glass_alpha = C_GLASS_ALPHA;   // white frost, more transparent by default
+        g_window_transparent = 0;      // whole-window transparency off by default
+        slider_drag = 0;
+        tr_label_x = tr_x = tr_w = tr_y = tr_total = 0;
         gui_mode = false;
         mouse_left = false;
         drag_counter = 0;
@@ -4775,7 +4775,10 @@ struct Win11Desktop {
 
         // Right side: clock removed by request; language indicator is drawn
         // in render_all() so it overlays the managed C# desktop as well.
-        int rx = gfx.width - 8;
+        // The transparency slider overlay reserves tr_total px on the right,
+        // so start the memory/64b indicators to its left.
+        transp_layout();
+        int rx = gfx.width - 8 - tr_total - 8;
 
         // Memory indicator (compact)
         if (g_cb.get_total_mem_kb) {
@@ -4797,6 +4800,52 @@ struct Win11Desktop {
             gfx.draw_text_transparent(rx - 3*g_font_w, 8, "64b", C_MEM_GOOD);
             rx -= 3 * g_font_w + 8;
         }
+    }
+
+    // ---- Transparency slider (top-right overlay) ----
+    // Fixed geometry of the slider in the top-right corner.  Filled into the
+    // tr_* members so handle_mouse_down / handle_mouse_move hit-test and drag
+    // exactly the rect that was drawn.
+    void transp_layout() {
+        int tlabel_w = 2 * g_font_w;           // "透明" label
+        int ttrack_w = 100;                    // slider track width (px)
+        int tgap     = 6;
+        tr_total   = tlabel_w + tgap + ttrack_w;
+        tr_label_x = gfx.width - 8 - tr_total;
+        tr_x       = tr_label_x + tlabel_w + tgap;
+        tr_y       = TOPBAR_H / 2 - 3;
+        tr_w       = ttrack_w;
+    }
+
+    // Draw the slider as a self-contained floating pill.  Called from
+    // render_all() AFTER the windows in BOTH desktop modes, so the control
+    // stays visible and grabbable even on the managed C# desktop (which has
+    // no native top bar at all).
+    void draw_transp_slider() {
+        transp_layout();
+        int ttrack_h = 6;
+        // Frosted pill backdrop so the control reads on any wallpaper
+        gfx.blend_rounded_rect(tr_label_x - 8, 2, tr_total + 16, TOPBAR_H - 4, 6,
+                               0x000000, 70);
+        // Label
+        gfx.draw_text_transparent(tr_label_x, 8, "透明", C_TOPBAR_TEXT);
+        // Track background
+        gfx.blend_rounded_rect(tr_x, tr_y, tr_w, ttrack_h, 3, 0xFFFFFF, 60);
+        // Filled portion up to the current alpha
+        int rel = glass_alpha - TRANSPARENT_MIN;
+        if (rel < 0) rel = 0;
+        int fill_w = (rel * tr_w) / (TRANSPARENT_MAX - TRANSPARENT_MIN);
+        if (fill_w > tr_w) fill_w = tr_w;
+        if (fill_w > 0)
+            gfx.blend_rounded_rect(tr_x, tr_y, fill_w, ttrack_h, 3, C_ACCENT, 190);
+        // Thumb (white pill)
+        int thumb_w = 8, thumb_h = 14;
+        int thumb_x = tr_x + fill_w - thumb_w / 2;
+        if (thumb_x < tr_x) thumb_x = tr_x;
+        if (thumb_x > tr_x + tr_w - thumb_w) thumb_x = tr_x + tr_w - thumb_w;
+        int thumb_y = TOPBAR_H / 2 - thumb_h / 2;
+        gfx.fill_rounded_rect(thumb_x, thumb_y, thumb_w, thumb_h, 3, COLOR_WHITE);
+        gfx.blend_rounded_rect(thumb_x, thumb_y, thumb_w, thumb_h, 3, 0x000000, 28);
     }
 
     void draw_desktop_icons() {
@@ -4907,20 +4956,27 @@ struct Win11Desktop {
             gfx.fill_rect(rx, ry, rw, TITLE_BAR_H,
                           win.active ? C_GLASS_TINT_ACT : C_GLASS_TINT);
         } else {
+            // "Whole window transparent" mode forces the glassy chrome to
+            // zero opacity: the desktop/wallpaper shows straight through the
+            // body AND the title band, leaving only the faint rim outline and
+            // the (opaque) content/text floating on the desktop.
+            int body_alpha  = g_window_transparent ? 0 : glass_alpha;
+            int title_alpha = g_window_transparent ? 0 : C_GLASS_TITLE_ALPHA;
             // Frosted translucent body: blurred desktop/wallpaper shows through.
             // While anything is moving, skip the (expensive) blur -- it is not
             // perceptible in motion, exactly like Windows degrading acrylic.
             if (g_no_glass)
-                gfx.blend_rounded_rect(rx, ry, rw, rh, WIN_RADIUS, glass, C_GLASS_ALPHA);
+                gfx.blend_rounded_rect(rx, ry, rw, rh, WIN_RADIUS, glass, body_alpha);
             else
-                glass_rounded_rect(gfx, rx, ry, rw, rh, WIN_RADIUS, glass, C_GLASS_ALPHA, C_GLASS_BLUR_R);
-            // Active-window accent glow across the title band.
-            if (win.active)
+                glass_rounded_rect(gfx, rx, ry, rw, rh, WIN_RADIUS, glass, body_alpha, C_GLASS_BLUR_R);
+            // Active-window accent glow across the title band (skipped when the
+            // window is fully transparent so nothing tints the bare backdrop).
+            if (win.active && !g_window_transparent)
                 gfx.blend_rect(rx + WIN_RADIUS, ry, rw - 2*WIN_RADIUS, TITLE_BAR_H,
                                C_GLASS_GLOW, C_GLASS_GLOW_ALPHA);
             // Title-band glass (extra opacity so text stays crisp).
             gfx.blend_rect(rx + WIN_RADIUS, ry, rw - 2*WIN_RADIUS, TITLE_BAR_H,
-                           glass, C_GLASS_TITLE_ALPHA);
+                           glass, title_alpha);
             // 1px top glass highlight + bottom separator under the title.
             gfx.blend_rect(rx + WIN_RADIUS, ry + 1, rw - 2*WIN_RADIUS, 1,
                            C_GLASS_EDGE, C_GLASS_EDGE_ALPHA);
@@ -7048,6 +7104,13 @@ struct Win11Desktop {
         perf_win_ms += tick_ms_now() - tS;    // stage 2: window compositing
         tS = tick_ms_now();
 
+        // Transparency slider overlay: drawn AFTER the windows in BOTH desktop
+        // modes so it stays visible and grabbable (the managed C# desktop has
+        // no native top bar).  Cheap (a few rects), and its strip is dirtied
+        // every frame so alpha changes show immediately.
+        draw_transp_slider();
+        dirty_add(tr_label_x - 10, 0, tr_total + 20, TOPBAR_H);
+
         // Layer 2 of the managed shell: taskbar + Start menu, on top of
         // every window.  The native start menu only exists as a fallback.
         // The taskbar strip is the only part of the overlay that changes every
@@ -7147,7 +7210,8 @@ struct Win11Desktop {
         if (!managed_desk) {
             const char* lang = g_ime_cn ? "中" : "EN";
             int lw = g_ime_cn ? 16 : (2 * g_font_w);
-            int lx = gfx.width - 8 - lw;
+            // Leave room for the transparency-slider overlay on the right.
+            int lx = gfx.width - 8 - lw - tr_total - 12;
             Color fg = g_ime_cn ? 0xFFCC00 : C_TOPBAR_TEXT;
             gfx.fill_rect(lx - 4, 0, lw + 8, TOPBAR_H, C_TOPBAR_BG);
             gfx.draw_text_utf8(lx, 8, lang, fg, C_TOPBAR_BG);
@@ -7396,6 +7460,18 @@ struct Win11Desktop {
             return;
         }
 
+        // Transparency slider drag: map the pointer's x onto the alpha range
+        // and repaint so the frosted windows update live behind the slider.
+        if (slider_drag && tr_w > 0) {
+            int rel = mouse_x - tr_x;
+            if (rel < 0) rel = 0; if (rel > tr_w) rel = tr_w;
+            glass_alpha = TRANSPARENT_MIN + rel * (TRANSPARENT_MAX - TRANSPARENT_MIN) / tr_w;
+            if (glass_alpha < TRANSPARENT_MIN) glass_alpha = TRANSPARENT_MIN;
+            if (glass_alpha > TRANSPARENT_MAX) glass_alpha = TRANSPARENT_MAX;
+            render_all();
+            return;
+        }
+
         // Dragging a window is a real UI state change (the window itself moves),
         // so it legitimately needs a full redraw 鈥?render_all repaints the cursor.
         if (was_drag) {
@@ -7578,6 +7654,19 @@ struct Win11Desktop {
                 render_all();
                 return;
             }
+            // Transparency slider (top-right overlay): grab before windows so
+            // a window under it cannot steal the drag.
+            if (mouse_y < TOPBAR_H && tr_total > 0 &&
+                mouse_x >= tr_label_x - 2 && mouse_x <= tr_x + tr_w + 2) {
+                slider_drag = 1;
+                int rel = mouse_x - tr_x;
+                if (rel < 0) rel = 0; if (rel > tr_w) rel = tr_w;
+                glass_alpha = TRANSPARENT_MIN + rel * (TRANSPARENT_MAX - TRANSPARENT_MIN) / tr_w;
+                if (glass_alpha < TRANSPARENT_MIN) glass_alpha = TRANSPARENT_MIN;
+                if (glass_alpha > TRANSPARENT_MAX) glass_alpha = TRANSPARENT_MAX;
+                render_all();
+                return;
+            }
             if (click_windows_z()) return;
             // Desktop icons: a single click only selects (no launch);
             // launching requires a double-click, like Windows.  A second
@@ -7609,6 +7698,18 @@ struct Win11Desktop {
 
         // Check top bar (Start button)
         if (mouse_y < TOPBAR_H) {
+            // Transparency slider (right side): grab anywhere on the label or
+            // track to start dragging; the thumb follows the pointer live.
+            if (tr_total > 0 && mouse_x >= tr_label_x - 2 && mouse_x <= tr_x + tr_w + 2) {
+                slider_drag = 1;
+                int rel = mouse_x - tr_x;
+                if (rel < 0) rel = 0; if (rel > tr_w) rel = tr_w;
+                glass_alpha = TRANSPARENT_MIN + rel * (TRANSPARENT_MAX - TRANSPARENT_MIN) / tr_w;
+                if (glass_alpha < TRANSPARENT_MIN) glass_alpha = TRANSPARENT_MIN;
+                if (glass_alpha > TRANSPARENT_MAX) glass_alpha = TRANSPARENT_MAX;
+                render_all();
+                return;
+            }
             if (mouse_x >= 8 && mouse_x < 52) {
                 start_menu_open = true;
                 render_all();
@@ -7865,6 +7966,7 @@ struct Win11Desktop {
         mouse_left = false;
         scroll_drag_win = -1;
         scroll_drag_axis = 0;
+        slider_drag = 0;
         int dw = drag_window;
         drag_window = -1;
 
@@ -10283,7 +10385,7 @@ void gui_exit(void) {
 }
 
 // ---- Remote-control security guard: implementation ----
-// Full-screen "NexOS 瀹夊叏鍗＋" overlay.  Triggered by kernel.cpp's remote
+// Full-screen "NexOS 安全模式" overlay.  Triggered by kernel.cpp's remote
 // command entry points (COM1 bridge / SSH) via gui_remote_begin()/cmd().
 
 static void remote_log_push(const char* cmd) {
@@ -10333,14 +10435,14 @@ void draw_remote_guard(void) {
     // Opaque full-screen backdrop
     g_wm.gfx.fill_rect(0, 0, W, H, 0x0B0E14);
 
-    // Top status bar: "NexOS 瀹夊叏鍗＋"
+    // Top status bar: "NexOS 安全模式"
     const int BAR_H = 46;
     g_wm.gfx.fill_rect(0, 0, W, BAR_H, 0x123A6B);
     g_wm.gfx.draw_line(0, BAR_H, W, BAR_H, 0x2E6FB5);
-    g_wm.gfx.draw_text_utf8(16, 14, "NexOS 瀹夊叏鍗＋", 0xFFFFFF, 0x123A6B);
-    g_wm.gfx.draw_text_utf8(W - 64, 16, "瀹夊叏涓績", 0x9FC7EF, 0x123A6B);
+    g_wm.gfx.draw_text_utf8(16, 14, "NexOS 安全模式", 0xFFFFFF, 0x123A6B);
+    g_wm.gfx.draw_text_utf8(W - 64, 16, "安全中心", 0x9FC7EF, 0x123A6B);
 
-    // Alert strip: "姝ｅ湪琚繙绋嬫帶鍒? + controller identity
+    // Alert strip: "正在被远程控制 + controller identity
     const int ALERT_H = 70;
     int ay = BAR_H;
     g_wm.gfx.fill_rect(0, ay, W, ALERT_H, 0x7A1020);

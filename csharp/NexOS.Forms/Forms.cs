@@ -183,6 +183,9 @@ namespace NexOS.Forms
         // Push the retro "pixel / CRT monitor" settings down to the kernel
         // framebuffer post-process: mode (on/off), scale (block size), scan (scanlines).
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void   SetPixel(int mode, int scale, int scan);
+        // Toggle "whole window fully transparent":  on != 0 drops every window's
+        // glassy chrome to zero opacity so the desktop shows straight through it.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void   SetWindowTransparent(int on);
     }
 #endif // !WINHOST
 

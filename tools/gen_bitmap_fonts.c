@@ -1,6 +1,7 @@
 /*
  * gen_bitmap_fonts.c - Host-side rasterizer that bakes the NexOS bitmap fonts
- * from a TrueType source (msyh.ttf) using stb_truetype's grayscale coverage.
+ * from open-source TrueType sources (Noto Sans CJK for Hanzi, DejaVu Sans for
+ * Latin) using stb_truetype's grayscale coverage.  No proprietary fonts.
  *
  * Produces TWO fonts, both 8-bit alpha (per-pixel coverage 0..255):
  *
@@ -10,10 +11,11 @@
  * The 8-bit alpha channel is what draw_char()/draw_cjk() blend with, so text
  * edges are anti-aliased instead of the old 1-bit binary stamp.
  *
- * Build/run (WSL):
+ * Build/run:
  *   gcc -O2 -o build/gen_bitmap_fonts tools/gen_bitmap_fonts.c -I tools/stb
- *   ./build/gen_bitmap_fonts sfs_files/msyh.ttf \
- *       build/afont_data.h sfs_files/zfont.bin build/gb2312_uni.txt
+ *   ./build/gen_bitmap_fonts <cjk.ttf> <afont.h> <zfont.bin> <gb2312.txt> [<latin.ttf>]
+ *     cjk.ttf    : NotoSansCJK-Regular.ttc  (Hanzi source, open / SIL OFL)
+ *     latin.ttf  : DejaVuSans.ttf          (ASCII source, open / Bitstream)
  *
  * ZFN3 file format (little-endian):
  *   char   magic[4] = "ZFN3"
@@ -60,27 +62,37 @@ static void place_glyph(const unsigned char* bmp, int bw, int bh,
 }
 
 int main(int argc, char** argv) {
-    const char* ttf     = argc > 1 ? argv[1] : "sfs_files/msyh.ttf";
-    const char* afont_h = argc > 2 ? argv[2] : "build/afont_data.h";
-    const char* zfont_b = argc > 3 ? argv[3] : "sfs_files/zfont.bin";
-    const char* uilist  = argc > 4 ? argv[4] : "build/gb2312_uni.txt";
+    const char* ttf       = argc > 1 ? argv[1] : "sfs_files/msyh.ttf";
+    const char* afont_h   = argc > 2 ? argv[2] : "afont_data.h";
+    const char* zfont_b   = argc > 3 ? argv[3] : "sfs_files/zfont.bin";
+    const char* uilist    = argc > 4 ? argv[4] : "build/gb2312_uni.txt";
+    const char* ascii_ttf = argc > 5 ? argv[5] : ttf;   /* open Latin source */
 
     const int AW = 16, AH = 16;     /* ASCII cell */
-    const int CW = 24, CH = 24;     /* CJK cell   */
+    const int CW = 16, CH = 16;     /* CJK cell: native 16x16, matches ASCII */
     const int A_BASE = 0x20, A_COUNT = 95;   /* 0x20..0x7E */
 
+    /* CJK / Hanzi source (e.g. Noto Sans CJK). */
     long tsz = 0;
     unsigned char* ttf_buf = slurp(ttf, &tsz);
     if (!ttf_buf) return 1;
-    stbtt_fontinfo font;
-    if (!stbtt_InitFont(&font, ttf_buf, stbtt_GetFontOffsetForIndex(ttf_buf, 0))) {
+    stbtt_fontinfo cjk_font;
+    if (!stbtt_InitFont(&cjk_font, ttf_buf, stbtt_GetFontOffsetForIndex(ttf_buf, 0))) {
         fprintf(stderr, "stbtt_InitFont failed for %s\n", ttf); return 1;
+    }
+    /* Latin source (e.g. DejaVu Sans) -- separate open font for ASCII. */
+    long lsz = 0;
+    unsigned char* lbuf = slurp(ascii_ttf, &lsz);
+    if (!lbuf) { fprintf(stderr, "open %s failed\n", ascii_ttf); return 1; }
+    stbtt_fontinfo latin_font;
+    if (!stbtt_InitFont(&latin_font, lbuf, stbtt_GetFontOffsetForIndex(lbuf, 0))) {
+        fprintf(stderr, "stbtt_InitFont failed for %s\n", ascii_ttf); return 1;
     }
 
     /* ---------------- ASCII 16x16 ---------------- */
-    float asc_scale = stbtt_ScaleForPixelHeight(&font, (float)AW);
+    float asc_scale = stbtt_ScaleForPixelHeight(&latin_font, (float)AW);
     int a_asc, a_desc, a_gap;
-    stbtt_GetFontVMetrics(&font, &a_asc, &a_desc, &a_gap);
+    stbtt_GetFontVMetrics(&latin_font, &a_asc, &a_desc, &a_gap);
     int a_base = (int)(a_asc * asc_scale + 0.5f);   /* baseline y within cell */
 
     unsigned char (*a_cell)[AW * AH] = malloc((size_t)A_COUNT * AW * AH);
@@ -88,7 +100,7 @@ int main(int argc, char** argv) {
     memset(a_cell, 0, (size_t)A_COUNT * AW * AH);
     for (int i = 0; i < A_COUNT; i++) {
         int cp = A_BASE + i, w = 0, h = 0, xo = 0, yo = 0;
-        unsigned char* bmp = stbtt_GetCodepointBitmap(&font, asc_scale, asc_scale,
+        unsigned char* bmp = stbtt_GetCodepointBitmap(&latin_font, asc_scale, asc_scale,
                                                       cp, &w, &h, &xo, &yo);
         int oy = a_base + yo;           /* stb yo is relative to baseline */
         if (bmp) {
@@ -96,7 +108,7 @@ int main(int argc, char** argv) {
             stbtt_FreeBitmap(bmp, 0);
         }
         int adv = 0, lsb = 0;
-        stbtt_GetCodepointHMetrics(&font, cp, &adv, &lsb);
+        stbtt_GetCodepointHMetrics(&latin_font, cp, &adv, &lsb);
         int apx = (int)(adv * asc_scale + 0.5f);
         if (apx < 1) apx = 1;
         if (apx > AW) apx = AW;
@@ -128,7 +140,7 @@ int main(int argc, char** argv) {
     fclose(fh);
     printf("ASCII: %d glyphs %dx%d -> %s\n", A_COUNT, AW, AH, afont_h);
 
-    /* ---------------- CJK 24x24 (GB2312 list) ---------------- */
+    /* ---------------- CJK 16x16 (GB2312 list) ---------------- */
     FILE* lf = fopen(uilist, "r");
     if (!lf) { fprintf(stderr, "open list %s failed (run gen_gb2312_list.py first)\n", uilist); return 1; }
     int cap = 8192, n = 0;
@@ -136,9 +148,9 @@ int main(int argc, char** argv) {
     while (n < cap && fscanf(lf, "%hu", &cps[n]) == 1) n++;
     fclose(lf);
 
-    float cjk_scale = stbtt_ScaleForPixelHeight(&font, (float)CH);
+    float cjk_scale = stbtt_ScaleForPixelHeight(&cjk_font, (float)CH);
     int c_asc, c_desc, c_gap;
-    stbtt_GetFontVMetrics(&font, &c_asc, &c_desc, &c_gap);
+    stbtt_GetFontVMetrics(&cjk_font, &c_asc, &c_desc, &c_gap);
     int c_base = (int)(c_asc * cjk_scale + 0.5f);
     if (c_base < 0) c_base = 0;
     if (c_base > CH) c_base = CH;
@@ -154,7 +166,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n; i++) {
         memset(cell, 0, (size_t)CW * CH);
         int cp = cps[i], w = 0, h = 0, xo = 0, yo = 0;
-        unsigned char* bmp = stbtt_GetCodepointBitmap(&font, cjk_scale, cjk_scale,
+        unsigned char* bmp = stbtt_GetCodepointBitmap(&cjk_font, cjk_scale, cjk_scale,
                                                       cp, &w, &h, &xo, &yo);
         int nonzero = 0;
         if (bmp) {
@@ -186,6 +198,7 @@ int main(int argc, char** argv) {
     printf("CJK: %d/%d glyphs %dx%d kept (%d blank) -> %s (%.2f MB)\n",
            kept, n, CW, CH, blank, zfont_b, total / 1048576.0);
 
-    free(keep_buf); free(keep_cp); free(cell); free(cps); free(a_cell); free(ttf_buf);
+    free(keep_buf); free(keep_cp); free(cell); free(cps); free(a_cell);
+    free(ttf_buf); free(lbuf);
     return 0;
 }

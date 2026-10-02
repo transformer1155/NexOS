@@ -36,7 +36,12 @@ namespace NexOS.Forms
 
         // Carried request for the next ControlPanel / Notepad instance:
         // lets the host open a settings page or a specific file.
-        static int   pendingSettingsPage = -1;
+        // NOTE: MiniCLR zero-fills statics and never runs field
+        // initialisers / .cctor, so "no request" must be representable by
+        // all-zero.  An `armed` flag does that; a plain "= -1" default
+        // silently became 0 and forced the panel onto the System page.
+        static int   pendingSettingsPage;
+        static int   pendingSettingsArmed;
         static string pendingNotepadFile = null;
 
         // ---- lifecycle ------------------------------------------------
@@ -315,10 +320,15 @@ namespace NexOS.Forms
         public static void OpenSettings(int page)
         {
             pendingSettingsPage = page;
+            pendingSettingsArmed = 1;
             Host.OpenApp(Kind.ControlPanel);
         }
         public static int TakeSettingsPage()
-        { int p = pendingSettingsPage; pendingSettingsPage = -1; return p; }
+        {
+            int armed = pendingSettingsArmed;
+            pendingSettingsArmed = 0;
+            return armed != 0 ? pendingSettingsPage : -1;
+        }
 
         // Open Notepad with a specific file already loaded.  The kernel
         // must create the native window, so we hand the request back to

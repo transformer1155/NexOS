@@ -238,12 +238,26 @@ namespace NexOS.Forms
 
     // =================================================================
     //  File Explorer
+    // -----------------------------------------------------------------
+    //  Reworked to feel like a modern Windows (Win11) Explorer:
+    //    * Win11-style command bar (Back / Forward / Up / New Folder /
+    //      Refresh / View toggle) with a real navigation history.
+    //    * A "This PC" root that lists the two volumes as drives, so
+    //      Back / Forward / Up actually mean something.
+    //    * Two layouts: the classic icon+name List, and a Details view
+    //      with sortable Name / Type columns and a status bar.
+    //    * Multi-select (Ctrl+A selects all; a click selects one) that
+    //      drives the selection count in the status bar and bulk delete.
+    //  The file system is still flat (MKFS / SFS volumes, no sub-folders
+    //  and no per-file size/date), so the columns reflect what the host
+    //  actually exposes: name and type.
     // =================================================================
     public class FileExplorerApp : App
     {
-        int fs;        // 0 = MKFS, 1 = SFS
-        int sel;       // selected index, -1 none
-        int scroll;    // first visible row
+        // Location: -1 = This PC (root), 0 = MKFS, 1 = SFS.
+        int fs;        // current location
+        int sel;       // focused / primary list index, -1 = none
+        int scroll;    // first visible row (native scrollbar drives this)
         int editMode;  // 0 none, 1 rename, 2 new folder
         string editBuf;// current text in the inline editor
         string editOld;// original name (rename source)
@@ -251,9 +265,8 @@ namespace NexOS.Forms
         int dblT;      // TickMs() of the last row click (double-click detect)
         int dblIdx;    // row index of that click
         static string clip;   // last "copied" path
-        // Address bar (location box) at the top of the window.  It shows the
-        // volume the explorer currently points at; clicking it starts inline
-        // editing and Enter navigates (an unknown location is reported).
+
+        // Address bar (location box) at the top of the window.
         string addr;     // committed address text, e.g. "C:\"
         string addrBuf;  // scratch buffer while editing
         bool   addrEdit; // true while the box owns the keyboard
@@ -263,76 +276,313 @@ namespace NexOS.Forms
         string owFile;   // file being opened by the chooser
         string owExt;    // its extension (recorded on pick)
 
-        public FileExplorerApp() { fs = 0; sel = -1; scroll = 0; editMode = 0; editBuf = ""; editOld = ""; editDirty = false; dblT = -100000; dblIdx = -1; addr = AddrOf(0); addrBuf = ""; addrEdit = false; addrDirty = false; addrErr = false; openWith = false; owFile = ""; owExt = ""; }
+        // Navigation history for Back / Forward.
+        int[] hist;  int histN; int histPos;
+
+        // View + sort state.
+        int viewMode;   // 0 = List, 1 = Details
+        int sortMode;   // 0 name asc, 1 name desc, 2 type asc, 3 type desc
+
+        // Multi-select set (list indices).  `sel` is the keyboard focus.
+        int[] selSet; int selN; int anchor;
+
+        // Display-order permutation of list indices (for sorting).
+        int[] order;
+
+        // Toolbar button geometry (filled during paint, read during click).
+        int[] tbX; int[] tbY; int[] tbW; int[] tbH;
+        const int TB_BACK = 1, TB_FWD = 2, TB_UP = 3, TB_NEW = 4, TB_REFRESH = 5, TB_VIEW = 6;
+        // Details header geometry.
+        int hdY; int hdH; int hdNameX; int hdNameW; int hdTypeX; int hdTypeW;
+
+        // Semi-blocking open plumbing.
+        int    pendKind = 0;
+        int    pendArg2 = 0;
+        string pendName = null;
+        string pendWhat = "";
+
+        const int NAVW = 150;
+        const int PAD = 12;
+
+        public FileExplorerApp()
+        {
+            fs = 0; sel = -1; scroll = 0; editMode = 0; editBuf = ""; editOld = ""; editDirty = false;
+            dblT = -100000; dblIdx = -1;
+            addr = "MKFS"; addrBuf = ""; addrEdit = false; addrDirty = false;
+            addrErr = false; openWith = false; owFile = ""; owExt = "";
+            hist = new int[64]; histN = 0; histPos = 0;
+            viewMode = 0; sortMode = 0;
+            selSet = new int[256]; selN = 0; anchor = -1;
+            order = new int[256];
+            tbX = new int[8]; tbY = new int[8]; tbW = new int[8]; tbH = new int[8];
+            hdY = 0; hdH = 26; hdNameX = 0; hdNameW = 0; hdTypeX = 0; hdTypeW = 0;
+            // Seed the history with the default location.
+            hist[0] = 0; histN = 1; histPos = 0;
+            RebuildOrder();
+        }
 
         public override string GetTitle() { return "File Explorer"; }
 
+        // ---- location helpers -------------------------------------
+        // Wrappers so the rest of the app can treat "This PC" (fs < 0) and a
+        // real volume uniformly: This PC lists the two volumes as folders.
+        int ListCount()
+        {
+            if (fs < 0) return 2;
+            int n = Host.FileCount(fs);
+            if (n > 256) n = 256;
+            return n;
+        }
+        string ListName(int i)
+        {
+            if (fs < 0) return i == 0 ? "Local Disk (MKFS)" : "System (SFS)";
+            if (i < 0 || i >= Host.FileCount(fs)) return "";
+            return Host.FileName(fs, i);
+        }
+        bool ListIsDir(int i)
+        {
+            if (fs < 0) return true;          // volumes render as folders
+            if (i < 0 || i >= Host.FileCount(fs)) return false;
+            return Host.FileIsDir(fs, i) != 0;
+        }
+
+        // Navigate to a location, recording it in the history (Back/Forward).
+        void Go(int loc)
+        {
+            if (histN == 0 || hist[histPos] != loc)
+            {
+                if (histPos < histN - 1) histN = histPos + 1;   // drop redo branch
+                if (histN < 64) { hist[histN] = loc; histN++; histPos = histN - 1; }
+            }
+            fs = loc; sel = -1; scroll = 0; anchor = -1; selN = 0;
+            addr = AddrOf(loc);
+            Host.FileRefresh();
+            RebuildOrder();
+        }
+        // Jump within the existing history (no new entry).
+        void ApplyHist()
+        {
+            int loc = hist[histPos];
+            fs = loc; sel = -1; scroll = 0; anchor = -1; selN = 0;
+            addr = AddrOf(loc);
+            Host.FileRefresh();
+            RebuildOrder();
+        }
+        void GoVolume(int nf) { Go(nf); }     // legacy name, volume only
+        void Back()    { if (histPos > 0) { histPos--; ApplyHist(); } }
+        void Forward() { if (histPos < histN - 1) { histPos++; ApplyHist(); } }
+        void NavigateUp() { if (fs >= 0) Go(-1); }   // volume -> This PC
+
+        // ---- selection helpers -------------------------------------
+        bool IsSelected(int li)
+        {
+            for (int k = 0; k < selN; k++) if (selSet[k] == li) return true;
+            return false;
+        }
+        void SelectOnly(int li) { sel = li; anchor = li; selN = 0; if (selN < 256) { selSet[selN] = li; selN++; } }
+        void SelectAll()
+        {
+            int n = ListCount(); selN = 0;
+            for (int i = 0; i < n && selN < 256; i++) { selSet[selN] = i; selN++; }
+            if (n > 0) { sel = 0; anchor = 0; }
+        }
+        void ClearSel() { selN = 0; sel = -1; anchor = -1; }
+
+        // ---- sorting -------------------------------------------------
+        static int StrCmp(string a, string b)
+        {
+            int n = a.Length; if (b.Length < n) n = b.Length;
+            for (int i = 0; i < n; i++)
+            {
+                int ca = (int)a[i], cb = (int)b[i];
+                if (ca >= 'A' && ca <= 'Z') ca += 32;
+                if (cb >= 'A' && cb <= 'Z') cb += 32;
+                if (ca < cb) return -1;
+                if (ca > cb) return 1;
+            }
+            if (a.Length < b.Length) return -1;
+            if (a.Length > b.Length) return 1;
+            return 0;
+        }
+        // Returns > 0 if list-index `a` should sort AFTER `b` (for ascending).
+        int Cmp(int a, int b)
+        {
+            string na = ListName(a), nb = ListName(b);
+            bool da = ListIsDir(a), db = ListIsDir(b);
+            if (sortMode == 0 || sortMode == 1)        // by name
+            {
+                int c = StrCmp(na, nb);
+                if (sortMode == 1) c = -c;
+                return c;
+            }
+            // by type: folders first, then by extension, then by name
+            if (da && !db) return sortMode == 2 ? -1 : 1;
+            if (!da && db) return sortMode == 2 ? 1 : -1;
+            int ce = StrCmp(ExtOf(na), ExtOf(nb));
+            if (ce == 0) ce = StrCmp(na, nb);
+            if (sortMode == 3) ce = -ce;
+            return ce;
+        }
+        void RebuildOrder()
+        {
+            int n = ListCount();
+            for (int i = 0; i < n; i++) order[i] = i;
+            for (int a = 0; a < n; a++)
+                for (int b = a + 1; b < n; b++)
+                    if (Cmp(order[a], order[b]) > 0)
+                    { int t = order[a]; order[a] = order[b]; order[b] = t; }
+        }
+        string TypeStr(int li)
+        {
+            if (ListIsDir(li)) return "Folder";
+            string e = ExtOf(ListName(li));
+            if (e == "") return "File";
+            // uppercase the extension for display: "TXT File"
+            string r = "";
+            for (int i = 0; i < e.Length; i++) { int c = (int)e[i]; if (c >= 'a' && c <= 'z') c -= 32; r = U.Cat(r, Host.CharStr(c)); }
+            return U.Cat(r, " File");
+        }
+
+        // ---- layout --------------------------------------------------
+        int BarTop() { return PAD; }
+        int BarH()   { return 30; }
+        int ToolY()  { return BarTop() + BarH() + 6; }
+        int ListTop() { return ToolY() + 32 + 8; }
+        int StatusH() { return 24; }
+        int ClientW(int w) { return w - (NAVW + PAD) - PAD; }
+        int ClientX() { return NAVW + PAD; }
+
+        bool TBEnabled(int id)
+        {
+            if (id == TB_BACK)    return histPos > 0;
+            if (id == TB_FWD)     return histPos < histN - 1;
+            if (id == TB_UP)      return fs >= 0;
+            if (id == TB_NEW)     return fs >= 0;
+            if (id == TB_REFRESH) return true;
+            if (id == TB_VIEW)    return true;
+            return false;
+        }
+        // Recompute + paint one toolbar button; caches its rect for click tests.
+        void ToolBtn(int id, int x, int y, int w, int h, string glyph, bool enabled)
+        {
+            bool hot = enabled && W.Hot(x, y, w, h);
+            uint bg = !enabled ? C.Card : (hot ? C.Hover : C.Card);
+            Gfx.FillRound(x, y, w, h, 6, bg);
+            Gfx.DrawRound(x, y, w, h, 6, enabled ? C.BorderMid : C.Border);
+            uint fg = enabled ? C.Text : C.TextFaint;
+            Gfx.TextCenter(x, y + (h - 16) / 2, w, glyph, fg);
+            tbX[id] = x; tbY[id] = y; tbW[id] = w; tbH[id] = h;
+        }
+
+        // =============================================================
+        //  PAINT
+        // =============================================================
         public override void OnPaint()
         {
             W.Clear();
             int w = Gfx.Width(), h = Gfx.Height();
-            int navW = 150, pad = 12;
+            int ax = ClientX(), aw = ClientW(w);
 
-            // Left navigation.
-            Gfx.FillRect(0, 0, navW, h, 0xFAFAFA);
-            Gfx.DrawLine(navW, 0, navW, h, C.Border);
-            Nav(10, 14, navW - 20, "This PC", false);
-            Nav(10, 14 + 40, navW - 20, "MKFS", fs == 0);
-            Nav(10, 14 + 80, navW - 20, "SFS", fs == 1);
+            // ---- left navigation rail ----
+            Gfx.FillRect(0, 0, NAVW, h, 0xFAFAFA);
+            Gfx.DrawLine(NAVW, 0, NAVW, h, C.Border);
+            Nav(10, 14,           NAVW - 20, "This PC", fs < 0);
+            Nav(10, 14 + 40,      NAVW - 20, "MKFS",    fs == 0);
+            Nav(10, 14 + 80,      NAVW - 20, "SFS",     fs == 1);
 
-            // File area header: an editable address bar showing the location
-            // this explorer points at, plus an item-count (or edit hint) line.
-            int ax = navW + pad, ay = pad;
-            int aw = w - ax - pad;
-            int n = Host.FileCount(fs);
-            int bh = BarH();
+            // ---- address (location) bar ----
+            int ay = BarTop(), bh = BarH();
             Gfx.FillRound(ax, ay, aw, bh, 6, addrEdit ? 0xFFFFFF : C.Card);
             Gfx.DrawRound(ax, ay, aw, bh, 6, addrEdit ? C.Accent : C.Border);
             Gfx.Icon(ax + 8, ay + (bh - 18) / 2, 18, 0x0078D4u, 'P', 0xFFFFFF);
             string shownAddr = addrEdit ? addrBuf : addr;
             if (addrEdit && (Host.Ticks() / 30) % 2 == 0) shownAddr = U.Cat(shownAddr, "|");
             Gfx.Text(ax + 32, ay + (bh - 16) / 2, shownAddr, C.Text);
-            Gfx.Text(ax, ay + bh + 2,
-                     addrEdit ? "输入路径后回车 · 例如 C:\\ 或 S:\\" : U.Cat(U.I(n), " items"),
-                     C.TextSub);
 
-            int ly = ay + 48;
-            // Draw EVERY file.  When the list is taller than the window the
-            // native layer raises a scrollbar (drag it, or use the wheel) to
-            // pan the list into view -- no in-app clipping.
-            for (int idx = 0; idx < n; idx++)
+            // ---- command toolbar (Win11-style) ----
+            int by = ToolY(), bs = 30, bg = 6;
+            int tx = ax;
+            ToolBtn(TB_BACK,    tx, by, bs, bs, "<", TBEnabled(TB_BACK));    tx += bs + bg;
+            ToolBtn(TB_FWD,     tx, by, bs, bs, ">", TBEnabled(TB_FWD));     tx += bs + bg;
+            ToolBtn(TB_UP,      tx, by, bs, bs, "^", TBEnabled(TB_UP));      tx += bs + bg;
+            tx += 10;
+            ToolBtn(TB_NEW,     tx, by, bs, bs, "+", TBEnabled(TB_NEW));     tx += bs + bg;
+            ToolBtn(TB_REFRESH, tx, by, bs, bs, "R", TBEnabled(TB_REFRESH)); tx += bs + bg;
+            tx += 10;
+            ToolBtn(TB_VIEW,    tx, by, 72, bs, viewMode == 0 ? "Details" : "List", true);
+
+            // ---- file list / details area ----
+            int ly = ListTop();
+            int n = ListCount();
+            int rows = (h - ly - StatusH() - PAD) / W.RowH;
+
+            if (viewMode == 1)   // Details: column header + aligned rows
             {
-                int y = ly + idx * W.RowH;
-                bool isDir = Host.FileIsDir(fs, idx) != 0;
-                string nm = Host.FileName(fs, idx);
-                if (idx == sel) Gfx.FillRound(ax, y, aw, W.RowH - 2, 6, C.Sel);
-                else if (W.Hot(ax, y, aw, W.RowH - 2)) Gfx.FillRound(ax, y, aw, W.RowH - 2, 6, C.Hover);
-                Gfx.Icon(ax + 8, y + 4, 22, isDir ? 0xF7C948u : 0x60A5FAu, isDir ? 'D' : 'F', 0xFFFFFF);
-                Gfx.Text(ax + 40, y + 8, nm, C.Text);
+                hdY = ly; hdH = 26;
+                hdNameX = ax + 40;                        // clear the 22 px type icon
+                hdNameW = ((aw - 52) * 58) / 100;
+                hdTypeX = hdNameX + hdNameW + 24;
+                hdTypeW = ax + aw - hdTypeX - 12;
+                int hy = ly;
+                Gfx.FillRound(ax, hy, aw, hdH, 6, C.CardAlt);
+                Gfx.DrawRound(ax, hy, aw, hdH, 6, C.Border);
+                // sort indicators
+                string nameArrow = (sortMode == 0) ? " ▲" : (sortMode == 1) ? " ▼" : "";
+                string typeArrow = (sortMode == 2) ? " ▲" : (sortMode == 3) ? " ▼" : "";
+                Gfx.Text(hdNameX, hy + 5, U.Cat("Name", nameArrow), C.Text);
+                Gfx.Text(hdTypeX, hy + 5, U.Cat("Type", typeArrow), C.Text);
+                ly = hy + hdH + 2;
             }
 
-            // Inline rename / new-folder editor.
+            for (int d = 0; d < n; d++)
+            {
+                int li = order[d];
+                int y = ly + d * W.RowH;
+                bool isDir = ListIsDir(li);
+                string nm = ListName(li);
+                bool isSel = IsSelected(li);
+                bool focused = (li == sel);
+                if (isSel)  Gfx.FillRound(ax, y, aw, W.RowH - 2, 6, focused ? C.Sel : 0xEFEFEF);
+                else if (W.Hot(ax, y, aw, W.RowH - 2)) Gfx.FillRound(ax, y, aw, W.RowH - 2, 6, C.Hover);
+                if (viewMode == 0)
+                {
+                    Gfx.Icon(ax + 8, y + 4, 22, isDir ? 0xF7C948u : 0x60A5FAu, isDir ? 'D' : 'F', 0xFFFFFF);
+                    Gfx.Text(ax + 40, y + 8, nm, focused ? C.Text : C.Text);
+                }
+                else
+                {
+                    Gfx.Icon(ax + 8, y + 4, 22, isDir ? 0xF7C948u : 0x60A5FAu, isDir ? 'D' : 'F', 0xFFFFFF);
+                    Gfx.Text(hdNameX, y + 8, nm, C.Text);
+                    Gfx.Text(hdTypeX, y + 8, TypeStr(li), C.TextSub);
+                }
+            }
+
+            // ---- inline rename / new-folder editor ----
             if (editMode != 0)
             {
                 int inputY = ly;
-                if (editMode == 1 && sel >= 0) inputY = ly + sel * W.RowH;
+                if (editMode == 1 && sel >= 0) inputY = ly + RowOf(sel) * W.RowH;
+                if (editMode == 2) inputY = ly;   // new folder name typed at top
                 int bx = ax + 4, bw = aw - 8, ebh = W.RowH - 2;
                 Gfx.FillRound(bx, inputY, bw, ebh, 4, 0xFFFFFFFF);
                 Gfx.DrawRound(bx, inputY, bw, ebh, 4, C.Accent);
                 string shown = editBuf;
                 if ((Host.Ticks() / 30) % 2 == 0) shown = U.Cat(shown, "|");
                 Gfx.Text(bx + 6, inputY + 6, shown, C.Text);
-                // Explicit finish/cancel hint so the mode is never a mystery.
-                Gfx.Text(ax + 4, inputY + W.RowH - 4,
-                         editMode == 1 ? "Enter 确认 · Esc 取消" : "", C.TextSub);
+                if (editMode == 1)
+                    Gfx.Text(ax + 4, inputY + W.RowH - 4, "Enter 确认 · Esc 取消", C.TextSub);
             }
 
-            // Invalid-address dialog.  Drawn INSIDE the window (not the
-            // shared screen Popup): the native compositor caches the managed
-            // overlay layer and only repaints it on desktop input, while the
-            // window layer is redrawn every frame -- so this is the only one
-            // guaranteed to show right after an address Enter.  Any click or
-            // key dismisses it.
+            // ---- status bar ----
+            int sy = h - StatusH();
+            Gfx.FillRect(0, sy, w, StatusH(), C.CardAlt);
+            Gfx.DrawLine(0, sy, w, sy, C.Border);
+            string status = U.Cat(U.I(n), " items");
+            if (selN > 1) status = U.Cat(status, U.Cat("  ·  ", U.Cat(U.I(selN), " selected")));
+            else if (selN == 1) status = U.Cat(status, "  ·  1 selected");
+            Gfx.Text(PAD, sy + 5, status, C.TextSub);
+
+            // ---- invalid-address dialog (in-window modal) ----
             if (addrErr)
             {
                 int dw = 320; if (dw > w - 40) dw = w - 40;
@@ -348,7 +598,7 @@ namespace NexOS.Forms
                 Gfx.TextCenter(dbx, dby + (dbh - 16) / 2, dbw, "确定", C.White);
             }
 
-            // "Open with" chooser panel (in-window modal).
+            // ---- "Open with" chooser (in-window modal) ----
             if (openWith)
             {
                 int rowH = OwRowH();
@@ -368,29 +618,27 @@ namespace NexOS.Forms
                 Gfx.Text(px + 12, py + ph - 20, "选择后该后缀以后都用此应用打开（Esc 取消）", C.TextSub);
             }
 
-            // ---- semi-blocking tail -------------------------------------
-            // Double-clicking a file used to run the loader straight from the
-            // click handler, so a slow open (PE load, big text file, app
-            // launch) froze the shell on the previous frame with no
-            // explanation.  The click now only RECORDS the request; here, at
-            // the very end of the paint, we draw a scrim naming what is being
-            // opened, flip that frame to the screen with Host.Repaint()
-            // (present-only, so it is safe to call from inside a paint), and
-            // only THEN run the blocking call -- the same shape as the AI
-            // desktop's deferred agent run.  The work still blocks; the window
-            // in front of it never looks dead.
+            // ---- semi-blocking tail: paint scrim, flip, then block ----
             if (pendKind != 0)
             {
-                int sx = navW + pad, sy = pad + 48;
-                int sw = w - navW - 2 * pad, sh2 = h - sy - pad;
+                int sx = ax, shy = ListTop();
+                int sw = aw, sh2 = h - shy - StatusH() - PAD;
                 if (sw > 40 && sh2 > 40)
                 {
-                    Gfx.FillRound(sx, sy, sw, sh2, 10, 0xF2FFFFFFu);
-                    Gfx.TextCenter(sx, sy + sh2 / 2 - 8, sw, pendWhat, C.Text);
+                    Gfx.FillRound(sx, shy, sw, sh2, 10, 0xF2FFFFFFu);
+                    Gfx.TextCenter(sx, shy + sh2 / 2 - 8, sw, pendWhat, C.Text);
                 }
                 Host.Repaint();
                 RunPending();
             }
+        }
+
+        // Map a list index to its display row (used to place the inline editor).
+        int RowOf(int li)
+        {
+            int n = ListCount();
+            for (int d = 0; d < n; d++) if (order[d] == li) return d;
+            return 0;
         }
 
         static void Nav(int x, int y, int w, string label, bool active)
@@ -401,13 +649,9 @@ namespace NexOS.Forms
         }
 
         // ---- address bar (location box) -----------------------------
-        static int BarH() { return 30; }
+        // Canonical address text for a location.
+        static string AddrOf(int f) { return f < 0 ? "This PC" : (f == 1 ? "SFS" : "MKFS"); }
 
-        // Canonical address text for a volume.
-        static string AddrOf(int f) { return f == 1 ? "SFS" : "MKFS"; }
-
-        // Trim surrounding blanks + lowercase ASCII, so address matching is
-        // case-insensitive without String.ToUpper (MiniCLR-safe).
         static string TrimLow(string s)
         {
             if (s == null) return "";
@@ -424,12 +668,9 @@ namespace NexOS.Forms
             return r;
         }
 
-        // Map a typed address to a volume index, or -1 when it is not a
-        // location this (flat, two-volume) explorer can open.
         static int ParseAddr(string s)
         {
             string t = TrimLow(s);
-            // Drop a trailing path separator so "C:\" == "C:".
             if (t.Length > 0)
             {
                 int last = (int)t[t.Length - 1];
@@ -440,9 +681,10 @@ namespace NexOS.Forms
                     t = r;
                 }
             }
+            if (t == "this pc" || t == "pc" || t == "") return -1;   // This PC root
             if (t == "c:" || t == "c" || t == "mkfs" || t == "local disk (mkfs)" || t == "local disk") return 0;
             if (t == "s:" || t == "s" || t == "sfs" || t == "system (sfs)" || t == "system") return 1;
-            return -1;
+            return -2;   // genuinely unknown
         }
 
         void BeginAddrEdit()
@@ -451,39 +693,22 @@ namespace NexOS.Forms
             addrBuf = addr;   // show current location; first keystroke replaces it
         }
 
-        // Commit the address box: navigate on a valid location, otherwise
-        // report the bad address and fall back to the default interface.
         void CommitAddr()
         {
             addrEdit = false;
             int nf = ParseAddr(addrBuf);
             addrBuf = ""; addrDirty = false;
-            if (nf >= 0) { GoVolume(nf); return; }
-            GoVolume(0);          // invalid -> default view (Local Disk)
+            if (nf >= -1) { Go(nf); return; }
+            Go(0);               // unknown -> default volume
             ShowInvalidAddr();
         }
 
-        void GoVolume(int nf)
-        {
-            fs = nf; sel = -1; scroll = 0;
-            addr = AddrOf(nf);
-            Host.FileRefresh();
-        }
-
-        // Raise the in-window "invalid address" dialog (see OnPaint).  It is
-        // dismissed by the next click or keystroke.
         void ShowInvalidAddr() { addrErr = true; }
 
         // =============================================================
-        //  File-type associations + "Open with"
+        //  File-type associations + "Open with"  (unchanged behaviour)
         // =============================================================
-        // Double-click semantics: executables run directly (.mex managed app,
-        // .exe PE image).  Every other file opens with the app associated to
-        // its extension; if there is no association yet we ask the user to
-        // pick one, then remember it in MKFS "assoc.cfg" so the same suffix
-        // opens with that app from then on.
-
-        static string assocData;         // "ext=kind\n" lines (lazy load)
+        static string assocData;
         static bool   assocLoaded;
 
         static string FxSub(string s, int a, int b)
@@ -516,8 +741,6 @@ namespace NexOS.Forms
             }
             return v;
         }
-
-        // Lower-case extension without the dot ("" when there is none).
         static string ExtOf(string nm)
         {
             if (nm == null) return "";
@@ -533,7 +756,6 @@ namespace NexOS.Forms
             }
             return r;
         }
-
         static void LoadAssoc()
         {
             if (assocLoaded) return;
@@ -541,8 +763,6 @@ namespace NexOS.Forms
             if (assocData == null) assocData = "";
             assocLoaded = true;
         }
-
-        // Kind previously registered for `ext`, or -1.
         static int AssocOf(string ext)
         {
             LoadAssoc();
@@ -560,8 +780,6 @@ namespace NexOS.Forms
             }
             return -1;
         }
-
-        // Remember (and persist) that `ext` opens with `kind`.
         static void SetAssoc(string ext, int kind)
         {
             LoadAssoc();
@@ -585,8 +803,6 @@ namespace NexOS.Forms
             assocData = outS;
             Host.WriteText(0, "assoc.cfg", outS);
         }
-
-        // Map a .mex base name to a launchable Kind, or -1 when unknown.
         static int KindForMex(string nm)
         {
             int dot = -1;
@@ -609,24 +825,23 @@ namespace NexOS.Forms
 
         void SelectAt(int mx, int my)
         {
-            int navW = 150, pad = 12;
-            int ax = navW + pad, ay = pad, aw = Gfx.Width() - ax - pad;
-            int ly = ay + 48;
-            int n = Host.FileCount(fs);
-            for (int idx = 0; idx < n; idx++)
+            int ax = ClientX(), ly = ListTop();
+            int n = ListCount();
+            for (int d = 0; d < n; d++)
             {
-                int y = ly + idx * W.RowH;
-                if (U.In(mx, my, ax, y, aw, W.RowH - 2)) { sel = idx; return; }
+                int y = ly + d * W.RowH;
+                if (U.In(mx, my, ax, y, ClientW(Gfx.Width()), W.RowH - 2)) { sel = order[d]; return; }
             }
         }
 
+        // =============================================================
+        //  CLICK
+        // =============================================================
         public override void OnClick(int mx, int my)
         {
-            // The invalid-address dialog is modal: any click dismisses it.
+            // Modals first.
             if (addrErr) { addrErr = false; return; }
 
-            // The "open with" chooser is modal: click a row to pick that app,
-            // click anywhere else to cancel.
             if (openWith)
             {
                 int rowH = OwRowH();
@@ -642,73 +857,90 @@ namespace NexOS.Forms
             }
 
             // Address bar owns the top strip: a click focuses it for editing.
-            int bnavW = 150, bpad = 12;
-            int bax = bnavW + bpad, bay = bpad;
-            int baw = Gfx.Width() - bax - bpad;
-            if (U.In(mx, my, bax, bay, baw, BarH()))
+            int ax = ClientX(), ay = BarTop(), aw = ClientW(Gfx.Width());
+            if (U.In(mx, my, ax, ay, aw, BarH()))
             {
                 if (editMode != 0) CommitEdit();
                 BeginAddrEdit();
                 return;
             }
-            // A click anywhere else commits a pending address edit (navigate).
             if (addrEdit) { CommitAddr(); return; }
 
-            // While editing, a click inside the inline box is ignored (the
-            // editor handles key input). A click outside commits the edit and
-            // then keeps processing, so nav buttons still work while a rename
-            // is pending.
+            // While editing, a click outside the inline box commits the edit.
             if (editMode != 0)
             {
-                int enavW = 150, epad = 12;
-                int eax = enavW + epad, eay = epad, eaw = Gfx.Width() - eax - epad;
-                int ely = eay + 48;
+                int ely = ListTop();
                 int inputY = ely;
-                if (editMode == 1 && sel >= 0) inputY = ely + sel * W.RowH;
-                if (U.In(mx, my, eax + 4, inputY, eaw - 8, W.RowH - 2)) return;
+                if (editMode == 1 && sel >= 0) inputY = ely + RowOf(sel) * W.RowH;
+                if (U.In(mx, my, ax + 4, inputY, aw - 8, W.RowH - 2)) return;
                 CommitEdit();
             }
-            int navW2 = 150, pad2 = 12;
-            if (U.In(mx, my, 10, 14 + 40, navW2 - 20, 30)) { GoVolume(0); return; }
-            if (U.In(mx, my, 10, 14 + 80, navW2 - 20, 30)) { GoVolume(1); return; }
 
-            int ax = navW2 + pad2, ay = pad2, aw = Gfx.Width() - ax - pad2;
-            int ly = ay + 48;
-            int n = Host.FileCount(fs);
-            for (int idx = 0; idx < n; idx++)
+            // ---- command toolbar ----
+            for (int id = TB_BACK; id <= TB_VIEW; id++)
             {
-                int y = ly + idx * W.RowH;
+                if (U.In(mx, my, tbX[id], tbY[id], tbW[id], tbH[id]))
+                {
+                    if (!TBEnabled(id)) return;
+                    if (id == TB_BACK) Back();
+                    else if (id == TB_FWD) Forward();
+                    else if (id == TB_UP) NavigateUp();
+                    else if (id == TB_NEW) BeginNewFolder();
+                    else if (id == TB_REFRESH) { Host.FileRefresh(); RebuildOrder(); }
+                    else if (id == TB_VIEW) { viewMode = viewMode == 0 ? 1 : 0; }
+                    return;
+                }
+            }
+
+            // ---- sidebar ----
+            if (U.In(mx, my, 10, 14,           NAVW - 20, 30)) { Go(-1); return; }
+            if (U.In(mx, my, 10, 14 + 40,      NAVW - 20, 30)) { Go(0);  return; }
+            if (U.In(mx, my, 10, 14 + 80,      NAVW - 20, 30)) { Go(1);  return; }
+
+            // ---- details header (sort) ----
+            if (viewMode == 1 && U.In(mx, my, ax, hdY, aw, hdH))
+            {
+                if (mx >= hdNameX && mx < hdNameX + hdNameW) sortMode = (sortMode == 0) ? 1 : 0;
+                else if (mx >= hdTypeX && mx < hdTypeX + hdTypeW) sortMode = (sortMode == 2) ? 3 : 2;
+                else return;
+                RebuildOrder();
+                return;
+            }
+
+            // ---- file list rows ----
+            int ly = ListTop();
+            int n = ListCount();
+            for (int d = 0; d < n; d++)
+            {
+                int li = order[d];
+                int y = ly + d * W.RowH;
                 if (U.In(mx, my, ax, y, aw, W.RowH - 2))
                 {
-                    // Single click selects; a second click on the same row
-                    // within 500 ms opens it with the default handler
-                    // (Notepad for files), like Windows Explorer.
                     int now = Host.TickMs();
-                    bool dbl = (now - dblT) < 500 && dblIdx == idx;
-                    dblT = now; dblIdx = idx;
-                    sel = idx;
+                    bool dbl = (now - dblT) < 500 && dblIdx == li;
+                    dblT = now; dblIdx = li;
+                    sel = li; anchor = li;
+                    if (!IsSelected(li)) SelectOnly(li);
+                    else if (selN == 1) SelectOnly(li);   // keep click = single-select
                     if (dbl) OpenSelected();
                     return;
                 }
             }
         }
 
+        // =============================================================
+        //  KEY
+        // =============================================================
         public override void OnKey(int ch)
         {
-            // The invalid-address dialog is modal: any key dismisses it.
             if (addrErr) { addrErr = false; return; }
-
-            // The "open with" chooser is modal: any key cancels it.
             if (openWith) { openWith = false; return; }
 
-            // The kernel bridge delivers Enter as -2 and Backspace as -1 to
-            // managed apps (see gui.cpp), while the WinForms host sends the
-            // raw 13 / 8.  Accept both so inline editing works in the VM too.
             if (addrEdit)
             {
-                if (ch == -2 || ch == 10 || ch == 13) { CommitAddr(); return; }   // Enter -> navigate
-                if (ch == 27) { addrEdit = false; addrBuf = ""; addrDirty = false; return; } // Esc
-                if (ch == -1 || ch == 8)                                          // Backspace
+                if (ch == -2 || ch == 10 || ch == 13) { CommitAddr(); return; }
+                if (ch == 27) { addrEdit = false; addrBuf = ""; addrDirty = false; return; }
+                if (ch == -1 || ch == 8)
                 {
                     if (!addrDirty) { addrBuf = ""; addrDirty = true; return; }
                     int m = addrBuf.Length;
@@ -723,9 +955,9 @@ namespace NexOS.Forms
             }
             if (editMode != 0)
             {
-                if (ch == 27) { CancelEdit(); return; }                             // Esc
-                if (ch == -2 || ch == 10 || ch == 13) { CommitEdit(); return; }     // Enter
-                if (ch == -1 || ch == 8) {                                          // Backspace
+                if (ch == 27) { CancelEdit(); return; }
+                if (ch == -2 || ch == 10 || ch == 13) { CommitEdit(); return; }
+                if (ch == -1 || ch == 8) {
                     if (!editDirty) { editBuf = ""; editDirty = true; return; }
                     int m = editBuf.Length;
                     if (m > 0) { string r = ""; for (int i = 0; i < m - 1; i++) r = U.Cat(r, Host.CharStr((int)editBuf[i])); editBuf = r; }
@@ -737,35 +969,39 @@ namespace NexOS.Forms
                 }
                 return;
             }
-            int n = Host.FileCount(fs);
-            if (ch == -4) { if (sel < n - 1) sel++; }        // down
-            else if (ch == -3) { if (sel > 0) sel--; }       // up
+
+            // ---- navigation / selection keys ----
+            if (ch == -2 || ch == 10 || ch == 13) { OpenSelected(); return; }   // Enter
+            if (ch == -1 || ch == 8) { NavigateUp(); return; }                   // Backspace = Up
+            if (ch == -6) { SelectAll(); return; }                               // Ctrl+A
+            int n = ListCount();
+            if (ch == -3) { if (sel > 0) sel--; else sel = 0; }                  // up (host harness)
+            else if (ch == -4) { if (sel < n - 1) sel++; }                       // down
         }
 
         public override void OnRightClick(int mx, int my, int ox, int oy)
         {
             dblT = -100000; dblIdx = -1;   // a right-click never starts a double-click
-            int navW = 150, pad = 12;
-            int ax = navW + pad, ly = pad + 48;
-            int rows = (Gfx.Height() - ly - pad) / W.RowH;
-            // Inside the file-list client area -> the file action menu.
-            if (mx >= ax && my >= ly && my < ly + rows * W.RowH)
+            int ax = ClientX(), ly = ListTop();
+            int rows = (Gfx.Height() - ly - StatusH() - PAD) / W.RowH;
+            // Inside the file-list client area (and only on a real volume) ->
+            // the file action menu.
+            if (fs >= 0 && mx >= ax && my >= ly && my < ly + rows * W.RowH)
             {
-                SelectAt(mx, my);             // right-click also selects
+                SelectAt(mx, my);
                 if (sel >= 0 && sel < Host.FileCount(fs))
                     Desktop.OpenFileMenu(id, fs, sel, ox + mx, oy + my);
                 return;
             }
-            // Nav buttons / address bar / empty space -> generic menu.
             base.OnRightClick(mx, my, ox, oy);
         }
 
         // ---- file-action dispatch (from the context menu) -----------
         public override void DoFileAction(int code)
         {
-            if (code == Desktop.A_F_OPEN)        OpenSelected();   // .exe -> run, else Notepad
-            else if (code == Desktop.A_F_EDIT)   OpenInNotepad();  // "Edit" is always the text viewer
-            else if (code == Desktop.A_F_NOTEPAD) OpenInNotepad(); // "Open with... > Notepad"
+            if (code == Desktop.A_F_OPEN)        OpenSelected();
+            else if (code == Desktop.A_F_EDIT)   OpenInNotepad();
+            else if (code == Desktop.A_F_NOTEPAD) OpenInNotepad();
             else if (code == Desktop.A_F_TERM)   Host.OpenApp(Kind.Terminal);
             else if (code == Desktop.A_F_COPY)   CopySelected();
             else if (code == Desktop.A_F_DEL)    DeleteSelected();
@@ -773,36 +1009,19 @@ namespace NexOS.Forms
             else if (code == Desktop.A_F_PROPS)  ShowProps();
             else if (code == Desktop.A_F_MKDIR)  BeginNewFolder();
             else if (code == Desktop.A_F_NEWFILE) BeginNewFile();
-            // Win11 cluster: Cut copies (no clipboard-move in the shell),
-            // Paste / Share are acknowledged but inert for now.
             else if (code == Desktop.A_F_CUT)   CopySelected();
             else if (code == Desktop.A_F_PASTE) Host.Log("[FILE] paste (no-op)");
             else if (code == Desktop.A_F_SHARE) Host.Log("[FILE] share (no-op)");
         }
 
-        // ---- semi-blocking: record the request, paint, then block --------
-        // Kind: 0 none, 1 open file, 2 run .exe, 3 notepad, 4 open-with(kind).
-        int    pendKind = 0;
-        int    pendArg2 = 0;
-        string pendName = null;
-        string pendWhat = "";
-
-        void RequestOpen(string nm, int kind, string what)
-        {
-            RequestOpen2(nm, kind, 0, what);
-        }
+        // ---- semi-blocking: record the request, paint, then block ----
+        void RequestOpen(string nm, int kind, string what) { RequestOpen2(nm, kind, 0, what); }
         void RequestOpen2(string nm, int kind, int arg2, string what)
         {
             pendKind = kind; pendName = nm; pendArg2 = arg2; pendWhat = what;
-            Host.SetAnim(1);        // guarantee another frame to paint the scrim
-            // Serial trace: proves the request was queued (painted) before the
-            // blocking call, which is the whole point of the pattern.
+            Host.SetAnim(1);
             Host.Log(U.Cat("[FILES] defer kind=", U.I(kind), " ", nm));
         }
-
-        // Executes the queued blocking call.  Called from the end of OnPaint,
-        // AFTER the scrim has been painted and flipped, so the scrim is what
-        // stays on screen for the whole stall.
         void RunPending()
         {
             int k = pendKind, k2 = pendArg2;
@@ -816,21 +1035,20 @@ namespace NexOS.Forms
             Host.SetAnim(0);
         }
 
-        // Default action for a double-click / "Open".
-        //   1. .mex -> run the managed app directly (no viewer).
-        //   2. .exe -> run through the kernel PE loader.
-        //   3. otherwise -> open with the extension's associated app, or ask
-        //      the user to choose one (and remember the choice).
         void OpenSelected()
         {
+            if (fs < 0)   // This PC: enter the chosen volume
+            {
+                if (sel == 0) Go(0);
+                else if (sel == 1) Go(1);
+                return;
+            }
             if (sel < 0 || sel >= Host.FileCount(fs)) return;
             if (Host.FileIsDir(fs, sel) != 0) return;     // dirs: no viewer
             string nm = Host.FileName(fs, sel);
             RequestOpen(nm, 1, U.Cat("正在打开 ", nm));
         }
 
-        // The actual (blocking) open.  Runs from RunPending(), i.e. once the
-        // "正在打开 …" scrim is already on screen.
         void DoOpenFile(string nm)
         {
             if (nm == null || nm == "") return;
@@ -842,9 +1060,6 @@ namespace NexOS.Forms
             OpenWithChooser(nm, ext);
         }
 
-        // Run a .mex managed executable.  Known built-in apps are launched
-        // through the resident shell (same as the taskbar); anything else
-        // goes through the `clrapp` shell command.
         void RunMex(string nm)
         {
             Host.Log(U.Cat("[FILES] run mex ", nm));
@@ -853,20 +1068,13 @@ namespace NexOS.Forms
             Host.Exec(U.Cat("clrapp ", nm));
         }
 
-        // Open a document with a specific app.
         void OpenWith(int kind, string nm)
         {
             if (kind == Kind.Notepad) { Shell.OpenNotepad(nm); return; }
-            // The other apps take no file argument, so we launch them and log
-            // the request; only the text viewer can actually display a file.
             Host.Log(U.Cat("[FILES] open ", nm, " with ", Desktop.KindName(kind)));
             Host.OpenApp(kind);
         }
 
-        // "Open with" chooser.  Drawn INSIDE the window (the managed overlay
-        // layer is cached by the native compositor and only repaints on
-        // desktop input, whereas the window layer is redrawn every frame), so
-        // it is guaranteed to appear right after a double-click.
         const int OW_N = 6;
         static int OwRowH() { return 32; }
         static string OwLabel(int i)
@@ -887,13 +1095,7 @@ namespace NexOS.Forms
             if (i == 4) return Kind.TaskManager;
             return Kind.ControlPanel;
         }
-
-        void OpenWithChooser(string nm, string ext)
-        {
-            openWith = true; owFile = nm; owExt = ext;
-        }
-
-        // Remember the pick for this extension, then open with it.
+        void OpenWithChooser(string nm, string ext) { openWith = true; owFile = nm; owExt = ext; }
         void ApplyOpenWith(int kind)
         {
             SetAssoc(owExt, kind);
@@ -902,9 +1104,6 @@ namespace NexOS.Forms
             RequestOpen2(nm, 4, kind, "正在启动应用…");
         }
 
-        // Execute a .exe through the PE loader.  On failure we report the
-        // loader's error code in a message box rather than silently falling
-        // back to Notepad -- an executable is not text.
         void DoRunExe(string nm)
         {
             Host.Log(U.Cat("[FILES] running PE image ", nm));
@@ -925,40 +1124,41 @@ namespace NexOS.Forms
             Popup.Open(Desktop.OWNER_FILE, Gfx.Width() / 2 - 130, Gfx.Height() / 2 - 60, labs, acts, 3);
         }
 
-        // "Open with... > Notepad": force the text viewer even for a .exe.
         void OpenInNotepad()
         {
-            if (sel < 0 || sel >= Host.FileCount(fs)) return;
+            if (fs < 0 || sel < 0 || sel >= Host.FileCount(fs)) return;
             if (Host.FileIsDir(fs, sel) != 0) return;
             string nm = Host.FileName(fs, sel);
             RequestOpen(nm, 3, U.Cat("正在读取 ", nm));
         }
         void CopySelected()
         {
-            if (sel < 0 || sel >= Host.FileCount(fs)) return;
+            if (fs < 0 || sel < 0 || sel >= Host.FileCount(fs)) return;
             clip = Host.FileName(fs, sel);
         }
         void DeleteSelected()
         {
-            if (sel < 0 || sel >= Host.FileCount(fs)) return;
-            Host.FileDelete(fs, Host.FileName(fs, sel));
+            if (fs < 0) return;
+            for (int k = 0; k < selN; k++)
+            {
+                int li = selSet[k];
+                if (li >= 0 && li < Host.FileCount(fs))
+                    Host.FileDelete(fs, Host.FileName(fs, li));
+            }
             Host.FileRefresh();
-            sel = -1;
+            RebuildOrder();
+            ClearSel();
         }
         void BeginRename()
         {
-            if (sel < 0 || sel >= Host.FileCount(fs)) return;
+            if (fs < 0 || sel < 0 || sel >= Host.FileCount(fs)) return;
             editOld = Host.FileName(fs, sel);
             editBuf = editOld;
             editMode = 1; editDirty = false;
         }
-        // Create a new folder IMMEDIATELY with an auto-unique name, then
-        // drop into the inline rename editor so the user can rename it on
-        // the spot (Enter confirms / Esc keeps the auto name).  The editor
-        // follows the new folder's row instead of overlaying the first
-        // file, and a hint line spells out how to finish editing.
         void BeginNewFolder()
         {
+            if (fs < 0) return;
             string baseName = "New Folder";
             string name = baseName;
             int n = Host.FileCount(fs);
@@ -975,8 +1175,6 @@ namespace NexOS.Forms
             }
             Host.FileMkDir(fs, name);
             Host.FileRefresh();
-            // Locate the new folder so the rename editor tracks its row
-            // (and scrolls it into view) instead of sitting on row 0.
             int nn = Host.FileCount(fs);
             sel = -1;
             for (int i = 0; i < nn; i++)
@@ -987,18 +1185,12 @@ namespace NexOS.Forms
                 if (sel >= scroll + rows) scroll = sel - rows + 1;
                 if (sel < scroll) scroll = sel;
             }
-            editOld = name;
-            editBuf = name;
-            editMode = 1; editDirty = false;   // rename mode
+            editOld = name; editBuf = name;
+            editMode = 1; editDirty = false;
         }
-        // Create a new EMPTY TEXT FILE immediately with an auto-unique name,
-        // then drop into the same inline rename editor so the user can name
-        // it on the spot (Enter confirms / Esc keeps the auto name).  Mirrors
-        // BeginNewFolder() but writes a file body ("" => empty file) via the
-        // writable MKFS volume (fs==0) -- SFS is read-only and never offers
-        // this action.
         void BeginNewFile()
         {
+            if (fs < 0) return;
             string baseName = "New File.txt";
             string name = baseName;
             int n = Host.FileCount(fs);
@@ -1013,12 +1205,9 @@ namespace NexOS.Forms
                 k++;
                 n = Host.FileCount(fs);
             }
-            // WriteText with an empty body creates the file on MKFS (fs==0).
             Host.WriteText(fs, name, "");
             Host.Log(U.Cat("[FILES] new file created: ", name));
             Host.FileRefresh();
-            // Locate the new file so the rename editor tracks its row
-            // (and scrolls it into view) instead of sitting on row 0.
             int nn = Host.FileCount(fs);
             sel = -1;
             for (int i = 0; i < nn; i++)
@@ -1029,9 +1218,8 @@ namespace NexOS.Forms
                 if (sel >= scroll + rows) scroll = sel - rows + 1;
                 if (sel < scroll) scroll = sel;
             }
-            editOld = name;
-            editBuf = name;
-            editMode = 1; editDirty = false;   // rename mode
+            editOld = name; editBuf = name;
+            editMode = 1; editDirty = false;
         }
         void CommitEdit()
         {
@@ -1043,13 +1231,14 @@ namespace NexOS.Forms
             else if (editMode == 2 && editBuf.Length > 0)
                 Host.FileMkDir(fs, editBuf);
             if (editMode != 0) Host.FileRefresh();
+            RebuildOrder();
             editMode = 0; editBuf = ""; editDirty = false;
         }
         void CancelEdit() { editMode = 0; editBuf = ""; editDirty = false; }
 
         void ShowProps()
         {
-            if (sel < 0 || sel >= Host.FileCount(fs)) return;
+            if (fs < 0 || sel < 0 || sel >= Host.FileCount(fs)) return;
             string nm = Host.FileName(fs, sel);
             string ty = Host.FileIsDir(fs, sel) != 0 ? "Folder" : "File";
             string loc = fs == 0 ? "Local Disk (MKFS)" : "System (SFS)";
@@ -1058,17 +1247,15 @@ namespace NexOS.Forms
             labs[0] = U.Cat("Name:    ", nm); acts[0] = -3;
             labs[1] = U.Cat("Type:    ", ty); acts[1] = -3;
             labs[2] = U.Cat("Location:", loc); acts[2] = -3;
-            labs[3] = "Close";                  acts[3] = -3;   // -3 = dismiss
-            // Screen centre so the dialog is easy to find.
+            labs[3] = "Close";                  acts[3] = -3;
             Popup.Open(Desktop.OWNER_FILE, Gfx.Width() / 2 - 90, Gfx.Height() / 2 - 70, labs, acts, 4);
         }
 
-        // Context-menu hooks: what is currently selected in this browser.
         public override string SelectedFile()
-        { return sel >= 0 && sel < Host.FileCount(fs) ? Host.FileName(fs, sel) : ""; }
+        { return (fs >= 0 && sel >= 0 && sel < Host.FileCount(fs)) ? Host.FileName(fs, sel) : ""; }
         public override int SelectedFs()   { return fs; }
         public override int SelectedIsDir()
-        { return sel >= 0 && sel < Host.FileCount(fs) ? Host.FileIsDir(fs, sel) : 0; }
+        { return (fs >= 0 && sel >= 0 && sel < Host.FileCount(fs)) ? Host.FileIsDir(fs, sel) : 0; }
     }
 
     // =================================================================
@@ -1078,10 +1265,23 @@ namespace NexOS.Forms
     {
         int page;   // -1 tiles, 0 System, 1 Power, 2 Display, 3 Network,
                     // 4 Storage, 5 Devices, 6 Personalize, 7 Taskbar, 8 Plugins
+        int winTransparent;   // 0 = normal glass, 1 = whole window fully transparent
         const int SW = 92, SGap = 12, SCols = 6;   // swatch grid
+
+        // ---- advanced search -----------------------------------------
+        int searchFocus = 0;          // search box has keyboard focus
+        string searchBuf = "";        // query text
+        int searchScroll = 0;         // results list scroll offset (px)
+        int searchSel = 0;            // keyboard-selected result index
+        string[] rName; int[] rPage; int[] rCat; int rN = 0;   // result cache
+        int sCount = 0;               // index builder counter
+        static string[] C_NAME; static int[] C_LETTER; static uint[] C_COLOR;
+        static string[] S_NAME, S_KEYS; static int[] S_PAGE, S_CAT; static int S_N;
 
         public ControlPanelApp()
         {
+            rName = new string[64]; rPage = new int[64]; rCat = new int[64];
+            InitSearch();
             int p = Shell.TakeSettingsPage();
             page = p < 0 ? -1 : p;
         }
@@ -1108,18 +1308,7 @@ namespace NexOS.Forms
             if (page == 8) { Plugins(pad, w); return; }
             if (page == 9) { AppsPage(pad, w); return; }
 
-            W.Header(pad, pad, "All Control Panel Items");
-            int gy = pad + 36, gx = pad;
-            int cols = 3;
-            int cw = (w - 2 * pad - (cols - 1) * 12) / cols;
-            int chh = 84;
-            for (int i = 0; i < 8; i++)
-            {
-                int r = i / cols, c = i % cols;
-                int x = gx + c * (cw + 12);
-                int y = gy + r * (chh + 12);
-                Tile(x, y, cw, chh, TileLetter(i), TileName(i), TileColor(i));
-            }
+            Home(pad, w);
         }
 
         static string TileName(int i)
@@ -1335,6 +1524,14 @@ namespace NexOS.Forms
                 if (Theme.Accent == acc[i])
                     Gfx.DrawRound(x + 4, y2 + 4, SW - 8, 36, 6, C.Accent);
             }
+
+            // Whole-window transparency toggle.  When on, the kernel drops
+            // every window's glassy chrome to zero opacity so the desktop
+            // shows straight through it (the floating content/text remain).
+            int ty = ay + 92;
+            Gfx.Text(pad, ty, "Window transparency", C.Text);
+            W.Button(pad + 200, ty + 16, 240, 36,
+                     winTransparent != 0 ? "Transparent: On" : "Transparent: Off");
         }
 
         // ---- Taskbar ---------------------------------------------------
@@ -1427,6 +1624,54 @@ namespace NexOS.Forms
         {
             int w = Gfx.Width();
             int pad = 16;
+
+            // ---- home page: advanced search + tile grid --------------
+            if (page == -1)
+            {
+                int sbx = pad, sby = pad + 38, sbw = w - 2 * pad, sbh = 34;
+                int cx = sbx + sbw - 22, cy = sby + sbh / 2;
+                if (U.In(mx, my, cx - 10, cy - 10, 20, 20))      // clear button
+                { searchBuf = ""; searchSel = 0; searchScroll = 0; searchFocus = 1; return; }
+                if (U.In(mx, my, sbx, sby, sbw, sbh))             // focus search box
+                { searchFocus = 1; return; }
+
+                if (searchFocus != 0 || NexOS.Sys.StrLen(searchBuf) > 0)
+                {
+                    int top = sby + sbh + 12;
+                    int listTop = top + 24, listBot = Gfx.Height() - pad;
+                    int rowH = 44, gap = 6;
+                    int visRows = (listBot - listTop) / (rowH + gap); if (visRows < 1) visRows = 1;
+                    int n = BuildSearch(searchBuf);
+                    int first = searchScroll / (rowH + gap);
+                    int yy = listTop - searchScroll;
+                    for (int i = first; i < n && yy < listBot; i++)
+                    {
+                        if (U.In(mx, my, sbx, yy, sbw, rowH))
+                        { searchSel = i; GoToPage(rPage[i]); return; }
+                        yy += rowH + gap;
+                    }
+                    return;
+                }
+
+                // no query: tile grid
+                int gy = sby + sbh + 14, gx = pad, cols = 3;
+                int cw = (w - 2 * pad - (cols - 1) * 12) / cols, chh = 84;
+                for (int i = 0; i < 8; i++)
+                {
+                    int r = i / cols, c = i % cols;
+                    int x = gx + c * (cw + 12), y = gy + r * (chh + 12);
+                    if (U.In(mx, my, x, y, cw, chh))
+                    {
+                        if (i == 0) page = 0; else if (i == 1) page = 2; else if (i == 2) page = 3;
+                        else if (i == 3) page = 4; else if (i == 4) page = 5; else if (i == 5) page = 1;
+                        else if (i == 6) { Host.Exec("plugin persist"); page = 8; }
+                        else if (i == 7) page = 9;
+                        return;
+                    }
+                }
+                return;
+            }
+
             if (page != -1)
             {
                 if (Back(mx, my)) { page = -1; return; }
@@ -1493,6 +1738,13 @@ namespace NexOS.Forms
                         int x = SwX(pad, i), y2 = ay + 22;
                         if (U.In(mx, my, x, y2, SW, 44)) { Theme.Accent = acc[i]; Theme.Save(); return; }
                     }
+                    // Whole-window transparency toggle.
+                    if (U.In(mx, my, pad + 200, ay + 92 + 16, 240, 36)) {
+                        winTransparent = winTransparent != 0 ? 0 : 1;
+                        Host.SetWindowTransparent(winTransparent);
+                        Host.Repaint();
+                        return;
+                    }
                     return;
                 }
                 else if (page == 7)   // Taskbar
@@ -1534,27 +1786,7 @@ namespace NexOS.Forms
                 return;
             }
 
-            // Tile grid.
-            int gy = pad + 36, gx = pad, cols = 3;
-            int cw = (w - 2 * pad - (cols - 1) * 12) / cols;
-            int chh = 84;
-            for (int i = 0; i < 7; i++)
-            {
-                int r = i / cols, c = i % cols;
-                int x = gx + c * (cw + 12), y = gy + r * (chh + 12);
-                if (U.In(mx, my, x, y, cw, chh))
-                {
-                    if (i == 0) page = 0;
-                    else if (i == 1) page = 2;
-                    else if (i == 2) page = 3;
-                    else if (i == 3) page = 4;
-                    else if (i == 4) page = 5;
-                    else if (i == 5) page = 1;
-                    else if (i == 6) { Host.Exec("plugin persist"); page = 8; }
-                    else if (i == 7) page = 9;
-                    return;
-                }
-            }
+            // (home-page tile grid / search handled at the top of OnClick)
         }
 
         // ---- "Apps & features" page (page 9) ---------------------------
@@ -1583,6 +1815,235 @@ namespace NexOS.Forms
                 Gfx.FillRound(btnX, by, btnW, btnH, 6, bcol);
                 Gfx.Text(btnX + (btnW - Gfx.Measure(label)) / 2, by + 7, label, 0xFFFFFF);
             }
+        }
+
+        // ---- advanced search -----------------------------------------
+        void GoToPage(int p) { page = p; }
+
+        void Home(int pad, int w)
+        {
+            W.Header(pad, pad, "All Control Panel Items");
+            int sbx = pad, sby = pad + 38, sbw = w - 2 * pad, sbh = 34;
+            DrawSearchBox(sbx, sby, sbw, sbh);
+
+            if (searchFocus != 0 || NexOS.Sys.StrLen(searchBuf) > 0)
+            {
+                int top = sby + sbh + 12;
+                int n = BuildSearch(searchBuf);
+                int hint = (NexOS.Sys.StrLen(searchBuf) == 0 && searchFocus != 0) ? 1 : 0;
+                string label2;
+                if (hint != 0) label2 = "Type to search settings...";
+                else if (n == 0) label2 = "No results";
+                else label2 = U.Cat(U.I(n), " result", n == 1 ? "" : "s");
+                Gfx.Text(pad, top, label2, C.TextSub);
+                int listTop = top + 24, listBot = Gfx.Height() - pad;
+                int rowH = 44, gap = 6;
+                int visRows = (listBot - listTop) / (rowH + gap); if (visRows < 1) visRows = 1;
+                int maxScroll = (n - visRows) * (rowH + gap); if (maxScroll < 0) maxScroll = 0;
+                if (searchScroll > maxScroll) searchScroll = maxScroll;
+                if (searchScroll < 0) searchScroll = 0;
+                int first = searchScroll / (rowH + gap);
+                int yy = listTop - searchScroll;
+                for (int i = first; i < n && yy < listBot; i++)
+                {
+                    bool sel = (i == searchSel);
+                    uint bg = sel ? C.Sel : (W.Hot(sbx, yy, sbw, rowH) ? C.Hover : C.Card);
+                    Gfx.FillRound(sbx, yy, sbw, rowH, 8, bg);
+                    Gfx.DrawRound(sbx, yy, sbw, rowH, 8, C.Border);
+                    int cat = rCat[i];
+                    Gfx.Icon(sbx + 12, yy + (rowH - 30) / 2, 30, C_COLOR[cat], C_LETTER[cat], 0xFFFFFF);
+                    Gfx.Text(sbx + 54, yy + 8, rName[i], C.Text);
+                    Gfx.Text(sbx + 54, yy + 26, C_NAME[cat], C.TextSub);
+                    yy += rowH + gap;
+                }
+                if (n > visRows)
+                    DrawVScroll(sbx + sbw - 6, listTop, 6, listBot - listTop, first, visRows, n);
+            }
+            else
+            {
+                int gy = sby + sbh + 14, gx = pad, cols = 3;
+                int cw = (w - 2 * pad - (cols - 1) * 12) / cols, chh = 84;
+                for (int i = 0; i < 8; i++)
+                {
+                    int r = i / cols, c = i % cols;
+                    int x = gx + c * (cw + 12), y = gy + r * (chh + 12);
+                    Tile(x, y, cw, chh, TileLetter(i), TileName(i), TileColor(i));
+                }
+            }
+        }
+
+        void DrawSearchBox(int x, int y, int w, int h)
+        {
+            uint border = searchFocus != 0 ? C.Accent : C.BorderMid;
+            Gfx.FillRound(x, y, w, h, h / 2, C.Card);
+            Gfx.DrawRound(x, y, w, h, h / 2, border);
+            int six = x + 16, siy = y + h / 2;
+            Gfx.DrawCircle(six, siy, 6, C.TextSub);
+            Gfx.DrawLine(six + 5, siy + 5, six + 11, siy + 11, C.TextSub);
+            int tx = x + 34;
+            if (NexOS.Sys.StrLen(searchBuf) > 0)
+            {
+                string shown = searchBuf;
+                if (searchFocus != 0 && (Host.Ticks() / 30) % 2 == 0) shown = U.Cat(shown, "|");
+                Gfx.Text(tx, y + (h - 16) / 2, shown, C.Text);
+                int cx = x + w - 22, cy = y + h / 2;
+                if (W.Hot(cx - 8, cy - 8, 16, 16)) Gfx.FillCircle(cx, cy, 9, C.Hover);
+                Gfx.Text(cx - 4, cy - 8, "x", C.TextSub);
+            }
+            else
+                Gfx.Text(tx, y + (h - 16) / 2, "Search settings...", C.TextSub);
+        }
+
+        void DrawVScroll(int x, int y, int w, int h, int first, int vis, int total)
+        {
+            Gfx.FillRound(x, y, w, h, 3, C.Border);
+            int th = (h * vis) / total; if (th < 12) th = 12;
+            int ty = y + ((h - th) * first) / (total - vis);
+            Gfx.FillRound(x, ty, w, th, 3, C.BorderMid);
+        }
+
+        // Build the filtered result set for query `q` into the r* cache.
+        int BuildSearch(string q)
+        {
+            rN = 0;
+            if (NexOS.Sys.StrLen(q) == 0) return 0;
+            string ql = Lower(q);
+            for (int i = 0; i < S_N; i++)
+            {
+                string hay = U.Cat(S_NAME[i], " ", S_KEYS[i]);
+                if (ContainsCI(hay, ql) != 0 && rN < 64)
+                {
+                    rName[rN] = S_NAME[i]; rPage[rN] = S_PAGE[i];
+                    rCat[rN] = S_CAT[i]; rN++;
+                }
+            }
+            if (searchSel >= rN) searchSel = rN - 1;
+            if (searchSel < 0) searchSel = 0;
+            return rN;
+        }
+
+        void InitSearch()
+        {
+            C_NAME = new string[10]; C_LETTER = new int[10]; C_COLOR = new uint[10];
+            C_NAME[0]="System";      C_LETTER[0]=(int)'S'; C_COLOR[0]=0x0078D4u;
+            C_NAME[1]="Display";     C_LETTER[1]=(int)'D'; C_COLOR[1]=0x8B5CF6u;
+            C_NAME[2]="Network";     C_LETTER[2]=(int)'N'; C_COLOR[2]=0x10B981u;
+            C_NAME[3]="Storage";     C_LETTER[3]=(int)'H'; C_COLOR[3]=0xF59E0Bu;
+            C_NAME[4]="Devices";     C_LETTER[4]=(int)'V'; C_COLOR[4]=0x06B6D4u;
+            C_NAME[5]="Power";       C_LETTER[5]=(int)'P'; C_COLOR[5]=0xEF4444u;
+            C_NAME[6]="Personalize"; C_LETTER[6]=(int)'W'; C_COLOR[6]=0x6D28D9u;
+            C_NAME[7]="Taskbar";     C_LETTER[7]=(int)'T'; C_COLOR[7]=0x0EA5E9u;
+            C_NAME[8]="Plugins";     C_LETTER[8]=(int)'G'; C_COLOR[8]=0x9333EAu;
+            C_NAME[9]="Apps";        C_LETTER[9]=(int)'A'; C_COLOR[9]=0x0EA5E9u;
+
+            S_NAME = new string[64]; S_KEYS = new string[64];
+            S_PAGE = new int[64]; S_CAT = new int[64];
+            sCount = 0;
+            // categories
+            AddS("System",           "system about os info cpu memory ram arch 系统 信息 关于", 0, 0);
+            AddS("Display",          "display screen 显示 屏幕", 2, 1);
+            AddS("Network & Internet","network internet ethernet wifi wireless 网络 以太网 无线", 3, 2);
+            AddS("Storage",          "storage disk drive capacity 存储 硬盘 容量", 4, 3);
+            AddS("Devices",          "devices hardware processor memory display audio network 设备 硬件 处理器 显示器 音频 网卡", 5, 4);
+            AddS("Power",            "power shutdown restart 电源 关机 重启", 1, 5);
+            AddS("Personalization",  "personalize wallpaper background theme accent 个性化 壁纸 背景 主题 强调色", 6, 6);
+            AddS("Taskbar",          "taskbar alignment labels 任务栏 对齐 标签", 7, 7);
+            AddS("Plugins",          "plugins extensions 插件 扩展", 8, 8);
+            AddS("Apps & features",  "apps applications install uninstall features 应用 安装 卸载 功能", 9, 9);
+            // leaf settings
+            AddS("System information","system about os name architecture memory ram 系统信息 关于 名称", 0, 0);
+            AddS("Resolution",       "resolution screen 分辨率 屏幕 显示", 2, 1);
+            AddS("Display scaling",  "scaling dpi zoom 缩放 显示", 2, 1);
+            AddS("Dark mode",        "theme dark light mode 主题 深色 浅色 模式 暗色", 2, 1);
+            AddS("Refresh rate",     "refresh rate hz 刷新率", 2, 1);
+            AddS("Accent colour",    "accent color colour 强调色 颜色", 2, 1);
+            AddS("Pixel / CRT mode", "pixel crt monitor scanline retro 像素 扫描线 复古 显示器", 2, 1);
+            AddS("Terminal font",    "terminal font size 终端 字体 字号", 2, 1);
+            AddS("Ethernet",         "ethernet lan wired 以太网 有线 网络", 3, 2);
+            AddS("Wi-Fi",            "wifi wireless 无线 网络 局域网", 3, 2);
+            AddS("Storage usage",    "storage usage disk capacity 存储 使用情况 容量", 4, 3);
+            AddS("Local Disk (MKFS)","local disk mkfs volume 本地磁盘 卷", 4, 3);
+            AddS("System volume (SFS)","system sfs volume 系统卷", 4, 3);
+            AddS("Device manager",   "devices processor memory disk audio network 设备管理器 硬件", 5, 4);
+            AddS("Shut down",        "shutdown power off 关机 关闭 电源", 1, 5);
+            AddS("Restart",          "restart reboot 重启 重新启动", 1, 5);
+            AddS("Desktop background","wallpaper background 桌面背景 壁纸", 6, 6);
+            AddS("Window transparency","transparency transparent window 透明 窗口 半透明", 6, 6);
+            AddS("Taskbar alignment","taskbar alignment center left 任务栏 对齐 居中 左侧", 7, 7);
+            AddS("Taskbar labels",   "taskbar labels show 任务栏 标签 显示文字", 7, 7);
+            AddS("Plugin manager",   "plugins enable disable 插件 管理 启用", 8, 8);
+            AddS("Apps & features",  "apps install uninstall 应用 安装 卸载 功能", 9, 9);
+            S_N = sCount;
+        }
+
+        void AddS(string n, string kw, int p, int c)
+        {
+            if (sCount >= 64) return;
+            S_NAME[sCount] = n; S_KEYS[sCount] = kw; S_PAGE[sCount] = p; S_CAT[sCount] = c; sCount++;
+        }
+
+        static string Lower(string s)
+        {
+            int n = NexOS.Sys.StrLen(s); string r = "";
+            for (int i = 0; i < n; i++)
+            {
+                int c = (int)NexOS.Sys.StrCharAt(s, i);
+                if (c >= 'A' && c <= 'Z') c = c + 32;
+                r = U.Cat(r, Host.CharStr(c));
+            }
+            return r;
+        }
+
+        static int ContainsCI(string hay, string needle)
+        {
+            string hl = Lower(hay);
+            int hn = NexOS.Sys.StrLen(hl), nn = NexOS.Sys.StrLen(needle);
+            if (nn == 0) return 1;
+            if (nn > hn) return 0;
+            for (int i = 0; i + nn <= hn; i++)
+            {
+                int ok = 1;
+                for (int j = 0; j < nn; j++)
+                    if (NexOS.Sys.StrCharAt(hl, i + j) != NexOS.Sys.StrCharAt(needle, j)) { ok = 0; break; }
+                if (ok != 0) return 1;
+            }
+            return 0;
+        }
+
+        public override void OnKey(int ch)
+        {
+            if (searchFocus == 0 || page != -1) return;
+            if (ch == 27)   // Esc: clear query, or unfocus when empty
+            {
+                if (NexOS.Sys.StrLen(searchBuf) > 0) { searchBuf = ""; searchSel = 0; searchScroll = 0; }
+                else searchFocus = 0;
+                return;
+            }
+            if (ch == -2 || ch == 10 || ch == 13)   // Enter: open selected result
+            {
+                int n = BuildSearch(searchBuf);
+                if (n > 0 && searchSel >= 0 && searchSel < n) GoToPage(rPage[searchSel]);
+                return;
+            }
+            if (ch == -1 || ch == 8)   // Backspace
+            {
+                int m = NexOS.Sys.StrLen(searchBuf);
+                if (m > 0) { string r = ""; for (int i = 0; i < m - 1; i++) r = U.Cat(r, Host.CharStr((int)searchBuf[i])); searchBuf = r; searchSel = 0; searchScroll = 0; }
+                return;
+            }
+            if (ch == -3 || ch == -18) { if (searchSel > 0) searchSel--; return; }   // up
+            if (ch == -4 || ch == -19) { if (searchSel < rN - 1) searchSel++; return; } // down
+            if ((ch >= 0x20 && ch < 0x7F) || (ch >= 0x80 && ch <= 0xFFFF))
+            { searchBuf = U.Cat(searchBuf, Host.CharStr(ch)); searchSel = 0; searchScroll = 0; return; }
+        }
+
+        public override void OnWheel(int dy)
+        {
+            if (page != -1) return;
+            if (!(searchFocus != 0 || NexOS.Sys.StrLen(searchBuf) > 0)) return;
+            int step = (dy > 0) ? -(44 + 6) : (44 + 6);
+            searchScroll += step;
+            if (searchScroll < 0) searchScroll = 0;
         }
     }
 

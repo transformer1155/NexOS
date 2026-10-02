@@ -52,17 +52,17 @@ static inline void outl(uint16_t p,uint32_t v){ __asm__ __volatile__("outl %0,%1
 // =====================================================================
 //  Serial debug output (port 0x3F8)  -  for UEFI boot tracing
 // =====================================================================
-static void serial_putc(char c){ outb(0x3F8, (uint8_t)c); }
-static void serial_puts(const char* s){ while(*s) outb(0x3F8, (uint8_t)*s++); }
+extern "C" void serial_putc(char c){ outb(0x3F8, (uint8_t)c); }
+extern "C" void serial_puts(const char* s){ while(*s) outb(0x3F8, (uint8_t)*s++); }
 // Print a non-negative integer in decimal to the serial port.
-static void serial_puts_dec(int v){
+extern "C" void serial_puts_dec(int v){
     if (v == 0){ serial_puts("0"); return; }
     if (v < 0){ serial_puts("-"); v = -v; }
     char t[12]; int n = 0;
     while (v > 0 && n < 11){ t[n++] = (char)('0' + (v % 10)); v /= 10; }
     for (int i = n - 1; i >= 0; i--) outb(0x3F8, (uint8_t)t[i]);
 }
-static void serial_hex(uint32_t v){
+extern "C" void serial_hex(uint32_t v){
     const char* H = "0123456789ABCDEF";
     char buf[9];
     for (int i = 0; i < 8; i++) buf[i] = H[(v >> (28 - i*4)) & 0xF];
@@ -949,6 +949,22 @@ extern "C" {
     int  net_wifi_status(char* out, int n);
     int  net_time(char* out, int n);
 }
+
+// ---- Agent stubs ----
+// net_agent_execute / agent_config_show / agent_load_config_reload are declared
+// above and invoked by the `agent` shell command, but this tree ships no real
+// implementation (the host-side LLM bridge is configured but unwired).  Provide
+// minimal no-op stubs so the kernel links; the command simply reports "no agent".
+extern "C" int net_agent_execute(const char* goal, char* out, int outsize) {
+    (void)goal;
+    if (out && outsize > 0) out[0] = 0;
+    return -1;
+}
+extern "C" void agent_config_show(char* buf, int n) {
+    if (buf && n > 0) buf[0] = 0;
+}
+extern "C" void agent_load_config_reload(void) {}
+
 static bool g_net_initialized = false;
 
 // =====================================================================
