@@ -1086,6 +1086,10 @@ struct GuiCallbacks {
 
 static GuiCallbacks g_cb;
 static int g_startup_app_id = -1;   // set by kernel before gui_enter()
+// One-shot AI Agent input-box prefill (set by boot flag 0x5020, applied in
+// launch_app when the AI Agent window is created).  Declared here so both the
+// early launch_app() and the later gui_agent_prefill() setter see it.
+static const char* g_agent_prefill = 0;
 
 // (enter_gui() is now always entered.  The old g_skip_enter_gui voice-test
 //  workaround for a phantom enter_gui() return-hang was skipping the desktop
@@ -8766,7 +8770,11 @@ struct Win11Desktop {
         // The whole point of the managed shell: these windows are painted
         // and driven entirely by NexOS.Forms.  Fall back to the legacy
         // native drawer only if the shell failed to load.
-        int mkind = managed_kind_for(app);
+        // APP_AIAGENT is forced to the native drawer: its managed Kind.AiAgent
+        // form faults inside the CLR (Shell::Open(10)), and a CLR fault there
+        // takes the whole managed desktop paint down with it -> black screen.
+        // The native draw_agent renderer is complete (trace / buttons / input).
+        int mkind = (app == APP_AIAGENT) ? -1 : managed_kind_for(app);
         if (mkind >= 0 && mforms_ready()) {
             int mid = mforms_open(mkind);
             if (mid >= 0) {
@@ -8788,6 +8796,17 @@ struct Win11Desktop {
                     for (int j = 0; j < window_count; j++) windows[j].active = false;
                     windows[wid].active = true;
                     active_window = wid;
+                    // Apply the one-shot demo prefill (boot flag 0x5020) to the
+                    // AI Agent goal box so the auto-opened desktop shows a
+                    // ready-to-run goal.
+                    if (app == APP_AIAGENT && g_agent_prefill) {
+                        int pl = 0;
+                        while (g_agent_prefill[pl] && pl < 255)
+                            windows[wid].term_input[pl] = g_agent_prefill[pl], pl++;
+                        windows[wid].term_input_len = pl;
+                        windows[wid].term_input[pl] = 0;
+                        g_agent_prefill = 0;
+                    }
                 }
                 return;
             }
@@ -8804,6 +8823,17 @@ struct Win11Desktop {
             strcpy_(win.term_buf, "NexOS Terminal v2.0\nType 'help' for commands.\n\n");
             win.term_len = strlen_(win.term_buf);
             win.term_scroll = 0;
+        }
+        // AI Agent native window: apply the one-shot demo prefill (boot flag
+        // 0x5020).  The managed branch above handles the (now-disabled) managed
+        // path; APP_AIAGENT is forced native, so it must be applied here too.
+        if (id >= 0 && app == APP_AIAGENT && g_agent_prefill) {
+            int pl = 0;
+            while (g_agent_prefill[pl] && pl < 255)
+                windows[id].term_input[pl] = g_agent_prefill[pl], pl++;
+            windows[id].term_input_len = pl;
+            windows[id].term_input[pl] = 0;
+            g_agent_prefill = 0;
         }
     }
 
@@ -9885,6 +9915,32 @@ int gui_init(void) {
 }
 
 extern "C" void gui_set_startup_app(int id) { g_startup_app_id = id; }
+
+// True iff an AI Agent window is currently on screen.  Lets the background
+// agent run avoid forcing repaints when nobody is watching (e.g. a serial /
+// recording session that drives the agent but never opens the panel).
+extern "C" int gui_agent_window_open(void) {
+    for (int i = 0; i < g_wm.window_count; i++) {
+        if (g_wm.windows[i].visible && g_wm.windows[i].app == APP_AIAGENT)
+            return 1;
+    }
+    return 0;
+}
+
+// One-shot prefill for the AI Agent input box (set by boot flag 0x5020 before
+// the window exists, applied the moment launch_app() creates it).  Lets the
+// auto-open desktop demo show a ready-to-run goal instead of an empty field.
+// (g_agent_prefill itself is declared at the top of this file.)
+extern "C" void gui_agent_prefill(const char* goal) { g_agent_prefill = goal; }
+
+// Force a synchronous repaint of the whole desktop.  Used by the AI Agent
+// panel's background agent run so its trace area streams live instead of
+// freezing until the whole run finishes.  Safe to call from any context: it
+// early-returns once gui_exit() has dropped gui_mode, and it is the exact
+// render entry point the remote-control sink already calls per output line.
+extern "C" void gui_agent_redraw(void) {
+    if (g_wm.gui_mode && gui_agent_window_open()) g_wm.render_all();
+}
 extern "C" int  gui_app_browser_id(void) { return (int)APP_BROWSER; }
 
 // Resolve a startup-app keyword to an AppType index, or -1 if unknown.

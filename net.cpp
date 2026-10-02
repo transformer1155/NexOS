@@ -1737,6 +1737,14 @@ static char g_agent_remote_url[256] = {0};
 static char g_agent_api_key[256] = {0};
 static char g_agent_model[64] = "nexos";
 
+// Provided by ai_engine.cpp (C linkage): shared activity log the "AI Agent"
+// GUI panel renders.  We stream each shell step into it so the panel shows the
+// real working process instead of one opaque final block.
+extern "C" void agent_trace_log(const char* tag, const char* msg);
+// Provided by gui.cpp (C linkage): force a desktop repaint so the panel's
+// trace streams live during a (synchronous) agent run.
+extern "C" void gui_agent_redraw(void);
+
 // Parse URL into host, port, path
 static void parse_url(const char* url){
     httpc_host[0] = 0;
@@ -3150,6 +3158,21 @@ extern "C" int net_agent_plan_exec(const char* goal, char* out, int outsize){
                     rep_add(report, &rp, "nexos$ "); rep_add(report, &rp, cmd); rep_add(report, &rp, "\n");
                     char capbuf[1500];
                     mcp_exec_capture(cmd, capbuf, sizeof(capbuf));
+                    // Stream this step into the shared agent trace IMMEDIATELY
+                    // (the AI Agent panel renders it) instead of waiting for the
+                    // whole run to finish.  This is the "upgrade": the desktop
+                    // agent now shows its real working log line-by-line, the same
+                    // way the terminal recording does, instead of one big block.
+                    agent_trace_log("shell", cmd);
+                    // First result line (or whole short output) as the "out" entry.
+                    {
+                        char firstline[160]; int fl = 0;
+                        for (int k = 0; capbuf[k] && capbuf[k] != '\n' && fl < 159; k++)
+                            firstline[fl++] = capbuf[k];
+                        firstline[fl] = 0;
+                        if (fl == 0) { firstline[0]='('; firstline[1]='n'; firstline[2]='o'; firstline[3]=' '; firstline[4]='o'; firstline[5]='u'; firstline[6]='t'; firstline[7]='p'; firstline[8]='u'; firstline[9]='t'; firstline[10]=')'; firstline[11]=0; }
+                        agent_trace_log("out", firstline);
+                    }
                     for (int k = 0; capbuf[k]; k++){
                         rep_addch(report, &rp, capbuf[k]);
                         if (capbuf[k]=='\n' && capbuf[k+1]) rep_add(report, &rp, "  ");
@@ -3165,6 +3188,8 @@ extern "C" int net_agent_plan_exec(const char* goal, char* out, int outsize){
                         while (capbuf[q] && capbuf[q] != '\n' && hp < (int)sizeof(history) - 4) history[hp++] = capbuf[q++];
                         history[hp++] = '\n';
                     }
+                    // Paint the panel now so the new step is visible at once.
+                    gui_agent_redraw();
                 } else if (net_strncmp(line + sp, "plugin:", 7) == 0){
                     int cs = sp + 7; while(line[cs]==' '||line[cs]=='\t') cs++;
                     char svc[64]; int si=0;
@@ -3200,6 +3225,8 @@ extern "C" int net_agent_plan_exec(const char* goal, char* out, int outsize){
                 } else if (net_strncmp(line + sp, "done:", 5) == 0){
                     int ds = sp + 5; while(line[ds]==' '||line[ds]=='\t') ds++;
                     rep_add(report, &rp, "SUMMARY: "); rep_add(report, &rp, line + ds); rep_add(report, &rp, "\n");
+                    agent_trace_log("summary", line + ds);
+                    gui_agent_redraw();
                     done = 1;
                 } else {
                     rep_add(report, &rp, line + sp); rep_add(report, &rp, "\n");

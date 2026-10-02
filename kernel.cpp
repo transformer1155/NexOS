@@ -1867,6 +1867,7 @@ extern "C" {
     void gui_probe_vbe(void);
     void gui_set_startup_app(int id);
     void gui_set_remote_to_terminal(int v);
+    extern "C" void gui_agent_prefill(const char* goal);   // AI Agent input prefill (gui.cpp)
     int  gui_app_browser_id(void);
     int  gui_app_id_by_name(const char* n);
     int  gui_available(void);
@@ -9081,6 +9082,17 @@ extern "C" void kmain(){
     if (boot_term && g_auto_gui) {
         gui_set_startup_app(gui_app_id_by_name("terminal"));
         gui_set_remote_to_terminal(1);   // stream agent output into the real terminal window
+    }
+    // 0x5020: open the AI Agent ("AI 桌面") window automatically on GUI boot and
+    // prefill the input box with a demo goal.  Surfaces the upgraded agent panel
+    // (live step-by-step trace) for screenshots / demos without manual clicks.
+    uint8_t boot_agent = *(volatile uint8_t*)0x5020;
+    if (boot_agent && g_auto_gui) {
+        int aid = gui_app_id_by_name("agent");
+        if (aid >= 0) {
+            gui_set_startup_app(aid);
+            gui_agent_prefill("create file demo.txt containing 'hello nexos' then cat it to verify");
+        }
     }
 
     // ---- Early boot animation -------------------------------------------
