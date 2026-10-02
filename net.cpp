@@ -11,7 +11,10 @@
 //    * HTTP server (port 8080) with REST API
 //    * Web UI (embedded HTML/CSS/JS)
 //
-//  QEMU: -net nic,model=ne2k_isa -net user,hostfwd=tcp::8080-:8080
+//  QEMU (NE2000, default): -net nic,model=ne2k_isa -net user,hostfwd=tcp::8080-:8080
+//  QEMU (virtio, faster):  -netdev user,id=n0,hostfwd=tcp::8080-:8080 -device virtio-net-pci,netdev=n0
+//    -> net_init() auto-probes for a virtio-net PCI device (vendor 0x1AF4,
+//       device 0x1000) and switches to it; otherwise it keeps NE2000.
 //  Guest IP: 10.0.2.15  Gateway: 10.0.2.2
 //
 //  No external dependencies. Uses kernel's kmalloc/kfree.
@@ -31,6 +34,19 @@ extern "C" {
     void  net_poll(void);   // defined below; pumped by nexos_input_wait
     int   net_init(void);   // defined below (~line 2909); needed by net_guest_connect
 }
+
+// ---- Stage-1 transport: optional virtio-net PCI driver (net_virtio.cpp) ----
+// g_use_virtio is set by net_init() only after virtio_net_probe() finds a real
+// virtio-net PCI device.  With the default "-net nic,model=ne2k_isa" QEMU config
+// no such device exists, so the NE2000 ISA path below stays the active one.
+extern "C" {
+    int  virtio_net_probe(void);
+    int  virtio_net_active(void);
+    void virtio_net_send(const uint8_t* data, int len);
+    int  virtio_net_recv(uint8_t* buf, int maxlen);
+    const uint8_t* virtio_net_mac(void);
+}
+static bool g_use_virtio = false;
 
 // ---- Optional idle hook -------------------------------------------------
 // Pumped from net_http_get's blocking poll loop below.  The 32-bit kernel
@@ -278,6 +294,7 @@ static void nic_init(){
 }
 
 static void nic_send(const uint8_t* data, int len){
+    if (g_use_virtio){ virtio_net_send(data, len); return; }
     if (!nic_present || len <= 0) return;
     if (len > 1514) len = 1514;
     if (len < 60) len = 60;  // minimum Ethernet frame
@@ -365,6 +382,7 @@ static void tx_flush(void){
 }
 
 static int nic_receive(uint8_t* buf, int maxlen){
+    if (g_use_virtio) return virtio_net_recv(buf, maxlen);
     if (!nic_present) return 0;
 
     uint8_t bnry = ninb(NE_BASE + NE_BNRY);
@@ -948,6 +966,7 @@ static void tcp_send_segment(TcpConn* c, uint8_t flags, const uint8_t* data, int
 
 // Forward declaration
 static void http_handle_request(TcpConn* conn);
+static void mcp_handle(TcpConn* conn, const char* body);  // MCP server (JSON-RPC)
 
 // SSH server (implemented below, in this file).  ssh_feed() is handed each
 // newly-arrived TCP segment's bytes for an SSH-bound connection; ssh_poll()
@@ -960,6 +979,8 @@ extern "C" int  nexos_auth(const char* user, const char* pw);   // returns 1 on 
 extern "C" void kernel_exec_line(const char* line);             // run a shell command
 extern "C" void term_set_ssh_sink(void (*fn)(const char*, int)); // arm output sink
 extern "C" void term_clear_ssh_sink(void);                       // disarm output sink
+extern "C" int  kern_fs_read(const char* name, unsigned char* buf, int bufsize);  // read data-disk file
+extern "C" int  kern_fs_create(const char* name, const unsigned char* data, int len); // write data-disk file
 
 // ---- SSH session state machine (needed by helper prototypes) ----
 enum SshState {
@@ -1716,6 +1737,14 @@ static char g_agent_remote_url[256] = {0};
 static char g_agent_api_key[256] = {0};
 static char g_agent_model[64] = "nexos";
 
+// Provided by ai_engine.cpp (C linkage): shared activity log the "AI Agent"
+// GUI panel renders.  We stream each shell step into it so the panel shows the
+// real working process instead of one opaque final block.
+extern "C" void agent_trace_log(const char* tag, const char* msg);
+// Provided by gui.cpp (C linkage): force a desktop repaint so the panel's
+// trace streams live during a (synchronous) agent run.
+extern "C" void gui_agent_redraw(void);
+
 // Parse URL into host, port, path
 static void parse_url(const char* url){
     httpc_host[0] = 0;
@@ -2101,9 +2130,13 @@ static void httpc_poll(void){
             else if (tcp_client.state == TCPC_ERROR){
                 httpc_state = HTTPC_ERROR;
             }
-            // Timeout (generous: once ESTABLISHED the body arrives within a few
-            // polls, but a slow/large transfer must not be cut short)
-            if (httpc_poll_count > 100000){
+            // Timeout (extremely generous: under TCG emulation a slow upstream
+            // -- an LLM behind the TLS proxy -- can take well over a minute to
+            // deliver the full body, and polls are cheap.  The outer guard in
+            // net_http_post (300M) is the real hard cap for true stalls.
+            // 5000000 / 100M were both too small and truncated model replies,
+            // making the agent drift off the requested task.
+            if (httpc_poll_count > 500000000){
                 httpc_state = HTTPC_COMPLETE;  // treat as complete with partial data
                 if (tcp_client.rx_len > 0){
                     net_serial("[HTTPC] Timeout, using partial data\n");
@@ -2181,10 +2214,15 @@ extern "C" int net_http_get(const char* url, char* out, int outsize)
     if (outsize > 0) out[0] = 0;
     if (httpc_get(url) != 0) return -1;          // busy or malformed URL
     int guard = 0;
+    // Generous guard: an LLM endpoint (DeepSeek via the TLS proxy) can take
+    // many seconds to answer, and under TCG emulation each net_poll() costs
+    // microseconds.  Dead endpoints still bail out early via TCP
+    // retransmission failure (HTTPC_ERROR), so a large bound only matters
+    // for slow-but-alive upstreams.
     while (httpc_state != HTTPC_COMPLETE && httpc_state != HTTPC_ERROR) {
         net_poll();
         if (g_net_idle_hook) g_net_idle_hook();   // keep the boot animation alive
-        if (++guard > 2000000) { httpc_state = HTTPC_ERROR; break; }
+        if (++guard > 300000000) { httpc_state = HTTPC_ERROR; break; }
     }
     int n = 0;
     if (httpc_state == HTTPC_COMPLETE)
@@ -2200,10 +2238,15 @@ extern "C" int net_http_post(const char* url, const char* body, char* out, int o
     if (outsize > 0) out[0] = 0;
     if (httpc_post(url, body) != 0) return -1;     // busy or malformed URL
     int guard = 0;
+    // Generous guard: an LLM endpoint (DeepSeek via the TLS proxy) can take
+    // many seconds to answer, and under TCG emulation each net_poll() costs
+    // microseconds.  Dead endpoints still bail out early via TCP
+    // retransmission failure (HTTPC_ERROR), so a large bound only matters
+    // for slow-but-alive upstreams.
     while (httpc_state != HTTPC_COMPLETE && httpc_state != HTTPC_ERROR) {
         net_poll();
         if (g_net_idle_hook) g_net_idle_hook();   // keep the boot animation alive
-        if (++guard > 2000000) { httpc_state = HTTPC_ERROR; break; }
+        if (++guard > 300000000) { httpc_state = HTTPC_ERROR; break; }
     }
     int n = 0;
     if (httpc_state == HTTPC_COMPLETE)
@@ -2303,13 +2346,13 @@ extern "C" int net_agent_remote(const char* prompt, const char* url, char* out, 
     // Build JSON body: {"model":"<g_agent_model>","messages":[{"role":"user","content":"<prompt>"}]}
     char body[1024];
     int bp = 0;
-    char pre[96];
+    char pre[256];
     int pp = 0;
     const char* m0 = "{\"model\":\"";
     net_memcpy(pre + pp, m0, net_strlen(m0)); pp += net_strlen(m0);
     int ml = net_strlen(g_agent_model);
     net_memcpy(pre + pp, g_agent_model, ml); pp += ml;
-    const char* m1 = "\",\"messages\":[{\"role\":\"user\",\"content\":\"";
+    const char* m1 = "\",\"temperature\":0.1,\"max_tokens\":1024,\"messages\":[{\"role\":\"user\",\"content\":\"";
     net_memcpy(pre + pp, m1, net_strlen(m1)); pp += net_strlen(m1);
     pre[pp] = 0;
     net_memcpy(body + bp, pre, net_strlen(pre)); bp += net_strlen(pre);
@@ -2913,9 +2956,548 @@ static void http_handle_request(TcpConn* conn){
         return;
     }
 
+    // Route: POST /mcp -> Model Context Protocol server (JSON-RPC 2.0).
+    // Exposes NexOS terminal/fs/plugin capabilities as standard MCP tools.
+    if (net_strcmp(method, "POST") == 0 && net_strcmp(path, "/mcp") == 0){
+        mcp_handle(conn, body);
+        return;
+    }
+
     // 404
     const char* not_found = "404 Not Found";
     http_send_response(conn, "404 Not Found", "text/plain", not_found, net_strlen(not_found));
+}
+
+// ===== MCP server (Model Context Protocol over HTTP, JSON-RPC 2.0) =====
+// Exposes NexOS terminal/file/plugin capabilities as standard MCP tools so any
+// MCP client (Claude Desktop, CodeBuddy, Cursor...) can drive the OS.  Reuses
+// the existing HTTP server + SSH output sink; no new network-stack code.
+#if !defined(__x86_64__)
+#include "plugins/plugin_manager.h"   // svc_lookup / svc_fn (32-bit only)
+#endif
+
+static char g_mcp_out[4096];
+static int  g_mcp_out_len = 0;
+
+static void mcp_sink(const char* s, int n){
+    for (int i = 0; i < n && g_mcp_out_len < (int)sizeof(g_mcp_out) - 1; i++)
+        g_mcp_out[g_mcp_out_len++] = s[i];
+}
+
+// Append a JSON string to dst, escaping ", \, newline.  Uses raw ASCII values
+// (34/92/10) so the source stays free of quote/backslash character literals.
+static int mcp_escape(char* dst, int dstcap, const char* src){
+    int p = 0;
+    for (int k = 0; src[k] && p < dstcap - 2; k++){
+        char c = src[k];
+        if (c == 34){ dst[p++] = 92; dst[p++] = 34; }
+        else if (c == 92){ dst[p++] = 92; dst[p++] = 92; }
+        else if (c == 10){ dst[p++] = 92; dst[p++] = 110; }
+        else if (c == 13){ }
+        else dst[p++] = c;
+    }
+    dst[p] = 0;
+    return p;
+}
+
+static void mcp_cat(char* dst, int* p, const char* s){
+    int l = net_strlen(s);
+    net_memcpy(dst + *p, s, l); *p += l;
+}
+
+static void mcp_write_id(char* dst, int* p, const char* idstr){
+    bool num = true;
+    for (int i = 0; idstr[i]; i++)
+        if (idstr[i] < '0' || idstr[i] > '9'){ num = false; break; }
+    if (num && idstr[0]) mcp_cat(dst, p, idstr);
+    else { dst[(*p)++] = 34; mcp_cat(dst, p, idstr); dst[(*p)++] = 34; }
+}
+
+// Execute a command and capture its terminal output through the SSH sink hook.
+// The previously-installed sink (if any) is preserved: while the agent runs
+// inside a remote console session the console streams output into the GUI
+// overlay, and a plain clear here would silently silence it for the rest of
+// the agent run.
+extern "C" void (*term_swap_ssh_sink(void (*fn)(const char*, int)))(const char*, int);
+static int mcp_exec_capture(const char* cmd, char* out, int outsz){
+    g_mcp_out_len = 0;
+    void (*prev)(const char*, int) = term_swap_ssh_sink(mcp_sink);
+    kernel_exec_line(cmd);
+    term_swap_ssh_sink(prev);
+    int n = g_mcp_out_len;
+    if (n > outsz - 1) n = outsz - 1;
+    net_memcpy(out, g_mcp_out, n); out[n] = 0;
+    return n;
+}
+
+// Cloud agent loop: ask the configured OpenAI-compatible endpoint (e.g.
+// DeepSeek, reached through the host TLS proxy) for a plan expressed as
+// `shell:` / `plugin:` action lines, execute those actions inside NexOS, and
+// return a human-readable report.  This is what turns the in-OS agent from
+// "echo the model's text" into "actually operate the OS".
+static void rep_add(char* report, int* rp, const char* s){
+    int l = net_strlen(s);
+    for (int i = 0; i < l && *rp < 4094; i++) report[(*rp)++] = s[i];
+}
+static void rep_addch(char* report, int* rp, char c){
+    if (*rp < 4094) report[(*rp)++] = c;
+}
+// Check whether a command string already appears in the compact execution
+// history.  Used by the ReAct loop to avoid re-running steps it already
+// completed in a previous round (prevents the agent from looping or
+// double-writing files).
+static int hist_contains(const char* hist, int hlen, const char* cmd){
+    int cl = net_strlen(cmd);
+    if (cl == 0) return 0;
+    for (int i = 0; i + cl <= hlen; i++){
+        if (net_strncmp(hist + i, cmd, cl) == 0) return 1;
+    }
+    return 0;
+}
+
+extern "C" int net_agent_plan_exec(const char* goal, char* out, int outsize){
+    out[0] = 0;
+    if (!goal || !goal[0] || outsize < 64) return -1;
+
+    // Full instruction for the first round (produces the most complete plans).
+    static const char* PREFIX =
+        "You are the operations planner for NexOS, a minimal OS with a Unix-like shell. "
+        "Commands: ls, cat, echo, fwrite <file> <text>, mkdir <dir>, cd <dir>, pwd, "
+        "rm <file>, mkfs, mount, whoami. Use fwrite to create a file in ONE step with "
+        "EXACTLY the file name and text the request specifies. Perform EVERY action the "
+        "request asks, in order. Reply ONLY with 'shell: <cmd>' lines, then ONE "
+        "'done: <summary>' line. Use the file name and text VERBATIM; never invent "
+        "different ones. Always finish by running 'cat' on any file you create, to "
+        "verify it; never skip the cat step. No markdown, no prose.\nREQUEST: ";
+
+    // Compact continuation prompt for follow-up rounds.  Each HTTP call to the
+    // model is stateless, so the original goal and the already-executed steps
+    // must be re-sent.  This shorter instruction leaves room for them within
+    // the ~1 KB request cap enforced by net_agent_remote(), and re-emphasizes
+    // that the model must use the EXACT file name / text from the request.
+    static const char* CONTINUE =
+        "You are the NexOS operations planner. Commands: ls cat echo fwrite <file> <text> "
+        "mkdir cd pwd rm mkfs mount whoami. Reply ONLY with 'shell: <cmd>' lines, then "
+        "ONE 'done: <summary>' line. Use the EXACT file name and text from the REQUEST; "
+        "never invent different ones. Always finish by running 'cat' on any file you "
+        "created, to verify it; never skip the cat step. No markdown, no prose.\nREQUEST: ";
+
+    char report[4096]; int rp = 0;
+    char history[320]; int hp = 0; history[0] = 0;   // compact done-steps for the model
+    int done = 0;
+
+    // ReAct loop: up to 3 rounds.  Round 0 gets the full prompt; later rounds
+    // re-state the goal and the steps already run so the model can finish any
+    // actions it skipped or truncated in the previous round.  We deliberately
+    // do NOT stop on the first `done:` -- a model sometimes emits it early, so
+    // we only stop once a round produces no new actions to run.
+    for (int round = 0; round < 3; round++){
+        char prompt[1000]; int pp = 0;
+        if (round == 0){
+            int pl = net_strlen(PREFIX);
+            for (int i = 0; i < pl && pp < 760; i++) prompt[pp++] = PREFIX[i];
+            int gl = net_strlen(goal);
+            for (int i = 0; i < gl && pp < 900; i++) prompt[pp++] = goal[i];
+        } else {
+            int cl = net_strlen(CONTINUE);
+            for (int i = 0; i < cl && pp < 520; i++) prompt[pp++] = CONTINUE[i];
+            int gl = net_strlen(goal);
+            for (int i = 0; i < gl && pp < 660; i++) prompt[pp++] = goal[i];
+            const char* ae = "\nALREADY EXECUTED:\n";
+            int al = net_strlen(ae);
+            for (int i = 0; i < al && pp < 730; i++) prompt[pp++] = ae[i];
+            for (int i = 0; i < hp && pp < 850; i++) prompt[pp++] = history[i];
+            const char* c2 = "\nContinue the REMAINING steps of the REQUEST using the EXACT file name and text given. Do not repeat steps already executed.\n";
+            int cn = net_strlen(c2);
+            for (int i = 0; i < cn && pp < 900; i++) prompt[pp++] = c2[i];
+        }
+        prompt[pp] = 0;
+
+        char text[4096];
+        int n = net_agent_remote(prompt, NULL, text, (int)sizeof(text));
+        if (n <= 0){
+            rep_add(report, &rp, "AGENT ERROR: "); rep_add(report, &rp, text); rep_add(report, &rp, "\n");
+            break;
+        }
+
+        // Parse + execute this round's action lines.  Commands already run in a
+        // previous round are skipped (deduped against the history).
+        char line[300]; int lp = 0; int new_actions = 0;
+        for (int i = 0; i <= n; i++){
+            char c = (i < n) ? text[i] : '\n';
+            if (c == '\r') continue;            // tolerate CRLF
+            if (c == '\n'){
+                line[lp] = 0;
+                int sp = 0; while (line[sp]==' '||line[sp]=='\t') sp++;
+                if (line[sp] == 0){ lp = 0; continue; }
+                if (net_strncmp(line + sp, "shell:", 6) == 0){
+                    int cs = sp + 6; while(line[cs]==' '||line[cs]=='\t') cs++;
+                    // Trimmed command (for display, capture, and dedupe).
+                    int ce = cs;
+                    while (line[ce] && line[ce] != '\n') ce++;
+                    int ctrim = ce; while (ctrim > cs && (line[ctrim-1]==' '||line[ctrim-1]=='\t')) ctrim--;
+                    char cmd[300]; int ci = 0;
+                    for (int x = cs; x < ctrim && ci < 299; x++) cmd[ci++] = line[x];
+                    cmd[ci] = 0;
+                    // Defensive: the model sometimes prefixes a summary or a
+                    // malformed token with 'shell:' (e.g. "shell: done: ...").
+                    // Don't try to execute those as commands -- just record
+                    // them, otherwise the OS prints "Unknown command" in the
+                    // demo panel.
+                    if (cmd[0] == 0 || net_strncmp(cmd, "done:", 5) == 0 ||
+                        net_strncmp(cmd, "shell:", 6) == 0 ||
+                        net_strncmp(cmd, "plugin:", 7) == 0){
+                        rep_add(report, &rp, "(skip non-action) "); rep_add(report, &rp, cmd); rep_add(report, &rp, "\n");
+                        lp = 0; continue;
+                    }
+                    if (hist_contains(history, hp, cmd)){
+                        rep_add(report, &rp, "(skip already executed) "); rep_add(report, &rp, cmd); rep_add(report, &rp, "\n");
+                        lp = 0; continue;
+                    }
+                    new_actions++;
+                    rep_add(report, &rp, "nexos$ "); rep_add(report, &rp, cmd); rep_add(report, &rp, "\n");
+                    char capbuf[1500];
+                    mcp_exec_capture(cmd, capbuf, sizeof(capbuf));
+                    // Stream this step into the shared agent trace IMMEDIATELY
+                    // (the AI Agent panel renders it) instead of waiting for the
+                    // whole run to finish.  This is the "upgrade": the desktop
+                    // agent now shows its real working log line-by-line, the same
+                    // way the terminal recording does, instead of one big block.
+                    agent_trace_log("shell", cmd);
+                    // First result line (or whole short output) as the "out" entry.
+                    {
+                        char firstline[160]; int fl = 0;
+                        for (int k = 0; capbuf[k] && capbuf[k] != '\n' && fl < 159; k++)
+                            firstline[fl++] = capbuf[k];
+                        firstline[fl] = 0;
+                        if (fl == 0) { firstline[0]='('; firstline[1]='n'; firstline[2]='o'; firstline[3]=' '; firstline[4]='o'; firstline[5]='u'; firstline[6]='t'; firstline[7]='p'; firstline[8]='u'; firstline[9]='t'; firstline[10]=')'; firstline[11]=0; }
+                        agent_trace_log("out", firstline);
+                    }
+                    for (int k = 0; capbuf[k]; k++){
+                        rep_addch(report, &rp, capbuf[k]);
+                        if (capbuf[k]=='\n' && capbuf[k+1]) rep_add(report, &rp, "  ");
+                    }
+                    rep_add(report, &rp, "\n");
+                    // Compact history entry: "cmd -> <first result line>\n"
+                    if (hp < (int)sizeof(history) - 120){
+                        int w = cs;
+                        while (line[w] && line[w] != '\n' && hp < (int)sizeof(history) - 4) history[hp++] = line[w++];
+                        const char* arrow = " -> ";
+                        for (int a = 0; arrow[a] && hp < (int)sizeof(history) - 4; a++) history[hp++] = arrow[a];
+                        int q = 0;
+                        while (capbuf[q] && capbuf[q] != '\n' && hp < (int)sizeof(history) - 4) history[hp++] = capbuf[q++];
+                        history[hp++] = '\n';
+                    }
+                    // Paint the panel now so the new step is visible at once.
+                    gui_agent_redraw();
+                } else if (net_strncmp(line + sp, "plugin:", 7) == 0){
+                    int cs = sp + 7; while(line[cs]==' '||line[cs]=='\t') cs++;
+                    char svc[64]; int si=0;
+                    while (line[cs] && line[cs]!=' ' && line[cs]!='\t' && si<63) svc[si++]=line[cs++];
+                    svc[si]=0;
+                    while(line[cs]==' '||line[cs]=='\t') cs++;
+                    char pargs[256]; int pi=0;
+                    while (line[cs] && pi<255) pargs[pi++]=line[cs++];
+                    pargs[pi]=0;
+                    rep_add(report, &rp, "plugin: "); rep_add(report, &rp, svc);
+                    rep_add(report, &rp, " "); rep_add(report, &rp, pargs); rep_add(report, &rp, "\n");
+#if !defined(__x86_64__)
+                    svc_fn fn = svc_lookup(svc);
+                    if (!fn){ rep_add(report, &rp, "  service not found\n"); }
+                    else {
+                        char pout[256]; int r = fn((void*)pargs, pout, (int)sizeof(pout));
+                        char tmp[320]; int tp=0;
+                        tmp[tp++]='r'; tmp[tp++]='c'; tmp[tp++]='=';
+                        if (r < 0){ tmp[tp++]='-'; r=-r; }
+                        int dig[12]; int dc=0;
+                        if (r == 0) dig[dc++]=0;
+                        while (r > 0){ dig[dc++]=(char)('0' + r % 10); r /= 10; }
+                        while (dc > 0) tmp[tp++] = dig[--dc];
+                        tmp[tp++]=' ';
+                        for (int _k=0; pout[_k] && tp<300; _k++) tmp[tp++]=pout[_k];
+                        tmp[tp]=0;
+                        rep_add(report, &rp, "  "); rep_add(report, &rp, tmp); rep_add(report, &rp, "\n");
+                    }
+#else
+                    (void)svc; (void)pargs;
+                    rep_add(report, &rp, "  plugin registry not linked in 64-bit kernel\n");
+#endif
+                } else if (net_strncmp(line + sp, "done:", 5) == 0){
+                    int ds = sp + 5; while(line[ds]==' '||line[ds]=='\t') ds++;
+                    rep_add(report, &rp, "SUMMARY: "); rep_add(report, &rp, line + ds); rep_add(report, &rp, "\n");
+                    agent_trace_log("summary", line + ds);
+                    gui_agent_redraw();
+                    done = 1;
+                } else {
+                    rep_add(report, &rp, line + sp); rep_add(report, &rp, "\n");
+                }
+                lp = 0;
+            } else if (lp < (int)sizeof(line) - 1){
+                line[lp++] = c;
+            }
+        }
+
+        // Stop only once a round produced nothing new to run.  This survives a
+        // premature `done:` (round 0 may finish with actions still pending) and
+        // a model that stalls after having acted.
+        if (done && new_actions == 0) break;
+        if (new_actions == 0 && round >= 1) break;
+    }
+
+    report[rp] = 0;
+    int rl = rp; if (rl > outsize - 1) rl = outsize - 1;
+    net_memcpy(out, report, rl); out[rl] = 0;
+    return rl;
+}
+
+// Emit a JSON double-quote (ASCII 34) into the response without using a
+// string literal that contains a quote, so the source stays escaper-free.
+static void mcp_q(char* dst, int* p){ dst[(*p)++] = 34; }
+
+// Minimal JSON value extractor for MCP request bodies.  Finds the first
+// occurrence of "key" and copies its scalar value (string or number) into
+// out.  Handles \" escapes inside strings.  Returns 1 on hit, 0 if absent.
+// The body is JSON-RPC, NOT the form-encoded format extract_value() expects,
+// so a dedicated parser is required here.
+static int mcp_json_value(const char* body, const char* key, char* out, int outsize){
+    int klen = net_strlen(key);
+    const char* p = body;
+    while (*p){
+        if (p[0] == 34 && net_strncmp(p + 1, key, klen) == 0 && p[1 + klen] == 34){
+            p += 1 + klen + 1; // skip "key"
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+            if (*p != ':'){ p -= (1 + klen); p++; continue; }
+            p++;
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+            int i = 0;
+            if (*p == 34){
+                p++;
+                while (*p && *p != 34 && i < outsize - 1){
+                    if (*p == 92 && p[1]) { p++; }  // skip escape backslash
+                    out[i++] = *p++;
+                }
+                if (*p == 34) p++;
+            } else {
+                while (*p && *p != ',' && *p != '}' && *p != ' ' &&
+                       *p != '\t' && *p != '\n' && *p != '\r' && i < outsize - 1)
+                    out[i++] = *p++;
+            }
+            out[i] = 0;
+            return 1;
+        }
+        p++;
+    }
+    out[0] = 0;
+    return 0;
+}
+
+static void mcp_handle(TcpConn* conn, const char* body){
+    char method[64];
+    mcp_json_value(body, "method", method, sizeof(method));
+    char id[32];
+    mcp_json_value(body, "id", id, sizeof(id));
+
+    char resp[6000];
+    int p = 0;
+    mcp_cat(resp, &p, "{");
+    mcp_q(resp, &p); mcp_cat(resp, &p, "jsonrpc"); mcp_q(resp, &p);
+    mcp_cat(resp, &p, ":");
+    mcp_q(resp, &p); mcp_cat(resp, &p, "2.0"); mcp_q(resp, &p);
+    mcp_cat(resp, &p, ",");
+    mcp_q(resp, &p); mcp_cat(resp, &p, "id"); mcp_q(resp, &p);
+    mcp_cat(resp, &p, ":");
+    mcp_write_id(resp, &p, id);
+    resp[p++] = ',';
+
+    if (net_strcmp(method, "initialize") == 0){
+        mcp_cat(resp, &p, "\"result\":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "protocolVersion"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "2024-11-05"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "capabilities"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "tools"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ":{}},");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "serverInfo"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "name"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "NexOS"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "version"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "2.0"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, "}}");
+    } else if (net_strcmp(method, "tools/list") == 0){
+        mcp_cat(resp, &p, "\"result\":{\"tools\":[");
+        mcp_cat(resp, &p, "{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "name"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "nexos_exec"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "description"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "Execute a shell command in the NexOS terminal and return its output"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "inputSchema"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "object"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "properties"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "command"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "string"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "description"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "command line to run"); mcp_q(resp, &p); mcp_cat(resp, &p, "}}}},");
+        mcp_cat(resp, &p, "{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "name"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "nexos_read_file"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "description"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "Read a file from the NexOS data disk"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "inputSchema"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "object"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "properties"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "path"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "string"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "description"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "file name"); mcp_q(resp, &p); mcp_cat(resp, &p, "}}}},");
+        mcp_cat(resp, &p, "{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "name"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "nexos_write_file"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "description"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "Write or create a file on the NexOS data disk"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "inputSchema"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "object"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "properties"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "path"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "string"); mcp_q(resp, &p); mcp_cat(resp, &p, "},");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "content"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "string"); mcp_q(resp, &p); mcp_cat(resp, &p, "}}}},");
+        mcp_cat(resp, &p, "{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "name"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "nexos_call_plugin"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "description"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "Call a registered plugin service by name"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "inputSchema"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "object"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "properties"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "service"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "string"); mcp_q(resp, &p); mcp_cat(resp, &p, "},");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "args"); mcp_q(resp, &p); mcp_cat(resp, &p, ":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "string"); mcp_q(resp, &p); mcp_cat(resp, &p, "}}}},");
+        if (p > 0 && resp[p - 1] == 44) p--;  // strip trailing comma before ]
+        mcp_cat(resp, &p, "]}");
+    } else if (net_strcmp(method, "tools/call") == 0){
+        char name[64];
+        mcp_json_value(body, "name", name, sizeof(name));
+        char tool_out[4400];
+        char raw[2048];
+        int rlen = 0;
+        bool is_error = false;
+        if (net_strcmp(name, "nexos_exec") == 0){
+            char cmd[256];
+            mcp_json_value(body, "command", cmd, sizeof(cmd));
+            mcp_exec_capture(cmd, raw, sizeof(raw));
+            mcp_escape(tool_out, sizeof(tool_out), raw);
+        } else if (net_strcmp(name, "nexos_read_file") == 0){
+            char path[128];
+            mcp_json_value(body, "path", path, sizeof(path));
+            unsigned char buf[2048];
+            int n = kern_fs_read(path, buf, sizeof(buf));
+            if (n >= 0){
+                int w = 0;
+                for (int k = 0; k < n && w < (int)sizeof(raw) - 1; k++) raw[w++] = (char)buf[k];
+                raw[w] = 0;
+                rlen = mcp_escape(tool_out, sizeof(tool_out), raw);
+            } else {
+                is_error = true;
+                rlen = mcp_escape(tool_out, sizeof(tool_out), "read failed: file not found or disk not mounted");
+            }
+        } else if (net_strcmp(name, "nexos_write_file") == 0){
+            char path[128];
+            mcp_json_value(body, "path", path, sizeof(path));
+            char content[2048];
+            mcp_json_value(body, "content", content, sizeof(content));
+            int n = kern_fs_create(path, (const unsigned char*)content, net_strlen(content));
+            if (n >= 0){
+                char tmp[64]; int tp = 0;
+                mcp_cat(tmp, &tp, "wrote ");
+                char num[12]; int q = 0; int v = n;
+                if (v == 0) num[q++] = '0';
+                while (v > 0){ num[q++] = (char)('0' + v % 10); v /= 10; }
+                while (q > 0) tmp[tp++] = num[--q];
+                tmp[tp] = 0;
+                rlen = mcp_escape(tool_out, sizeof(tool_out), tmp);
+            } else {
+                is_error = true;
+                rlen = mcp_escape(tool_out, sizeof(tool_out), "write failed: disk not mounted");
+            }
+        } else if (net_strcmp(name, "nexos_call_plugin") == 0){
+            char svc[64];
+            mcp_json_value(body, "service", svc, sizeof(svc));
+            char args[256];
+            mcp_json_value(body, "args", args, sizeof(args));
+#if !defined(__x86_64__)
+            svc_fn fn = svc_lookup(svc);
+            if (!fn){
+                is_error = true;
+                rlen = mcp_escape(tool_out, sizeof(tool_out), "service not found");
+            } else {
+                char out[256];
+                int r = fn((void*)args, out, (int)sizeof(out));
+                char tmp[320]; int tp = 0;
+                mcp_cat(tmp, &tp, "rc=");
+                char num[12]; int q = 0; int v = r;
+                if (v < 0) tmp[tp++] = '-';
+                if (v < 0) v = -v;
+                if (v == 0) num[q++] = '0';
+                while (v > 0){ num[q++] = (char)('0' + v % 10); v /= 10; }
+                while (q > 0) tmp[tp++] = num[--q];
+                tmp[tp++] = ' ';
+                for (int k = 0; out[k] && tp < 300; k++) tmp[tp++] = out[k];
+                tmp[tp] = 0;
+                rlen = mcp_escape(tool_out, sizeof(tool_out), tmp);
+            }
+#else
+            (void)svc; (void)args;
+            is_error = true;
+            rlen = mcp_escape(tool_out, sizeof(tool_out), "plugin registry not linked in 64-bit kernel");
+#endif
+        } else {
+            is_error = true;
+            rlen = mcp_escape(tool_out, sizeof(tool_out), "unknown tool");
+        }
+        (void)rlen;
+        mcp_cat(resp, &p, "\"result\":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "content"); mcp_q(resp, &p); mcp_cat(resp, &p, ":[");
+        mcp_cat(resp, &p, "{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "type"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "text"); mcp_q(resp, &p); mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "text"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p);
+        mcp_cat(resp, &p, tool_out);
+        mcp_q(resp, &p);
+        mcp_cat(resp, &p, "}]");
+        mcp_cat(resp, &p, ",");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "isError"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_cat(resp, &p, is_error ? "true" : "false");
+        mcp_cat(resp, &p, "}");
+    } else if (net_strcmp(method, "ping") == 0){
+        mcp_cat(resp, &p, "\"result\":{}");
+    } else {
+        mcp_cat(resp, &p, "\"error\":{");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "code"); mcp_q(resp, &p); mcp_cat(resp, &p, ":-32601,");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "message"); mcp_q(resp, &p); mcp_cat(resp, &p, ":");
+        mcp_q(resp, &p); mcp_cat(resp, &p, "Method not found"); mcp_q(resp, &p);
+        mcp_cat(resp, &p, "}");
+    }
+    resp[p++] = '}';
+    resp[p] = 0;
+    http_send_response(conn, "200 OK", "application/json", resp, p);
 }
 
 // =====================================================================
@@ -2953,12 +3535,20 @@ void ssh_put_str(uint8_t* b, int* n, const uint8_t* str, int len);
 int net_init(void){
     net_serial("[NET] Initializing network...\n");
 
-    if (!nic_detect()){
+    // Stage-1 transport: prefer virtio-net PCI when present, else NE2000 ISA.
+    if (virtio_net_probe() != 0){
+        g_use_virtio = true;
+        const uint8_t* m = virtio_net_mac();
+        for (int i = 0; i < 6; i++) nic_mac[i] = m[i];
+        nic_present = true;
+        net_serial("[NET] Using virtio-net PCI driver\n");
+    } else if (!nic_detect()){
         net_serial("[NET] NE2000 not detected!\n");
         return -1;
+    } else {
+        nic_init();
     }
 
-    nic_init();
     arp_init();
     tcp_init();
     tcp_client_init();
@@ -4574,3 +5164,9 @@ extern "C" __attribute__((weak)) void term_set_ssh_sink(void (*fn)(const char*, 
 extern "C" __attribute__((weak)) void term_clear_ssh_sink(void){}
 
 }  // extern "C"
+
+// Stage-1 transport: pull in the optional virtio-net PCI driver so it links
+// into every image that already links net.o (no extra Makefile link edits).
+// Compiled as part of net.o; probe-gated in net_init() via g_use_virtio, so the
+// default "-net nic,model=ne2k_isa" build is completely unaffected.
+#include "net_virtio.cpp"

@@ -93,6 +93,14 @@ SECTIONS
      *  heap began overwriting the kernel's own globals -- only a runtime
      *  [HEAP] FATAL warned about it.  This ASSERT turns that into a build
      *  failure instead.
+     *
+     *  This bound was briefly 0xAE0000 because kernel.cpp had raised
+     *  HEAP_START to match.  That was based on a stale __bss_end; nm puts
+     *  the real one at 0x97D9A4, comfortably under 0x9A0000.  Because
+     *  HEAP_END is pinned at 0x13F0000, the higher floor cost the heap
+     *  half its size (10.3 MiB -> 5.1 MiB) and starved the GUI into a
+     *  "cannot allocate managed heap" black screen.  Keep this in sync
+     *  with HEAP_START, and do not raise it without checking nm.
      * ----------------------------------------------------------------- */
     ASSERT(__bss_end <= 0x9A0000,
         "kernel .bss runs into HEAP_START (kernel.cpp) -- raise HEAP_START and shrink HEAP_SIZE by the same amount")
