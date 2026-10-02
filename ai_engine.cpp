@@ -25,10 +25,21 @@ static void ai_serial(const char* s){
 extern "C" {
     void* kmalloc(uint32_t size);
     void  kfree(void* ptr);
+    // Cloud API pipeline (skill -> net_agent_remote -> net_ask_host -> local).
+    int  net_agent_execute(const char* goal, char* out, int outsize);
 }
 
 #include "ai_model.h"   // model recognition + registry
 #include "ai_env.h"     // VM vs bare-metal detection
+
+// Agent tool layer: plugin services + Linux command execution.  These are only
+// linked into the 32-bit kernel (plugin_manager.o / linux_compat.o); the 64-bit
+// long-mode kernel does not carry them, so guard both the headers and the calls
+// behind __x86_64__ to keep the 64-bit link clean (and report gracefully).
+#if !defined(__x86_64__)
+#include "plugins/plugin_manager.h"   // svc_lookup / svc_call
+#include "linux_compat.h"              // linux_run (32-bit ELF shim)
+#endif
 
 // ---- Freestanding libc ----
 static int   ai_strlen(const char* s){ int n=0; while(s[n]) n++; return n; }
@@ -1039,6 +1050,135 @@ static void agent_log(int level, const char* msg){
     ai_serial("[AGENT]["); ai_serial(tag); ai_serial("] "); ai_serial(msg); ai_serial("\n");
 }
 
+// =====================================================================
+//  Agent activity trace (shared ring buffer with the GUI output panel)
+// ---------------------------------------------------------------------
+//  Every plan step, tool call and result is logged here so the GUI "AI Agent"
+//  window can render the agent's thinking -> tool -> result trajectory,
+//  instead of only the final answer.  Lines are oldest..newest; dump copies
+//  them in order.  Arch-neutral (no kernel deps) so it links in both the
+//  32-bit and 64-bit kernels.
+// =====================================================================
+#define AGENT_TRACE_LINES 96
+#define AGENT_TRACE_LEN   120
+static char  g_agent_trace[AGENT_TRACE_LINES][AGENT_TRACE_LEN];
+static int   g_agent_trace_head = 0;   // next slot to write
+static int   g_agent_trace_count = 0;
+
+static void agent_trace_append(const char* tag, const char* msg){
+    char* line = g_agent_trace[g_agent_trace_head];
+    int p = 0;
+    for (int i = 0; tag[i] && p < AGENT_TRACE_LEN - 2; i++) line[p++] = tag[i];
+    if (p < AGENT_TRACE_LEN - 2) line[p++] = ':';
+    if (p < AGENT_TRACE_LEN - 2) line[p++] = ' ';
+    for (int i = 0; msg[i] && p < AGENT_TRACE_LEN - 1; i++) line[p++] = msg[i];
+    line[p] = 0;
+    g_agent_trace_head = (g_agent_trace_head + 1) % AGENT_TRACE_LINES;
+    if (g_agent_trace_count < AGENT_TRACE_LINES) g_agent_trace_count++;
+}
+
+static void agent_trace_clear(void){
+    g_agent_trace_head = 0; g_agent_trace_count = 0;
+    for (int i = 0; i < AGENT_TRACE_LINES; i++) g_agent_trace[i][0] = 0;
+}
+
+// Dump oldest..newest into buf.  Returns bytes written.
+static int agent_trace_dump(char* buf, int bufsize){
+    int pos = 0;
+    int start = (g_agent_trace_head - g_agent_trace_count + AGENT_TRACE_LINES)
+                % AGENT_TRACE_LINES;
+    for (int k = 0; k < g_agent_trace_count; k++){
+        const char* l = g_agent_trace[(start + k) % AGENT_TRACE_LINES];
+        for (int i = 0; l[i] && pos < bufsize - 2; i++) buf[pos++] = l[i];
+        if (pos < bufsize - 2) buf[pos++] = '\n';
+    }
+    buf[pos] = 0;
+    return pos;
+}
+
+// Find a substring (freestanding, no libc).
+static const char* agent_find(const char* hay, const char* needle){
+    int n = ai_strlen(needle), hl = ai_strlen(hay);
+    for (int i = 0; i + n <= hl; i++){
+        bool m = true;
+        for (int k = 0; k < n; k++) if (hay[i + k] != needle[k]) { m = false; break; }
+        if (m) return hay + i;
+    }
+    return nullptr;
+}
+
+// Real OS tool calls the agent can perform.  Returns 0 if the task was a tool
+// directive and was handled (result written to g_tasks[task_idx].result);
+// -1 if it is not a tool directive (caller should fall back to AI text gen).
+// The plugin / Linux-ELF paths are 32-bit only (see guard at top of file):
+// the 64-bit long-mode kernel does not link the plugin registry or the 32-bit
+// ELF loader, so it reports gracefully instead of breaking the link.
+static int agent_execute_tool(int task_idx){
+    if (task_idx < 0 || task_idx >= g_task_count) return -1;
+    const char* d = g_tasks[task_idx].description;
+
+    // "plugin:<service> <args...>" -> call a registered plugin service.
+    const char* pt = agent_find(d, "plugin:");
+    if (pt){
+        const char* s = pt + 7;            // len("plugin:")
+        while (*s == ' ') s++;
+        char svc[64]; int n = 0;
+        while (*s && *s != ' ' && n < 63) svc[n++] = *s++; svc[n] = 0;
+        while (*s == ' ') s++;
+#if !defined(__x86_64__)
+        svc_fn fn = svc_lookup(svc);
+        if (!fn){
+            ai_sprintf(g_tasks[task_idx].result, AGENT_MAX_MSG,
+                       "(service not found: %s)", svc);
+        } else {
+            char out[256];
+            int r = fn((void*)s, out, (int)sizeof(out));
+            ai_sprintf(g_tasks[task_idx].result, AGENT_MAX_MSG,
+                       "[%s] rc=%d %s", svc, r, out);
+        }
+#else
+        ai_sprintf(g_tasks[task_idx].result, AGENT_MAX_MSG,
+                   "(svc registry not linked in 64-bit kernel: %s)", svc);
+#endif
+        g_tasks[task_idx].status = TASK_DONE;
+        g_tasks[task_idx].score = 0;
+        return 0;
+    }
+
+    // "shell:<command> [args...]" -> run a Linux ELF via linux_run().
+    const char* st = agent_find(d, "shell:");
+    if (st){
+        const char* s = st + 6;            // len("shell:")
+        while (*s == ' ') s++;
+        char words[33][64]; int nw = 0;
+        const char* p = s;
+        while (*p && nw < 32){
+            while (*p == ' ') p++; if (!*p) break;
+            int w = 0;
+            while (*p && *p != ' ' && w < 63) words[nw][w++] = *p++;
+            words[nw][w] = 0; nw++;
+        }
+        if (nw == 0){
+            ai_sprintf(g_tasks[task_idx].result, AGENT_MAX_MSG, "(empty shell command)");
+        } else {
+#if !defined(__x86_64__)
+            const char* av[33];
+            for (int i = 0; i < nw; i++) av[i] = words[i];
+            int r = linux_run(av[0], nw, av);
+            ai_sprintf(g_tasks[task_idx].result, AGENT_MAX_MSG,
+                       "(launched %s rc=%d; output -> console)", av[0], r);
+#else
+            ai_sprintf(g_tasks[task_idx].result, AGENT_MAX_MSG,
+                       "(linux_run unavailable in 64-bit kernel; use 'linux <elf>' via shell)");
+#endif
+        }
+        g_tasks[task_idx].status = TASK_DONE;
+        g_tasks[task_idx].score = 0;
+        return 0;
+    }
+    return -1;
+}
+
 extern "C" {
 
 void agent_init(void){
@@ -1160,6 +1300,14 @@ int agent_execute(int task_idx){
     g_tasks[task_idx].status = TASK_RUNNING;
     agent_log(0, g_tasks[task_idx].description);  // heartbeat / progress tick
 
+    // Real tool dispatch: a task whose description carries a plugin: or shell:
+    // directive runs in the OS instead of generating text.  The result is
+    // logged by agent_run()'s per-step trace so the GUI panel shows it.
+    if (agent_execute_tool(task_idx) == 0){
+        return 0;
+    }
+    agent_trace_append("task", g_tasks[task_idx].description);
+
     char prompt[AGENT_MAX_MSG + 16];
     ai_sprintf(prompt, sizeof(prompt), "%s", g_tasks[task_idx].description);
 
@@ -1264,6 +1412,12 @@ int agent_run(const char* goal, char* output, int outsize){
         if (agent_execute(i) != 0) continue;   // execute already set status
         agent_evaluate(i);
 
+        // Record the outcome in the shared trace (GUI panel renders it).
+        if (g_tasks[i].status == TASK_DONE){
+            agent_trace_append(g_tasks[i].assigned_to == 2 ? "critic" : "result",
+                               g_tasks[i].result);
+        }
+
         // Reflection: retry a failed / low-scoring task before giving up.
         if (g_tasks[i].status == TASK_FAILED || g_tasks[i].score < 50){
             int rl = ai_strlen(g_tasks[i].description);
@@ -1355,6 +1509,33 @@ int agent_get_status(char* buf, int bufsize){
 // Public controls (declared extern "C" so the 32/64-bit shells can call them).
 void agent_abort(void){ g_agent_aborted = true; agent_log(1, "abort requested"); }
 void agent_set_confirm(int on){ g_agent_confirm = (on != 0); }
+
+// ---- GUI-facing agent API (C linkage; safe to call from 32/64-bit gui.cpp) ----
+// These wrap the file-local trace helpers so the "AI Agent" output panel can
+// read and extend the agent's activity log.
+void agent_trace_reset(void){ agent_trace_clear(); }
+int  agent_trace_get(char* buf, int bufsize){ return agent_trace_dump(buf, bufsize); }
+void agent_trace_log(const char* tag, const char* msg){ agent_trace_append(tag, msg); }
+
+// Run a goal either through the cloud pipeline (skill -> net_agent_remote ->
+// net_ask_host) or the local ReAct agent (which may in turn call plugins /
+// Linux commands).  All activity is recorded in the trace buffer for the GUI.
+int agent_dispatch(const char* goal, char* output, int outsize, int use_cloud){
+    agent_trace_clear();
+    agent_trace_append("goal", goal);
+    if (use_cloud){
+        int n = net_agent_execute(goal, output, outsize);
+        if (n > 0){
+            agent_trace_append("cloud", output);
+            return n;
+        }
+        agent_trace_append("cloud", "(cloud unavailable; falling back to local agent)");
+    }
+    if (!g_agent_initialized) agent_init();
+    int n = agent_run(goal, output, outsize);
+    agent_trace_append("answer", output);
+    return n;
+}
 
 }  // extern "C"
 

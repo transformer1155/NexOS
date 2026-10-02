@@ -102,6 +102,26 @@ static inline int         mforms_desktop_menu(int) { return -1; }
 static inline void        mforms_set_running(uint32_t) {}
 #endif
 
+// ---------------------------------------------------------------------
+//  MForms bridge gap (pre-existing, independent of the VNC work):
+//  mforms_paint_wall / mforms_paint_desk_icons are referenced by the Win11
+//  desktop renderer (see render_all) but were only declared inside the
+//  (dead) MForms-disabled stub branch above, so under a real build they are
+//  undeclared AND undefined.
+//
+//  OWNER: mforms.cpp -- NOT here.  Those two entry points delegate to the
+//  managed Shell::PaintDesktop, which is what actually paints the wallpaper
+//  and the desktop icons.  Defining no-op stubs here (as an earlier attempt
+//  did) both duplicated the symbol at link time and left the desktop layer
+//  unpainted.  Declared in mforms.h; defined in mforms.cpp.
+//
+//  TODO(perf): render_all() caches the wallpaper so unchanged frames re-blit
+//  it and repaint only the cheap icons layer, but the managed side still
+//  exposes PaintDesktop as a single whole-layer call -- so both hooks run the
+//  full ~95 ms C# desktop paint.  Splitting PaintWall / PaintDesktopIcons in
+//  the managed shell would let the cache actually pay off.
+// ---------------------------------------------------------------------
+
 // Height of the managed taskbar.  Mirrors NexOS.Forms.Desktop.TaskH:
 // the strip is reserved so a click on the bar is never eaten by a window
 // that reaches the bottom of the screen.
@@ -119,9 +139,30 @@ static char   g_remote_who[64]  = {0};                   // controller identity 
 static char   g_remote_cmd[512] = {0};                   // latest command (center display)
 static char   g_remote_log[8][256] = {{0}};              // recent command scrollback
 static int    g_remote_log_n    = 0;
+static char   g_remote_out[14][128] = {{0}};             // recent command OUTPUT scrollback
+static int    g_remote_out_n    = 0;
+// Partial-line accumulator for gui_remote_output.  The kernel sink feeds ONE
+// character per call (Terminal::put_char -> g_ssh_out_fn(&c,1)), so the
+// accumulator MUST live across calls; it is flushed only on '\n', when full,
+// or by gui_remote_end().  (It used to be a call-local static flushed at the
+// end of EVERY call, which turned every single character into its own
+// scrollback row -- the "one char per line" panel bug.)
+static char   g_remote_line[128];
+static int    g_remote_li = 0;
+// Demo/recording mode: stream the agent's remote output into the REAL terminal
+// window (draw_terminal) instead of the full-screen remote-control overlay.
+static bool   g_remote_to_terminal = false;
 static int    g_remote_btn_x = 0, g_remote_btn_y = 0, g_remote_btn_w = 0, g_remote_btn_h = 0;
 extern "C" void gui_remote_end(void);                    // defined below, called by handle_mouse_down
 extern "C" void draw_remote_guard(void);                 // defined below (inside extern "C"), called by render_all
+
+// ---- AI Agent panel API (provided by ai_engine.cpp, C linkage) ----
+extern "C" int  agent_dispatch(const char* goal, char* output, int outsize, int use_cloud);
+extern "C" int  agent_trace_get(char* buf, int bufsize);
+extern "C" void agent_trace_reset(void);
+extern "C" void agent_trace_log(const char* tag, const char* msg);
+extern "C" void agent_abort(void);
+extern "C" int  agent_init(void);
 
 // Clipboard is owned by the kernel but shared with the GUI (terminal /
 // browser URL copy-paste) and the C# host bridge.
@@ -1062,6 +1103,10 @@ struct GuiCallbacks {
 
 static GuiCallbacks g_cb;
 static int g_startup_app_id = -1;   // set by kernel before gui_enter()
+// One-shot AI Agent input-box prefill (set by boot flag 0x5020, applied in
+// launch_app when the AI Agent window is created).  Declared here so both the
+// early launch_app() and the later gui_agent_prefill() setter see it.
+static const char* g_agent_prefill = 0;
 
 // (enter_gui() is now always entered.  The old g_skip_enter_gui voice-test
 //  workaround for a phantom enter_gui() return-hang was skipping the desktop
@@ -1942,6 +1987,30 @@ struct Graphics {
         for (int row = 0; row < h; row++) {
             uint32_t* p = backbuffer + (y + row) * width + x;
             for (int col = 0; col < w; col++) p[col] = c;
+        }
+    }
+
+    // Bulk blit a w*h RGBX32 (0x00RRGGBB) pixel block into the backbuffer.
+    // Replaces the VNC client's per-pixel put_pixel() loop with a row-wise
+    // copy: no per-pixel virtual call, no per-pixel bounds check, no vtable
+    // indirection. On a 1024x768 full frame this removes ~786k function calls
+    // per frame and is the single biggest client-side speedup.  The source and
+    // backbuffer share the same Color layout (0x00RRGGBB), so no format
+    // conversion is needed -- a straight 32-bit copy is correct.
+    void blit_rect(int x, int y, int w, int h, const uint32_t* src) {
+        if (!src || w <= 0 || h <= 0) return;
+        int sx = 0, sy = 0;                       // left/top clipped columns/rows
+        if (x < 0) { sx = -x; w += x; x = 0; }     // w now = original_w - sx
+        if (y < 0) { sy = -y; h += y; y = 0; }     // h now = original_h - sy
+        if (x + w > (int)width)  w = (int)width  - x;
+        if (y + h > (int)height) h = (int)height - y;
+        if (w <= 0 || h <= 0) return;
+        int src_stride = w + sx;                    // original source row width
+        const uint32_t* row = src + (uint64_t)sy * src_stride + sx;
+        for (int r = 0; r < h; r++) {
+            uint32_t* dst = backbuffer + (uint64_t)(y + r) * width + x;
+            for (int c = 0; c < w; c++) dst[c] = row[c];
+            row += src_stride;
         }
     }
 
@@ -3432,10 +3501,11 @@ struct Win11Window {
     int calc_prev;          // previous operand
     int calc_op;            // 0=none,1=+,2=-,3=*,4=/
     bool calc_new_input;    // true = start new number
-    char term_buf[1024];    // terminal output buffer
+    char term_buf[8192];    // terminal output scrollback buffer
     int term_len;
     char term_input[128];
     int term_input_len;
+    int term_scroll;        // terminal scrollback: lines scrolled up from bottom (0 = follow tail)
     char sel_file[64];      // selected file name in file explorer
     int sel_file_idx;       // selected file index (-1 = none)
     int file_scroll;        // file list scroll offset
@@ -3447,6 +3517,9 @@ struct Win11Window {
     int browser_scroll;     // scroll offset for page content
     int browser_status;     // 0=idle,1=connecting,2=loading,3=done,-1=error
     bool browser_url_focused; // URL bar is focused for input
+
+    // AI Agent panel state
+    bool agent_cloud;       // use cloud API pipeline for the next run
 
     // Undo buffers for text input fields (Ctrl+Z).  -1 == nothing to undo.
     char term_undo[128];
@@ -5040,6 +5113,7 @@ struct Win11Desktop {
             case APP_TERMINAL:        draw_terminal(id, cx, cy, cw, ch); break;
             case APP_ABOUT:           draw_about(id, cx, cy, cw, ch); break;
             case APP_BROWSER:         draw_browser(id, cx, cy, cw, ch); break;
+            case APP_AIAGENT:         draw_agent(id, cx, cy, cw, ch); break;
             case APP_WIN32:           draw_win32_app(id, rx + 2, ry + TITLE_BAR_H + 2,
                                                      rw - 4, rh - TITLE_BAR_H - 4); break;
             case APP_MANAGED: {
@@ -6233,34 +6307,96 @@ struct Win11Desktop {
     }
 
     // ---- Terminal ----
+    // Overflow-safe append: keep only the most recent output in term_buf.
+    // When the buffer would overflow, evict the oldest whole line(s) so the
+    // tail (newest content) is always retained -- this is what makes the
+    // terminal auto-scroll to the latest output instead of freezing on the
+    // oldest screenful.
+    void term_append(Win11Window& w, const char* s) {
+        if (!s) return;
+        int cap = (int)sizeof(w.term_buf) - 2;
+        int need = strlen_(s);
+        while (w.term_len > 0 && w.term_len + need > cap) {
+            // Drop the oldest whole line to make room for the new output.
+            int drop = w.term_len;
+            for (int i = 0; i < w.term_len; i++) {
+                if (w.term_buf[i] == '\n') { drop = i + 1; break; }
+            }
+            // Leftward shift (dest < src) is safe with a simple copy.
+            for (int i = drop; i < w.term_len; i++) w.term_buf[i - drop] = w.term_buf[i];
+            w.term_len -= drop;
+        }
+        int room = cap - w.term_len;
+        if (need > room) need = room;
+        if (need > 0) { memcpy_(w.term_buf + w.term_len, s, need); w.term_len += need; }
+        w.term_buf[w.term_len] = 0;
+    }
+
     void draw_terminal(int id, int x, int y, int w, int h) {
         Win11Window& win = windows[id];
         // Terminal background (black)
         gfx.fill_rect(win.x + 1, win.content_y(), win.w - 2, win.content_h(), 0x0C0C0C);
 
-        // Terminal output (UTF-8 aware)
-        char* p = win.term_buf;
-        int ty = y;
-        int max_lines = h / 16;
-        int line = 0;
-        while (*p && line < max_lines) {
-            char t[160];
-            int ti = 0;
-            while (*p && *p != '\n' && ti < 159) t[ti++] = *p++;
-            t[ti] = 0;
-            if (*p == '\n') p++;
-            gfx.draw_text_utf8_transparent(x, ty, t, 0xCCCCCC);
-            ty += g_font_h;
-            line++;
+        // Demo/recording mode: stream the agent's remote output into this REAL
+        // terminal window instead of the (suppressed) remote-control overlay.
+        if (g_remote_active && g_remote_to_terminal) {
+            int ty = y;
+            // Show the latest command (masked key) as the prompt, then the
+            // streamed output lines (g_remote_out is a 14-line ring scrollback).
+            if (g_remote_cmd[0]) {
+                gfx.draw_text_transparent(x, ty, "> ", 0x00FF66);
+                gfx.draw_text_utf8_transparent(x + 16, ty, g_remote_cmd, 0xCCCCCC);
+                ty += g_font_h;
+            }
+            for (int k = 0; k < 14 && ty - y < win.content_h() - g_font_h; k++) {
+                if (!g_remote_out[k][0]) continue;
+                gfx.draw_text_utf8_transparent(x, ty, g_remote_out[k], 0xCCCCCC);
+                ty += g_font_h;
+            }
+            // Blinking input caret (no live input in demo mode)
+            gfx.fill_rect(x + 4, ty, 8, 16, 0xCCCCCC);
+            return;
         }
 
-        // Input line
-        gfx.draw_text_transparent(x, ty, "> ", 0x00FF66);
-        gfx.draw_text_utf8_transparent(x + 16, ty, win.term_input, 0xCCCCCC);
-        // Cursor (account for CJK width)
-        int cw = utf8_display_width(win.term_input);
-        int cx = x + 16 + cw;
-        gfx.fill_rect(cx, ty, 8, 16, 0xCCCCCC);
+        // Terminal output (UTF-8 aware), auto-scroll to the tail.
+        // The view follows the newest output by default (term_scroll == 0);
+        // scrolling the wheel up sets term_scroll > 0 to review history.
+        int max_lines = h / g_font_h;
+        int total = 0;
+        for (int i = 0; i < win.term_len; i++)
+            if (win.term_buf[i] == '\n') total++;
+        int view_total = total + 1;                 // +1 for the live input line
+        int maxscroll = (view_total > max_lines) ? (view_total - max_lines) : 0;
+        if (win.term_scroll > maxscroll) win.term_scroll = maxscroll;
+        if (win.term_scroll < 0) win.term_scroll = 0;
+        int start_view = view_total - max_lines - win.term_scroll;
+        if (start_view < 0) start_view = 0;
+        int end_view = start_view + max_lines;       // exclusive upper bound
+
+        // Render the visible output lines, then the live input line.
+        const char* p = win.term_buf;
+        int cur = 0, ty = y;
+        while (*p && cur < total) {
+            char t[200];
+            int ti = 0;
+            while (*p && *p != '\n' && ti < 199) t[ti++] = *p++;
+            t[ti] = 0;
+            if (*p == '\n') p++;
+            if (cur >= start_view && cur < end_view) {
+                gfx.draw_text_utf8_transparent(x, ty, t, 0xCCCCCC);
+                ty += g_font_h;
+            }
+            cur++;
+        }
+        // Live input line (only when it falls inside the viewport).
+        if (total < end_view) {
+            gfx.draw_text_transparent(x, ty, "> ", 0x00FF66);
+            gfx.draw_text_utf8_transparent(x + 16, ty, win.term_input, 0xCCCCCC);
+            int cw = utf8_display_width(win.term_input);
+            int cx = x + 16 + cw;
+            gfx.fill_rect(cx, ty, 8, 16, 0xCCCCCC);
+            ty += g_font_h;
+        }
 
         // ---- IME candidate bar (drawn just above the input line, inside window) ----
         if (g_ime_active && g_ime_cand_count > 0) {
@@ -6331,6 +6467,114 @@ struct Win11Desktop {
             gfx.draw_text_transparent(ccx, by + 6, num, 0xFFCC00);
             gfx.draw_cjk_transparent(ccx + 10, by + 5, (uint32_t)g_ime_cands[i], 0xFFFFFF);
             ccx += 34;
+        }
+    }
+
+
+    // ---- Helper: AI Agent panel button geometry (shared with click handler) ----
+    void agent_rects(int x, int y, int w, int h, int idx,
+                    int& bx, int& by, int& bw, int& bh) const {
+        int headH = 22, pad = 8;
+        int out_y = y + headH + 4;
+        int out_h = h - headH - 4 - 92;          // bottom strip reserved
+        if (out_h < 40) out_h = 40;
+        int bww = (w - pad * 5) / 4;
+        bx = x + pad + idx * (bww + pad);
+        by = out_y + out_h + 6;
+        bw = bww; bh = 26;
+    }
+
+    // ---- AI Agent output panel ----
+    // Renders the agent's activity trace (plan -> tool -> result), an input
+    // box, and Run / Cloud / Abort / Clear buttons.  The trace is fed by
+    // agent_trace_get() (ai_engine.cpp) so the panel shows exactly what the
+    // agent did, not just the final answer.
+    void draw_agent(int id, int x, int y, int w, int h) {
+        Win11Window& win = windows[id];
+        int pad = 8, headH = 22;
+        // Header
+        gfx.draw_text(x, y, "AI Agent  -  plan / tools / cloud", C_BTN_TEXT, COLOR_WHITE);
+        int out_y = y + headH + 4;
+        int out_h = h - headH - 4 - 92;
+        if (out_h < 40) out_h = 40;
+
+        // Output (trace) area
+        gfx.fill_rect(x, out_y, w, out_h, 0x0E0E16);
+        gfx.draw_rounded_rect(x, out_y, w, out_h, 4, C_BTN_BORDER);
+        static char trace[4096];
+        agent_trace_get(trace, (int)sizeof(trace));
+        // Count lines, then show the last `maxl` that fit (scroll to bottom).
+        int nlines = 1;
+        for (int i = 0; trace[i]; i++) if (trace[i] == '\n') nlines++;
+        const int lh = 16;
+        int maxl = out_h / lh;
+        int first = (nlines > maxl) ? nlines - maxl : 0;
+        int li = 0, ly = out_y + 4;
+        const char* p = trace;
+        int maxchars = (w - 12) / g_font_w;
+        while (*p) {
+            if (li < first) {
+                while (*p && *p != '\n') p++;
+                if (*p == '\n') p++;
+                li++;
+                continue;
+            }
+            char line[160]; int lc = 0;
+            while (*p && *p != '\n' && lc < maxchars && lc < 159) line[lc++] = *p++;
+            line[lc] = 0;
+            gfx.draw_text(x + 6, ly, line, COLOR_WHITE, 0x0E0E16);
+            if (*p == '\n') p++;
+            li++; ly += lh;
+            if (ly > out_y + out_h - lh) break;
+        }
+
+        // Buttons row (geometry mirrored in handle_app_click via agent_rects)
+        int by = out_y + out_h + 6;
+        int bw = (w - pad * 5) / 4;
+        draw_action_button(x + pad + 0 * (bw + pad), by, bw, 26, "Run", false, win);
+        draw_action_button(x + pad + 1 * (bw + pad), by, bw, 26,
+                          win.agent_cloud ? "Cloud:ON" : "Cloud:OFF", win.agent_cloud, win);
+        draw_action_button(x + pad + 2 * (bw + pad), by, bw, 26, "Abort", false, win);
+        draw_action_button(x + pad + 3 * (bw + pad), by, bw, 26, "Clear", false, win);
+
+        // Input box
+        int iy = by + 26 + 6;
+        gfx.fill_rect(x, iy, w, 24, 0x0A0A12);
+        gfx.draw_rounded_rect(x, iy, w, 24, 4, C_BTN_BORDER);
+        gfx.draw_text(x + 6, iy + 5, win.term_input, C_BTN_TEXT, 0x0A0A12);
+        // Solid caret at end of input
+        int cw = utf8_display_width(win.term_input) * g_font_w;
+        gfx.draw_rect(x + 6 + cw, iy + 4, 2, 16, COLOR_WHITE);
+        // Hint
+        gfx.draw_text(x, iy + 28,
+                      "!cmd=shell   goal=agent   plugin:/shell:=tools",
+                      C_BTN_TEXT, COLOR_WHITE);
+    }
+
+
+    // Submit the agent panel input.  A leading '!' runs a NexOS shell command
+    // through the kernel shell (g_cb.exec_command captures the output); any
+    // other text is a goal handed to agent_dispatch(), which uses the cloud
+    // pipeline when the Cloud toggle is on, otherwise the local ReAct agent
+    // (which may in turn call plugins / Linux commands).  All activity lands in
+    // the shared trace the panel renders.
+    void gui_agent_submit(Win11Window& win) {
+        if (win.term_input_len <= 0) return;
+        char goal[256]; int n = 0;
+        for (int i = 0; i < win.term_input_len && n < 255; i++) goal[n++] = win.term_input[i];
+        goal[n] = 0;
+        win.term_input_len = 0; win.term_input[0] = 0;
+        if (goal[0] == '!') {
+            const char* cmd = goal + 1;
+            while (*cmd == ' ') cmd++;
+            agent_trace_log("shell", cmd);
+            static char out[2048];
+            if (g_cb.exec_command) g_cb.exec_command(cmd, out, (int)sizeof(out));
+            else { out[0] = 0; }
+            agent_trace_log("out", out[0] ? out : "(no output)");
+        } else {
+            static char out[6000];
+            agent_dispatch(goal, out, (int)sizeof(out), win.agent_cloud ? 1 : 0);
         }
     }
 
@@ -7949,16 +8193,31 @@ struct Win11Desktop {
         for (int i = window_count - 1; i >= 0; i--) {
             Win11Window& w = windows[i];
             if (!w.visible || w.minimized) continue;
-            if (w.app != APP_MANAGED) continue;
             if (!w.contains(mouse_x, mouse_y)) continue;
-            int mh = w.h - TITLE_BAR_H;
-            int maxy = w.scroll_ch - mh;
-            if (maxy <= 0) return;                 // nothing overflows
-            w.scroll_y -= dz * 28;
-            if (w.scroll_y < 0) w.scroll_y = 0;
-            if (w.scroll_y > maxy) w.scroll_y = maxy;
-            render_all();
-            return;
+            if (w.app == APP_MANAGED) {
+                int mh = w.h - TITLE_BAR_H;
+                int maxy = w.scroll_ch - mh;
+                if (maxy <= 0) return;                 // nothing overflows
+                w.scroll_y -= dz * 28;
+                if (w.scroll_y < 0) w.scroll_y = 0;
+                if (w.scroll_y > maxy) w.scroll_y = maxy;
+                render_all();
+                return;
+            } else if (w.app == APP_TERMINAL) {
+                // dz > 0 = wheel up -> reveal older lines (scroll up).
+                int mh = w.h - TITLE_BAR_H;
+                int max_lines = mh / g_font_h;
+                int total = 0;
+                for (int k = 0; k < w.term_len; k++)
+                    if (w.term_buf[k] == '\n') total++;
+                int view_total = total + 1;
+                int maxscroll = view_total > max_lines ? view_total - max_lines : 0;
+                w.term_scroll += dz;
+                if (w.term_scroll < 0) w.term_scroll = 0;
+                if (w.term_scroll > maxscroll) w.term_scroll = maxscroll;
+                render_all();
+                return;
+            }
         }
     }
 
@@ -8282,6 +8541,21 @@ struct Win11Desktop {
             // Clickable hyperlink
             char href[256];
             if (browser::hit_link(mouse_x, mouse_y, href)) { browser::navigate(browser::g_active, href); return; }
+        }
+        else if (win.app == APP_AIAGENT) {
+            // Run / Cloud / Abort / Clear buttons (geometry from agent_rects).
+            int bx, by, bw, bh;
+            for (int i = 0; i < 4; i++) {
+                agent_rects(x, y, w, h, i, bx, by, bw, bh);
+                if (mouse_x >= bx && mouse_x < bx + bw &&
+                    mouse_y >= by && mouse_y < by + bh) {
+                    if      (i == 0) gui_agent_submit(win);          // Run
+                    else if (i == 1) win.agent_cloud = !win.agent_cloud; // Cloud toggle
+                    else if (i == 2) agent_abort();                   // Abort
+                    else             agent_trace_reset();             // Clear
+                    return;
+                }
+            }
         }
     }
 
@@ -8607,7 +8881,11 @@ struct Win11Desktop {
         // The whole point of the managed shell: these windows are painted
         // and driven entirely by NexOS.Forms.  Fall back to the legacy
         // native drawer only if the shell failed to load.
-        int mkind = managed_kind_for(app);
+        // APP_AIAGENT is forced to the native drawer: its managed Kind.AiAgent
+        // form faults inside the CLR (Shell::Open(10)), and a CLR fault there
+        // takes the whole managed desktop paint down with it -> black screen.
+        // The native draw_agent renderer is complete (trace / buttons / input).
+        int mkind = (app == APP_AIAGENT) ? -1 : managed_kind_for(app);
         if (mkind >= 0 && mforms_ready()) {
             int mid = mforms_open(mkind);
             if (mid >= 0) {
@@ -8629,6 +8907,17 @@ struct Win11Desktop {
                     for (int j = 0; j < window_count; j++) windows[j].active = false;
                     windows[wid].active = true;
                     active_window = wid;
+                    // Apply the one-shot demo prefill (boot flag 0x5020) to the
+                    // AI Agent goal box so the auto-opened desktop shows a
+                    // ready-to-run goal.
+                    if (app == APP_AIAGENT && g_agent_prefill) {
+                        int pl = 0;
+                        while (g_agent_prefill[pl] && pl < 255)
+                            windows[wid].term_input[pl] = g_agent_prefill[pl], pl++;
+                        windows[wid].term_input_len = pl;
+                        windows[wid].term_input[pl] = 0;
+                        g_agent_prefill = 0;
+                    }
                 }
                 return;
             }
@@ -8644,6 +8933,18 @@ struct Win11Desktop {
             Win11Window& win = windows[id];
             strcpy_(win.term_buf, "NexOS Terminal v2.0\nType 'help' for commands.\n\n");
             win.term_len = strlen_(win.term_buf);
+            win.term_scroll = 0;
+        }
+        // AI Agent native window: apply the one-shot demo prefill (boot flag
+        // 0x5020).  The managed branch above handles the (now-disabled) managed
+        // path; APP_AIAGENT is forced native, so it must be applied here too.
+        if (id >= 0 && app == APP_AIAGENT && g_agent_prefill) {
+            int pl = 0;
+            while (g_agent_prefill[pl] && pl < 255)
+                windows[id].term_input[pl] = g_agent_prefill[pl], pl++;
+            windows[id].term_input_len = pl;
+            windows[id].term_input[pl] = 0;
+            g_agent_prefill = 0;
         }
     }
 
@@ -9010,38 +9311,68 @@ struct Win11Desktop {
             }
             if (ch == '\n' || ch == 0x0D) { // Enter
                 if (win.term_input_len > 0) {
-                    // Add command to output
-                    win.term_buf[win.term_len++] = '>';
-                    for (int i = 0; i < win.term_input_len; i++)
-                        win.term_buf[win.term_len++] = win.term_input[i];
-                    win.term_buf[win.term_len++] = '\n';
+                    // Echo the command line into the scrollback buffer.
+                    char echo[200];
+                    int ek = 0;
+                    echo[ek++] = '>';
+                    for (int i = 0; i < win.term_input_len && ek < 199; i++)
+                        echo[ek++] = win.term_input[i];
+                    echo[ek++] = '\n';
+                    echo[ek] = 0;
+                    term_append(win, echo);
 
                     // Execute command via kernel callback (full shell)
                     if (g_cb.exec_command) {
                         static char cmd_out[2048];
                         g_cb.exec_command(win.term_input, cmd_out, sizeof(cmd_out));
-                        // Append output to terminal buffer
-                        for (int i = 0; cmd_out[i] && win.term_len < (int)sizeof(win.term_buf) - 2; i++)
-                            win.term_buf[win.term_len++] = cmd_out[i];
+                        term_append(win, cmd_out);   // overflow-safe append
                     } else {
                         // Fallback: simple built-in commands
                         if (strcmp_(win.term_input, "help") == 0) {
-                            const char* msg = "Commands: help, mem, clear, exit, ls, cat, etc.\nFull shell commands available.\n";
-                            while (*msg) win.term_buf[win.term_len++] = *msg++;
+                            term_append(win, "Commands: help, mem, clear, exit, ls, cat, etc.\nFull shell commands available.\n");
                         } else if (strcmp_(win.term_input, "clear") == 0) {
                             win.term_len = 0;
                             win.term_buf[0] = 0;
                         } else if (strcmp_(win.term_input, "exit") == 0) {
                             close_window(active_window);
                         } else {
-                            const char* msg = "Shell not available. Try: help\n";
-                            while (*msg) win.term_buf[win.term_len++] = *msg++;
+                            term_append(win, "Shell not available. Try: help\n");
                         }
                     }
-                    win.term_buf[win.term_len] = 0;
+                    // New output arrived: jump back to the tail (auto-scroll).
+                    win.term_scroll = 0;
                     win.term_input_len = 0;
                     win.term_input[0] = 0;
                 }
+                render_all();
+                return true;
+            } else if (ch == 0x08) { // Backspace
+                if (win.term_input_len > 0) {
+                    memcpy_(win.term_undo, win.term_input, 128);
+                    win.term_undo_len = win.term_input_len;
+                    win.term_input_len--;
+                    win.term_input[win.term_input_len] = 0;
+                    render_all();
+                }
+                return true;
+            } else if (ch >= 32 && ch < 127 && win.term_input_len < 126) {
+                memcpy_(win.term_undo, win.term_input, 128);
+                win.term_undo_len = win.term_input_len;
+                win.term_input[win.term_input_len++] = ch;
+                win.term_input[win.term_input_len] = 0;
+                render_all();
+                return true;
+            }
+        }
+        // Handle AI Agent panel input (reuses the window's term_input field).
+        else if (active_window >= 0 && windows[active_window].app == APP_AIAGENT) {
+            Win11Window& win = windows[active_window];
+            if (ime_route(ch, win.term_input, &win.term_input_len, 127)) {
+                render_all();
+                return true;
+            }
+            if (ch == '\n' || ch == 0x0D) { // Enter -> submit goal / command
+                gui_agent_submit(win);
                 render_all();
                 return true;
             } else if (ch == 0x08) { // Backspace
@@ -9401,32 +9732,44 @@ static bool tex_load_one(int id, const char* file) {
     if (t.loaded) return true;
     t.loaded = false; t.data = 0; t.w = t.h = 0; t.fmt = 0;
     if (!g_cb.read_file) return false;
-    const int kMaxFile = 2 * 1024 * 1024;
-    uint8_t* buf = (uint8_t*)kmalloc(kMaxFile);
-    if (!buf) return false;
-    int n = g_cb.read_file(1, file, buf, kMaxFile);
-    if (n >= 24 && buf[0] == 'T' && buf[1] == 'E' && buf[2] == 'X' && buf[3] == '1') {
-        const uint8_t* p = buf + 4;
+
+    // Read the 24-byte header first, then allocate exactly the pixel payload.
+    // The obvious `kmalloc(2 MiB)` up front cost that much *per texture*
+    // (tex_load_all walks five of them) at a moment when the heap is also
+    // fighting the 3.5 MiB backbuffer -- with a small heap every texture
+    // load failed on a request far larger than the file, and the boot log
+    // filled with "[HEAP] OOM: request 00200000".  The header is all we
+    // need to size the real buffer.
+    const int kHdr = 24;
+    uint8_t hdr[kHdr];
+    int nh = g_cb.read_file(1, file, hdr, kHdr);
+    if (nh < kHdr || hdr[0] != 'T' || hdr[1] != 'E' || hdr[2] != 'X' || hdr[3] != '1')
+        goto fail;
+
+    {
+        const uint8_t* p = hdr + 4;
         uint32_t ver   = tex_rd32(p); p += 4;
         uint32_t w     = tex_rd32(p); p += 4;
         uint32_t h     = tex_rd32(p); p += 4;
         uint32_t fmt   = tex_rd32(p); p += 4;
         uint32_t bytes = tex_rd32(p); p += 4;
-        if (ver == 1 && w > 0 && h > 0 && w <= 4096 && h <= 4096 &&
-            fmt <= 1 && bytes <= (uint32_t)n - 24) {
-            uint8_t* data = (uint8_t*)kmalloc(bytes ? bytes : 1);
-            if (data) {
-                for (uint32_t i = 0; i < bytes; i++) data[i] = p[i];
-                t.w = (uint16_t)w; t.h = (uint16_t)h; t.fmt = (uint8_t)fmt;
-                t.data = data; t.loaded = true;
-            }
-        }
+        if (ver != 1 || w == 0 || h == 0 || w > 4096 || h > 4096 || fmt > 1)
+            goto fail;
+
+        // One buffer sized to the payload, read straight into it.
+        uint8_t* data = (uint8_t*)kmalloc(bytes ? bytes : 1);
+        if (!data) goto fail;
+        int got = g_cb.read_file(1, file, data, (int)bytes);
+        if (got != (int)bytes) { kfree(data); goto fail; }
+
+        t.w = (uint16_t)w; t.h = (uint16_t)h; t.fmt = (uint8_t)fmt;
+        t.data = data; t.loaded = true;
     }
-    kfree(buf);
-    if (!t.loaded) {
-        serial_puts("[TEX] load failed: "); serial_puts(file); serial_puts("\n");
-    }
-    return t.loaded;
+    return true;
+
+fail:
+    serial_puts("[TEX] load failed: "); serial_puts(file); serial_puts("\n");
+    return false;
 }
 
 static void tex_load_all(void) {
@@ -9695,6 +10038,32 @@ int gui_init(void) {
 }
 
 extern "C" void gui_set_startup_app(int id) { g_startup_app_id = id; }
+
+// True iff an AI Agent window is currently on screen.  Lets the background
+// agent run avoid forcing repaints when nobody is watching (e.g. a serial /
+// recording session that drives the agent but never opens the panel).
+extern "C" int gui_agent_window_open(void) {
+    for (int i = 0; i < g_wm.window_count; i++) {
+        if (g_wm.windows[i].visible && g_wm.windows[i].app == APP_AIAGENT)
+            return 1;
+    }
+    return 0;
+}
+
+// One-shot prefill for the AI Agent input box (set by boot flag 0x5020 before
+// the window exists, applied the moment launch_app() creates it).  Lets the
+// auto-open desktop demo show a ready-to-run goal instead of an empty field.
+// (g_agent_prefill itself is declared at the top of this file.)
+extern "C" void gui_agent_prefill(const char* goal) { g_agent_prefill = goal; }
+
+// Force a synchronous repaint of the whole desktop.  Used by the AI Agent
+// panel's background agent run so its trace area streams live instead of
+// freezing until the whole run finishes.  Safe to call from any context: it
+// early-returns once gui_exit() has dropped gui_mode, and it is the exact
+// render entry point the remote-control sink already calls per output line.
+extern "C" void gui_agent_redraw(void) {
+    if (g_wm.gui_mode && gui_agent_window_open()) g_wm.render_all();
+}
 extern "C" int  gui_app_browser_id(void) { return (int)APP_BROWSER; }
 
 // Resolve a startup-app keyword to an AppType index, or -1 if unknown.
@@ -9764,6 +10133,14 @@ extern "C" void nexos_fb_query(struct NexosFBInfo* out) {
 
 int gui_available(void) {
     return g_wm.gfx.initialized ? 1 : 0;
+}
+
+// C entry point for the bulk-blit service used by the VNC client plugin.
+// Mirrors the nexos.gui.api vtable's put_pixel but copies a whole rectangle
+// at once instead of one pixel per call.
+extern "C" void gui_blit_pixels(int x, int y, int w, int h, const uint32_t* src) {
+    if (!g_wm.gfx.initialized) return;
+    g_wm.gfx.blit_rect(x, y, w, h, src);
 }
 
 #ifdef FB_DIAG
@@ -10402,6 +10779,70 @@ static void remote_log_push(const char* cmd) {
     }
 }
 
+// Push one finished OUTPUT line into the overlay's output ring.
+static void remote_out_push(const char* s) {
+    if (g_remote_out_n < 14) {
+        int i = 0; while (s[i] && i < 126) g_remote_out[g_remote_out_n][i] = s[i], i++;
+        g_remote_out[g_remote_out_n][i] = 0; g_remote_out_n++;
+    } else {
+        for (int k = 0; k < 13; k++) {
+            int j = 0; while (g_remote_out[k+1][j] && j < 126) g_remote_out[k][j] = g_remote_out[k+1][j], j++;
+            g_remote_out[k][j] = 0;
+        }
+        int i = 0; while (s[i] && i < 126) g_remote_out[13][i] = s[i], i++;
+        g_remote_out[13][i] = 0;
+    }
+}
+
+// Append command OUTPUT (streamed through the terminal sink while a remote
+// command executes) to the remote-control overlay, so an observer watching
+// the machine sees not only the command but also what it actually did.
+extern "C" void gui_remote_output(const char* s, int n) {
+    if (!s || n <= 0) return;
+    bool pushed = false;
+    for (int i = 0; i < n; i++) {
+        char c = s[i];
+        if (c == '\n') {
+            if (g_remote_li == 0) {
+                // Stream contained a blank line.  Rendering it as a real empty
+                // line made the panel look like "one char, blank, one char...".
+                // Push a visible newline symbol (↵, U+21B5) so an empty line is
+                // still obvious instead of an invisible gap.
+                remote_out_push("\xE2\x86\xB5");
+            } else {
+                g_remote_line[g_remote_li] = 0; remote_out_push(g_remote_line);
+            }
+            g_remote_li = 0; pushed = true;
+        } else if (c == '\r') {
+            // ignore carriage returns
+        } else if (g_remote_li < 126) {
+            g_remote_line[g_remote_li++] = c;
+        } else {
+            g_remote_line[g_remote_li] = 0; remote_out_push(g_remote_line); g_remote_li = 0; pushed = true;
+            g_remote_line[g_remote_li++] = c;
+        }
+    }
+    // NOTE: no flush here.  The sink is called once per character, so a flush
+    // at the end of every call would push each character as its own row.
+    // The pending partial line is flushed on '\n', when the buffer fills, or
+    // by gui_remote_end() when the remote session finishes.
+    if (pushed && g_wm.gui_mode) g_wm.render_all();
+}
+
+// Mask secrets before echoing a remote command on screen: any "key <token>"
+// has its token replaced with '*' so API keys never appear in the overlay
+// (or in a recording of it).
+static void remote_mask_secrets(char* s) {
+    for (int i = 0; s[i]; i++) {
+        if (s[i]=='k' && s[i+1]=='e' && s[i+2]=='y' && (s[i+3]==' '||s[i+3]=='\t')) {
+            int j = i + 4;
+            while (s[j]==' '||s[j]=='\t') j++;
+            while (s[j] && s[j]!=' ' && s[j]!='\t') { s[j] = '*'; j++; }
+            i = j - 1;
+        }
+    }
+}
+
 extern "C" void gui_remote_begin(const char* who) {
     g_remote_active = true;
     int i = 0;
@@ -10412,13 +10853,24 @@ extern "C" void gui_remote_begin(const char* who) {
 extern "C" void gui_remote_cmd(const char* cmd) {
     if (!cmd) return;
     g_remote_active = true;
-    int i = 0; while (cmd[i] && i < 511) g_remote_cmd[i] = cmd[i], i++;
+    char masked[512];
+    int mi = 0;
+    while (cmd[mi] && mi < 510) { masked[mi] = cmd[mi]; mi++; }
+    masked[mi] = 0;
+    remote_mask_secrets(masked);
+    int i = 0; while (masked[i] && i < 511) g_remote_cmd[i] = masked[i], i++;
     g_remote_cmd[i] = 0;
-    remote_log_push(cmd);
+    remote_log_push(masked);
     if (g_wm.gui_mode) g_wm.render_all();   // pop the panel immediately
 }
 
 extern "C" void gui_remote_end(void) {
+    // Flush any pending partial line so the last output row is not lost.
+    if (g_remote_li > 0) {
+        g_remote_line[g_remote_li] = 0;
+        remote_out_push(g_remote_line);
+        g_remote_li = 0;
+    }
     g_remote_active = false;
     // The guard drew an opaque full-screen overlay into the backbuffer, so the
     // cached managed desktop layer behind it is now stale.  With perf_opt=1 the
@@ -10428,8 +10880,18 @@ extern "C" void gui_remote_end(void) {
     g_desk_needs_full = true;
 }
 
+// Enable/disable demo mode: route remote (agent) output into the real terminal
+// window instead of the full-screen remote-control overlay.  Set by the kernel
+// when it auto-opens the Terminal for recording (boot flag 0x501F).
+extern "C" void gui_set_remote_to_terminal(int v) {
+    g_remote_to_terminal = (v != 0);
+}
+
 void draw_remote_guard(void) {
     if (!g_remote_active) return;
+    // Demo/recording: when output is being streamed into the real terminal
+    // window, suppress the full-screen overlay so the genuine desktop shows.
+    if (g_remote_to_terminal) return;
     int W = g_wm.gfx.width, H = g_wm.gfx.height;
 
     // Opaque full-screen backdrop
@@ -10455,22 +10917,24 @@ void draw_remote_guard(void) {
     src[sl] = 0;
     g_wm.gfx.draw_text_utf8(16, ay + 42, src, 0xFFB0B0, 0x7A1020);
 
-    // Command panel (center): instructions sent by the controller
+    // Command panel (upper half): instructions sent by the controller
     int pan_x = 40, pan_y = ay + ALERT_H + 24, pan_w = W - 80;
     int pan_h = H - pan_y - 130;
     if (pan_h < 90) pan_h = 90;
-    g_wm.gfx.fill_rect(pan_x, pan_y, pan_w, pan_h, 0x141A24);
+    int cmd_h = pan_h * 4 / 10;
+    if (cmd_h < 100) cmd_h = 100;
+    g_wm.gfx.fill_rect(pan_x, pan_y, pan_w, cmd_h, 0x141A24);
     g_wm.gfx.draw_line(pan_x, pan_y, pan_x + pan_w, pan_y, 0x2E6FB5);
     g_wm.gfx.draw_text_utf8(pan_x + 12, pan_y + 10, "远程控制者发来的指令:", 0x8FD0FF, 0x141A24);
 
     int lh = 22;
-    int max_lines = pan_h / lh - 1;
+    int max_lines = cmd_h / lh - 1;
     if (max_lines < 1) max_lines = 1;
     int start = (g_remote_log_n > max_lines) ? g_remote_log_n - max_lines : 0;
     int ly = pan_y + 40;
     int maxc = pan_w / 8 - 6;
     if (maxc < 8) maxc = 8;
-    for (int k = start; k < g_remote_log_n && ly < pan_y + pan_h - lh; k++) {
+    for (int k = start; k < g_remote_log_n && ly < pan_y + cmd_h - lh; k++) {
         char line[320];
         int li = 0;
         line[li++] = '>'; line[li++] = ' ';
@@ -10479,6 +10943,28 @@ void draw_remote_guard(void) {
         line[li] = 0;
         g_wm.gfx.draw_text_utf8(pan_x + 16, ly, line, 0xE6F0FF, 0x141A24);
         ly += lh;
+    }
+
+    // Output panel (lower half): what the machine actually did, streamed
+    // through the terminal sink while each remote command executed.
+    int out_y = pan_y + cmd_h + 14;
+    int out_h = pan_y + pan_h - out_y;
+    if (out_h < 90) out_h = 90;
+    g_wm.gfx.fill_rect(pan_x, out_y, pan_w, out_h, 0x101820);
+    g_wm.gfx.draw_line(pan_x, out_y, pan_x + pan_w, out_y, 0x2FBF71);
+    g_wm.gfx.draw_text_utf8(pan_x + 12, out_y + 10, "NexOS 执行输出:", 0x9FE8C0, 0x101820);
+    int omax = out_h / lh - 1;
+    if (omax < 1) omax = 1;
+    int ostart = (g_remote_out_n > omax) ? g_remote_out_n - omax : 0;
+    int oy = out_y + 40;
+    for (int k = ostart; k < g_remote_out_n && oy < out_y + out_h - lh; k++) {
+        char line[320];
+        int li = 0;
+        const char* c = g_remote_out[k];
+        for (int q = 0; c[q] && li < maxc && li < 319; ) line[li++] = c[q++];
+        line[li] = 0;
+        g_wm.gfx.draw_text_utf8(pan_x + 16, oy, line, 0xC9E8D8, 0x101820);
+        oy += lh;
     }
 
     // "缁撴潫鎺у埗" button (centered, bottom)

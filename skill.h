@@ -34,6 +34,6 @@ void agent_skill_list(char* out, int outsz);
 
 // Kernel-side bridge: create/overwrite a file on the writable MKFS volume.
 //   returns >=0 on success (bytes written), <0 on error (e.g. -2 not mounted)
-int  kern_fs_create(const char* name, const unsigned char* data, int len);
+extern "C" int kern_fs_create(const char* name, const unsigned char* data, int len);
 
 #endif // NEXOS_SKILL_H

@@ -30,6 +30,9 @@ extern "C" void  kfree(void* ptr);
 
 /* ---- GUI backend (cached after vnc_init) ------------------------------ */
 static const NexosGuiAPI* g_gui_api = 0;
+/* Bulk-blit service "gui.blit_pixels" (set in vnc_init).  When present we
+ * copy a whole rectangle per call instead of one put_pixel() at a time. */
+static svc_fn g_blit_svc = 0;
 
 /* ---- freestanding helpers (no libc) ----------------------------------- */
 static int my_strlen(const char* s){ int n=0; while(s[n]) n++; return n; }
@@ -266,12 +269,19 @@ static int vnc_send_prefs(void) {
     fmt[17] = fmt[18] = fmt[19] = 0;
     vnc_write_all(fmt, 20);
 
-    /* Set Encodings (only Raw — we blit pixel-for-pixel) */
-    uint8_t enc[8];
+    /* Set Encodings: Hextile + RRE, with Raw as the guaranteed fallback.
+     * We deliberately do NOT request Zlib(6)/Tight(7): the kernel has no
+     * zlib/inflate and cannot decode them.  Negotiating an efficient encoding
+     * is the client-side half of fixing the "Raw-only" bandwidth blow-up
+     * documented in docs/PERFORMANCE.md (stage 3). */
+    uint8_t enc[4 + 3 * 4];
     enc[0] = VNC_SET_ENCODINGS;
-    enc[1] = enc[2] = 0; enc[3] = 1;  /* count = 1 (Raw) */
-    enc[4] = enc[5] = enc[6] = 0; enc[7] = VNC_ENC_RAW;
-    vnc_write_all(enc, 8);
+    enc[1] = enc[2] = 0;
+    enc[3] = 3;                         /* count = 3 */
+    enc[4]  = enc[5]  = enc[6]  = 0; enc[7]  = VNC_ENC_HEXTILE;  /* pref 1 */
+    enc[8]  = enc[9]  = enc[10] = 0; enc[11] = VNC_ENC_RRE;      /* pref 2 */
+    enc[12] = enc[13] = enc[14] = 0; enc[15] = VNC_ENC_RAW;      /* fallback */
+    vnc_write_all(enc, sizeof(enc));
 
     return 0;
 }
@@ -314,11 +324,26 @@ static int vnc_send_key(uint8_t down, uint32_t keysym) {
  * buf layout: Raw RFB pixel data as configured by SetPixelFormat:
  *   bpp=32, depth=24, big_endian=0, red_shift=16, green_shift=8, blue_shift=0
  * => each pixel is 4 bytes little-endian, read as uint32 = 0x00RRGGBB,
- *    which matches NexOS Color (ARGB, A=0 opaque). Direct put_pixel.      */
+ *    which matches NexOS Color (ARGB, A=0 opaque).
+ *
+ * Fast path: when the "gui.blit_pixels" service is available we copy the whole
+ * rectangle per call (a row-wise 32-bit copy into the backbuffer).  Fallback:
+ * when that service is absent we fall back to one put_pixel() per pixel so the
+ * plugin still works against older GUI builds.                      */
+struct VncBlitArgs { int x, y, w, h; const uint32_t* pixels; };
 static void vnc_blit_raw(uint16_t x_start, uint16_t y_start,
                          uint16_t w, uint16_t h, const uint8_t* buf) {
+    const uint32_t* pixels = (const uint32_t*)buf;
+    if (g_blit_svc) {
+        VncBlitArgs a;
+        a.x = (int)x_start; a.y = (int)y_start;
+        a.w = (int)w; a.h = (int)h;
+        a.pixels = pixels;
+        g_blit_svc(&a, 0, 0);
+        return;
+    }
+    /* Fallback: per-pixel (older GUI without gui.blit_pixels). */
     if (!g_gui_api || !g_gui_api->put_pixel) return;
-    const Color* pixels = (const Color*)buf;
     for (uint16_t yy = 0; yy < h; yy++) {
         for (uint16_t xx = 0; xx < w; xx++) {
             g_gui_api->put_pixel((int)(x_start + xx),
@@ -328,27 +353,116 @@ static void vnc_blit_raw(uint16_t x_start, uint16_t y_start,
     }
 }
 
+/* ---- pixel / fill helpers (stage-3 decode support) --------------------
+ * vnc_read_pixel() reconstructs a 32-bit Color the SAME way the Raw path does
+ * (direct little-endian cast of the 4 wire bytes), so RRE/Hextile fills stay
+ * colour-consistent with Raw blits.  vnc_fill_rect() paints a solid rectangle
+ * through the GUI vtable (same backbuffer the blit writes).                */
+static uint32_t vnc_read_pixel(void) {
+    uint8_t b[4];
+    if (vnc_read_exact(b, 4) != 0) return 0;
+    return ((uint32_t)b[0]) | ((uint32_t)b[1] << 8) |
+           ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+static void vnc_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color) {
+    if (g_gui_api && g_gui_api->fill_rect)
+        g_gui_api->fill_rect((int)x, (int)y, (int)w, (int)h, (Color)color);
+}
+
+/* RRE (rise-and-run-length): one background fill + N solid sub-rectangles. */
+static int vnc_decode_rre(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+    uint32_t bg = vnc_read_pixel();
+    uint8_t nbuf[4];
+    if (vnc_read_exact(nbuf, 4) != 0) return -1;
+    uint32_t n = ((uint32_t)nbuf[0] << 24) | ((uint32_t)nbuf[1] << 16) |
+                 ((uint32_t)nbuf[2] << 8) | (uint32_t)nbuf[3];
+    vnc_fill_rect(x, y, w, h, bg);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t pix = vnc_read_pixel();
+        uint8_t s[8];
+        if (vnc_read_exact(s, 8) != 0) return -1;
+        uint16_t rx = (uint16_t)(((uint16_t)s[0] << 8) | s[1]);
+        uint16_t ry = (uint16_t)(((uint16_t)s[2] << 8) | s[3]);
+        uint16_t rw = (uint16_t)(((uint16_t)s[4] << 8) | s[5]);
+        uint16_t rh = (uint16_t)(((uint16_t)s[6] << 8) | s[7]);
+        vnc_fill_rect((uint16_t)(x + rx), (uint16_t)(y + ry), rw, rh, pix);
+    }
+    return 0;
+}
+
+/* Hextile: 16x16 tiles, each optionally Raw / bg / fg / coloured sub-rects. */
+static int vnc_decode_hextile(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+    uint32_t bg = 0, fg = 0;               /* persist across tiles */
+    uint16_t tx = 0;
+    while (tx < w) {
+        uint16_t tw = (w - tx > 16) ? 16 : (uint16_t)(w - tx);
+        uint16_t ty = 0;
+        while (ty < h) {
+            uint16_t th = (h - ty > 16) ? 16 : (uint16_t)(h - ty);
+            uint8_t mask;
+            if (vnc_read_exact(&mask, 1) != 0) return -1;
+            if (mask & 0x01) {             /* Raw tile */
+                int n = (int)tw * (int)th * 4;
+                uint8_t* buf = (uint8_t*)kmalloc((uint32_t)n);
+                if (!buf) return -1;
+                int rem = n;
+                while (rem > 0) {
+                    int c = rem > 4096 ? 4096 : rem;
+                    if (vnc_read_exact(buf + (n - rem), c) != 0) { kfree(buf); return -1; }
+                    rem -= c;
+                }
+                vnc_blit_raw((uint16_t)(x + tx), (uint16_t)(y + ty), tw, th, buf);
+                kfree(buf);
+                ty += 16;
+                continue;
+            }
+            if (mask & 0x02) bg = vnc_read_pixel();   /* BackgroundSpecified */
+            if (mask & 0x04) fg = vnc_read_pixel();   /* ForegroundSpecified */
+            /* RFB 3.8 §6.5.6: the ENTIRE tile is painted with the background
+               colour first (bg persists across tiles when BackgroundSpecified
+               is clear), then subrectangles are drawn on top. Skipping the
+               fill when subrects are present would leave stale pixels. */
+            vnc_fill_rect((uint16_t)(x + tx), (uint16_t)(y + ty), tw, th, bg);
+            if (mask & 0x08) {                        /* AnySubrects */
+                uint8_t cnt;
+                if (vnc_read_exact(&cnt, 1) != 0) return -1;
+                for (uint8_t s = 0; s < cnt; s++) {
+                    uint32_t col = fg;
+                    if (mask & 0x10) col = vnc_read_pixel();   /* SubrectsColoured */
+                    uint8_t sub[2];
+                    if (vnc_read_exact(sub, 2) != 0) return -1;
+                    uint16_t rx = (uint16_t)((sub[0] >> 4) & 0xF);
+                    uint16_t ry = (uint16_t)(sub[0] & 0xF);
+                    uint16_t rw = (uint16_t)(((sub[1] >> 4) & 0xF) + 1);
+                    uint16_t rh = (uint16_t)((sub[1] & 0xF) + 1);
+                    vnc_fill_rect((uint16_t)(x + tx + rx), (uint16_t)(y + ty + ry),
+                                  rw, rh, col);
+                }
+            }
+            ty += 16;
+        }
+        tx += 16;
+    }
+    return 0;
+}
+
 /* ---- Handle one Framebuffer Update ------------------------------------ */
 static int vnc_handle_fb_update(void) {
     uint8_t hdr[4];
     if (vnc_read_exact(hdr, 4) != 0) return -1;
-    uint16_t nrects = (hdr[2] << 8) | hdr[3];
+    uint16_t nrects = (uint16_t)((hdr[2] << 8) | hdr[3]);
 
     for (uint16_t i = 0; i < nrects; i++) {
         uint8_t rh[12];
         if (vnc_read_exact(rh, 12) != 0) return -1;
-        uint16_t x = (rh[0] << 8) | rh[1];
-        uint16_t y = (rh[2] << 8) | rh[3];
-        uint16_t w = (rh[4] << 8) | rh[5];
-        uint16_t h = (rh[6] << 8) | rh[7];
+        uint16_t x = (uint16_t)((rh[0] << 8) | rh[1]);
+        uint16_t y = (uint16_t)((rh[2] << 8) | rh[3]);
+        uint16_t w = (uint16_t)((rh[4] << 8) | rh[5]);
+        uint16_t h = (uint16_t)((rh[6] << 8) | rh[7]);
         int32_t enc = ((int32_t)rh[8] << 24) | ((int32_t)rh[9] << 16) |
                       ((int32_t)rh[10] << 8) | (int32_t)rh[11];
 
-        if (enc == VNC_ENC_COPYRECT) {
-            /* Not decoded; server should not send it (we only ask Raw). */
-            uint8_t src[4];
-            vnc_read_exact(src, 4);
-        } else if (enc == VNC_ENC_RAW) {
+        if (enc == VNC_ENC_RAW) {
             int bytes = (int)w * (int)h * 4;
             if (bytes <= 0) continue;
             uint8_t* buf = (uint8_t*)kmalloc((uint32_t)bytes);
@@ -363,6 +477,15 @@ static int vnc_handle_fb_update(void) {
             }
             vnc_blit_raw(x, y, w, h, buf);
             kfree(buf);
+        } else if (enc == VNC_ENC_RRE) {
+            if (vnc_decode_rre(x, y, w, h) != 0) return -1;
+        } else if (enc == VNC_ENC_HEXTILE) {
+            if (vnc_decode_hextile(x, y, w, h) != 0) return -1;
+        } else if (enc == VNC_ENC_COPYRECT) {
+            /* Not requested (see vnc_send_prefs); skip defensively. */
+            uint8_t src[4];
+            vnc_read_exact(src, 4);
+            log_hex("copyskip enc", (uint32_t)enc);
         } else {
             log_hex("skip enc", (uint32_t)enc);
             return -1;
@@ -471,6 +594,11 @@ static int vnc_init(Plugin* self) {
     } else {
         log_str("OK", "gui.api ready");
     }
+    /* Cache the bulk-blit service (stage-2 optimization).  Falls back to
+     * per-pixel put_pixel when the service is unavailable. */
+    g_blit_svc = svc_lookup("gui.blit_pixels");
+    if (g_blit_svc) log_str("OK", "gui.blit_pixels ready");
+    else             log_str("WARN", "no gui.blit_pixels — per-pixel fallback");
     log_str("OK", "init");
     return 0;
 }

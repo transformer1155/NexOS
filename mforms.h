@@ -45,7 +45,9 @@ struct MFormsHost {
     // Win11 Mica/Acrylic sign-in card). tint = base colour, alpha = opacity,
     // blur = blur radius in px.
     void (*glass)       (int x, int y, int w, int h, int r, uint32_t tint, int alpha, int blur);
-    // Soft glow / bloom effect (drives h.glow -> mh_glow()).
+    // Soft accent glow / bloom (sign-in card highlight, focus ring, AI
+    // desktop halo).  Drives h.glow -> mh_glow(); matches the gui.cpp native
+    // drawer mh_glow(int cx,int cy,int rx,int ry,uint32_t,int).
     void (*glow)        (int cx, int cy, int rx, int ry, uint32_t color, int alpha);
     // UTF-8 text at an explicit glyph height `px` (default Gfx.Text uses 16).
     void (*text_px)     (int x, int y, const char* s, uint32_t fg, int px);
@@ -202,8 +204,9 @@ extern int g_mforms_anim;
 // Layer 1: wallpaper + desktop icons, painted *behind* the windows.
 void mforms_paint_desktop(int w, int h);
 
-// Finer-grained paint hooks split out of render_all(): wallpaper layer and
-// desktop-icons layer.  In this tree the managed C# Shell::PaintDesktop paints
+// Layer 1b: finer-grained paint hooks split out of render_all() -- the
+// wallpaper layer and the desktop-icons layer, referenced by gui.cpp's Win11
+// desktop renderer.  In this tree the managed C# Shell::PaintDesktop paints
 // the whole layer at once, so both delegate to mforms_paint_desktop().
 void mforms_paint_wall(int w, int h);
 void mforms_paint_desk_icons(int w, int h);

@@ -79,6 +79,12 @@ static int serial_try_getc(void){
 static char g_serial_inbuf[256];
 static int  g_serial_inlen = 0;
 
+// Forward terminal output of a remote console command into the GUI's
+// remote-control overlay (implemented in gui.cpp) so an observer of the
+// machine sees what each command actually did, not just what was typed.
+extern "C" void gui_remote_output(const char* s, int n);
+static void remote_gui_out(const char* s, int n){ gui_remote_output(s, n); }
+
 // =====================================================================
 //  Hardware Detection Module
 //  Auto-detects CPU, memory, display, input, disk, and network
@@ -938,8 +944,21 @@ extern "C" {
     void net_set_agent_model(const char* m);
     void agent_config_show(char* buf, int n);
     void agent_load_config_reload(void);
+    // Pre-existing gap (independent of the VNC work): these were declared and
+    // called but never defined.  Minimal stubs so the kernel links; the real
+    // agent-config persistence can be filled in later.
+    void agent_config_show(char* buf, int n){ if (buf && n > 0) buf[0] = 0; }
+    void agent_load_config_reload(void){}
     const char* net_get_agent_remote_url(void);
     int  net_agent_remote(const char* prompt, const char* url, char* out, int outsize);
+    // Pre-existing gap: net_agent_execute was declared + called but never
+    // defined.  Now routes through net_agent_plan_exec(), which asks the
+    // configured cloud LLM for `shell:`/`plugin:` action lines and executes
+    // them inside NexOS (the agent actually operates the OS).
+    int net_agent_plan_exec(const char* goal, char* out, int outsize);
+    int net_agent_execute(const char* goal, char* out, int outsize){
+        return net_agent_plan_exec(goal, out, outsize);
+    }
     // ICMP ping client: returns 1 if any attempt got a reply, 0 on timeout.
     int  net_ping(const char* host, int attempts);
     // WiFi manager (control plane) + time-server client (net.cpp)
@@ -949,21 +968,6 @@ extern "C" {
     int  net_wifi_status(char* out, int n);
     int  net_time(char* out, int n);
 }
-
-// ---- Agent stubs ----
-// net_agent_execute / agent_config_show / agent_load_config_reload are declared
-// above and invoked by the `agent` shell command, but this tree ships no real
-// implementation (the host-side LLM bridge is configured but unwired).  Provide
-// minimal no-op stubs so the kernel links; the command simply reports "no agent".
-extern "C" int net_agent_execute(const char* goal, char* out, int outsize) {
-    (void)goal;
-    if (out && outsize > 0) out[0] = 0;
-    return -1;
-}
-extern "C" void agent_config_show(char* buf, int n) {
-    if (buf && n > 0) buf[0] = 0;
-}
-extern "C" void agent_load_config_reload(void) {}
 
 static bool g_net_initialized = false;
 
@@ -1863,6 +1867,8 @@ extern "C" {
     int  gui_init(void);
     void gui_probe_vbe(void);
     void gui_set_startup_app(int id);
+    void gui_set_remote_to_terminal(int v);
+    extern "C" void gui_agent_prefill(const char* goal);   // AI Agent input prefill (gui.cpp)
     int  gui_app_browser_id(void);
     int  gui_app_id_by_name(const char* n);
     int  gui_available(void);
@@ -3002,17 +3008,32 @@ constexpr uint32_t PAGE_SIZE       = 4096;
 constexpr uint32_t PAGE_SHIFT      = 12;
 constexpr uint32_t PMM_BASE_ADDR   = 0x100000;     // 1 MiB – managed start
 constexpr uint32_t PMM_MAX_PAGES   = 65536;        // 256 MB / 4 KiB
-// The relocated .bss lives at 0x120000 and now ends at 0x009961E0 (verified via
-// nm on kernel.elf: __bss_end = 0x009961E0).  Linking the plugin objects grew
-// .bss substantially -- app_calculator's static SkillVM alone is ~530 KiB and
-// plugin_manager's service table ~68 KiB -- so HEAP_START had to move up to
-// 0x9A0000 to stay clear of live globals.  HEAP_SIZE was reduced by the same
-// amount to keep HEAP_END at 0x13F0000, just below the RAM-SFS reserve at
-// 0x1400000 (and well clear of .lmboot @ 0x1800000).  linker.ld now ASSERTs
-// HEAP_START > __bss_end so a future .bss growth fails the build instead of
-// silently producing a heap that overwrites the kernel's own globals.
-constexpr uint32_t HEAP_START      = 0x9A0000;     // 10 MiB (must stay > __bss_end; plugins grew .bss to 0x9961E0)
-constexpr uint32_t HEAP_SIZE       = 0xA50000;     // ~10.3 MiB (HEAP_END = 0x13F0000 < RAM-SFS @ 0x1400000; must also hold the ~4 MiB GB2312 24x24 CJK bitmap)
+// The relocated .bss lives at 0x120000 and ends at 0x0097D9A4 (verified via
+// nm on kernel.elf).  Linking the plugin objects grew .bss substantially --
+// app_calculator's static SkillVM alone is ~530 KiB and plugin_manager's
+// service table ~68 KiB -- so HEAP_START has to stay clear of live globals.
+//
+// HEAP_SIZE is the real constraint here, and it used to be got wrong.
+// HEAP_END must stay at 0x13F0000, just below the RAM-SFS reserve at
+// 0x1400000 (and well clear of .lmboot @ 0x1800000), so *every* byte that
+// HEAP_START gives up is a byte the heap loses.  An earlier revision raised
+// HEAP_START to 0xAE0000 on the belief that .bss had grown past 0x9A0000;
+// nm says __bss_end is 0x97D9A4, so that raised the floor by 1.25 MiB for
+// nothing and cut the heap from 10.3 MiB to 5.1 MiB.  The GUI needs far
+// more than 5.1 MiB at 1280x720: the backbuffer alone is 3.5 MiB
+// (1280*720*4), and the remote commits added a wallpaper cache
+// (gui.cpp g_wall) and a window-snapshot cache (g_snap) that are another
+// 3.5 MiB each.  With the heap that small every kmalloc past the first
+// frame returned null and the managed shell never came up at all -- the
+// boot log filled with "[HEAP] OOM: request 00200000 ..." and ended in
+// "[CLR] fault: cannot allocate managed heap" with a black desktop.
+//
+// 0x9A0000 leaves ~137 KiB of head-room over the real __bss_end, and keeps
+// the heap at its full 10.3 MiB.  linker.ld ASSERTs __bss_end <= 0x9A0000,
+// so if .bss ever really does grow past that the build fails loudly instead
+// of silently producing a heap that overwrites the kernel's own globals.
+constexpr uint32_t HEAP_START      = 0x9A0000;     // 9.66 MiB (must stay > __bss_end = 0x97D9A4)
+constexpr uint32_t HEAP_SIZE       = 0xA50000;     // ~10.3 MiB (HEAP_END = 0x13F0000 < RAM-SFS @ 0x1400000)
 constexpr uint32_t HEAP_END        = HEAP_START + HEAP_SIZE;
 
 // Page-table / PDE flags
@@ -3589,6 +3610,32 @@ extern "C" void* kmalloc(uint32_t size){
             return (uint8_t*)blk + sizeof(HeapBlock);
         }
         blk = blk->next;
+    }
+
+    // ---- OOM diagnostic -------------------------------------------
+    //  A bare "return nullptr" here made every caller report the same
+    //  useless "cannot allocate X" message, which gave no hint that the
+    //  5 MiB heap was already full.  Print the live byte count, the
+    //  request size and the largest contiguous free block so the actual
+    //  budget (and whether the failure is fragmentation or exhaustion)
+    //  is visible right in the boot log.
+    {
+        uint32_t biggest = 0, freecnt = 0;
+        for (HeapBlock* b = heap_head; b; b = b->next) {
+            if (b->magic == HEAP_MAGIC_FREE && b->size > biggest) biggest = b->size;
+            if (b->magic == HEAP_MAGIC_FREE) freecnt++;
+        }
+        serial_puts("[HEAP] OOM: request ");
+        serial_hex(size);
+        serial_puts(" bytes, live ");
+        serial_hex(heap_bytes_alloc - heap_bytes_freed);
+        serial_puts(" / ");
+        serial_hex(HEAP_SIZE);
+        serial_puts(" bytes, largest free ");
+        serial_hex(biggest);
+        serial_puts(" bytes in ");
+        { char nb[16]; uint_to_str(freecnt, nb); serial_puts(nb); }
+        serial_puts(" block(s)\n");
     }
     return nullptr;  // OOM
 }
@@ -4167,6 +4214,35 @@ static void cmd_write(const char* name){
     g_mode=MODE_WRITE;
     term.write("Writing to: "); term.write(g_write_name);
     term.write("\nEnter text (empty line to save, max 8KB):\n");
+}
+
+// Non-interactive file write for scripted/agent tooling:
+//   fwrite <file> <text...>
+// Creates or overwrites <file> with <text> in one shot.  The interactive
+// `write` switches the terminal into line-editor mode (MODE_WRITE), which a
+// scripted agent or remote planner cannot drive, so the cloud agent planner
+// uses this instead.
+static void cmd_fwrite(const char* args){
+    const char* p = args;
+    while (*p == ' ') p++;
+    char buf[FS_NAME_LEN];
+    int i = 0;
+    while (*p && *p != ' ' && i < FS_NAME_LEN-1) buf[i++] = *p++;
+    buf[i] = 0;
+    while (*p == ' ') p++;
+    if (!buf[0] || !*p){ term.write("Usage: fwrite <file> <text>\n"); return; }
+    if (mkfs.find(buf) >= 0){
+        if(!perm_check(buf, 'w', false)) return;
+    }
+    int len = 0; while (p[len]) len++;
+    int ret = mkfs.create(buf, (const uint8_t*)p, len);
+    if (ret >= 0) {
+        perm_set(buf, (uint32_t)cur_uid(), (uint32_t)cur_gid(), DEFAULT_FILE_MODE);
+        term.write("Wrote "); term.write_dec(len); term.write(" bytes to ");
+        term.write(buf); term.put_char('\n');
+    } else {
+        term.write("Failed (code "); term.write_dec(ret); term.write(")\n");
+    }
 }
 
 static void cmd_mkdir(const char* name){
@@ -6021,7 +6097,7 @@ static void cmd_plugin_mgr(const char* args){
 // P4 bridge: create/overwrite a file on the writable MKFS volume, used by the
 // skill system (skill.cpp) so skills can call system FS APIs without reaching
 // into kernel internals. Returns >=0 bytes written, <0 on error.
-int kern_fs_create(const char* name, const unsigned char* data, int len){
+extern "C" int kern_fs_create(const char* name, const unsigned char* data, int len){
     if (!mkfs.mounted) return -2;
     return mkfs.create(name, (const uint8_t*)data, len);
 }
@@ -6076,7 +6152,20 @@ static void cmd_agent(const char* args){
         // P4: try the skill registry first (natural-language intent -> system API).
         char skill_out[256];
         if(agent_skill_dispatch(args, skill_out, (int)sizeof(skill_out))){
-            term.write("[Skill] "); term.write(skill_out); term.put_char('\n');
+            // A directive skill (shell:/plugin: prefix) is forwarded to the
+            // real agent tool layer so the OS actually executes the command or
+            // calls the plugin.  Anything else is a plain text result -> show it.
+            bool directive = false;
+            if (skill_out[0]=='s'&&skill_out[1]=='h'&&skill_out[2]=='e'&&skill_out[3]=='l'&&skill_out[4]==':') directive = true;
+            else if (skill_out[0]=='p'&&skill_out[1]=='l'&&skill_out[2]=='u'&&skill_out[3]=='g'&&skill_out[4]=='i'&&skill_out[5]=='n'&&skill_out[6]==':') directive = true;
+            if (directive){
+                char output[4096];
+                int n = agent_run(skill_out, output, (int)sizeof(output));
+                if (n > 0) term.write(output);
+                else term.write("Agent tool execution failed. Initialize first with 'agent init'.\n");
+            } else {
+                term.write("[Skill] "); term.write(skill_out); term.put_char('\n');
+            }
             return;
         }
         // Real multi-step agent (ReAct loop): ask the LLM what tool to call,
@@ -6634,12 +6723,13 @@ static void cmd_netstart(){
         term.set_color(make_color(GREEN, BLACK));
         term.write("Network UP! HTTP server on http://10.0.2.15:8080\n");
         term.set_color(make_color(CYAN, BLACK));
-        term.write("  (QEMU: use -net nic,model=ne2k_isa -net user,hostfwd=tcp::8080-:8080)\n");
+        term.write("  (QEMU: -net nic,model=ne2k_isa -net user,hostfwd=tcp::8080-:8080)\n");
+        term.write("  (faster: -netdev user,id=n0,hostfwd=tcp::8080-:8080 -device virtio-net-pci,netdev=n0)\n");
     } else {
         term.set_color(make_color(RED, BLACK));
-        term.write("Network init failed! (NE2000 NIC not detected)\n");
+        term.write("Network init failed! (no NIC detected)\n");
         term.set_color(make_color(CYAN, BLACK));
-        term.write("  Make sure QEMU has: -net nic,model=ne2k_isa\n");
+        term.write("  Make sure QEMU has: -net nic,model=ne2k_isa (or virtio-net-pci)\n");
     }
     term.set_color(make_color(WHITE, BLACK));
 }
@@ -7939,6 +8029,7 @@ static void run_command(const char* line){
     else if(!strcmp_(cmd,"rm")||!strcmp_(cmd,"del")||!strcmp_(cmd,"erase")) cmd_rm(args);
     else if(!strcmp_(cmd,"copy")||!strcmp_(cmd,"cp"))  cmd_copy(args);
     else if(!strcmp_(cmd,"write")) cmd_write(args);
+    else if(!strcmp_(cmd,"fwrite")) cmd_fwrite(args);
     else if(!strcmp_(cmd,"mkdir")||!strcmp_(cmd,"md")) cmd_mkdir(args);
     else if(!strcmp_(cmd,"cd")||!strcmp_(cmd,"sl"))    cmd_cd(args);
     else if(!strcmp_(cmd,"pwd")||!strcmp_(cmd,"gl"))   cmd_pwd();
@@ -8064,6 +8155,14 @@ extern "C" void kernel_exec_line(const char* line){
 // terminal character emitted by the shell is forwarded to the SSH channel.
 extern "C" void term_set_ssh_sink(ssh_out_fn_t fn){ g_ssh_out_fn = fn; }
 extern "C" void term_clear_ssh_sink(void){ g_ssh_out_fn = 0; }
+// Swap the terminal output sink and return the previous one, so nested
+// captures (e.g. the agent executing a command while a remote console
+// session is streaming its output) do not silently disarm the outer sink.
+extern "C" ssh_out_fn_t term_swap_ssh_sink(ssh_out_fn_t fn){
+    ssh_out_fn_t old = g_ssh_out_fn;
+    g_ssh_out_fn = fn;
+    return old;
+}
 
 // =====================================================================
 //  Terminal::render (defined after the class, uses its members)
@@ -9018,6 +9117,25 @@ extern "C" void kmain(){
     // survives the 32->64 handoff untouched.
     uint8_t boot_no_gui = *(volatile uint8_t*)0x501E;
     if (boot_no_gui) g_auto_gui = 0;
+    // 0x501F: open the Terminal window automatically on GUI boot.  Lets the
+    // demo/recording drive the built-in agent from the REAL graphical terminal
+    // (output renders in the window, not the remote-control overlay).
+    uint8_t boot_term = *(volatile uint8_t*)0x501F;
+    if (boot_term && g_auto_gui) {
+        gui_set_startup_app(gui_app_id_by_name("terminal"));
+        gui_set_remote_to_terminal(1);   // stream agent output into the real terminal window
+    }
+    // 0x5020: open the AI Agent ("AI 桌面") window automatically on GUI boot and
+    // prefill the input box with a demo goal.  Surfaces the upgraded agent panel
+    // (live step-by-step trace) for screenshots / demos without manual clicks.
+    uint8_t boot_agent = *(volatile uint8_t*)0x5020;
+    if (boot_agent && g_auto_gui) {
+        int aid = gui_app_id_by_name("agent");
+        if (aid >= 0) {
+            gui_set_startup_app(aid);
+            gui_agent_prefill("create file demo.txt containing 'hello nexos' then cat it to verify");
+        }
+    }
 
     // ---- Early boot animation -------------------------------------------
     // Start it as early as the framebuffer is addressable.  vmm_init() above
@@ -9404,10 +9522,14 @@ extern "C" void kmain(){
                             if (g_serial_inlen > 0) {
                                 g_serial_inbuf[g_serial_inlen] = 0;
                                 // Remote command over COM1 (frontend ops console / bridge):
-                                // arm the security-guard overlay before executing it.
+                                // arm the security-guard overlay before executing it,
+                                // and stream the command's output into that overlay so
+                                // an observer sees what the machine actually did.
                                 gui_remote_begin("远程运维通道 (COM1)");
                                 gui_remote_cmd(g_serial_inbuf);
+                                term_set_ssh_sink(remote_gui_out);
                                 run_command(g_serial_inbuf);
+                                term_clear_ssh_sink();
                                 g_serial_inlen = 0;
                             }
                         } else if (ch == 0x7F || ch == '\b') {
