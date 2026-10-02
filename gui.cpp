@@ -132,6 +132,17 @@ static char   g_remote_log[8][256] = {{0}};              // recent command scrol
 static int    g_remote_log_n    = 0;
 static char   g_remote_out[14][128] = {{0}};             // recent command OUTPUT scrollback
 static int    g_remote_out_n    = 0;
+// Partial-line accumulator for gui_remote_output.  The kernel sink feeds ONE
+// character per call (Terminal::put_char -> g_ssh_out_fn(&c,1)), so the
+// accumulator MUST live across calls; it is flushed only on '\n', when full,
+// or by gui_remote_end().  (It used to be a call-local static flushed at the
+// end of EVERY call, which turned every single character into its own
+// scrollback row -- the "one char per line" panel bug.)
+static char   g_remote_line[128];
+static int    g_remote_li = 0;
+// Demo/recording mode: stream the agent's remote output into the REAL terminal
+// window (draw_terminal) instead of the full-screen remote-control overlay.
+static bool   g_remote_to_terminal = false;
 static int    g_remote_btn_x = 0, g_remote_btn_y = 0, g_remote_btn_w = 0, g_remote_btn_h = 0;
 extern "C" void gui_remote_end(void);                    // defined below, called by handle_mouse_down
 extern "C" void draw_remote_guard(void);                 // defined below (inside extern "C"), called by render_all
@@ -6231,6 +6242,27 @@ struct Win11Desktop {
         // Terminal background (black)
         gfx.fill_rect(win.x + 1, win.content_y(), win.w - 2, win.content_h(), 0x0C0C0C);
 
+        // Demo/recording mode: stream the agent's remote output into this REAL
+        // terminal window instead of the (suppressed) remote-control overlay.
+        if (g_remote_active && g_remote_to_terminal) {
+            int ty = y;
+            // Show the latest command (masked key) as the prompt, then the
+            // streamed output lines (g_remote_out is a 14-line ring scrollback).
+            if (g_remote_cmd[0]) {
+                gfx.draw_text_transparent(x, ty, "> ", 0x00FF66);
+                gfx.draw_text_utf8_transparent(x + 16, ty, g_remote_cmd, 0xCCCCCC);
+                ty += g_font_h;
+            }
+            for (int k = 0; k < 14 && ty - y < win.content_h() - g_font_h; k++) {
+                if (!g_remote_out[k][0]) continue;
+                gfx.draw_text_utf8_transparent(x, ty, g_remote_out[k], 0xCCCCCC);
+                ty += g_font_h;
+            }
+            // Blinking input caret (no live input in demo mode)
+            gfx.fill_rect(x + 4, ty, 8, 16, 0xCCCCCC);
+            return;
+        }
+
         // Terminal output (UTF-8 aware)
         char* p = win.term_buf;
         int ty = y;
@@ -10529,32 +10561,33 @@ static void remote_out_push(const char* s) {
 // the machine sees not only the command but also what it actually did.
 extern "C" void gui_remote_output(const char* s, int n) {
     if (!s || n <= 0) return;
-    static char line[128];
-    static int  li = 0;
     bool pushed = false;
     for (int i = 0; i < n; i++) {
         char c = s[i];
         if (c == '\n') {
-            if (li == 0) {
+            if (g_remote_li == 0) {
                 // Stream contained a blank line.  Rendering it as a real empty
                 // line made the panel look like "one char, blank, one char...".
                 // Push a visible newline symbol (↵, U+21B5) so an empty line is
                 // still obvious instead of an invisible gap.
                 remote_out_push("\xE2\x86\xB5");
             } else {
-                line[li] = 0; remote_out_push(line);
+                g_remote_line[g_remote_li] = 0; remote_out_push(g_remote_line);
             }
-            li = 0; pushed = true;
+            g_remote_li = 0; pushed = true;
         } else if (c == '\r') {
             // ignore carriage returns
-        } else if (li < 126) {
-            line[li++] = c;
+        } else if (g_remote_li < 126) {
+            g_remote_line[g_remote_li++] = c;
         } else {
-            line[li] = 0; remote_out_push(line); li = 0; pushed = true;
-            line[li++] = c;
+            g_remote_line[g_remote_li] = 0; remote_out_push(g_remote_line); g_remote_li = 0; pushed = true;
+            g_remote_line[g_remote_li++] = c;
         }
     }
-    if (li > 0) { line[li] = 0; remote_out_push(line); li = 0; pushed = true; }
+    // NOTE: no flush here.  The sink is called once per character, so a flush
+    // at the end of every call would push each character as its own row.
+    // The pending partial line is flushed on '\n', when the buffer fills, or
+    // by gui_remote_end() when the remote session finishes.
     if (pushed && g_wm.gui_mode) g_wm.render_all();
 }
 
@@ -10594,6 +10627,12 @@ extern "C" void gui_remote_cmd(const char* cmd) {
 }
 
 extern "C" void gui_remote_end(void) {
+    // Flush any pending partial line so the last output row is not lost.
+    if (g_remote_li > 0) {
+        g_remote_line[g_remote_li] = 0;
+        remote_out_push(g_remote_line);
+        g_remote_li = 0;
+    }
     g_remote_active = false;
     // The guard drew an opaque full-screen overlay into the backbuffer, so the
     // cached managed desktop layer behind it is now stale.  With perf_opt=1 the
@@ -10603,8 +10642,18 @@ extern "C" void gui_remote_end(void) {
     g_desk_needs_full = true;
 }
 
+// Enable/disable demo mode: route remote (agent) output into the real terminal
+// window instead of the full-screen remote-control overlay.  Set by the kernel
+// when it auto-opens the Terminal for recording (boot flag 0x501F).
+extern "C" void gui_set_remote_to_terminal(int v) {
+    g_remote_to_terminal = (v != 0);
+}
+
 void draw_remote_guard(void) {
     if (!g_remote_active) return;
+    // Demo/recording: when output is being streamed into the real terminal
+    // window, suppress the full-screen overlay so the genuine desktop shows.
+    if (g_remote_to_terminal) return;
     int W = g_wm.gfx.width, H = g_wm.gfx.height;
 
     // Opaque full-screen backdrop

@@ -1866,6 +1866,7 @@ extern "C" {
     int  gui_init(void);
     void gui_probe_vbe(void);
     void gui_set_startup_app(int id);
+    void gui_set_remote_to_terminal(int v);
     int  gui_app_browser_id(void);
     int  gui_app_id_by_name(const char* n);
     int  gui_available(void);
@@ -9073,6 +9074,14 @@ extern "C" void kmain(){
     // survives the 32->64 handoff untouched.
     uint8_t boot_no_gui = *(volatile uint8_t*)0x501E;
     if (boot_no_gui) g_auto_gui = 0;
+    // 0x501F: open the Terminal window automatically on GUI boot.  Lets the
+    // demo/recording drive the built-in agent from the REAL graphical terminal
+    // (output renders in the window, not the remote-control overlay).
+    uint8_t boot_term = *(volatile uint8_t*)0x501F;
+    if (boot_term && g_auto_gui) {
+        gui_set_startup_app(gui_app_id_by_name("terminal"));
+        gui_set_remote_to_terminal(1);   // stream agent output into the real terminal window
+    }
 
     // ---- Early boot animation -------------------------------------------
     // Start it as early as the framebuffer is addressable.  vmm_init() above
