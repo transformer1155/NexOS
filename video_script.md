@@ -1,9 +1,9 @@
-# NexOS · 云端 DeepSeek 自主 Agent 演示视频脚本（图形界面版）
+# NexOS · 云端 DeepSeek 自主 Agent 演示视频脚本（真实 GUI 定稿版）
 
-> 用途：演示视频分镜 + 解说脚本。**本版以 NexOS 图形远程控制面板为绝对主角**，突出 GUI 交互而非纯终端命令行。
+> 用途：演示视频分镜 + 解说脚本。**本版以 NexOS 真实图形桌面为绝对主角**——真实 Win11 风格桌面、真实 Terminal 窗口，Agent 输出流式打进真终端，全程无远程控制面板遮罩。
 > 风格：科技感、深色主题（Catppuccin 风）、产品发布向。
-> 时长：≈ 02:25（145s）
-> BGM：低沉电子 Ambient；关键节点 UI 音效（点击、扫描、完成提示）。
+> 成片：`build/agent_gui_demo.webm`（16s 精剪宣传版，VP9）；长版素材 `build/agent_gui_demo.avi`（136s，mpeg4 1024×768@12fps）。
+> BGM：低沉电子 Ambient；关键节点 UI 音效（连接、逐行点亮、完成提示）。
 
 ---
 
@@ -11,84 +11,70 @@
 
 | 项 | 内容 |
 |---|---|
-| 总时长 | ≈ 02:25（145s） |
-| 主标题 | 一个会自己干活的图形界面——NexOS × 云端 DeepSeek |
-| 副标题 | 在 GUI 里打一句话，Agent 在真实系统里把它做完 |
-| 核心卖点 | 图形远程控制面板 + 云端大模型驱动 + 真实闭环执行 |
-| GUI 三要素 | 命令区 `gui_remote_cmd` / 输出区 `gui_remote_output` / API key 掩码 `remote_mask_secrets` + 空行符号 `↵` |
+| 宣传版时长 | 16s（精剪自 136s 原始录制，剪掉首尾死时间） |
+| 主标题 | 一个会自己干活的桌面——NexOS × 云端 DeepSeek |
+| 副标题 | 开机即进真实图形桌面，Agent 在真终端窗口里把活干完 |
+| 核心卖点 | 真实 GUI（非面板遮罩）+ 云端大模型 + 真实闭环执行 + 流式逐行输出 |
+| 技术三要素 | 0x501F 录制模式（自动开终端窗口）/ sink→`g_remote_out` 流式管线 / 密钥打码 `remote_mask_secrets` |
 
 ---
 
-## 1. 分镜表（9 镜，GUI 为主角）
+## 1. 分镜表（5 镜，对齐 16s 成片时间轴）
 
-| 镜号 | 时间 | 画面 | 旁白 / 字幕 |
+| 镜号 | 成片时间 | 画面 | 旁白 / 字幕 |
 |---|---|---|---|
-| S1 | 00:00–08 | 黑场淡入标题：「一个会自己干活的图形界面」 | （字幕）当操作系统，有了图形界面 + 大模型。 |
-| S2 | 00:08–22 | NexOS **图形界面**启动：内核 → 桌面/窗口环境，鼠标移动，展示这不是纯命令行 | （旁白）这是 NexOS 的图形界面。我们要做的，是在一个窗口里，把活交给 Agent。 |
-| S3 | 00:22–42 | 特写**远程控制面板**：左侧命令输入区 `gui_remote_cmd`、右侧输出区 `gui_remote_output`，边框高亮分两块 | （旁白）这就是远程控制面板——左边打字下指令，右边实时看 Agent 执行。全程图形化。 |
-| S4 | 00:42–60 | 在命令区输入自然语言目标：`Format the data disk with mkfs. Next: fwrite demo.txt hello nexos. Last: cat demo.txt.` | （旁白）我们只打一句话：格式化、写文件、再读出来。不用记命令，不用写脚本。 |
-| S5 | 00:60–78 | 面板右下角出现"调用云端"状态：面板 → 宿主 TLS 代理 → `api.deepseek.com` 流动画 | （旁白）点击发送后，面板把请求经宿主代理加密，打到云端 DeepSeek——模型不在本地。 |
-| S6 | 01:18–1:40 | 输出区逐行点亮：规划 → 执行 mkfs → fwrite → cat，ReAct 回路步骤逐个亮起 | （旁白）Agent 用 ReAct 回路：规划、执行、回看、再规划，最多三轮，绝不放过任何一步。 |
-| S7 | 01:40–2:02 | **放大输出区细节**：① API key 被 `remote_mask_secrets` 掩成 `sk-****`；② 空行处显示 `↵` 而非真空白；③ `hello nexos` 回显高亮 | （旁白）注意两个细节：密钥全程打码，绝不外泄；空行用 `↵` 标出，输出一目了然。`hello nexos` 原样回来。 |
-| S8 | 02:02–2:18 | 输出区定格"闭环完成"，面板显示目标已达成；切回完整 GUI 全貌 | （旁白）一句话进去，结果出来——大模型负责"想"，图形界面负责"呈现"，操作系统负责"做"。 |
-| S9 | 02:18–2:25 | 片尾：仓库地址 + 一句话 | （字幕）开源：gitee.com/transformer1155/NexOS |
+| S1 | 0:00–0:02 | 深色桌面就绪：Win11 风格任务栏 + 深色壁纸 + 真实 Terminal 窗口（标题栏 / 最小化·关闭按钮齐全） | （字幕）开机即桌面。这不是终端模拟器，是操作系统自己的 GUI。 |
+| S2 | 0:02–0:06 | 终端窗口打出第一行：`> agent config url http://…/v1/chat/completions` → `Agent config updated.`（URL 属宿主代理，密钥不入屏） | （旁白）两行命令，接通云端 DeepSeek。密钥全程不落屏。 |
+| S3 | 0:06–0:08 | 窗口短暂等待——Agent 经宿主 TLS 代理连上 `api.deepseek.com`，ReAct 规划中 | （字幕）模型在云端，规划在此刻。 |
+| S4 | 0:08–0:11 | **高潮：输出逐行流入真终端**——`nexos$ mkfs`（MKFS formatted, 135 KB）→ `nexos$ fwrite demo.txt hello nexos`（Wrote 11 bytes）→ `nexos$ cat demo.txt`（`hello nexos` 原样回来） | （旁白）规划、执行、验证——mkfs、写文件、读回来，三步闭环，全程在真实系统里。 |
+| S5 | 0:11–0:16 | 定格完整工作日志：两条 `SUMMARY`（"Formatted the data disk… verified it with cat" / "All requested steps already executed"），画面停留 | （旁白）一句话目标进去，验收报告出来。NexOS：让大模型在真实系统里，动手。 |
 
 ---
 
-## 2. 完整解说词（可配音 · 约 250 字）
+## 2. 完整解说词（可配音 · 约 130 字）
 
-> 当操作系统，有了图形界面，再加上大模型。
+> 开机即桌面。这不是终端模拟器，是操作系统自己的图形界面。
 >
-> 这是 NexOS 的图形界面。我们要做的，是在一个窗口里，把活交给 Agent。
+> 两行命令，接通云端 DeepSeek——密钥全程不落屏。
 >
-> 这就是远程控制面板——左边打字下指令，右边实时看 Agent 执行，全程图形化。
+> 模型在云端，规划在此刻。
 >
-> 我们只打一句话：格式化、写文件、再读出来。不用记命令，不用写脚本。
+> 看，输出正一行一行，流进这个真实的终端窗口：格式化磁盘、写入 demo.txt、再原样读回来——hello nexos。
 >
-> 点击发送后，面板把请求经宿主代理加密，打到云端 DeepSeek。模型不在本地。
->
-> Agent 用 ReAct 回路：规划、执行、回看、再规划，最多三轮，绝不放过任何一步。
->
-> 注意两个细节：密钥全程打码，绝不外泄；空行用 ↵ 标出，输出一目了然。hello nexos，原样回来。
->
-> 一句话进去，结果出来。大模型负责"想"，图形界面负责"呈现"，操作系统负责"做"。
+> 三步闭环，一条验收报告。
 >
 > NexOS：让大模型在真实系统里，动手。
+> 开源：gitee.com/transformer1155/NexOS
 
 ---
 
 ## 3. 屏幕内嵌字幕（关键帧）
 
-- 00:10 — 「图形界面 + 大模型 = 会干活的 OS」
-- 00:30 — 面板分两块：命令区 / 输出区
-- 00:45 — 输入：`agent run ... fwrite demo.txt hello nexos ... cat demo.txt`
-- 01:05 — 「请求路径：面板 → 宿主 TLS 代理 → api.deepseek.com」
-- 01:20 — 「ReAct 回路：规划 → 执行 → 回看 → 再规划（≤3 轮）」
-- 01:45 — 细节：密钥掩码 `sk-****` ｜ 空行符号 `↵` ｜ 回显 `hello nexos`
-- 02:05 — 「闭环完成 · 想 / 呈现 / 做 三者分离」
-- 02:20 — 开源：gitee.com/transformer1155/NexOS
+- S1：`真实桌面 · 真实终端窗口`
+- S2：`接通云端 DeepSeek`
+- S3：`ReAct：规划 → 执行 → 回看`
+- S4：`mkfs ✓  fwrite ✓  cat ✓`
+- S5：`SUMMARY：闭环完成`
 
 ---
 
-## 4. 片尾信息卡
+## 4. 录制与复现要点
 
-```
-NexOS — 让大模型在真实系统里动手
-图形界面：远程控制面板（命令区 + 输出区，密钥打码）
-云端驱动：DeepSeek（OpenAI 兼容协议）
-架构：GUI 面板 → 宿主 TLS 代理 → 云端大模型 → ReAct 回路 → 真实 shell 执行
-开源：gitee.com/transformer1155/NexOS
-```
+1. **构建**：`make` → `build/os_v2.img`（含 0x501F 录制模式支持）。
+2. **启动**：QEMU `-device loader,addr=0x501F,data=1,data-len=1` —— 内核读到该 boot flag 后自动打开 Terminal 窗口并启用"远程输出→真终端"模式（`gui_set_remote_to_terminal(1)`），同时抑制全屏远程遮罩。
+3. **驱动**：串口（COM1）向 guest 发送 `agent config url/key/model` → `agent run <GOAL>`；agent 经宿主 `10.0.2.2:18999` TLS 代理访问 DeepSeek。
+4. **录制**：Xvfb 虚拟屏 + QEMU `-display sdl` + `ffmpeg -f x11grab` 抓桌面。
+5. **流式原理**：内核 sink（`Terminal::put_char → g_ssh_out_fn`）逐字符进入 `gui_remote_output`，跨调用累加成行后压入 14 行环形缓冲 `g_remote_out`，终端窗口 demo 分支逐行渲染——成片中可见输出**逐行点亮**而非一次性蹦出。
+6. **剪辑**：原始录制 136s 中 agent 约 13s 内完成全部工作，13s 后为静止尾帧；精剪取 2s–18s（桌面就绪 → 配置 → 流式执行 → 定格），保留 ~5s 收尾停留。
 
 ---
 
-## 5. 录制说明（实际拍 GUI 而非终端）
+## 5. 长版素材备注（136s AVI）
 
-若需按本脚本重新录制，关键是**录图形显示而非串口文本**。两种做法：
-
-- **做法 A（推荐）**：QEMU 用 `-display sdl` 跑 NexOS 图形界面，Xvfb 提供虚拟屏，`ffmpeg -f x11grab` 录整个窗口。在 GUI 里手动/脚本触发 `agent run`，天然拍到面板。
-- **做法 B**：复用 `record_agent_demo.sh` 的 `agent run` 目标文本，但把 GUI 作为显示后端，截图/录屏聚焦 `gui_remote_cmd` / `gui_remote_output` 两块区域。
-
-GUI 细节提示：
-- 录制前确认 `remote_mask_secrets` 已生效（API key 在面板显示为 `sk-****`）；
-- 输出区空行已渲染为 `↵`（即 `gui.cpp` 刚提交的 `51443cc` 修复），录制时能直观看到。
+| 时间段 | 内容 | 用途 |
+|---|---|---|
+| 0–2s | 引导画面 → 桌面就绪 | 可做片头 |
+| 2–5s | Terminal 窗口 + `agent config` 配置上屏 | S2 素材 |
+| 5–10s | 云端连接 / ReAct 规划（画面静止属正常） | S3 素材 |
+| 10–13s | 输出逐行流入（mkfs → fwrite → cat → SUMMARY） | S4/S5 核心素材 |
+| 13s–末尾 | 静止定格（agent 已收工） | 可截定格帧做封面 |
