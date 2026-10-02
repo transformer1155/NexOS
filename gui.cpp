@@ -130,6 +130,8 @@ static char   g_remote_who[64]  = {0};                   // controller identity 
 static char   g_remote_cmd[512] = {0};                   // latest command (center display)
 static char   g_remote_log[8][256] = {{0}};              // recent command scrollback
 static int    g_remote_log_n    = 0;
+static char   g_remote_out[14][128] = {{0}};             // recent command OUTPUT scrollback
+static int    g_remote_out_n    = 0;
 static int    g_remote_btn_x = 0, g_remote_btn_y = 0, g_remote_btn_w = 0, g_remote_btn_h = 0;
 extern "C" void gui_remote_end(void);                    // defined below, called by handle_mouse_down
 extern "C" void draw_remote_guard(void);                 // defined below (inside extern "C"), called by render_all
@@ -10507,6 +10509,60 @@ static void remote_log_push(const char* cmd) {
     }
 }
 
+// Push one finished OUTPUT line into the overlay's output ring.
+static void remote_out_push(const char* s) {
+    if (g_remote_out_n < 14) {
+        int i = 0; while (s[i] && i < 126) g_remote_out[g_remote_out_n][i] = s[i], i++;
+        g_remote_out[g_remote_out_n][i] = 0; g_remote_out_n++;
+    } else {
+        for (int k = 0; k < 13; k++) {
+            int j = 0; while (g_remote_out[k+1][j] && j < 126) g_remote_out[k][j] = g_remote_out[k+1][j], j++;
+            g_remote_out[k][j] = 0;
+        }
+        int i = 0; while (s[i] && i < 126) g_remote_out[13][i] = s[i], i++;
+        g_remote_out[13][i] = 0;
+    }
+}
+
+// Append command OUTPUT (streamed through the terminal sink while a remote
+// command executes) to the remote-control overlay, so an observer watching
+// the machine sees not only the command but also what it actually did.
+extern "C" void gui_remote_output(const char* s, int n) {
+    if (!s || n <= 0) return;
+    static char line[128];
+    static int  li = 0;
+    bool pushed = false;
+    for (int i = 0; i < n; i++) {
+        char c = s[i];
+        if (c == '\n') {
+            line[li] = 0; remote_out_push(line); li = 0; pushed = true;
+        } else if (c == '\r') {
+            // ignore carriage returns
+        } else if (li < 126) {
+            line[li++] = c;
+        } else {
+            line[li] = 0; remote_out_push(line); li = 0; pushed = true;
+            line[li++] = c;
+        }
+    }
+    if (li > 0) { line[li] = 0; remote_out_push(line); li = 0; pushed = true; }
+    if (pushed && g_wm.gui_mode) g_wm.render_all();
+}
+
+// Mask secrets before echoing a remote command on screen: any "key <token>"
+// has its token replaced with '*' so API keys never appear in the overlay
+// (or in a recording of it).
+static void remote_mask_secrets(char* s) {
+    for (int i = 0; s[i]; i++) {
+        if (s[i]=='k' && s[i+1]=='e' && s[i+2]=='y' && (s[i+3]==' '||s[i+3]=='\t')) {
+            int j = i + 4;
+            while (s[j]==' '||s[j]=='\t') j++;
+            while (s[j] && s[j]!=' ' && s[j]!='\t') { s[j] = '*'; j++; }
+            i = j - 1;
+        }
+    }
+}
+
 extern "C" void gui_remote_begin(const char* who) {
     g_remote_active = true;
     int i = 0;
@@ -10517,9 +10573,14 @@ extern "C" void gui_remote_begin(const char* who) {
 extern "C" void gui_remote_cmd(const char* cmd) {
     if (!cmd) return;
     g_remote_active = true;
-    int i = 0; while (cmd[i] && i < 511) g_remote_cmd[i] = cmd[i], i++;
+    char masked[512];
+    int mi = 0;
+    while (cmd[mi] && mi < 510) { masked[mi] = cmd[mi]; mi++; }
+    masked[mi] = 0;
+    remote_mask_secrets(masked);
+    int i = 0; while (masked[i] && i < 511) g_remote_cmd[i] = masked[i], i++;
     g_remote_cmd[i] = 0;
-    remote_log_push(cmd);
+    remote_log_push(masked);
     if (g_wm.gui_mode) g_wm.render_all();   // pop the panel immediately
 }
 
@@ -10560,22 +10621,24 @@ void draw_remote_guard(void) {
     src[sl] = 0;
     g_wm.gfx.draw_text_utf8(16, ay + 42, src, 0xFFB0B0, 0x7A1020);
 
-    // Command panel (center): instructions sent by the controller
+    // Command panel (upper half): instructions sent by the controller
     int pan_x = 40, pan_y = ay + ALERT_H + 24, pan_w = W - 80;
     int pan_h = H - pan_y - 130;
     if (pan_h < 90) pan_h = 90;
-    g_wm.gfx.fill_rect(pan_x, pan_y, pan_w, pan_h, 0x141A24);
+    int cmd_h = pan_h * 4 / 10;
+    if (cmd_h < 100) cmd_h = 100;
+    g_wm.gfx.fill_rect(pan_x, pan_y, pan_w, cmd_h, 0x141A24);
     g_wm.gfx.draw_line(pan_x, pan_y, pan_x + pan_w, pan_y, 0x2E6FB5);
     g_wm.gfx.draw_text_utf8(pan_x + 12, pan_y + 10, "远程控制者发来的指令:", 0x8FD0FF, 0x141A24);
 
     int lh = 22;
-    int max_lines = pan_h / lh - 1;
+    int max_lines = cmd_h / lh - 1;
     if (max_lines < 1) max_lines = 1;
     int start = (g_remote_log_n > max_lines) ? g_remote_log_n - max_lines : 0;
     int ly = pan_y + 40;
     int maxc = pan_w / 8 - 6;
     if (maxc < 8) maxc = 8;
-    for (int k = start; k < g_remote_log_n && ly < pan_y + pan_h - lh; k++) {
+    for (int k = start; k < g_remote_log_n && ly < pan_y + cmd_h - lh; k++) {
         char line[320];
         int li = 0;
         line[li++] = '>'; line[li++] = ' ';
@@ -10584,6 +10647,28 @@ void draw_remote_guard(void) {
         line[li] = 0;
         g_wm.gfx.draw_text_utf8(pan_x + 16, ly, line, 0xE6F0FF, 0x141A24);
         ly += lh;
+    }
+
+    // Output panel (lower half): what the machine actually did, streamed
+    // through the terminal sink while each remote command executed.
+    int out_y = pan_y + cmd_h + 14;
+    int out_h = pan_y + pan_h - out_y;
+    if (out_h < 90) out_h = 90;
+    g_wm.gfx.fill_rect(pan_x, out_y, pan_w, out_h, 0x101820);
+    g_wm.gfx.draw_line(pan_x, out_y, pan_x + pan_w, out_y, 0x2FBF71);
+    g_wm.gfx.draw_text_utf8(pan_x + 12, out_y + 10, "NexOS 执行输出:", 0x9FE8C0, 0x101820);
+    int omax = out_h / lh - 1;
+    if (omax < 1) omax = 1;
+    int ostart = (g_remote_out_n > omax) ? g_remote_out_n - omax : 0;
+    int oy = out_y + 40;
+    for (int k = ostart; k < g_remote_out_n && oy < out_y + out_h - lh; k++) {
+        char line[320];
+        int li = 0;
+        const char* c = g_remote_out[k];
+        for (int q = 0; c[q] && li < maxc && li < 319; ) line[li++] = c[q++];
+        line[li] = 0;
+        g_wm.gfx.draw_text_utf8(pan_x + 16, oy, line, 0xC9E8D8, 0x101820);
+        oy += lh;
     }
 
     // "缁撴潫鎺у埗" button (centered, bottom)

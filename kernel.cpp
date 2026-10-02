@@ -79,6 +79,12 @@ static int serial_try_getc(void){
 static char g_serial_inbuf[256];
 static int  g_serial_inlen = 0;
 
+// Forward terminal output of a remote console command into the GUI's
+// remote-control overlay (implemented in gui.cpp) so an observer of the
+// machine sees what each command actually did, not just what was typed.
+extern "C" void gui_remote_output(const char* s, int n);
+static void remote_gui_out(const char* s, int n){ gui_remote_output(s, n); }
+
 // =====================================================================
 //  Hardware Detection Module
 //  Auto-detects CPU, memory, display, input, disk, and network
@@ -946,9 +952,12 @@ extern "C" {
     const char* net_get_agent_remote_url(void);
     int  net_agent_remote(const char* prompt, const char* url, char* out, int outsize);
     // Pre-existing gap: net_agent_execute was declared + called but never
-    // defined.  Implemented in terms of the existing net_agent_remote().
+    // defined.  Now routes through net_agent_plan_exec(), which asks the
+    // configured cloud LLM for `shell:`/`plugin:` action lines and executes
+    // them inside NexOS (the agent actually operates the OS).
+    int net_agent_plan_exec(const char* goal, char* out, int outsize);
     int net_agent_execute(const char* goal, char* out, int outsize){
-        return net_agent_remote(goal, nullptr, out, outsize);
+        return net_agent_plan_exec(goal, out, outsize);
     }
     // ICMP ping client: returns 1 if any attempt got a reply, 0 on timeout.
     int  net_ping(const char* host, int attempts);
@@ -4161,6 +4170,35 @@ static void cmd_write(const char* name){
     g_mode=MODE_WRITE;
     term.write("Writing to: "); term.write(g_write_name);
     term.write("\nEnter text (empty line to save, max 8KB):\n");
+}
+
+// Non-interactive file write for scripted/agent tooling:
+//   fwrite <file> <text...>
+// Creates or overwrites <file> with <text> in one shot.  The interactive
+// `write` switches the terminal into line-editor mode (MODE_WRITE), which a
+// scripted agent or remote planner cannot drive, so the cloud agent planner
+// uses this instead.
+static void cmd_fwrite(const char* args){
+    const char* p = args;
+    while (*p == ' ') p++;
+    char buf[FS_NAME_LEN];
+    int i = 0;
+    while (*p && *p != ' ' && i < FS_NAME_LEN-1) buf[i++] = *p++;
+    buf[i] = 0;
+    while (*p == ' ') p++;
+    if (!buf[0] || !*p){ term.write("Usage: fwrite <file> <text>\n"); return; }
+    if (mkfs.find(buf) >= 0){
+        if(!perm_check(buf, 'w', false)) return;
+    }
+    int len = 0; while (p[len]) len++;
+    int ret = mkfs.create(buf, (const uint8_t*)p, len);
+    if (ret >= 0) {
+        perm_set(buf, (uint32_t)cur_uid(), (uint32_t)cur_gid(), DEFAULT_FILE_MODE);
+        term.write("Wrote "); term.write_dec(len); term.write(" bytes to ");
+        term.write(buf); term.put_char('\n');
+    } else {
+        term.write("Failed (code "); term.write_dec(ret); term.write(")\n");
+    }
 }
 
 static void cmd_mkdir(const char* name){
@@ -7947,6 +7985,7 @@ static void run_command(const char* line){
     else if(!strcmp_(cmd,"rm")||!strcmp_(cmd,"del")||!strcmp_(cmd,"erase")) cmd_rm(args);
     else if(!strcmp_(cmd,"copy")||!strcmp_(cmd,"cp"))  cmd_copy(args);
     else if(!strcmp_(cmd,"write")) cmd_write(args);
+    else if(!strcmp_(cmd,"fwrite")) cmd_fwrite(args);
     else if(!strcmp_(cmd,"mkdir")||!strcmp_(cmd,"md")) cmd_mkdir(args);
     else if(!strcmp_(cmd,"cd")||!strcmp_(cmd,"sl"))    cmd_cd(args);
     else if(!strcmp_(cmd,"pwd")||!strcmp_(cmd,"gl"))   cmd_pwd();
@@ -8072,6 +8111,14 @@ extern "C" void kernel_exec_line(const char* line){
 // terminal character emitted by the shell is forwarded to the SSH channel.
 extern "C" void term_set_ssh_sink(ssh_out_fn_t fn){ g_ssh_out_fn = fn; }
 extern "C" void term_clear_ssh_sink(void){ g_ssh_out_fn = 0; }
+// Swap the terminal output sink and return the previous one, so nested
+// captures (e.g. the agent executing a command while a remote console
+// session is streaming its output) do not silently disarm the outer sink.
+extern "C" ssh_out_fn_t term_swap_ssh_sink(ssh_out_fn_t fn){
+    ssh_out_fn_t old = g_ssh_out_fn;
+    g_ssh_out_fn = fn;
+    return old;
+}
 
 // =====================================================================
 //  Terminal::render (defined after the class, uses its members)
@@ -9412,10 +9459,14 @@ extern "C" void kmain(){
                             if (g_serial_inlen > 0) {
                                 g_serial_inbuf[g_serial_inlen] = 0;
                                 // Remote command over COM1 (frontend ops console / bridge):
-                                // arm the security-guard overlay before executing it.
+                                // arm the security-guard overlay before executing it,
+                                // and stream the command's output into that overlay so
+                                // an observer sees what the machine actually did.
                                 gui_remote_begin("远程运维通道 (COM1)");
                                 gui_remote_cmd(g_serial_inbuf);
+                                term_set_ssh_sink(remote_gui_out);
                                 run_command(g_serial_inbuf);
+                                term_clear_ssh_sink();
                                 g_serial_inlen = 0;
                             }
                         } else if (ch == 0x7F || ch == '\b') {
