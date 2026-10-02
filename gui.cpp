@@ -3501,10 +3501,11 @@ struct Win11Window {
     int calc_prev;          // previous operand
     int calc_op;            // 0=none,1=+,2=-,3=*,4=/
     bool calc_new_input;    // true = start new number
-    char term_buf[1024];    // terminal output buffer
+    char term_buf[8192];    // terminal output scrollback buffer
     int term_len;
     char term_input[128];
     int term_input_len;
+    int term_scroll;        // terminal scrollback: lines scrolled up from bottom (0 = follow tail)
     char sel_file[64];      // selected file name in file explorer
     int sel_file_idx;       // selected file index (-1 = none)
     int file_scroll;        // file list scroll offset
@@ -6237,6 +6238,31 @@ struct Win11Desktop {
     }
 
     // ---- Terminal ----
+    // Overflow-safe append: keep only the most recent output in term_buf.
+    // When the buffer would overflow, evict the oldest whole line(s) so the
+    // tail (newest content) is always retained -- this is what makes the
+    // terminal auto-scroll to the latest output instead of freezing on the
+    // oldest screenful.
+    void term_append(Win11Window& w, const char* s) {
+        if (!s) return;
+        int cap = (int)sizeof(w.term_buf) - 2;
+        int need = strlen_(s);
+        while (w.term_len > 0 && w.term_len + need > cap) {
+            // Drop the oldest whole line to make room for the new output.
+            int drop = w.term_len;
+            for (int i = 0; i < w.term_len; i++) {
+                if (w.term_buf[i] == '\n') { drop = i + 1; break; }
+            }
+            // Leftward shift (dest < src) is safe with a simple copy.
+            for (int i = drop; i < w.term_len; i++) w.term_buf[i - drop] = w.term_buf[i];
+            w.term_len -= drop;
+        }
+        int room = cap - w.term_len;
+        if (need > room) need = room;
+        if (need > 0) { memcpy_(w.term_buf + w.term_len, s, need); w.term_len += need; }
+        w.term_buf[w.term_len] = 0;
+    }
+
     void draw_terminal(int id, int x, int y, int w, int h) {
         Win11Window& win = windows[id];
         // Terminal background (black)
@@ -6263,29 +6289,45 @@ struct Win11Desktop {
             return;
         }
 
-        // Terminal output (UTF-8 aware)
-        char* p = win.term_buf;
-        int ty = y;
-        int max_lines = h / 16;
-        int line = 0;
-        while (*p && line < max_lines) {
-            char t[160];
+        // Terminal output (UTF-8 aware), auto-scroll to the tail.
+        // The view follows the newest output by default (term_scroll == 0);
+        // scrolling the wheel up sets term_scroll > 0 to review history.
+        int max_lines = h / g_font_h;
+        int total = 0;
+        for (int i = 0; i < win.term_len; i++)
+            if (win.term_buf[i] == '\n') total++;
+        int view_total = total + 1;                 // +1 for the live input line
+        int maxscroll = (view_total > max_lines) ? (view_total - max_lines) : 0;
+        if (win.term_scroll > maxscroll) win.term_scroll = maxscroll;
+        if (win.term_scroll < 0) win.term_scroll = 0;
+        int start_view = view_total - max_lines - win.term_scroll;
+        if (start_view < 0) start_view = 0;
+        int end_view = start_view + max_lines;       // exclusive upper bound
+
+        // Render the visible output lines, then the live input line.
+        const char* p = win.term_buf;
+        int cur = 0, ty = y;
+        while (*p && cur < total) {
+            char t[200];
             int ti = 0;
-            while (*p && *p != '\n' && ti < 159) t[ti++] = *p++;
+            while (*p && *p != '\n' && ti < 199) t[ti++] = *p++;
             t[ti] = 0;
             if (*p == '\n') p++;
-            gfx.draw_text_utf8_transparent(x, ty, t, 0xCCCCCC);
-            ty += g_font_h;
-            line++;
+            if (cur >= start_view && cur < end_view) {
+                gfx.draw_text_utf8_transparent(x, ty, t, 0xCCCCCC);
+                ty += g_font_h;
+            }
+            cur++;
         }
-
-        // Input line
-        gfx.draw_text_transparent(x, ty, "> ", 0x00FF66);
-        gfx.draw_text_utf8_transparent(x + 16, ty, win.term_input, 0xCCCCCC);
-        // Cursor (account for CJK width)
-        int cw = utf8_display_width(win.term_input);
-        int cx = x + 16 + cw;
-        gfx.fill_rect(cx, ty, 8, 16, 0xCCCCCC);
+        // Live input line (only when it falls inside the viewport).
+        if (total < end_view) {
+            gfx.draw_text_transparent(x, ty, "> ", 0x00FF66);
+            gfx.draw_text_utf8_transparent(x + 16, ty, win.term_input, 0xCCCCCC);
+            int cw = utf8_display_width(win.term_input);
+            int cx = x + 16 + cw;
+            gfx.fill_rect(cx, ty, 8, 16, 0xCCCCCC);
+            ty += g_font_h;
+        }
 
         // ---- IME candidate bar (drawn just above the input line, inside window) ----
         if (g_ime_active && g_ime_cand_count > 0) {
@@ -8037,16 +8079,31 @@ struct Win11Desktop {
         for (int i = window_count - 1; i >= 0; i--) {
             Win11Window& w = windows[i];
             if (!w.visible || w.minimized) continue;
-            if (w.app != APP_MANAGED) continue;
             if (!w.contains(mouse_x, mouse_y)) continue;
-            int mh = w.h - TITLE_BAR_H;
-            int maxy = w.scroll_ch - mh;
-            if (maxy <= 0) return;                 // nothing overflows
-            w.scroll_y -= dz * 28;
-            if (w.scroll_y < 0) w.scroll_y = 0;
-            if (w.scroll_y > maxy) w.scroll_y = maxy;
-            render_all();
-            return;
+            if (w.app == APP_MANAGED) {
+                int mh = w.h - TITLE_BAR_H;
+                int maxy = w.scroll_ch - mh;
+                if (maxy <= 0) return;                 // nothing overflows
+                w.scroll_y -= dz * 28;
+                if (w.scroll_y < 0) w.scroll_y = 0;
+                if (w.scroll_y > maxy) w.scroll_y = maxy;
+                render_all();
+                return;
+            } else if (w.app == APP_TERMINAL) {
+                // dz > 0 = wheel up -> reveal older lines (scroll up).
+                int mh = w.h - TITLE_BAR_H;
+                int max_lines = mh / g_font_h;
+                int total = 0;
+                for (int k = 0; k < w.term_len; k++)
+                    if (w.term_buf[k] == '\n') total++;
+                int view_total = total + 1;
+                int maxscroll = view_total > max_lines ? view_total - max_lines : 0;
+                w.term_scroll += dz;
+                if (w.term_scroll < 0) w.term_scroll = 0;
+                if (w.term_scroll > maxscroll) w.term_scroll = maxscroll;
+                render_all();
+                return;
+            }
         }
     }
 
@@ -8746,6 +8803,7 @@ struct Win11Desktop {
             Win11Window& win = windows[id];
             strcpy_(win.term_buf, "NexOS Terminal v2.0\nType 'help' for commands.\n\n");
             win.term_len = strlen_(win.term_buf);
+            win.term_scroll = 0;
         }
     }
 
@@ -9112,35 +9170,36 @@ struct Win11Desktop {
             }
             if (ch == '\n' || ch == 0x0D) { // Enter
                 if (win.term_input_len > 0) {
-                    // Add command to output
-                    win.term_buf[win.term_len++] = '>';
-                    for (int i = 0; i < win.term_input_len; i++)
-                        win.term_buf[win.term_len++] = win.term_input[i];
-                    win.term_buf[win.term_len++] = '\n';
+                    // Echo the command line into the scrollback buffer.
+                    char echo[200];
+                    int ek = 0;
+                    echo[ek++] = '>';
+                    for (int i = 0; i < win.term_input_len && ek < 199; i++)
+                        echo[ek++] = win.term_input[i];
+                    echo[ek++] = '\n';
+                    echo[ek] = 0;
+                    term_append(win, echo);
 
                     // Execute command via kernel callback (full shell)
                     if (g_cb.exec_command) {
                         static char cmd_out[2048];
                         g_cb.exec_command(win.term_input, cmd_out, sizeof(cmd_out));
-                        // Append output to terminal buffer
-                        for (int i = 0; cmd_out[i] && win.term_len < (int)sizeof(win.term_buf) - 2; i++)
-                            win.term_buf[win.term_len++] = cmd_out[i];
+                        term_append(win, cmd_out);   // overflow-safe append
                     } else {
                         // Fallback: simple built-in commands
                         if (strcmp_(win.term_input, "help") == 0) {
-                            const char* msg = "Commands: help, mem, clear, exit, ls, cat, etc.\nFull shell commands available.\n";
-                            while (*msg) win.term_buf[win.term_len++] = *msg++;
+                            term_append(win, "Commands: help, mem, clear, exit, ls, cat, etc.\nFull shell commands available.\n");
                         } else if (strcmp_(win.term_input, "clear") == 0) {
                             win.term_len = 0;
                             win.term_buf[0] = 0;
                         } else if (strcmp_(win.term_input, "exit") == 0) {
                             close_window(active_window);
                         } else {
-                            const char* msg = "Shell not available. Try: help\n";
-                            while (*msg) win.term_buf[win.term_len++] = *msg++;
+                            term_append(win, "Shell not available. Try: help\n");
                         }
                     }
-                    win.term_buf[win.term_len] = 0;
+                    // New output arrived: jump back to the tail (auto-scroll).
+                    win.term_scroll = 0;
                     win.term_input_len = 0;
                     win.term_input[0] = 0;
                 }
