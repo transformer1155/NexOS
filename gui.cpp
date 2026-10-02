@@ -10535,7 +10535,16 @@ extern "C" void gui_remote_output(const char* s, int n) {
     for (int i = 0; i < n; i++) {
         char c = s[i];
         if (c == '\n') {
-            line[li] = 0; remote_out_push(line); li = 0; pushed = true;
+            if (li == 0) {
+                // Stream contained a blank line.  Rendering it as a real empty
+                // line made the panel look like "one char, blank, one char...".
+                // Push a visible newline symbol (↵, U+21B5) so an empty line is
+                // still obvious instead of an invisible gap.
+                remote_out_push("\xE2\x86\xB5");
+            } else {
+                line[li] = 0; remote_out_push(line);
+            }
+            li = 0; pushed = true;
         } else if (c == '\r') {
             // ignore carriage returns
         } else if (li < 126) {
