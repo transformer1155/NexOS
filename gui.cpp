@@ -1303,6 +1303,11 @@ static uint32_t* g_wall = nullptr;
 static uint32_t  g_wall_cap = 0;        // capacity in pixels
 static uint32_t  g_wall_w = 0, g_wall_h = 0;
 static bool      g_wall_ok = false;
+// Pixel count of the last failed g_wall allocation (0 = none yet).  The cache
+// is a full-screen copy that may simply not fit alongside the backbuffer and
+// the managed heap; without this the render loop re-requested it every frame
+// and the OOM diagnostic spammed the log forever.
+static uint32_t  g_wall_failed = 0;
 
 extern "C" void gui_wall_invalid(void) {
     // Drop the cached wallpaper so the next (throttled) desktop repaint actually
@@ -3570,6 +3575,9 @@ struct Win11Window {
     uint32_t* cbmp;
     int  cbw, cbh;
     bool cvalid;
+    // Pixel count of the last failed content-bitmap allocation (0 = none yet);
+    // see content_buf() for why a failed size is remembered.
+    int  cbmp_failed;
 
     // Animation state (Phase 2 visual polish)
     int anim_state;   // 0=none,1=opening,2=closing,3=minimizing,4=restoring
@@ -4391,6 +4399,9 @@ struct Win11Desktop {
     // blit, not a content redraw).
     uint32_t* g_snap;
     int       g_snap_cap;
+    // Pixel count of the last failed g_snap allocation (0 = none yet), so a
+    // full-screen snapshot that does not fit is requested once, not per frame.
+    int       g_snap_failed;
     // True while anything is moving (window animation / drag / scroll drag):
     // the acrylic blur is skipped then -- it is invisible in motion and very
     // expensive (Windows degrades acrylic the same way while moving).
@@ -4471,7 +4482,7 @@ struct Win11Desktop {
         drag_window = -1;
         scroll_drag_win = -1;
         scroll_drag_axis = 0;
-        g_snap = nullptr; g_snap_cap = 0; g_no_glass = false;
+        g_snap = nullptr; g_snap_cap = 0; g_snap_failed = 0; g_no_glass = false;
         glass_alpha = C_GLASS_ALPHA;   // white frost, more transparent by default
         g_window_transparent = 0;      // whole-window transparency off by default
         slider_drag = 0;
@@ -4612,6 +4623,7 @@ struct Win11Desktop {
         windows[id].file_scroll = 0;
         windows[id].cbmp = nullptr; windows[id].cbw = 0; windows[id].cbh = 0;
         windows[id].cvalid = false;
+        windows[id].cbmp_failed = 0;
         windows[id].last_valid = false;
         windows[id].browser_url[0] = 0;
         windows[id].browser_url_len = 0;
@@ -5244,8 +5256,14 @@ struct Win11Desktop {
         if (win.cbmp && win.cbw == mw && win.cbh == mh) return win.cbmp;
         if (win.cbmp) { kfree(win.cbmp); win.cbmp = nullptr; }
         win.cbw = 0; win.cbh = 0; win.cvalid = false;
+        // Like the desktop snapshot, a window's content bitmap is optional:
+        // the caller falls back to painting straight into the backbuffer when
+        // this returns null.  Remember a failed size so we do not re-request
+        // it on every frame of a drag/resize.
+        if (win.cbmp_failed >= mw * mh) return nullptr;
         uint32_t* b = (uint32_t*)kmalloc((uint32_t)(mw * mh) * 4u);
-        if (!b) return nullptr;
+        if (!b) { win.cbmp_failed = mw * mh; return nullptr; }
+        win.cbmp_failed = 0;
         win.cbmp = b; win.cbw = mw; win.cbh = mh;
         return b;
     }
@@ -5257,9 +5275,17 @@ struct Win11Desktop {
         int n = gfx.width * gfx.height;
         if (n <= 0 || !gfx.backbuffer) return;
         if (g_snap && g_snap_cap >= n) return;
+        // The snapshot is a full-screen copy (1280*720*4 = 3.5 MiB) that
+        // competes with the backbuffer and the managed heap for a fixed
+        // budget.  When it does not fit we simply run without it -- the
+        // window-erase paths are all guarded by `if (g_snap)`.  Retrying
+        // every frame produced the same OOM forever and buried the boot
+        // log in noise, so remember the failure and stop asking.
+        if (g_snap_failed && n <= g_snap_failed) return;
         if (g_snap) { kfree(g_snap); g_snap = nullptr; g_snap_cap = 0; }
         g_snap = (uint32_t*)kmalloc((uint32_t)n * 4u);
         g_snap_cap = g_snap ? n : 0;
+        if (!g_snap) g_snap_failed = n;
     }
     // Copy a rect between the backbuffer and the snapshot.
     //   to_snap = true  : backbuffer -> snapshot (capture background)
@@ -7264,10 +7290,12 @@ struct Win11Desktop {
                     // disabled (it repaints every frame by design).
                     g_wall_ok = (mforms_ready() != 0);
                     mforms_paint_wall(gfx.width, gfx.height);
-                    if (!g_wall || g_wall_cap < (uint32_t)npix) {
+                    if ((!g_wall || g_wall_cap < (uint32_t)npix) &&
+                        (uint32_t)npix > g_wall_failed) {
                         if (g_wall) { kfree(g_wall); g_wall = nullptr; g_wall_cap = 0; }
                         g_wall = (uint32_t*)kmalloc((uint32_t)npix * 4u);
                         g_wall_cap = g_wall ? (uint32_t)npix : 0;
+                        if (!g_wall) g_wall_failed = (uint32_t)npix;
                     }
                     if (g_wall) {
                         for (int ry = 0; ry < gfx.height; ry++)
