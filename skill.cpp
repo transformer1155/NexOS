@@ -66,10 +66,32 @@ static void build_msg(char* buf, int sz, const char* fmt, const char* s1, int n)
 // CONTENT_MARKS lists "content:" before "text:", so a goal containing
 // "text: ... content: ..." reported content:'s offset and the caller's later
 // `end < cpos` comparisons split the string at the wrong place.
+// Case-insensitive keyword search that respects ASCII word boundaries so
+// "run" does not match inside "runs" or "browser" (which would let a goal
+// like "NexOS runs on DeepSeek" short-circuit into the run_command skill).
+// CJK keywords are unaffected: their edge characters are non-ASCII, which
+// the boundary check treats as non-alphanumeric.  Returns the match offset
+// of the first boundary-respecting occurrence, or -1.
+static int sk_word_hit(const char* s, const char* kw){
+    int klen = sk_strlen(kw);
+    int pos = sk_istr(s, kw);
+    while (pos >= 0){
+        unsigned char l = pos > 0 ? (unsigned char)s[pos-1] : 0;
+        unsigned char r = (unsigned char)s[pos + klen];
+        bool alnumL = (l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z') || (l >= '0' && l <= '9');
+        bool alnumR = (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9');
+        if (!alnumL && !alnumR) return pos;
+        int nxt = sk_istr(s + pos + 1, kw);
+        if (nxt < 0) return -1;
+        pos += 1 + nxt;
+    }
+    return -1;
+}
+
 static int find_any(const char* s, const char* const* cands, int n, int* matchlen){
     int best = -1, bestlen = 0;
     for (int i = 0; i < n; i++){
-        int pos = sk_istr(s, cands[i]);
+        int pos = sk_word_hit(s, cands[i]);
         if (pos >= 0 && (best < 0 || pos < best)){
             best = pos; bestlen = sk_strlen(cands[i]);
         }
@@ -256,7 +278,7 @@ int agent_skill_dispatch(const char* goal, char* out, int outsz){
                     int t = 0;
                     for (int x = start; x < s && t < 31; x++) tmp[t++] = kw[x];
                     tmp[t] = 0;
-                    if (sk_istr(goal, tmp) >= 0){
+                    if (sk_word_hit(goal, tmp) >= 0){
                         char* r = g_skills[i].execute((char*)goal);
                         int n = 0;
                         while (r[n] && n < outsz - 1){ out[n] = r[n]; n++; }
