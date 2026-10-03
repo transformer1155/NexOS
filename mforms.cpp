@@ -392,6 +392,8 @@ int32_t h_disk_mb(int32_t*)    { return g_h.disk_size_mb ? (int32_t)g_h.disk_siz
 int32_t h_is64(int32_t*)       { return g_h.is_64bit ? g_h.is_64bit() : 0; }
 int32_t h_pci(int32_t*)        { return g_h.pci_count ? g_h.pci_count() : 0; }
 int32_t h_nic(int32_t*)        { return g_h.nic_present ? g_h.nic_present() : 0; }
+extern "C" int gui_cpu_load_pct(void);   // defined in gui.cpp (C linkage)
+int32_t h_cpu_load(int32_t*)    { return gui_cpu_load_pct(); }
 
 int32_t h_ticks(int32_t*) {
     uint32_t t;
@@ -801,6 +803,7 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::Is64Bit",      h_is64        },
     { "NexOS.Forms.Host::PciCount",     h_pci         },
     { "NexOS.Forms.Host::NicPresent",   h_nic         },
+    { "NexOS.Forms.Host::CpuLoad",      h_cpu_load    },
     { "NexOS.Forms.Host::Ticks",        h_ticks       },
     { "NexOS.Forms.Host::TickMs",       h_tick_ms     },
     { "NexOS.Forms.Host::SetAnim",      h_set_anim    },
@@ -1047,10 +1050,29 @@ extern "C" void mforms_paint_desktop(int w, int h) {
     diag_step(201, "mforms_paint_desktop returned -> DeferredRun");
     // AI desktop deferred work (e.g. agent run) must happen AFTER the paint
     // heap is reset so its allocations survive as persistent state.
-    if (clr_call("NexOS.Forms.Desktop::DeferredRun", nullptr, 0, &r) == 0)
+    //
+    // PER-FRAME DISCIPLINE: this runs on EVERY desktop frame, and whatever
+    // it leaves allocated is promoted to the persistent watermark by
+    // rebaseline().  A stray `U.Cat(...)`/`U.I(...)` in that path therefore
+    // grows the baseline forever until Shell::Paint has no headroom left and
+    // faults with "managed heap exhausted" (the shell then loses all managed
+    // text).  DeferredRun must stay allocation-free unless it is actually
+    // doing one-shot work; the guard below turns any future regression into
+    // a loud warning instead of a silent, slow-motion death.
+    uint32_t before = clr_heap_mark();
+    if (clr_call("NexOS.Forms.Desktop::DeferredRun", nullptr, 0, &r) == 0) {
+        uint32_t after = clr_heap_mark();
+        uint32_t grew  = after - before;
+        // >256 B per frame is far above any legitimate one-shot work.
+        if (grew > 256u && after > CLR_HEAP_BYTES / 2u) {
+            serial_puts("[MFORMS] WARNING: DeferredRun leaked ");
+            serial_putdec((int)grew);
+            serial_puts(" B into the persistent baseline this frame\n");
+        }
         rebaseline();
-    else
+    } else {
         heap_recover();
+    }
     // g_clr_trace left ON intentionally for diagnosis (every frame traced).
 }
 

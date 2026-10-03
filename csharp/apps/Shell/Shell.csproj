@@ -45,6 +45,8 @@
     <Compile Include="AiSetup.cs" />
     <Compile Include="AiAgent.cs" />
     <Compile Include="Demo.cs" />
+    <Compile Include="NetTools.cs" />
+    <Compile Include="AiLauncher.cs" />
     <Compile Include="Popup.cs" />
     <Compile Include="Toast.cs" />
     <Compile Include="Lang.cs" />

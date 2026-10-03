@@ -98,6 +98,8 @@ namespace NexOS.Forms
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Is64Bit();
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int PciCount();
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int NicPresent();
+        // System load 0..100 (TSC idle-accounting from the GUI loop).  0 == idle.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int CpuLoad();
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Ticks();
         // Monotonic milliseconds (host-calibrated); used for double-click
         // detection.  Wraps after ~49 days.
@@ -389,6 +391,7 @@ namespace NexOS.Forms
         public static int    PixelMode  = 1;
         public static int    PixelScale = 1;
         public static int    PixelScan  = 0;
+        public static int    WidgetsOn  = 1;   // 1 = show desktop telemetry widget
 
         // Terminal (GNOME-Terminal-style) presentation, persisted so it
         // survives reboot.  NOTE: the kernel bitmap font is fixed-size, so
@@ -455,6 +458,9 @@ namespace NexOS.Forms
             cfg = NexOS.Sys.StrConcat(cfg, "pixelscan=");
             cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(PixelScan));
             cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "widgetson=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(WidgetsOn));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
             cfg = NexOS.Sys.StrConcat(cfg, "termcellh=");
             cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(TermCellH));
             cfg = NexOS.Sys.StrConcat(cfg, "\n");
@@ -493,6 +499,7 @@ namespace NexOS.Forms
                 else if (NexOS.Sys.StrEq(key, "pixelmode"))   PixelMode  = v;
                 else if (NexOS.Sys.StrEq(key, "pixelscale"))  PixelScale = (v > 1) ? v : 1;
                 else if (NexOS.Sys.StrEq(key, "pixelscan"))   PixelScan  = v;
+                else if (NexOS.Sys.StrEq(key, "widgetson"))   WidgetsOn = v;
                 else if (NexOS.Sys.StrEq(key, "termcellh"))   { TermCellH = v; if (TermCellH < 12) TermCellH = 12; if (TermCellH > 28) TermCellH = 28; }
                 else if (NexOS.Sys.StrEq(key, "termbgmode"))  TermBgMode = v;
             }

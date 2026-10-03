@@ -25,7 +25,9 @@ namespace NexOS.Forms
         public const int Browser      = 8;
         public const int AiSetup      = 9;   // one-tap AI enablement wizard
         public const int AiAgent      = 10;  // AI Agent runner (Planner/Actor/Critic)
-        public const int Demo         = 11;  // button-shrink + reply "啊" demo window
+        public const int Demo         = 11;  // button-shrink + reply demo window
+        public const int NetTools     = 12;  // network diagnostics (ipconfig/netstat/ping)
+        public const int AiLauncher   = 13;  // AI command console / launcher
     }
 
     public static class Shell
@@ -68,6 +70,7 @@ namespace NexOS.Forms
             Theme.PixelMode  = 1;    // retro pixel / CRT-monitor look ON by default
             Theme.PixelScale = 1;    // full spatial detail (no chunkiness) by default
             Theme.PixelScan  = 0;    // scanlines off by default (toggle in Settings)
+            Theme.WidgetsOn  = 1;    // desktop telemetry widget ON by default
 
             // Re-apply any persisted personalization from a previous session
             // (nexos.cfg on the MKFS data disk).  Safe no-op if the file is
@@ -82,6 +85,10 @@ namespace NexOS.Forms
             Login.Init();          // lock screen (no-op if already signed in)
             Toast.Init();          // transient notification stack
             Toast.Show("NexOS", "系统就绪", 3000);
+            // Keep the overlay repainting every frame so the desktop telemetry
+            // HUD (clock / meters / sparkline) updates live.  The HUD also
+            // re-arms SetAnim(1) from PaintOverlay as a self-healing fallback.
+            if (Theme.WidgetsOn != 0) Host.SetAnim(1);
             Host.Log("NexOS.Forms.Shell initialised");
         }
 
@@ -115,6 +122,8 @@ namespace NexOS.Forms
             if (kind == Kind.AiSetup)      return new AiSetupApp();
             if (kind == Kind.AiAgent)      return new AiAgentApp();
             if (kind == Kind.Demo)         return new DemoApp();
+            if (kind == Kind.NetTools)     return new NetToolsApp();
+            if (kind == Kind.AiLauncher)   return new AiLauncherApp();
             return null;
         }
 

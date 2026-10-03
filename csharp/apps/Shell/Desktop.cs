@@ -107,12 +107,24 @@ namespace NexOS.Forms
         // truth lives in a MKFS file ("installed.cfg") so the Control Panel
         // "Apps" page and the shell share one source of state across boots.
         static bool[]   Installed;        // index == Kind value (0..11)
-        const  int     KINDS = 12;
+        const  int     KINDS = 14;
+        // Public count so other apps (Control Panel "Apps & features") can
+        // enumerate every registered Kind without a magic number.
+        public static int KindCount { get { return KINDS; } }
         const  int     CFG_FS = 3;        // same volume the Desktop folder uses
         const  string  CFG_NAME = "installed.cfg";
 
         static bool menuOpen;
         static int  CurrentDesktop = 0;   // 0 = default desktop (icons/right-click)
+
+        // ---- desktop telemetry HUD (persistent ring buffer) ------------
+        // Allocated once in Init() (outside paint) so the per-frame heap
+        // rewind never turns it into a dangling reference.
+        static int[]    hudHist;     // CPU-load history samples
+        static int      hudCount;    // valid samples (<= HUD_MAX)
+        static int      hudIdx;      // ring write position
+        static int      hudLast;     // TickMs() of last sample
+        const  int      HUD_MAX = 40;
 
         // ---- Start menu state -----------------------------------------
         static int startView = 0;         // 0 = Pinned, 1 = All apps
@@ -470,10 +482,10 @@ namespace NexOS.Forms
             // Desktop icons are read from the "Desktop" folder on MKFS.
             SyncFromFs();
 
-            tN    = 7;
-            tKind = new int[7];
-            tCol  = new int[7];
-            tLet  = new int[7];
+            tN    = 9;
+            tKind = new int[10];
+            tCol  = new int[10];
+            tLet  = new int[10];
             Pin(0, Kind.FileExplorer, 0xFFC83D, 'P');
             Pin(1, Kind.Terminal,     0x2F3A45, '>');
             Pin(2, Kind.Calculator,   0x00A3A3, '=');
@@ -481,17 +493,20 @@ namespace NexOS.Forms
             Pin(4, Kind.ControlPanel, 0x0078D4, 'S');
             Pin(5, Kind.About,        0xD8541B, 'i');
             Pin(6, Kind.Browser,      0x1A73E8, 'B');
+            Pin(7, Kind.NetTools,     0x1FB85A, 'W');
+            Pin(8, Kind.AiLauncher,   0x9B6BFF, 'K');
 
             trayRect = new int[4];
             sortMode = 0;
             menuOpen = false;
             renameIdx = -1;
 
-            kName = new string[12];
+            kName = new string[KINDS];
             kName[0] = "Settings";     kName[1] = "This PC";    kName[2] = "Terminal";
             kName[3] = "Calculator";   kName[4] = "Task Mgr";   kName[5] = "Optimizer";
             kName[6] = "Notepad";      kName[7] = "About";      kName[8] = "Browser";
             kName[9] = "AI Setup";     kName[10] = "AI Agent";  kName[11] = "Demo";
+            kName[12] = "Net Tools";   kName[13] = "AI 命令台";
 
             Popup.Init();
 
@@ -502,6 +517,12 @@ namespace NexOS.Forms
             // AI desktop chat buffers (MiniCLR: no static initialisers).
             aiHist   = new string[40];
             aiHistN  = 0;
+
+            // Telemetry HUD ring buffer (allocated once, outside paint).
+            hudHist  = new int[HUD_MAX];
+            hudCount = 0;
+            hudIdx   = 0;
+            hudLast  = 0;
             aiCode   = new int[200];
             aiCodeN  = 0;
             aiFocus  = 0;
@@ -546,6 +567,8 @@ namespace NexOS.Forms
             Put(9, Kind.AiSetup,      "AI Setup",   0x6A3EA1, 'A');
             Put(10, Kind.AiAgent,     "AI Agent",   0x8A5CF6, 'R');
             Put(11, Kind.Demo,        "Demo",       0x8A5CF6, 'D');
+            Put(12, Kind.NetTools,    "Net Tools",  0x1FB85A, 'W');
+            Put(13, Kind.AiLauncher,  "AI 命令台",  0x9B6BFF, 'K');
         }
 
         static void Put(int i, int k, string n, int c, int l)
@@ -571,6 +594,8 @@ namespace NexOS.Forms
             else if (kind == Kind.AiSetup) { gCol = 0x6A3EA1; gLet = 'A'; }
             else if (kind == Kind.AiAgent) { gCol = 0x8A5CF6; gLet = 'R'; }
             else if (kind == Kind.Demo)   { gCol = 0x8A5CF6; gLet = 'D'; }
+            else if (kind == Kind.NetTools)   { gCol = 0x1FB85A; gLet = 'W'; }
+            else if (kind == Kind.AiLauncher) { gCol = 0x9B6BFF; gLet = 'K'; }
             else { gCol = 0x888888; gLet = '?'; }
         }
 
@@ -682,7 +707,7 @@ namespace NexOS.Forms
                 // Install: re-pin to the taskbar if there is room.
                 int have = 0;
                 for (int i = 0; i < tN; i++) if (tKind[i] == k) have = 1;
-                if (have == 0 && tN < 7)
+                if (have == 0 && tN < 10)
                 {
                     KindStyle(k);
                     Pin(tN, k, (int)gCol, gLet);
@@ -911,6 +936,8 @@ namespace NexOS.Forms
             if (k == Kind.About)        return "关于";
             if (k == Kind.AiAgent)      return "人工智能";
             if (k == Kind.Demo)         return "演示";
+            if (k == Kind.NetTools)     return "网络";
+            if (k == Kind.AiLauncher)   return "命令台";
             return "";
         }
 
@@ -1238,8 +1265,13 @@ namespace NexOS.Forms
         // (blocking) agent call without the reply string becoming a dangling
         // reference on the next frame.
         public static void DeferredRun() {
-            Host.Log(U.Cat("[AIDESK] DeferredRun thinking=", U.I(aiThinking), " pending=", aiPendingGoal != null ? "yes" : "no"));
-            if (aiThinking != 0) { AiRunPending(); return; }
+            // NOTE: mforms calls this AFTER Shell::PaintDesktop and then
+            // re-baselines the managed watermark, so ANY string allocated
+            // here is promoted to persistent state instead of being
+            // reclaimed with the frame.  A per-frame diagnostic string
+            // therefore ratchets the baseline up forever until paint runs
+            // out of heap.  Log a fixed literal (no allocation) instead.
+            if (aiThinking != 0) { Host.Log("[AIDESK] deferred: running agent"); AiRunPending(); return; }
             // Safety net: if no animation is pending and the typewriter is
             // idle, clear any stale repaint request (e.g. AiRunPending was
             // skipped because the goal was empty or the run faulted early).
@@ -1258,6 +1290,83 @@ namespace NexOS.Forms
         // =============================================================
         //  Layer 2 - taskbar + Start menu (painted above every window)
         // =============================================================
+        // ---- desktop telemetry HUD ------------------------------------
+        // A compact, always-on corner dashboard: clock, RAM / CLR-heap /
+        // CPU load meters, NIC status, and a live CPU sparkline.  Every
+        // figure is a real Host counter; the sparkline samples CpuLoad()
+        // at ~2 Hz.  The card sits bottom-right, above the taskbar, and is
+        // painted by the overlay layer so it rides on top of any window.
+        static string P2(int v) { string s = U.I(v); if (s.Length < 2) s = U.Cat("0", s); return s; }
+
+        static void TelemetryHud(int w, int h)
+        {
+            // Sample CPU every 500 ms into the ring buffer.  CpuLoad() resets
+            // the kernel counters on each call, so the cadence sets the window.
+            int now = Host.TickMs();
+            if (hudHist != null && (now - hudLast >= 500 || hudLast == 0))
+            {
+                int load = Host.CpuLoad();
+                hudHist[hudIdx] = load;
+                hudIdx = hudIdx + 1; if (hudIdx >= HUD_MAX) hudIdx = 0;
+                if (hudCount < HUD_MAX) hudCount = hudCount + 1;
+                hudLast = now;
+            }
+
+            // Card geometry: bottom-right, but lifted well clear of the
+            // taskbar's tray cluster / clock so the HUD never swallows a
+            // click meant for the tray (a real conflict observed on device).
+            int cw = 206, ch = 166;
+            int cx = w - cw - 12;
+            int cy = h - TaskH - ch - 20;
+
+            Gfx.FillRound(cx, cy, cw, ch, 10, 0xF21C1C1Fu);   // acrylic dark
+            Gfx.DrawRound(cx, cy, cw, ch, 10, 0xFF3A3F4Bu);
+
+            int px = cx + 12, pw = cw - 24;
+
+            // Title + clock.
+            Gfx.FillRound(cx + 10, cy + 8, 4, 14, 2, 0x9B6BFFu);
+            Gfx.Text(cx + 22, cy + 8, "遥测 HUD", 0xE8EBF2u);
+            string clk = U.Cat(P2(Host.Hour()), ":", P2(Host.Minute()), ":", P2(Host.Second()));
+            Gfx.Text(cx + cw - 12 - Gfx.Measure(clk), cy + 8, clk, 0x8CD1FFu);
+
+            // Meters.
+            int used = Host.PagesUsed(), total = Host.PagesTotal();
+            int memPct  = total > 0 ? used * 100 / total : 0;
+            int heapPct = Host.HeapAlloc() * 100 / (512 * 1024); if (heapPct > 100) heapPct = 100;
+            int cpuPct  = hudCount > 0 ? hudHist[(hudIdx - 1 + HUD_MAX) % HUD_MAX] : 0;
+
+            int my = cy + 30;
+            W.Meter(px, my, pw, "RAM", memPct, 0x0078D4u);       my += 30;
+            W.Meter(px, my, pw, "CLR Heap", heapPct, 0x1FB85Au);  my += 30;
+            W.Meter(px, my, pw, "CPU", cpuPct, 0x9B6BFFu);       my += 26;
+
+            // NIC status.
+            int nic = Host.NicPresent();
+            uint nicCol = nic != 0 ? 0x1FB85Au : 0xE5534Bu;
+            Gfx.Text(px, my, nic != 0 ? "NIC: UP" : "NIC: DOWN", nicCol);
+
+            // CPU sparkline strip (below the NIC line, inside the card).
+            int sx = px, sy = my + 20, sw = pw, sh = 20;
+            Gfx.DrawRound(sx, sy, sw, sh, 4, 0xFF2A2A30u);
+            if (hudCount > 1)
+            {
+                int n = hudCount;
+                int bw = sw / n; if (bw < 2) bw = 2;
+                for (int k = 0; k < n; k++)
+                {
+                    int idx = (hudIdx - n + k + HUD_MAX * 2) % HUD_MAX;
+                    int v = hudHist[idx]; if (v > 100) v = 100;
+                    int bh = v * sh / 100; if (bh < 1) bh = 1;
+                    uint bc = v > 75 ? 0xE5534Bu : (v > 40 ? 0xF2A33Cu : 0x1FB85Au);
+                    Gfx.FillRect(sx + 1 + k * bw, sy + sh - bh, bw - 1, bh, bc);
+                }
+            }
+
+            // Keep the overlay repainting so the HUD stays live.
+            Host.SetAnim(1);
+        }
+
         public static void PaintOverlay(int w, int h)
         {
             ShellTheme();
@@ -1265,6 +1374,7 @@ namespace NexOS.Forms
             if (menuOpen || Anim.Get(START_KEY) != 0) StartMenu(w, h);
             if (Popup.IsOpen()) Popup.Paint(w, h);
             Toast.Paint(w, h);
+            if (Theme.WidgetsOn != 0) TelemetryHud(w, h);
         }
 
         static void Taskbar(int w, int h)
@@ -1415,10 +1525,11 @@ namespace NexOS.Forms
                 case 3: return 0x2F3A45; case 4: return 0x00A3A3; case 5: return 0xD8541B;
                 case 6: return 0x6B3FA0; case 7: return 0x1B6BC9; case 8: return 0x1A73E8;
                 case 9: return 0x888888; case 10: return 0x0078D4; case 11: return 0x888888;
+                case 12: return 0x1FB85A; case 13: return 0x9B6BFF;
             }
             return 0x888888;
         }
-        public static int AppLetter(int kind) { if (kind >= 0 && kind < 12) return kName[kind][0]; return '?'; }
+        public static int AppLetter(int kind) { if (kind >= 0 && kind < KINDS) return kName[kind][0]; return '?'; }
         static bool IsStartPinned(int kind) { for (int i = 0; i < dN; i++) if (dKind[i] == kind) return true; return false; }
 
         static void StartMenu(int w, int h)
@@ -1498,7 +1609,7 @@ namespace NexOS.Forms
                 int rowH = 22, lx = x + 28, ly = y + 94, listW = mw - 56;
                 int fyEnd = FootY(y, mh);
                 int sel = 0;                          // running index over installed kinds
-                for (int i = 0; i < 12; i++)
+                for (int i = 0; i < KINDS; i++)
                 {
                     int ry = ly + i * rowH;
                     if (ry + rowH > fyEnd - 4) break;
@@ -1579,7 +1690,7 @@ namespace NexOS.Forms
             {
                 int rowH = 22, lx = x + 28, ly = y + 94, listW = mw - 56;
                 int fyEnd = FootY(y, mh);
-                for (int i = 0; i < 12; i++)
+                for (int i = 0; i < KINDS; i++)
                 {
                     int ry = ly + i * rowH;
                     if (ry + rowH > fyEnd - 4) break;
@@ -1774,7 +1885,7 @@ namespace NexOS.Forms
                 // All apps list rows.
                 int rowH = 22, lx = x + 28, ly = y + 94, listW = mw - 56;
                 int fy2 = FootY(y, mh);
-                for (int i = 0; i < 12; i++)
+                for (int i = 0; i < KINDS; i++)
                 {
                     int ry = ly + i * rowH;
                     if (ry + rowH > fy2 - 4) break;
