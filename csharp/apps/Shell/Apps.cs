@@ -1773,7 +1773,7 @@ namespace NexOS.Forms
             {
                 int top = pad + 60, rowH = 44, btnW = 110, btnH = 30;
                 int btnX = w - pad - btnW;
-                for (int i = 0; i < 12; i++)
+                for (int i = 0; i < Desktop.KindCount; i++)
                 {
                     int ry = top + i * rowH;
                     if (U.In(mx, my, btnX, ry + (rowH - btnH) / 2, btnW, btnH))
@@ -1797,7 +1797,7 @@ namespace NexOS.Forms
             int listW = w - 2 * pad;
             Gfx.Text(pad, top - 36, "Apps & features", C.Text);
             Gfx.Text(pad, top - 16, "Install or uninstall the built-in applications.", C.TextSub);
-            for (int i = 0; i < 12; i++)
+            for (int i = 0; i < Desktop.KindCount; i++)
             {
                 int ry = top + i * rowH;
                 if (i > 0) Gfx.DrawLine(pad, ry, pad + listW, ry, C.Border);

@@ -3201,6 +3201,8 @@ enum AppType {
     APP_AISETUP,        // one-tap AI enablement wizard (managed)
     APP_AIAGENT,        // AI Agent runner (managed): Planner/Actor/Critic
     APP_DEMO,           // button-shrink + reply "啥" demo window (managed)
+    APP_NETTOOLS,        // network diagnostics console (managed)
+    APP_AILAUNCHER,      // AI command console / natural-language launcher (managed)
     APP_START_MENU,      // Start menu: loaded into the window DB so it is
                          // composited & dirty-tracked like any other window
 };
@@ -6768,6 +6770,7 @@ struct Win11Desktop {
         anim_active_prev = any_animating();
     }
 
+    // ---- CPU load sampling (lightweight, measurement-only) ----------------
     // ---- Smooth easing curves (涓濇粦鍔ㄧ敾) --------------------------------
     // p is 0..1000 (per-mille); returns eased 0..1000.  Cubic easing removes
     // the robotic constant-speed feel of the old linear ramp.
@@ -8781,6 +8784,8 @@ struct Win11Desktop {
             case APP_AISETUP:       return 9;   // Kind.AiSetup
             case APP_AIAGENT:       return 10;  // Kind.AiAgent
             case APP_DEMO:          return 11;  // Kind.Demo
+            case APP_NETTOOLS:      return 12;  // Kind.NetTools
+            case APP_AILAUNCHER:    return 13;  // Kind.AiLauncher
             default:                return -1;   // Win32 stay native
         }
     }
@@ -8801,6 +8806,8 @@ struct Win11Desktop {
             case 9: return APP_AISETUP;
             case 10: return APP_AIAGENT;
             case 11: return APP_DEMO;
+            case 12: return APP_NETTOOLS;
+            case 13: return APP_AILAUNCHER;
             default: return APP_NONE;
         }
     }
@@ -8884,6 +8891,10 @@ struct Win11Desktop {
                 ww = 420; wh = 440; title = "AI Agent"; break;
             case APP_DEMO:
                 ww = 600; wh = 660; title = "Demo"; break;
+            case APP_NETTOOLS:
+                ww = 640; wh = 560; title = "Net Tools"; break;
+            case APP_AILAUNCHER:
+                ww = 640; wh = 480; title = "AI Launcher"; break;
             default: return;
         }
 
@@ -9603,6 +9614,48 @@ struct Win11Desktop {
 //  C interface for kernel integration
 // =====================================================================
 static Win11Desktop g_wm;
+
+// ---- CPU load accounting (external linkage) -------------------------
+// gui_cpu_account(idle) is called once per GUI loop iteration from
+// kernel.cpp: idle==1 when the loop hit its idle-throttle (no input was
+// pending, so it busy-waited on the TSC), 0 when it did real work.  We
+// accumulate TSC time and derive the fraction spent NOT idle -- a
+// meaningful system-load figure.  gui_cpu_load_pct() returns 0..100 and
+// resets the window (the C# telemetry HUD samples it ~2 Hz).  This never
+// alters scheduling: it is purely observational.  Defined OUTSIDE the
+// anonymous namespace so kernel.cpp (gui_cpu_account) and mforms.cpp
+// (gui_cpu_load_pct via Host.CpuLoad) can link to them.
+static uint32_t g_cpu_busy, g_cpu_total, g_cpu_lt;   // zero-init (BSS)
+
+static inline uint32_t gui_rdtsc32(void) {
+    uint32_t lo;
+    __asm__ __volatile__("rdtsc" : "=a"(lo) : : "edx");
+    return lo;
+}
+
+extern "C" void gui_cpu_account(int idle) {
+    uint32_t n = gui_rdtsc32();
+    if (g_cpu_lt == 0) { g_cpu_lt = n; return; }   // prime on first call
+    uint32_t dt = n - g_cpu_lt;
+    g_cpu_lt = n;
+    g_cpu_total += dt;
+    if (!idle) {
+        g_cpu_busy += dt;
+    } else if (dt > 3000000u) {
+        // idle throttle is ~3M TSC ticks; the small remainder is real work
+        g_cpu_busy += (dt - 3000000u);
+    }
+}
+
+extern "C" int gui_cpu_load_pct(void) {
+    uint32_t total = g_cpu_total;
+    if (total == 0) return 0;
+    uint32_t busy = g_cpu_busy;
+    uint32_t pct = (busy * 100u) / total;
+    if (pct > 100) pct = 100;
+    g_cpu_busy = 0; g_cpu_total = 0;
+    return (int)pct;
+}
 
 // Programmatic window geometry action (WAct.*).  Called from the managed
 // shell via Host.WinAction(id, code).  Mirrors the title-bar / taskbar

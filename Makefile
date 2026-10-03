@@ -516,6 +516,8 @@ SHELL_SRC := csharp/apps/Shell/Shell.cs csharp/apps/Shell/Apps.cs \
              csharp/apps/Shell/Popup.cs \
              csharp/apps/Shell/Lang.cs \
              csharp/apps/Shell/Demo.cs \
+             csharp/apps/Shell/NetTools.cs \
+             csharp/apps/Shell/AiLauncher.cs \
              csharp/NexOS.Forms/Forms.cs csharp/NexOS.Forms/Voice.cs \
              csharp/apps/Shell/Shell.csproj
 $(SFS_DIR)/shell.mex: $(SHELL_SRC) $(CS_CORE) tools/mex_pack.py

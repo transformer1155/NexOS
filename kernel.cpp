@@ -1897,6 +1897,7 @@ extern "C" {
     void gui_remote_end(void);                // dismiss the overlay
     void gui_tick(void);
     void gui_animate_frame(void);
+    void gui_cpu_account(int);
     // Open a Windows executable file (exe/bat/ps1/com) inside the GUI.
     // Initializes the GUI on demand (kernel boots to command line only).
     void gui_open_file(const char* filename, const char* args);
@@ -9627,6 +9628,7 @@ extern "C" void kmain(){
                     do { __asm__ __volatile__("rdtsc" : "=a"(_t1) : : "edx"); }
                     while ((uint32_t)(_t1 - _t0) < 3000000u);
                 }
+                gui_cpu_account(st == 0 ? 1 : 0);
             }
             // The desktop was torn down (Start menu -> Terminal, or a
             // managed ExitGui).  If the boot deferred sign-in to the lock
