@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>NexOS 32-bit on V86</title>
+<style>
+  body { background:#111; color:#ddd; font-family:monospace; margin:0; padding:16px; }
+  #screen { background:#000; width:720px; height:400px; }
+  #serial { white-space:pre-wrap; background:#000; color:#0f0; padding:8px;
+            height:200px; overflow:auto; font-size:12px; }
+  #status { margin:8px 0; color:#8af; }
+</style>
+</head>
+<body>
+<h3>NexOS 32-bit — V86</h3>
+<div id="status">loading…</div>
+<div id="screen"></div>
+<pre id="serial"></pre>
+<script src="libv86.js"></script>
+<script>
+(function () {
+  var status = document.getElementById('status');
+  var serial = document.getElementById('serial');
+  var emulator = new V86({
+    wasm_path: 'v86.wasm',
+    memory_size: 64 * 1024 * 1024,
+    vga_memory_size: 2 * 1024 * 1024,
+    bios:    { url: 'seabios.bin' },
+    vga_bios:{ url: 'vgabios.bin' },
+    hda:     {
+      url: 'nexos32.img',
+      async: false,
+      // State the geometry explicitly.  Left to itself, v86 derives one
+      // from the MBR partition table; this image has no partition table,
+      // and the BIOS then reports an all-zero geometry via INT 13h AH=08h,
+      // which makes large LBA reads get rejected with AH=0x01.
+      size: 4 * 1024 * 1024,
+      heads: 16,
+      sectors_per_track: 63
+    },
+    autostart: true,
+    screen_container: document.getElementById('screen'),
+    serial_container: serial
+  });
+
+  window.emu = emulator;
+  window.serialText = '';
+  emulator.add_listener('serial0-output-byte', function (b) {
+    var c = String.fromCharCode(b);
+    window.serialText += c;
+    serial.textContent += c;
+    serial.scrollTop = serial.scrollHeight;
+  });
+  emulator.add_listener('emulator-ready', function () { status.textContent = 'emulator ready'; });
+  emulator.add_listener('emulator-loaded', function () { status.textContent = 'emulator loaded (running)'; });
+
+  // Convenience hooks for automated testing.
+  window.sendText = function (t) {
+    for (var i = 0; i < t.length; i++) emulator.serial0_send(t[i]);
+    emulator.serial0_send('\n');
+  };
+
+  // PS/2 scancodes for the characters the kernel's shell needs.  The kernel
+  // reads the keyboard through the PS/2 controller, not the serial port, so
+  // typing has to go in as scancodes.
+  var SCANCODES = {
+    ' ': 0x39, '\n': 0x1C, '\r': 0x1C, '\b': 0x0E, '\t': 0x0F,
+    '-': 0x0C, '=': 0x0D, '[': 0x1A, ']': 0x1B, ';': 0x27, "'": 0x28,
+    '`': 0x29, '\\': 0x2B, ',': 0x33, '.': 0x34, '/': 0x35,
+    '0': 0x0B, '1': 0x02, '2': 0x03, '3': 0x04, '4': 0x05, '5': 0x06,
+    '6': 0x07, '7': 0x08, '8': 0x09, '9': 0x0A
+  };
+  'abcdefghijklmnopqrstuvwxyz'.split('').forEach(function (ch, i) {
+    SCANCODES[ch] = [0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17,
+                     0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13,
+                     0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C][i];
+  });
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').forEach(function (ch, i) {
+    var lower = 'abcdefghijklmnopqrstuvwxyz'[i];
+    SCANCODES[ch] = { shift: SCANCODES[lower] };
+  });
+
+  window.typeText = function (text) {
+    for (var i = 0; i < text.length; i++) {
+      var ch = text[i];
+      var code = SCANCODES[ch];
+      if (code === undefined) continue;
+      if (typeof code === 'object') {
+        emulator.keyboard_send_scancodes([0x2A, code.shift, 0xAA]); // shift down, key, shift up
+      } else {
+        emulator.keyboard_send_scancodes([code]);
+      }
+    }
+  };
+})();
+</script>
+</body>
+</html>
