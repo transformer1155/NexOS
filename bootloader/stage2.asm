@@ -23,6 +23,13 @@ KERNEL_LOAD_OFF    equ 0x0000
 KERNEL_LBA         equ 33          ; 1 (boot) + 32 (stage2) = 33
 KERNEL_SECTORS     equ 512         ; 256 KiB max (kernel.bin ~219 KB; keeps load below 0xA0000 VGA)
 KERNEL_CHUNK       equ 64          ; sectors per INT 13h call (BIOS-safe limit)
+; Per-call progress in real-mode segment units.  Each INT 13h call moves
+; CHUNK*512 bytes and one segment unit is 16 bytes, so the load segment has to
+; advance by CHUNK*512/16 = CHUNK*32 per call.  Keep this derived from
+; KERNEL_CHUNK: it used to be hard-coded to 0x0800, which is only correct for
+; 64 sectors, so changing the chunk size would have made the kernel image
+; overlap itself while loading.
+KERNEL_SEG_STEP    equ KERNEL_CHUNK * 32
 KERNEL_ENTRY       equ 0x10000     ; kernel entry (linked at this address)
 
 start:
@@ -59,15 +66,23 @@ start:
     mov eax, esi
     add eax, KERNEL_LBA
     mov dword [dap_kernel + 8], eax              ; LBA
+    ; ESI holds the sector offset within the kernel, but the DAP pointer has to
+    ; go in SI for INT 13h, and the BIOS is free to clobber SI.  Save ESI across
+    ; the call: without this the offset becomes the DAP address after the first
+    ; read, so every later read targets the wrong sector (observed under V86 as
+    ; a spurious AH=0x01 failure on the second read, while a single read with
+    ; identical parameters succeeds).
+    push esi
     mov si, dap_kernel
     mov ah, 0x42
     mov dl, [boot_drive]
     int 0x13
+    pop esi
     jc disk_error
     sub ax, cx                                   ; remaining -= chunk
     movzx ecx, cx
     add esi, ecx                                 ; lba_off += chunk
-    add word [dap_kernel + 6], 0x0800            ; segment += 32KB
+    add word [dap_kernel + 6], KERNEL_SEG_STEP   ; segment += CHUNK*32
     jmp .load_loop
 .load_done:
     mov word [dap_kernel + 2], KERNEL_CHUNK      ; restore
