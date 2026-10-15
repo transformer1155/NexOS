@@ -52,8 +52,14 @@ static inline void outl(uint16_t p,uint32_t v){ __asm__ __volatile__("outl %0,%1
 // =====================================================================
 //  Serial debug output (port 0x3F8)  -  for UEFI boot tracing
 // =====================================================================
-extern "C" void serial_putc(char c){ outb(0x3F8, (uint8_t)c); }
-extern "C" void serial_puts(const char* s){ while(*s) outb(0x3F8, (uint8_t)*s++); }
+extern "C" void serial_putc(char c){
+    // Wait for the transmit holding register to be empty before sending.
+    // Without this, bursts of characters overrun the 16550A FIFO on emulators
+    // (VirtualBox/QEMU) and bytes are dropped or corrupted in the host log.
+    while((inb(0x3FD) & 0x20) == 0);
+    outb(0x3F8, (uint8_t)c);
+}
+extern "C" void serial_puts(const char* s){ while(*s) serial_putc(*s++); }
 // Print a non-negative integer in decimal to the serial port.
 extern "C" void serial_puts_dec(int v){
     if (v == 0){ serial_puts("0"); return; }
@@ -74,6 +80,17 @@ static int serial_try_getc(void){
     if (inb(0x3FD) & 0x01) return (int)(unsigned char)inb(0x3F8);
     return -1;
 }
+// VirtualBox defaults COM1 to 9600 baud, but our raw outb(0x3F8, c) assumes the
+// host side is also sampling at 115200 (QEMU default).  Force 115200 8N1 before
+// any real serial diagnostics so VBox logs are readable.
+extern "C" void serial_init_115200(void){
+    outb(0x3FB, 0x80);   // DLAB=1
+    outb(0x3F8, 0x01);   // divisor low (115200)
+    outb(0x3F9, 0x00);   // divisor high
+    outb(0x3FB, 0x03);   // 8N1
+    outb(0x3F9, 0x00);   // disable interrupts
+    outb(0x3FC, 0x0B);   // DTR+RTS+OUT2 (OUT2 required by some emulators)
+}
 // Remote console buffer: commands arriving over COM1 (frontend ops terminal /
 // bridge) are accumulated here and dispatched to run_command() on newline.
 static char g_serial_inbuf[256];
@@ -84,6 +101,11 @@ static int  g_serial_inlen = 0;
 // machine sees what each command actually did, not just what was typed.
 extern "C" void gui_remote_output(const char* s, int n);
 static void remote_gui_out(const char* s, int n){ gui_remote_output(s, n); }
+
+// GUI test harness: drive real GUI code paths by name over the serial line.
+// Lines prefixed "gt " are routed to gui_test_cmd() and never parsed as shell
+// commands (so they can't trigger the remote-control overlay).
+extern "C" void gui_test_cmd(const char* cmd);
 
 // =====================================================================
 //  Hardware Detection Module
@@ -2594,6 +2616,7 @@ public:
                     return s * FS_ENTRY_PER_SEC + e;
             }
         }
+        serial_puts("[SFS-FIND] not found: "); serial_puts(name); serial_puts("\n");
         return -1;
     }
 
@@ -6824,7 +6847,9 @@ static void cmd_gui(const char* args){
     // (the persistent "jaggies" the desktop showed).  The callbacks are plain
     // kernel functions, so wiring them first is safe.
     register_gui_callbacks();
+    serial_puts("[GUI-STEP] callbacks OK\n");
 
+    serial_puts("[GUI-STEP] gui_init start\n");
     // Bring up the GUI subsystem on demand (allocates backbuffer, etc.)
     if(gui_init() != 0){
         boot_splash_finish();     // let the text console report the failure
@@ -6833,6 +6858,7 @@ static void cmd_gui(const char* args){
         term.set_color(make_color(WHITE, BLACK));
         return;
     }
+    serial_puts("[GUI-STEP] gui_init OK\n");
     // gui_init() loads the fonts from SFS (several MB) -- the slowest step of
     // the whole boot.  Keep the animation alive across it.
     boot_splash_tick();
@@ -6845,11 +6871,15 @@ static void cmd_gui(const char* args){
     // Win32 subsystem must be live before we hand over.  It used to be
     // initialised only by `winapp`/`reg`/`winver`/`winenv`, so a
     // double-click in a fresh session found no PE file reader and failed
+    serial_puts("[GUI-STEP] win32 start\n");
     // with "file not found".  Idempotent.
     win32_ensure_init();
+    serial_puts("[GUI-STEP] win32 OK\n");
 
+    serial_puts("[GUI-STEP] seed start\n");
     // Seed the Desktop folder with .lnk shortcut files (idempotent).
     seed_desktop_shortcuts();
+    serial_puts("[GUI-STEP] seed OK\n");
 
     term.set_color(make_color(CYAN, BLACK));
     term.write("Entering Win11 Desktop GUI mode...\n");
@@ -9063,6 +9093,9 @@ static void boot_stage(uint8_t s){
 
 extern "C" void plugin_manager_boot(void);  /* Phase 1 plugin manager */
 extern "C" void kmain(){
+    // Make sure COM1 runs at 115200 8N1 before any diagnostic output.
+    // VirtualBox defaults COM1 to 9600; without this its serial log is garbled.
+    serial_init_115200();
     // RAW early marker: proves kmain entry is reached (bypasses C++ serial_puts)
     __asm__ __volatile__("movb $0x5A, %%al\n\tmovw $0x3F8, %%dx\n\toutb %%al, %%dx" ::: "eax","edx");
     // ---- Mask all 8259 PIC interrupts ----
@@ -9522,6 +9555,14 @@ extern "C" void kmain(){
                         if (ch == '\r' || ch == '\n') {
                             if (g_serial_inlen > 0) {
                                 g_serial_inbuf[g_serial_inlen] = 0;
+                                // GUI test harness: "gt ..." lines drive the real GUI
+                                // handlers by name (see gui_test_cmd).  They bypass the
+                                // shell and the remote-control overlay entirely.
+                                if (g_serial_inbuf[0] == 'g' && g_serial_inbuf[1] == 't'
+                                        && g_serial_inbuf[2] == ' ') {
+                                    gui_test_cmd(g_serial_inbuf);
+                                    g_serial_inlen = 0;
+                                } else {
                                 // Remote command over COM1 (frontend ops console / bridge):
                                 // arm the security-guard overlay before executing it,
                                 // and stream the command's output into that overlay so
@@ -9532,6 +9573,7 @@ extern "C" void kmain(){
                                 run_command(g_serial_inbuf);
                                 term_clear_ssh_sink();
                                 g_serial_inlen = 0;
+                                }
                             }
                         } else if (ch == 0x7F || ch == '\b') {
                             if (g_serial_inlen > 0) g_serial_inlen--;

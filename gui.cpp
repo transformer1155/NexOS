@@ -1662,7 +1662,7 @@ struct Graphics {
             // Synthesize a default VBE info so the rest of init works.
             // enable_vbe_mode() will actually set the mode via BGA ports.
             info->vbe_ok         = 1;
-            info->vbe_mode_set   = 1;            // will be set via BGA
+            info->vbe_mode_set   = 0;            // BGA will set it; do not claim BIOS already did
             info->width          = 1024;
             info->height         = 768;
             info->bpp            = 32;
@@ -1943,10 +1943,25 @@ struct Graphics {
             serial_puts("[GUI] UEFI GOP surface is already active - skipping BGA mode set\n");
             return;
         }
-        // If BGA ports available (QEMU/VirtualBox), set mode dynamically
+        // If BGA ports available (QEMU/VirtualBox/Bochs), set a KNOWN-GOOD
+        // 32bpp mode directly via the BGA ports.  The BIOS (SeaBIOS/VBoxVGA)
+        // often enumerates a 16bpp mode (0x118) and the GUI's backbuffer +
+        // present() path is built around 32bpp, so we MUST force 32bpp here
+        // AND normalize the descriptor (bpp/pitch/pixel_format) to match what
+        // we just programmed -- otherwise present() writes 4 bytes/pixel with a
+        // 2-byte/px pitch and the live framebuffer never shows the desktop.
         if (g_bga_available) {
-            bochs_vbe_set_mode(width, height, bpp);
-            serial_puts("[GUI] VBE mode set via BGA ports\n");
+            bochs_vbe_set_mode(width, height, 32);
+            bpp          = 32;
+            pitch        = (uint16_t)((uint32_t)width * 4u);
+            pixel_format = PXF_BGRX32;
+            serial_puts("[GUI] VBE mode forced to 32bpp via BGA ports (w=");
+            serial_putdec((int)width);
+            serial_puts(" h=");
+            serial_putdec((int)height);
+            serial_puts(" pitch=");
+            serial_putdec((int)pitch);
+            serial_puts(")\n");
         } else if (g_vbe_mode_set_by_bios) {
             // Mode already set by BIOS INT 10h or UEFI GOP - nothing to do
             serial_puts("[GUI] VBE mode already set by BIOS/UEFI\n");
@@ -5705,12 +5720,41 @@ struct Win11Desktop {
         // Draw divider between list and preview
         gfx.draw_line(x + list_w + 2, y, x + list_w + 2, y + list_h, C_WIN_BORDER);
 
-        // Get file list from kernel
-        static char filebuf[4096];
+        // Get file list from kernel.
+        // BUG-B1 fix: do NOT hit the disk on every frame.  draw_file_explorer is
+        // called from render_all(), which runs on every mouse move / hover /
+        // animation frame; re-listing (gui_cb_list_files -> ata_read_sector
+        // storms) each time made the File Explorer (and the mouse) grind to a
+        // halt.  Cache the listing per FS tab and only refresh when the tab
+        // changes or an explicit refresh/modify invalidates it.
         int fs_type = win.selected_item; // 0=MKFS, 1=SFS, 2=FAT32
+        static char filebuf[4096];
         int file_count = 0;
-        if (g_cb.list_files) {
-            file_count = g_cb.list_files(fs_type, filebuf, sizeof(filebuf));
+        bool need_refresh = (fs_type != fe_cache_fs) || !fe_cache_valid;
+        if (need_refresh) {
+            fe_file_count = 0;
+            if (g_cb.list_files) {
+                file_count = g_cb.list_files(fs_type, filebuf, sizeof(filebuf));
+            }
+            // Parse into fe_files (mirrors the original per-frame parse) only
+            // when we actually re-fetched.
+            if (file_count > 0) {
+                char* p = filebuf;
+                while (*p && fe_file_count < 64) {
+                    char fname[64];
+                    int fi = 0;
+                    while (*p && *p != '\n' && fi < 63) fname[fi++] = *p++;
+                    fname[fi] = 0;
+                    if (*p == '\n') p++;
+                    memcpy_(fe_files[fe_file_count], fname, fi + 1);
+                    fe_file_count++;
+                }
+            }
+            fe_cache_fs    = fs_type;
+            fe_cache_valid = true;
+        } else {
+            // Reuse the cached listing (no disk I/O this frame).
+            file_count = fe_file_count;
         }
 
         if (file_count <= 0) {
@@ -5721,29 +5765,14 @@ struct Win11Desktop {
             return;
         }
 
-        // Parse and display files (newline-separated) - left pane
+        // Display files from the (cached) fe_files list - left pane.
+        // BUG-B1 fix: fe_files / fe_file_count are filled once per FS tab (above);
+        // this loop only renders, it never touches the disk.
         int line_y = y + 4;
-        char* p = filebuf;
         int max_lines = list_h / 18;
-        int line = 0;
-
-        // Store file entries for click detection
-        
-        
-
-        while (*p && line < max_lines && fe_file_count < 64) {
-            // Extract one line
-            char fname[64];
-            int fi = 0;
-            while (*p && *p != '\n' && fi < 63) {
-                fname[fi++] = *p++;
-            }
-            fname[fi] = 0;
-            if (*p == '\n') p++;
-
-            // Save entry for click detection
-            memcpy_(fe_files[fe_file_count], fname, fi + 1);
-            fe_file_count++;
+        for (int line = 0; line < fe_file_count && line < max_lines; line++) {
+            // Use the cached entry directly.
+            char* fname = fe_files[line];
 
             // Extract clean filename for type detection
             char clean_name[64];
@@ -5782,7 +5811,6 @@ struct Win11Desktop {
                                        selected ? C_ACCENT : C_WIN_TEXT);
 
             line_y += 18;
-            line++;
         }
 
         // ---- Preview pane (right side) ----
@@ -6881,6 +6909,13 @@ struct Win11Desktop {
     char fe_info_name[64], fe_info_ty[32], fe_info_fs[24];
     char fe_files[64][64];          // file list parsed by draw_file_explorer
     int  fe_file_count;
+    // BUG-B1 fix: cache the directory listing so we don't re-read the disk
+    // on every frame (draw_file_explorer runs inside render_all, which is
+    // invoked on every mouse move / hover / animation frame).  The list is
+    // only re-fetched when the FS tab changes or an explicit refresh/modify
+    // invalidates it.
+    int  fe_cache_fs   = -1;         // fs type the cache currently holds (-1 = stale)
+    bool fe_cache_valid = false;
 
     void fe_menu_close() {
         fe_menu.win = -1;
@@ -6987,11 +7022,14 @@ struct Win11Desktop {
         } else if (idx == 1) {               // Refresh
             for (int i = 0; i < window_count; i++)
                 if (windows[i].app == APP_FILE_EXPLORER) windows[i].sel_file_idx = -1;
+            fe_cache_valid = false;          // BUG-B1 fix: force re-list next paint
         } else if (idx == 2) {               // New folder
             if (g_cb.mkdir) g_cb.mkdir(fe_menu.fs, "New Folder");
+            fe_cache_valid = false;          // BUG-B1 fix: contents changed
         } else if (idx == 3) {               // Delete
             if (fe_menu.sel >= 0 && fe_menu.name[0] && g_cb.remove)
                 g_cb.remove(fe_menu.fs, fe_menu.name);
+            fe_cache_valid = false;          // BUG-B1 fix: contents changed
         }
         fe_menu_close();
     }
@@ -7441,6 +7479,17 @@ struct Win11Desktop {
                         Win11Window& sm = windows[start_menu_id];
                         dirty_add(sm.x, sm.y, sm.w, sm.h);
                     }
+                    // BUG-C1 fix: a managed (C#) popup / sub-menu can appear ANYWHERE
+                    // on screen (the overlay paints it but its rect is unknown here),
+                    // so its items never reached the LFB -- only the panel background
+                    // showed until the next click forced a refresh.  When the overlay
+                    // is dirty, also mark every visible window's rect dirty: popups
+                    // live over/inside windows, so this guarantees their pixels flip.
+                    // (Cheap: only runs on overlay-dirty frames, not every frame.)
+                    for (int i = 0; i < window_count; i++) {
+                        if (windows[i].visible && !windows[i].minimized)
+                            dirty_add(windows[i].x, windows[i].y, windows[i].w, windows[i].h);
+                    }
                 }
                 if (g_over_force_n > 0) g_over_force_n--;
             }
@@ -7778,6 +7827,17 @@ struct Win11Desktop {
         if (y < 0) y = 0;
         if (x >= gfx.width  - MouseCursor::CURSOR_SIZE) x = gfx.width  - MouseCursor::CURSOR_SIZE;
         if (y >= gfx.height - MouseCursor::CURSOR_SIZE) y = gfx.height - MouseCursor::CURSOR_SIZE;
+        // BUG-A1 fix: the absolute-pointer path (USB tablet / VMMDev) moves the
+        // cursor in one jump instead of by a delta, so we must erase the PREVIOUS
+        // soft-cursor pixels before adopting the new position -- otherwise the old
+        // cursor stays pinned on screen (ghost / double cursor).  Mirror the
+        // restore-before-move sequence used by handle_mouse_move().
+        if (g_cursor_backend == CURSOR_SOFT && cursor.visible && cursor.saved_valid) {
+            int ox = cursor.x, oy = cursor.y;
+            cursor.restore_bg(gfx);
+            gfx.present_rect(ox, oy, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
+            cursor.saved_valid = false;
+        }
         cursor.x = x; cursor.y = y;
         mouse_x = x; mouse_y = y;
         cursor_backend_sync(x, y);
@@ -7787,6 +7847,12 @@ struct Win11Desktop {
             if (windows[drag_window].y < TOPBAR_H) windows[drag_window].y = TOPBAR_H;
             drag_counter++;
             if (drag_counter >= 3) { drag_counter = 0; render_all(); }
+        }
+        // Repaint the soft cursor at the new (absolute) position and flip its rect.
+        if (g_cursor_backend == CURSOR_SOFT && cursor.visible) {
+            cursor.save_bg(gfx);
+            cursor.draw(gfx);
+            gfx.present_rect(cursor.x, cursor.y, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
         }
     }
 
@@ -10959,6 +11025,130 @@ extern "C" void gui_remote_end(void) {
     // changes (or this flag is set); without it the wallpaper/icons would stay
     // covered by the dim backdrop until some unrelated full repaint.  Force one.
     g_desk_needs_full = true;
+}
+
+// ---------------------------------------------------------------------------
+// GUI TEST HARNESS (serial-driven control API)
+// ---------------------------------------------------------------------------
+// Lets an automated test (or a human over the serial console) drive the exact
+// same GUI code paths a real mouse would, by name instead of by pixel coord:
+//
+//   gt open <app>        launch an app window (filexplorer/terminal/calc/...)
+//   gt fe_open           open the File Explorer window (no double-click needed)
+//   gt fe_tab <0|1|2>    switch the FE window's FS tab (MKFS/SFS/FAT32)
+//   gt click <x> <y>     set the pointer and run a left-button down
+//   gt rclick <x> <y>    set the pointer and run a right-button down
+//   gt status            dump window/mouse/fe-cache state to serial
+//
+// The kernel's serial line routes any line prefixed "gt " here (see
+// kernel.cpp).  Everything just calls the real Win11Desktop handlers, so a
+// passing test means the on-screen behaviour is identical to a live click.
+extern "C" void gui_test_cmd(const char* cmd) {
+    if (!cmd) return;
+    // skip the "gt " prefix if present
+    const char* p = cmd;
+    if (p[0] == 'g' && p[1] == 't' && p[2] == ' ') p += 3;
+    char tok[64]; int ti = 0;
+    auto next_tok = [&]() -> const char* {
+        ti = 0;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) return nullptr;
+        while (*p && *p != ' ' && *p != '\t' && ti < 63) {
+            char c = *p++;
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');  // lowercase for matching
+            tok[ti++] = c;
+        }
+        tok[ti] = 0;
+        return tok;
+    };
+    auto gt_atoi = [](const char* s) -> int {
+        int v = 0, sign = 1;
+        if (*s == '-') { sign = -1; s++; }
+        while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
+        return v * sign;
+    };
+    const char* verb = next_tok();
+    if (!verb) { serial_puts("[GT] empty\n"); return; }
+
+    if (strcmp_(verb, "status") == 0) {
+        serial_puts("[GT] windows="); serial_putdec(g_wm.window_count);
+        serial_puts(" active="); serial_putdec(g_wm.active_window);
+        serial_puts(" mouse="); serial_putdec(g_wm.mouse_x);
+        serial_puts(","); serial_putdec(g_wm.mouse_y);
+        serial_puts(" fe_cache_fs="); serial_putdec(g_wm.fe_cache_fs);
+        serial_puts(" fe_cache_valid="); serial_puts(g_wm.fe_cache_valid ? "1" : "0");
+        serial_puts(" fe_file_count="); serial_putdec(g_wm.fe_file_count);
+        for (int i = 0; i < g_wm.window_count; i++) {
+            serial_puts(" win"); serial_putdec(i);
+            serial_puts("=a"); serial_putdec((int)g_wm.windows[i].app);
+            serial_puts(",x"); serial_putdec(g_wm.windows[i].x);
+            serial_puts(",y"); serial_putdec(g_wm.windows[i].y);
+            serial_puts(",w"); serial_putdec(g_wm.windows[i].w);
+            serial_puts(",h"); serial_putdec(g_wm.windows[i].h);
+            serial_puts(",v"); serial_puts(g_wm.windows[i].visible ? "1":"0");
+        }
+        serial_puts("\n");
+        return;
+    }
+    if (strcmp_(verb, "open") == 0 || strcmp_(verb, "fe_open") == 0) {
+        AppType app = APP_FILE_EXPLORER;
+        if (strcmp_(verb, "open") == 0) {
+            const char* name = next_tok();
+            if (!name) { serial_puts("[GT] open: missing name\n"); return; }
+            if (strcmp_(name, "filexplorer") == 0 || strcmp_(name, "fe") == 0) app = APP_FILE_EXPLORER;
+            else if (strcmp_(name, "controlpanel") == 0 || strcmp_(name, "cp") == 0) app = APP_CONTROL_PANEL;
+            else if (strcmp_(name, "terminal") == 0 || strcmp_(name, "term") == 0) app = APP_TERMINAL;
+            else if (strcmp_(name, "taskmgr") == 0) app = APP_TASK_MANAGER;
+            else if (strcmp_(name, "calc") == 0) app = APP_CALCULATOR;
+            else if (strcmp_(name, "browser") == 0) app = APP_BROWSER;
+            else if (strcmp_(name, "memopt") == 0) app = APP_MEM_OPTIMIZER;
+            else if (strcmp_(name, "about") == 0) app = APP_ABOUT;
+            else { serial_puts("[GT] open: unknown app "); serial_puts(name); serial_puts("\n"); return; }
+        }
+        serial_puts("[GT] open: before launch app="); serial_putdec((int)app); serial_puts("\n");
+        g_wm.launch_app(app);
+        serial_puts("[GT] open: after launch app="); serial_putdec((int)app); serial_puts("\n");
+        return;
+    }
+    if (strcmp_(verb, "fe_tab") == 0) {
+        const char* s = next_tok();
+        int idx = s ? gt_atoi(s) : 0;
+        if (idx < 0 || idx > 2) { serial_puts("[GT] fe_tab: idx 0..2\n"); return; }
+        // The File Explorer may be a native (APP_FILE_EXPLORER) or a managed
+        // (APP_MANAGED) window depending on the running shell.  Managed windows
+        // can leave .visible unset while still on screen, so we prefer the
+        // active window and only fall back to the first non-desktop window.
+        int wid = (g_wm.active_window >= 0 && g_wm.active_window < g_wm.window_count)
+                  ? g_wm.active_window : -1;
+        if (wid < 0 || g_wm.windows[wid].app == APP_START_MENU) {
+            for (int i = 0; i < g_wm.window_count; i++)
+                if (g_wm.windows[i].app != APP_START_MENU) { wid = i; break; }
+        }
+        if (wid < 0) { serial_puts("[GT] fe_tab: no window open (count="); serial_putdec(g_wm.window_count); serial_puts(")\n"); return; }
+        Win11Window& win = g_wm.windows[wid];
+        // FS-tab geometry mirrors draw_file_explorer: x + i*(70+4), y+24, 22px tall
+        int tab_w = 70, tab_x = win.x + idx * (tab_w + 4), tab_y = win.y + 24;
+        g_wm.mouse_x = tab_x + tab_w / 2;
+        g_wm.mouse_y = tab_y + 11;
+        g_wm.handle_mouse_down();
+        serial_puts("[GT] fe_tab wid="); serial_putdec(wid);
+        serial_puts(" idx="); serial_putdec(idx);
+        serial_puts(" sel="); serial_putdec(win.selected_item);
+        serial_puts("\n");
+        return;
+    }
+    if (strcmp_(verb, "click") == 0 || strcmp_(verb, "rclick") == 0) {
+        const char* sx = next_tok(); const char* sy = next_tok();
+        if (!sx || !sy) { serial_puts("[GT] click: need x y\n"); return; }
+        g_wm.mouse_x = gt_atoi(sx); g_wm.mouse_y = gt_atoi(sy);
+        if (strcmp_(verb, "rclick") == 0) g_wm.handle_mouse_down_right();
+        else g_wm.handle_mouse_down();
+        serial_puts("[GT] "); serial_puts(verb); serial_puts(" at ");
+        serial_putdec(g_wm.mouse_x); serial_puts(","); serial_putdec(g_wm.mouse_y);
+        serial_puts("\n");
+        return;
+    }
+    serial_puts("[GT] unknown verb "); serial_puts(verb); serial_puts("\n");
 }
 
 // Enable/disable demo mode: route remote (agent) output into the real terminal
