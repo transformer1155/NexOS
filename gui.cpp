@@ -3141,7 +3141,8 @@ struct MouseCursor {
     int x, y;
     bool visible;
     uint32_t saved[CURSOR_SIZE * CURSOR_SIZE];
-    bool saved_valid;
+    int      saved_x, saved_y;   // position the snapshot was taken at
+    bool     saved_valid;
 
     // Win11 aero_arrow cursor: 32x32, white fill + black outline, hotspot at (0,0)
     // Each bit = 1 pixel; MSB = column 0
@@ -3168,8 +3169,17 @@ struct MouseCursor {
 
     void init(int w, int h) { x = w / 2; y = h / 2; visible = false; saved_valid = false; }
 
+    // BUG-CURSOR1: the snapshot must remember WHERE it was taken.  save_bg() and
+    // restore_bg() used to both index with the live (x,y), which is only valid
+    // while the cursor has not moved.  render_all()'s cursor block can run
+    // after the pointer has already advanced -- then restore_bg() wrote the
+    // OLD background at the NEW position (corrupting the pixels there) and
+    // left the OLD cursor pixels untouched (the permanent ghost).  Tracking
+    // the origin makes restore always put the pixels back exactly where they
+    // came from.
     void save_bg(Graphics& g) {
         if (!saved_valid) {
+            saved_x = x; saved_y = y;
             for (int dy = 0; dy < CURSOR_SIZE; dy++)
                 for (int dx = 0; dx < CURSOR_SIZE; dx++)
                     saved[dy * CURSOR_SIZE + dx] = g.get_pixel(x + dx, y + dy);
@@ -3180,7 +3190,7 @@ struct MouseCursor {
         if (saved_valid) {
             for (int dy = 0; dy < CURSOR_SIZE; dy++)
                 for (int dx = 0; dx < CURSOR_SIZE; dx++)
-                    g.put_pixel(x + dx, y + dy, saved[dy * CURSOR_SIZE + dx]);
+                    g.put_pixel(saved_x + dx, saved_y + dy, saved[dy * CURSOR_SIZE + dx]);
             saved_valid = false;
         }
     }
@@ -7533,21 +7543,26 @@ struct Win11Desktop {
             int cx0 = cursor.x, cy0 = cursor.y;   // hotspot at (0,0): top-left = (x,y)
 
             // Only peel off the PREVIOUS cursor pixels when this frame did NOT
-            // repaint the area under the pointer.  If a dirty rectangle covered
-            // the cursor this frame (e.g. a click changed the UI there, or a
-            // window / animation drew fresh content underneath), the backbuffer
-            // already holds the NEW pixels and the saved background is stale;
-            // restoring it would overwrite the new pixels, so the change never
-            // appears and only the cursor's own rect ends up correct -- that is
-            // exactly the "interface change not cleared at the pointer" (Bug 1)
-            // and "animation only shows one dirty rect" (Bug 2) symptom.  In that
-            // case we skip restore_bg and simply re-capture the fresh content as
-            // the new background.
+            // repaint the ENTIRE area under the pointer.  If a dirty rectangle
+            // covered the whole cursor box this frame (e.g. a window moved under
+            // it, or the desktop repainted), the backbuffer already holds the
+            // NEW pixels and the saved background is stale; restoring it would
+            // overwrite the new pixels, so the change never appears.
+            //
+            // BUG-CURSOR1 fix: the old test was "damage INTERSECTS the cursor
+            // box".  That is far too permissive.  A hover highlight on a button
+            // damages only the control's own rect (e.g. 60x24), which sits
+            // entirely INSIDE the 32x32 cursor box -- so the old code decided
+            // "covered" and skipped the restore, leaving the cursor pixels that
+            // fell outside the control rect permanently on screen.  Because the
+            // desktop layer is retained, nothing ever erased them, producing the
+            // ghost / trail ("重影") that follows the pointer across controls.
+            // Require the damage to fully CONTAIN the cursor box before skipping.
             bool under_covered = false;
             for (int n = g_dmg_head; n >= 0; n = g_dnode[n].next) {
                 DmgNode& r = g_dnode[n];
-                if (cx0 < r.x + r.w && cx0 + cw > r.x &&
-                    cy0 < r.y + r.h && cy0 + ch > r.y) {
+                if (r.x <= cx0 && r.y <= cy0 &&
+                    r.x + r.w >= cx0 + cw && r.y + r.h >= cy0 + ch) {
                     under_covered = true;
                     break;
                 }
@@ -7556,8 +7571,12 @@ struct Win11Desktop {
                 // Desktop layer retained: old cursor pixels may still linger in
                 // the backbuffer.  Restore the saved (cursor-free) background so
                 // save_bg captures the real pixels and no square ghost is left.
+                // restore_bg() writes back at the snapshot's own origin, so the
+                // damage rect must be that origin too (not the current
+                // cursor.x/y, which may already have advanced).
+                int ox = cursor.saved_x, oy = cursor.saved_y;
                 cursor.restore_bg(gfx);
-                dirty_add(cx0, cy0, cw, ch);
+                dirty_add(ox, oy, cw, ch);
             }
             cursor.saved_valid = false;
             cursor.save_bg(gfx);
@@ -7802,7 +7821,7 @@ struct Win11Desktop {
         // cursor stays pinned on screen (ghost / double cursor).  Mirror the
         // restore-before-move sequence used by handle_mouse_move().
         if (g_cursor_backend == CURSOR_SOFT && cursor.visible && cursor.saved_valid) {
-            int ox = cursor.x, oy = cursor.y;
+            int ox = cursor.saved_x, oy = cursor.saved_y;
             cursor.restore_bg(gfx);
             gfx.present_rect(ox, oy, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
             cursor.saved_valid = false;
@@ -11114,6 +11133,22 @@ extern "C" void gui_test_cmd(const char* cmd) {
         else g_wm.handle_mouse_down();
         serial_puts("[GT] "); serial_puts(verb); serial_puts(" at ");
         serial_putdec(g_wm.mouse_x); serial_puts(","); serial_putdec(g_wm.mouse_y);
+        serial_puts("\n");
+        return;
+    }
+    // gt move <x> <y> -- drive the soft cursor to an absolute position through
+    // the SAME path the PS/2 handler uses (handle_mouse_move by delta), so a
+    // serial-only harness can exercise cursor erase/redraw without a real
+    // mouse.  Used to verify the ghost-cursor fix (BUG-CURSOR1).
+    if (strcmp_(verb, "move") == 0) {
+        const char* sx = next_tok(); const char* sy = next_tok();
+        if (!sx || !sy) { serial_puts("[GT] move: need x y\n"); return; }
+        int tx = gt_atoi(sx), ty = gt_atoi(sy);
+        int dx = tx - g_wm.mouse_x, dy = ty - g_wm.mouse_y;
+        g_wm.handle_mouse_move(dx, dy);
+        serial_puts("[GT] move -> "); serial_putdec(g_wm.mouse_x);
+        serial_puts(","); serial_putdec(g_wm.mouse_y);
+        serial_puts(" saved_valid="); serial_puts(g_wm.cursor.saved_valid ? "1" : "0");
         serial_puts("\n");
         return;
     }
