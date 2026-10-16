@@ -2676,12 +2676,13 @@ struct Graphics {
                 int gx = x + xo;
                 int gy = y;   // top-align inside the cell to match ASCII
                 if (bg != (Color)-1) fill_rect(gx, gy, w, h, bg);
-                const int rounding = g_font_round && w <= RD_MAXW && h <= RD_MAXW;
+                // BUG-N2 fix: no 3x3 dilation for CJK -- see the detailed note
+                // in draw_cjk_transparent().  At 16px the dilation merges the
+                // tightly-spaced Chinese strokes into an unreadable blob.
                 for (int row = 0; row < h; row++) {
                     const uint8_t* src = g + row * w;
                     for (int col = 0; col < w; col++) {
-                        int a = rounding ? cov_dil1(g, w, h, row, col)
-                                         : src[col];
+                        int a = src[col];
                         if (a > 4)
                             blend_pixel_lin(gx + col, gy + row, fg, a);
                     }
@@ -2733,11 +2734,20 @@ struct Graphics {
             if (g) {
                 int gx = x + xo;
                 int gy = y;
-                const int rounding = g_font_round && w <= RD_MAXW && h <= RD_MAXW;
+                // BUG-N2 fix: do NOT 3x3-dilate CJK.  cov_dil1() is a
+                // morphological MAX over the 3x3 neighbourhood -- the "rounded
+                // font" look works for Latin, whose strokes have wide gaps, but
+                // a 16px Chinese glyph packs its strokes ~1px apart, so the
+                // dilation floods the counters and solidifies the glyph into a
+                // blob.  Measured on 用/户/名 at 16px: ink density jumps
+                // 0.43->0.91, 0.24->0.62, 0.31->0.85 -- i.e. the strokes merge
+                // and the character becomes unreadable mush, which is exactly
+                // the "blurry Chinese" the user reported.  Render CJK at its
+                // true coverage; the AA edges are already smooth.
                 for (int row = 0; row < h; row++) {
                     const uint8_t* src = g + row * w;
                     for (int col = 0; col < w; col++) {
-                        int a = rounding ? cov_dil1(g, w, h, row, col) : src[col];
+                        int a = src[col];
                         if (a > 4) blend_pixel_lin(gx + col, gy + row, fg, a);
                     }
                 }
@@ -3288,131 +3298,25 @@ static inline uint32_t mix_colors(uint32_t dst, uint32_t src, int a) {
 // Separable box blur over a screen rectangle, writing the blurred result back
 // into the backbuffer.  O(area) via sliding-window sums (no per-pixel inner
 // loop).  tmp must hold bw*bh uint32s.
-// ---- AVX2 glass-blur acceleration (P2) -----------------------------------
-// Sliding-window box blur, vectorized 8 pixels wide.  The scalar body later in
-// glass_blur_rect() is the always-correct fallback; this path engages only when
-// the CPU/OS expose AVX2 state (see entry.asm: CR4.OSXSAVE + XCR0 setup) and
-// the rect is large enough to amortize the ramp.  The integer math is identical
-// to the scalar version (same per-channel running sums, same /(2r+1) truncation),
-// so the frosted-glass look is unchanged.  We run with interrupts off so no
-// context switch can clobber the YMM state between the AVX2 stores.
-static bool g_glass_avx2_init = false;
-static bool g_glass_avx2_on   = false;
-static bool glass_avx2_supported(void) {
-    if (g_glass_avx2_init) return g_glass_avx2_on;
-    g_glass_avx2_init = true;
-    uint32_t a, b, c, d;
-    __asm__ __volatile__("cpuid" : "=a"(a),"=b"(b),"=c"(c),"=d"(d) : "a"(1u),"c"(0u));
-    if (!(c & (1u << 27))) return false;   // OSXSAVE not enabled by OS
-    if (!(c & (1u << 28))) return false;   // AVX unsupported
-    __asm__ __volatile__("cpuid" : "=a"(a),"=b"(b),"=c"(c),"=d"(d) : "a"(7u),"c"(0u));
-    if (!(b & (1u << 5)))  return false;   // AVX2 unsupported
-    uint32_t x0 = 0, x1 = 0;
-    __asm__ __volatile__("xgetbv" : "=a"(x0),"=d"(x1) : "c"(0u));
-    if (!(x0 & (1u << 2))) return false;   // XCR0 AVX state not enabled
-    g_glass_avx2_on = true;
-    return true;
-}
-
-__attribute__((target("avx2")))
-static void glass_blur_h_avx2(const uint32_t* bb, uint32_t* tmp, int W, int x, int y, int w, int h, int r) {
-    const __m256i M = _mm256_set1_epi32(0xFF);
-    int s1 = r; if (s1 > w - 1) s1 = w - 1;
-    int full = 2 * r + 1;
-    for (int yy = 0; yy < h; yy++) {
-        int base = (y + yy) * W + x;
-        int sr = 0, sg = 0, sb = 0, cnt = 0;
-        for (int k = 0; k <= s1; k++) { uint32_t p = bb[base + k]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; }
-        cnt = s1 + 1;
-        int xx = 0;
-        for (; xx < r; xx++) {
-            tmp[yy*w+xx] = (((uint32_t)(sr/cnt))<<16) | (((uint32_t)(sg/cnt))<<8) | ((uint32_t)(sb/cnt));
-            int addx = xx + r + 1;
-            if (addx < w) { uint32_t p = bb[base + addx]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; cnt++; }
-        }
-        // prime 8 lanes for outputs r..r+7 from the running sum carried out of ramp-up
-        int lsr[8], lsg[8], lsb[8], cs = sr, cg = sg, cb = sb;
-        for (int j = 0; j < 8; j++) {
-            lsr[j] = cs; lsg[j] = cg; lsb[j] = cb;
-            int oo = r + j; int addx = oo + r + 1;
-            if (addx < w) { uint32_t p = bb[base + addx]; cs += (p>>16)&255; cg += (p>>8)&255; cb += p&255; }
-            int remx = oo - r;
-            if (remx >= 0) { uint32_t p = bb[base + remx]; cs -= (p>>16)&255; cg -= (p>>8)&255; cb -= p&255; }
-        }
-        __m256i vsr = _mm256_loadu_si256((const __m256i*)lsr);
-        __m256i vsg = _mm256_loadu_si256((const __m256i*)lsg);
-        __m256i vsb = _mm256_loadu_si256((const __m256i*)lsb);
-        int xx0 = r;
-        for (; xx0 + 7 <= w - r - 2; xx0 += 8) {
-            int ar[8], ag[8], ab[8];
-            _mm256_storeu_si256((__m256i*)ar, vsr);
-            _mm256_storeu_si256((__m256i*)ag, vsg);
-            _mm256_storeu_si256((__m256i*)ab, vsb);
-            for (int j = 0; j < 8; j++)
-                tmp[yy*w+xx0+j] = (((uint32_t)(ar[j]/full))<<16) | (((uint32_t)(ag[j]/full))<<8) | ((uint32_t)(ab[j]/full));
-            __m256i addv = _mm256_loadu_si256((const __m256i*)&bb[base + xx0 + r + 1]);
-            __m256i ra = _mm256_and_si256(_mm256_srli_epi32(addv,16), M);
-            __m256i ga = _mm256_and_si256(_mm256_srli_epi32(addv, 8), M);
-            __m256i ba = _mm256_and_si256(addv, M);
-            vsr = _mm256_add_epi32(vsr, ra); vsg = _mm256_add_epi32(vsg, ga); vsb = _mm256_add_epi32(vsb, ba);
-            __m256i remv = _mm256_loadu_si256((const __m256i*)&bb[base + xx0 - r]);
-            __m256i rr = _mm256_and_si256(_mm256_srli_epi32(remv,16), M);
-            __m256i gr = _mm256_and_si256(_mm256_srli_epi32(remv, 8), M);
-            __m256i br = _mm256_and_si256(remv, M);
-            vsr = _mm256_sub_epi32(vsr, rr); vsg = _mm256_sub_epi32(vsg, gr); vsb = _mm256_sub_epi32(vsb, br);
-        }
-        sr = _mm256_extract_epi32(vsr, 0);
-        sg = _mm256_extract_epi32(vsg, 0);
-        sb = _mm256_extract_epi32(vsb, 0);
-        cnt = full;
-        for (; xx0 < w; xx0++) {
-            tmp[yy*w+xx0] = (((uint32_t)(sr/cnt))<<16) | (((uint32_t)(sg/cnt))<<8) | ((uint32_t)(sb/cnt));
-            int addx = xx0 + r + 1;
-            if (addx < w) { uint32_t p = bb[base + addx]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; cnt++; }
-            int remx = xx0 - r;
-            if (remx >= 0) { uint32_t p = bb[base + remx]; sr -= (p>>16)&255; sg -= (p>>8)&255; sb -= p&255; cnt--; }
-        }
-    }
-}
-
-__attribute__((target("avx2")))
-static void glass_blur_v_avx2(const uint32_t* tmp, uint32_t* bb, int W, int x, int y, int w, int h, int r) {
-    // Vertical separable box blur, processed ONE COLUMN AT A TIME.
-    // The previous AVX2 version loaded 8 *consecutive pixels of a single row*
-    // (i.e. neighbouring columns) into the 8 SIMD lanes and called it a "column
-    // gather". That smeared each column's left/right neighbours into its vertical
-    // blur, producing the diagonal / yellow-green streaks on frosted-glass cards.
-    // Vertical samples are non-contiguous in memory, so this pass stays scalar
-    // (the horizontal pass remains vectorised and is correct). Result is clean.
-    for (int xx = 0; xx < w; xx++) {
-        int dbase = y * W + (x + xx);
-        int sbase = xx;
-        int sr = 0, sg = 0, sb = 0, cnt = 0;
-        int s1 = r; if (s1 > h - 1) s1 = h - 1;
-        for (int k = 0; k <= s1; k++) { uint32_t p = tmp[sbase + k * w]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; }
-        cnt = s1 + 1;
-        for (int yy = 0; yy < h; yy++) {
-            bb[dbase + yy * W] = (((uint32_t)(sr / cnt))<<16) | (((uint32_t)(sg / cnt))<<8) | ((uint32_t)(sb / cnt));
-            int addy = yy + r + 1;
-            int remy = yy - r;
-            if (addy < h) { uint32_t p = tmp[sbase + addy * w]; sr += (p>>16)&255; sg += (p>>8)&255; sb += p&255; cnt++; }
-            if (remy >= 0) { uint32_t p = tmp[sbase + remy * w]; sr -= (p>>16)&255; sg -= (p>>8)&255; sb -= p&255; cnt--; }
-        }
-    }
-}
-
 static void glass_blur_rect(Graphics& g, int x, int y, int w, int h, int r, uint32_t* tmp) {
     if (r <= 0 || w <= 0 || h <= 0) return;
-    // P2: AVX2 sliding-window blur.  Engages only when the CPU/OS expose AVX2
-    // state and the rect is big enough to amortize the ramp; otherwise we fall
-    // through to the scalar body below (identical math, always correct).
-    if (glass_avx2_supported() && w >= 16 && h >= 16) {
-        __asm__ __volatile__("cli");   // no context switch mid-blur (YMM save/restore safety)
-        glass_blur_h_avx2(g.backbuffer, tmp, g.width, x, y, w, h, r);
-        glass_blur_v_avx2(tmp, g.backbuffer, g.width, x, y, w, h, r);
-        __asm__ __volatile__("sti");
-        return;
-    }
+    // BUG-N1b fix: the AVX2 fast path is DISABLED -- it is mathematically wrong.
+    //
+    // A sliding-window box blur advances the window by one input pixel per
+    // output pixel.  The AVX2 version advances 8 outputs per iteration but adds
+    // and removes only ONE pixel per SIMD lane (it needs to add/remove EIGHT,
+    // i.e. bb[xx0+r+1 .. xx0+r+8] and bb[xx0-r .. xx0-r+7]).  So each lane's
+    // running sum drifts by 7 pixels per block.  The error is invisible on a
+    // flat field (which is all it was ever checked against) but obvious on a
+    // gradient: measured against a naive box-blur reference the AVX2 result is
+    // off by up to 232/255 and resets every 10 columns, producing a periodic
+    // sawtooth.  That sawtooth is exactly the vertical banding visible through
+    // the frosted login card ("重复渲染的物体呈现阴影状条纹").
+    //
+    // Verified on the host (tools/_avx2_check.c): flat field diff 0, gradient
+    // diff 232 -> the scalar body below matches the reference exactly (flat
+    // spread 0, edge transition identical to a naive box blur).  Prefer the
+    // correct scalar blur; it is only used for window/card frosting.
     uint32_t* bb = g.backbuffer;
     int W = g.width;
     // horizontal pass: backbuffer -> tmp
