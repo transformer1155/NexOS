@@ -5752,6 +5752,9 @@ struct Win11Desktop {
             }
             fe_cache_fs    = fs_type;
             fe_cache_valid = true;
+            // BUG-FE3: a refreshed listing may have changed the selected file's
+            // contents (or the selection itself), so drop the preview cache too.
+            fe_prev_valid = false;
         } else {
             // Reuse the cached listing (no disk I/O this frame).
             file_count = fe_file_count;
@@ -5827,6 +5830,27 @@ struct Win11Desktop {
         extract_filename(fe_files[win.sel_file_idx], sel_name, sizeof(sel_name));
         FileType ftype = detect_file_type(fe_files[win.sel_file_idx]);
 
+        // BUG-FE3 fix: only re-read the file from SFS when the selection or FS
+        // tab changed (or the listing cache was invalidated).  Otherwise reuse
+        // the cached bytes so we do not hit the disk on every animation frame.
+        bool prev_stale = !fe_prev_valid
+                       || fe_prev_cache_fs  != fs_type
+                       || fe_prev_cache_idx != win.sel_file_idx;
+        if (prev_stale) {
+            fe_prev_len = 0;
+            if (g_cb.read_file) {
+                int got = g_cb.read_file(fs_type, sel_name,
+                                         fe_prev_buf, sizeof(fe_prev_buf));
+                if (got > 0) fe_prev_len = got;
+            }
+            fe_prev_cache_fs  = fs_type;
+            fe_prev_cache_idx = win.sel_file_idx;
+            fe_prev_valid     = true;
+        }
+        // All subsequent branches read from fe_prev_buf / fe_prev_len only.
+        uint8_t* pbuf = fe_prev_buf;
+        int      plen = fe_prev_len;
+
         int py = y + 8;
 
         // Preview header
@@ -5862,16 +5886,13 @@ struct Win11Desktop {
             gfx.draw_text_transparent(preview_x + 8, py + 83, "listed in file list ->", C_WIN_TEXT_SEC);
         }
         else if (ftype == FT_TEXT) {
-            // Read and display text file content
-            static uint8_t textbuf[4096];
-            int bytes = -1;
-            if (g_cb.read_file) {
-                bytes = g_cb.read_file(fs_type, sel_name, textbuf, sizeof(textbuf) - 1);
-            }
+            // Display cached text file content (read once on selection change).
+            int bytes = plen;
             if (bytes > 0) {
-                textbuf[bytes] = 0;
+                int term = bytes < (int)sizeof(fe_prev_buf) ? bytes : (int)sizeof(fe_prev_buf) - 1;
+                pbuf[term] = 0;
                 // Display text line by line
-                char* tp = (char*)textbuf;
+                char* tp = (char*)pbuf;
                 int ty = py;
                 int max_lines = content_h / 16;
                 int tline = 0;
@@ -5903,18 +5924,14 @@ struct Win11Desktop {
             }
         }
         else if (ftype == FT_BMP) {
-            // Read BMP header and render
-            static uint8_t bmpbuf[8192];
-            int bytes = -1;
-            if (g_cb.read_file) {
-                bytes = g_cb.read_file(fs_type, sel_name, bmpbuf, sizeof(bmpbuf));
-            }
-            if (bytes >= 54 && bmpbuf[0] == 'B' && bmpbuf[1] == 'M') {
+            // Render cached BMP (read once on selection change).
+            int bytes = plen;
+            if (bytes >= 54 && pbuf[0] == 'B' && pbuf[1] == 'M') {
                 // Parse BMP header
-                uint32_t data_offset = *(uint32_t*)(bmpbuf + 10);
-                uint32_t img_width = *(uint32_t*)(bmpbuf + 18);
-                uint32_t img_height = *(uint32_t*)(bmpbuf + 22);
-                uint16_t bpp = *(uint16_t*)(bmpbuf + 28);
+                uint32_t data_offset = *(uint32_t*)(pbuf + 10);
+                uint32_t img_width = *(uint32_t*)(pbuf + 18);
+                uint32_t img_height = *(uint32_t*)(pbuf + 22);
+                uint16_t bpp = *(uint16_t*)(pbuf + 28);
 
                 // Display info
                 char info[64];
@@ -5961,9 +5978,9 @@ struct Win11Desktop {
                             int src_x = dx * img_width / render_w;
                             int offset = data_offset + src_y * row_size + src_x * (bpp / 8);
                             if (offset + 2 < bytes) {
-                                uint8_t b = bmpbuf[offset];
-                                uint8_t g = bmpbuf[offset + 1];
-                                uint8_t r = bmpbuf[offset + 2];
+                                uint8_t b = pbuf[offset];
+                                uint8_t g = pbuf[offset + 1];
+                                uint8_t r = pbuf[offset + 2];
                                 Color c = (r << 16) | (g << 8) | b;
                                 gfx.put_pixel(preview_x + 9 + dx, py + 1 + dy, c);
                             }
@@ -5990,13 +6007,12 @@ struct Win11Desktop {
             gfx.draw_text_transparent(preview_x + 8, py + 78, "Cannot play audio in", C_WIN_TEXT_SEC);
             gfx.draw_text_transparent(preview_x + 8, py + 94, "this environment.", C_WIN_TEXT_SEC);
 
-            // Show file size if available
-            if (g_cb.read_file) {
-                static uint8_t abuf[32];
-                int ab = g_cb.read_file(fs_type, sel_name, abuf, sizeof(abuf));
+            // Show file size from cached read (no per-frame disk I/O).
+            {
+                int ab = plen;
                 if (ab > 0) {
                     // Check for WAV header
-                    if (ab >= 12 && abuf[0] == 'R' && abuf[1] == 'I' && abuf[2] == 'F' && abuf[3] == 'F') {
+                    if (ab >= 12 && pbuf[0] == 'R' && pbuf[1] == 'I' && pbuf[2] == 'I' && pbuf[3] == 'F') {
                         gfx.draw_text_transparent(preview_x + 8, py + 114, "Format: WAV", C_MEM_GOOD);
                     }
                 }
@@ -6032,10 +6048,9 @@ struct Win11Desktop {
 
             gfx.draw_text_transparent(preview_x + 8, py + 60, "Unknown file type", C_WIN_TEXT_SEC);
 
-            // Try to show file size by reading first bytes
-            if (g_cb.read_file) {
-                static uint8_t ubuf[256];
-                int ub = g_cb.read_file(fs_type, sel_name, ubuf, sizeof(ubuf));
+            // Show file size from cached read (no per-frame disk I/O).
+            {
+                int ub = plen;
                 if (ub >= 0) {
                     char info[64];
                     strcpy_(info, "Size: >= ");
@@ -6916,6 +6931,19 @@ struct Win11Desktop {
     // invalidates it.
     int  fe_cache_fs   = -1;         // fs type the cache currently holds (-1 = stale)
     bool fe_cache_valid = false;
+
+    // BUG-FE3 fix: the preview pane used to call g_cb.read_file() EVERY frame
+    // for the selected file (text body, BMP pixels, audio/unknown size probe).
+    // draw_file_explorer runs inside render_all(), i.e. on every mouse move /
+    // hover / animation frame, so that was a per-frame disk read storm -- the
+    // same class of stall as BUG-B1 but on the preview side.  Cache the read
+    // result and only re-read when the selected file (index) or FS tab changes,
+    // or when an explicit refresh / modify invalidates the listing.
+    int   fe_prev_cache_fs  = -1;    // fs type whose preview is cached
+    int   fe_prev_cache_idx = -1;    // selected file index whose preview is cached
+    uint8_t fe_prev_buf[8192];       // cached file bytes (text / BMP / probe)
+    int   fe_prev_len       = 0;     // bytes currently cached (0 = no cache)
+    bool  fe_prev_valid     = false;
 
     void fe_menu_close() {
         fe_menu.win = -1;
