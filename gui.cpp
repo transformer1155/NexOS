@@ -2646,12 +2646,13 @@ struct Graphics {
     // 16x16 1-bit font as the last-resort early-boot fallback.
     // Returns the horizontal advance (pixels).
     int draw_cjk(int x, int y, uint32_t cp, Color fg, Color bg) {
-        // (1) Pre-baked 16x16 8-bit-alpha bitmap from SFS (Noto Sans CJK).
-        {
-            int adv = blit_cjk_alpha(x, y, cp, fg, bg, false);
-            if (adv) return adv;
-        }
-        // (2) Vector outline path (stb_truetype), as in draw_char().
+        // (1) Vector outline path (stb_truetype / msyh.ttf).  Microsoft YaHei
+        //     ships full CJK outlines, so rasterizing at the native g_font_px is
+        //     crisp at every size -- unlike the baked 24x24 bitmap, which the
+        //     old priority-1 path had to box-DOWNSAMPLE to 16px, blurring every
+        //     Chinese glyph ("矢量字体中文非常模糊").  ASCII already prefers the
+        //     vector path (draw_char, line ~2456), so doing the same for CJK
+        //     keeps the two consistent and sharp.
         if (g_font_mode != 0 && vec_ready()) {
             int w = 0, h = 0, xo = 0, yo = 0;
             const uint8_t* g = vec_glyph(cp, g_font_px, &w, &h, &xo, &yo);
@@ -2672,6 +2673,12 @@ struct Graphics {
                 int adv = vec_advance(cp, g_font_px);
                 return adv > g_font_px ? adv : g_font_px;
             }
+        }
+        // (2) Pre-baked 24x24 8-bit-alpha bitmap from SFS (Noto Sans CJK) -- the
+        //     box-downsample to 16px is soft, so it is now a fallback only.
+        {
+            int adv = blit_cjk_alpha(x, y, cp, fg, bg, false);
+            if (adv) return adv;
         }
         // (3) Embedded 16x16 1-bit font: last-resort early-boot fallback.
         int idx = zfont_find_unicode(cp);
@@ -2701,12 +2708,9 @@ struct Graphics {
     // Priority mirrors draw_cjk(): baked 16x16 Noto bitmap first, then the
     // vector path, then the embedded 1-bit font.
     int draw_cjk_transparent(int x, int y, uint32_t cp, Color fg) {
-        // (1) Pre-baked 16x16 8-bit-alpha bitmap from SFS (Noto Sans CJK).
-        {
-            int adv = blit_cjk_alpha(x, y, cp, fg, (Color)-1, true);
-            if (adv) return adv;
-        }
-        // (2) Vector outline path (stb_truetype), as in draw_char().
+        // (1) Vector outline path (stb_truetype / msyh.ttf) -- crisp native-size
+        //     CJK, same rationale as draw_cjk() above.  This is the primary path
+        //     now; the baked 24x24 bitmap is only a fallback.
         if (g_font_mode != 0 && vec_ready()) {
             int w = 0, h = 0, xo = 0, yo = 0;
             const uint8_t* g = vec_glyph(cp, g_font_px, &w, &h, &xo, &yo);
@@ -2724,6 +2728,11 @@ struct Graphics {
                 int adv = vec_advance(cp, g_font_px);
                 return adv > g_font_px ? adv : g_font_px;
             }
+        }
+        // (2) Pre-baked 24x24 8-bit-alpha bitmap from SFS (Noto Sans CJK).
+        {
+            int adv = blit_cjk_alpha(x, y, cp, fg, (Color)-1, true);
+            if (adv) return adv;
         }
         // (3) Embedded 16x16 1-bit font: last-resort early-boot fallback.
         int idx = zfont_find_unicode(cp);
