@@ -7558,9 +7558,25 @@ struct Win11Desktop {
             // desktop layer is retained, nothing ever erased them, producing the
             // ghost / trail ("重影") that follows the pointer across controls.
             // Require the damage to fully CONTAIN the cursor box before skipping.
+            //
+            // BUG-CURSOR2 fix: "intersects but does not contain" is a third,
+            // distinct case.  A click on a control repaints that control in its
+            // PRESSED/highlight state, damaging only the control's own rect.
+            // Restoring the previous (pre-highlight) snapshot is correct -- it
+            // both erases the stale cursor and reverts the transient highlight.
+            // But re-snapshotting in the SAME frame would bake that transient
+            // highlight into the new background, and the next move-off would
+            // re-print it over the control ("鼠标点击时有重印").  So in that case
+            // restore, then leave the snapshot invalid and skip drawing: the
+            // control settles back to its steady state, and the next frame
+            // captures clean pixels.
+            bool intersects = false;
             bool under_covered = false;
             for (int n = g_dmg_head; n >= 0; n = g_dnode[n].next) {
                 DmgNode& r = g_dnode[n];
+                if (cx0 < r.x + r.w && cx0 + cw > r.x &&
+                    cy0 < r.y + r.h && cy0 + ch > r.y)
+                    intersects = true;
                 if (r.x <= cx0 && r.y <= cy0 &&
                     r.x + r.w >= cx0 + cw && r.y + r.h >= cy0 + ch) {
                     under_covered = true;
@@ -7578,10 +7594,26 @@ struct Win11Desktop {
                 cursor.restore_bg(gfx);
                 dirty_add(ox, oy, cw, ch);
             }
-            cursor.saved_valid = false;
-            cursor.save_bg(gfx);
-            cursor.draw(gfx);
-            dirty_add(cx0, cy0, cw, ch);   // ensure new cursor region is flipped
+            if (intersects && !under_covered) {
+                // Transient content under the pointer (a hover/pressed control
+                // repainted its own rect).  The restore above already erased
+                // the stale cursor AND reverted the transient highlight.  Do
+                // NOT re-snapshot: the snapshot would freeze the transient state
+                // in as the background, and the next move-off would re-print it
+                // over the control ("鼠标点击时有重印").  Do NOT draw the cursor
+                // either: with no valid snapshot there is nothing to erase it
+                // with next frame, so it would be baked into that frame's
+                // background and become a ghost.  The cursor is simply absent
+                // for this one frame; the settled next frame captures clean
+                // pixels and draws it normally.
+                cursor.saved_valid = false;
+                dirty_add(cx0, cy0, cw, ch);
+            } else {
+                cursor.saved_valid = false;
+                cursor.save_bg(gfx);
+                cursor.draw(gfx);
+                dirty_add(cx0, cy0, cw, ch);   // ensure new cursor region is flipped
+            }
         }
 
         // Retro pixel / CRT-monitor post-process over the whole backbuffer
