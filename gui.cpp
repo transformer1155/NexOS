@@ -1529,16 +1529,30 @@ static bool load_font_la16(void) {
     g_fla16_base  = hdr[4];
     g_fla16_count = hdr[5];
     g_fla16_h     = (int)hdr[6] | ((int)hdr[7] << 8);
-    int n = g_fla16_count * (2 + g_fla16_h * g_fla16_h);
+    // BUG-N5 fix: the on-disk glyph stride is (1 + h*h), NOT (2 + h*h).
+    // tools/bake_la16.c writes each glyph as:
+    //     [0]      cell width (== h)
+    //     [1..h*h] h*h grayscale coverage bytes
+    // i.e. one width byte plus the coverage plane, with NO advance byte.  The
+    // loader used to assume (2 + h*h), so it asked read_file for
+    // 96*(2+256) + 8 = 24776 bytes from a 24680-byte file, the length check
+    // failed, and load_font_la16() returned false -- "[GUI] font_la16 not
+    // present", leaving ASCII on the un-anti-aliased 8x16 bitmap.  Use the
+    // real stride so the file matches and the AA font loads.
+    const int stride = 1 + g_fla16_h * g_fla16_h;
+    int n = g_fla16_count * stride;
     uint8_t* buf = (uint8_t*)kmalloc((uint32_t)n + 8);
     if (!buf) return false;
     if (g_cb.read_file(1, "font_la16.bin", buf, n + 8) != n + 8) { kfree(buf); return false; }
     for (int i = 0; i < g_fla16_count; i++) {
         int cp = g_fla16_base + i;
-        uint32_t o = 8u + (uint32_t)i * (2u + (uint32_t)g_fla16_h * g_fla16_h);
+        uint32_t o = 8u + (uint32_t)i * (uint32_t)stride;
         if (cp >= 0 && cp < 128) {
             g_fla16_off[cp] = o;
-            g_fla16_adv[cp] = (int)buf[o + 1];   // advance is the 2nd byte
+            // No advance byte exists in this format; fla16_advance() falls back
+            // to (h + 1) when the table entry is 0, which is the intended
+            // monospaced advance for the baked cell.
+            g_fla16_adv[cp] = 0;
         }
     }
     // Pre-bake the rounded (1px dilated) coverage: the hot text loop then just
@@ -1548,13 +1562,13 @@ static bool load_font_la16(void) {
         if (rb) {
             int cell = g_fla16_h * g_fla16_h;
             for (int i = 0; i < g_fla16_count; i++) {
-                uint32_t o = 8u + (uint32_t)i * (2u + (uint32_t)cell);
-                rb[o] = buf[o]; rb[o + 1] = buf[o + 1];
+                uint32_t o = 8u + (uint32_t)i * (uint32_t)stride;
+                rb[o] = buf[o];
                 int gw = (int)buf[o];
                 int gh = g_fla16_h;
                 if (gw <= 0 || gw * gh > cell) continue;   // layout guard
-                const uint8_t* src = buf + o + 2;
-                uint8_t* dst = rb + o + 2;
+                const uint8_t* src = buf + o + 1;
+                uint8_t* dst = rb + o + 1;
                 for (int ry = 0; ry < gh; ry++)
                     for (int rx = 0; rx < gw; rx++)
                         dst[ry * gw + rx] = (uint8_t)dil1_cov(src, gw, gh, ry, rx);
@@ -1574,7 +1588,9 @@ static const uint8_t* fla16_glyph(int cp, int* out_w, int* out_h) {
     if (!off) return nullptr;
     *out_w = (int)g_fla16[off];            // real per-glyph width
     *out_h = g_fla16_h;
-    return g_fla16 + off + 2;   // skip width(1) + advance(1)
+    // BUG-N5: the format is width(1) followed directly by the coverage plane --
+    // there is no advance byte, so the plane starts at off + 1.
+    return g_fla16 + off + 1;
 }
 
 // Per-glyph horizontal advance (px) for the baked LA16 font.
@@ -5036,8 +5052,20 @@ struct Win11Desktop {
         if (rx < 0) { rx = win.x; ry = win.y; rw = win.w; rh = win.h; }
         // Record what this frame actually paints (incl. the shadow margin) so
         // the compositor can erase exactly this rect next frame.
-        win.last_rx = rx - 16; win.last_ry = ry - 16;
-        win.last_rw = rw + 32; win.last_rh = rh + 32; win.last_valid = true;
+        //
+        // BUG-N1 fix: blend_rounded_rect(x,y,w,h) covers x in [x-1, x+w] and
+        // y in [y-1, y+h] (it extends one pixel past the nominal box on each
+        // side).  The outermost shadow layer is drawn at
+        // (rx-14, ry-10, rw+28, rh+26), so it actually reaches
+        // y = ry-10 + rh+26 + 1 = ry+rh+17, but the recorded erase rect only
+        // reached ry-16 + (rh+32) - 1 = ry+rh+15.  The bottom row of the shadow
+        // was therefore NEVER erased.  Because the desktop layer is retained
+        // (not repainted every frame), that stray row re-accumulated the shadow
+        // blend on every frame -- the "duplicate-rendered object shows a
+        // shadow-like line" artefact.  Expand the margin by 2px on every side
+        // so the recorded rect strictly contains every shadow layer.
+        win.last_rx = rx - 17; win.last_ry = ry - 17;
+        win.last_rw = rw + 34; win.last_rh = rh + 34; win.last_valid = true;
 
         // ---- Win11-style soft drop shadow (acrylic float) ----
         // The gfx backend's fill_/put_pixel are hard-replace and ignore alpha,

@@ -37,21 +37,37 @@ def main():
         print(f"Error: source directory '{src_dir}' does not exist")
         sys.exit(1)
 
-    # Collect files from source directory
+    # Collect files from source directory, recursing into subdirectories.
+    # BUG-N6 fix: this used os.listdir() + isfile(), which silently DROPPED
+    # every subdirectory -- so sfs_files/lang/{en,zh}.txt never made it into
+    # the image and the managed shell logged "[SFS-FIND] not found:
+    # lang/zh.txt" (Lang.cs loads its pack via Host.ReadText(1,"lang/zh.txt")).
+    # Sfs::find() matches entry names with a flat strcmp and has no directory
+    # support, so a nested file is stored under its relative path
+    # ("lang/zh.txt") as a single flat entry name -- which is exactly the
+    # string the caller asks for. The name field is 20 bytes, so the path must
+    # stay within 19 characters.
     files = []
     if os.path.isdir(src_dir):
-        for name in sorted(os.listdir(src_dir)):
-            fpath = os.path.join(src_dir, name)
-            if os.path.isfile(fpath):
+        for root, dirs, names in os.walk(src_dir):
+            dirs.sort()
+            rel_root = os.path.relpath(root, src_dir)
+            for name in sorted(names):
+                fpath = os.path.join(root, name)
+                if not os.path.isfile(fpath):
+                    continue
+                # Relative, forward-slash entry name ("" for the root itself).
+                rel = name if rel_root == '.' else os.path.join(rel_root, name)
+                rel = rel.replace(os.sep, '/')
                 if exclude_tex and name.startswith('tex_'):
                     continue
                 if exclude_fonts and name in ('zfont.bin', 'afont.bin'):
                     continue
                 data = open(fpath, 'rb').read()
-                if len(name) >= 20:
-                    print(f"Warning: filename '{name}' too long, truncating")
-                    name = name[:19]
-                files.append((name, data))
+                if len(rel) >= 20:
+                    print(f"Warning: path '{rel}' too long for the 20-byte SFS name field; truncating")
+                    rel = rel[:19]
+                files.append((rel, data))
 
     print(f"SFS: packing {len(files)} files from {src_dir}")
 

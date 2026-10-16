@@ -396,11 +396,11 @@ $(SFS_DIR)/%.bc: $(SFS_DIR)/%.skill tools/skillc.py | $(BUILD)
 
 skillbc: $(SKILL_BCS)
 
-$(SFS_IMG): $(wildcard $(SFS_DIR)/*) tools/sfs_gen.py tools/tex_pack.py $(SKILL_BCS) $(SFS_DIR)/userdemo $(SFS_DIR)/hello.mex $(SFS_DIR)/shell.mex $(SFS_DIR)/hello.nex | $(BUILD)
+$(SFS_IMG): $(wildcard $(SFS_DIR)/*) $(wildcard $(SFS_DIR)/*/*) tools/sfs_gen.py tools/tex_pack.py $(SKILL_BCS) $(SFS_DIR)/userdemo $(SFS_DIR)/hello.mex $(SFS_DIR)/shell.mex $(SFS_DIR)/hello.nex | $(BUILD)
 	$(PYTHON) tools/tex_pack.py
 	$(PYTHON) tools/sfs_gen.py $(SFS_DIR) $@
 
-$(BUILD)/sfs_uefi.img: $(wildcard $(SFS_DIR)/*) tools/sfs_gen.py $(SFS_IMG) | $(BUILD)
+$(BUILD)/sfs_uefi.img: $(wildcard $(SFS_DIR)/*) $(wildcard $(SFS_DIR)/*/*) tools/sfs_gen.py $(SFS_IMG) | $(BUILD)
 	$(PYTHON) tools/sfs_gen.py $(SFS_DIR) $@ --exclude-fonts
 
 # =====================================================================
