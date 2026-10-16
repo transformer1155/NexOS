@@ -1039,8 +1039,14 @@ extern "C" int mforms_has_desktop(void) {
 extern "C" void mforms_paint_desktop(int w, int h) {
     if (!mforms_ready()) return;
     diag_step(200, "mforms_paint_desktop enter");
-    extern int g_clr_trace;
-    g_clr_trace = 1;
+    // PERF-BUG fix: g_clr_trace used to be forced to 1 here "for diagnosis",
+    // which made the CLR print an [icall]/[clr] trace line for EVERY managed
+    // method call on EVERY desktop frame.  That is a ~2 MB/80 s serial flood
+    // (the COM port drains at ~11 KB/s at 115200 baud), so the guest spent
+    // most of each frame blocked writing to COM1 -- the whole UI (and the
+    // mouse) crawled.  Tracing is off by default (g_clr_trace == 0 in clr.cpp);
+    // leave it alone so the shell runs at full speed.  Re-enable temporarily
+    // only when actively diagnosing the CLR.
     set_context(0, 0, w, h);
     g_flist_fs = -1;
     uint32_t mark = clr_heap_mark();
@@ -1073,7 +1079,8 @@ extern "C" void mforms_paint_desktop(int w, int h) {
     } else {
         heap_recover();
     }
-    // g_clr_trace left ON intentionally for diagnosis (every frame traced).
+    // PERF-BUG fix: do NOT re-enable g_clr_trace here.  Leaving the per-call
+    // trace on floods COM1 every frame and stalls the whole system.
 }
 
 // Finer-grained wallpaper / desktop-icon layers.  The managed Shell::PaintDesktop
