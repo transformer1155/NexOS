@@ -1,0 +1,61 @@
+fix(svga): handle VirtualBox vmsvga quirks and add safe fallback when no HW cursor
+
+VirtualBox's vmsvga controller (the default graphics controller) exposes
+PCI 15AD:0405 but is a partial SVGA-II implementation. Through serial-log
++ screenshot verification we found two real driver bugs and one emulation
+limitation:
+
+--- Bug 1: FIFO ring base ignored device clamping ---
+
+F_MIN is a device-owned register.  vmsvga clamps it down to 64 bytes
+(16 dwords) regardless of what the driver writes.  The old code wrote
+F_MIN=88 and used that as the queue base, so every command was queued at
+an offset the device never scans.  Symptom in the log: after queuing 3
+cursor commands, F_NEXT_CMD advanced (0x458 -> 0x470) but F_STOP never
+moved (0x40 -> 0x40) -- the device consumed ZERO FIFO bytes.
+
+Fix: write the polite F_MIN hint, then READ IT BACK and use the device's
+actual value as sv_fifo_min.  Ring is now correctly based at 64.
+
+--- Bug 2: FIFO completion wait on the wrong signal ---
+
+sv_fifo_commit() spun on R_BUSY, which vmsvga never raises for FIFO work.
+Fix: wait for F_STOP to catch up to F_NEXT_CMD (the only correct completion
+signal for a guest-RAM FIFO driven by DMA).
+
+--- Limitation: this vmsvga build has no hardware cursor ---
+
+R_CAPABILITIES reads back 0x00020001 = [RECT_FILL, TRACES] only -- no
+SVGA_CAP_CURSOR (bit5), no SVGA_CAP_ALPHA_CURSOR (bit9), and the FIFO
+register block is clamped to 16 dwords so the cursor reflection regs
+(index 18+) do not exist.  Issuing DEFINE/MOVE/DISPLAY_CURSOR against it
+can never be honoured, and ENABLE would only risk the latent 16bpp-vs-32bpp
+surface conflict (the GUI draws BGRX32 while the device powers up at 16bpp).
+
+Fix:
+- Decode and log the capability bits as readable text.
+- Gate R_ENABLE on actually having a hardware cursor (have_cursor);
+  otherwise keep the firmware scanout + painted software arrow.
+- svga_cursor_selftest() now skips the impossible cursor commands on a
+  cursor-less device and reports the honest outcome instead of a misleading
+  NO-ACK.
+- Correct, truthful status lines ("2D acceleration ready; hardware cursor
+  not available", "device has no hardware cursor capability; ENABLING would
+  not help").
+
+--- Verification (VirtualBox, vmsvga, 1024x768) ---
+
+- make builds clean (kernel32 509KB, kernel64 within LBA bounds).
+- Serial log now reads, verbatim:
+    caps=0x00020001 [RECT_FILL,TRACES]
+    device has no hardware cursor capability; ENABLING would not help.
+    keeping firmware scanout + painted arrow
+    2D acceleration ready; hardware cursor not available
+    cursor selftest: device lacks SVGA_CAP_CURSOR; skipping hardware cursor
+- Screenshot is clean: no blank, no stripe, lock screen renders correctly.
+- The ring-base + completion fixes are real and would let a cursor-capable
+  SVGA-II device (e.g. QEMU std-vga) drain the FIFO correctly; this run just
+  confirms the safe fallback path on the partial VBox implementation.
+
+Note: an unrelated [HEAP] OOM: request 00300000 is still observed during
+shell.mex (CLR) load; it is independent of SVGA and is left for a follow-up.

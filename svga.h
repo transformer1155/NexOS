@@ -33,18 +33,30 @@ extern "C" {
 // drawing happily.  The hint is what keeps the two in step.
 void svga_mode_hint(int w, int h, int bpp, int pitch);
 
-// Whether svga_init() may actually ENABLE the device.  Default OFF.
+// Whether svga_init() may actually ENABLE the device.  Default ON.
 //
 // Enabling hands the scanout to SVGA, and it then takes the surface size and
 // PIXEL FORMAT from its own registers.  On this guest the firmware left a
 // 16 bpp VBE mode while the device insists on 32 bpp (a write of
 // SVGA_REG_BITS_PER_PIXEL=16 reads back 32), so the host scans out 4 bytes
 // per pixel against a 2 byte framebuffer: the picture comes back horizontally
-// duplicated and striped.  Until that format ownership is resolved, the
-// driver must audit and report WITHOUT touching the display.
+// duplicated and striped.
+//
+// That regression is now PREVENTED by a format self-check in sv_fifo_init():
+// the driver programs the kernel's mode into the device, reads it back, and
+// refuses to ENABLE on any disagreement (size or format).  If the firmware
+// mode already matches (the common 32bpp case), the device is enabled and the
+// hardware cursor + 2D FIFO acceleration come alive; if they disagree, the
+// driver keeps the firmware scanout and the painted software cursor.  So the
+// default is safe to leave ON.
 int  svga_init(void);
 void svga_allow_enable(int on);
 int  svga_ready(void);
+// 1 once R_ENABLE was actually applied (device owns the scanout).  The hardware
+// cursor overlay and 2D FIFO acceleration are only meaningful when this is set;
+// without it the firmware still scans the linear framebuffer and the CPU paint
+// path + painted arrow keep working.
+int  svga_scanout_enabled(void);
 
 // ---- 2D acceleration ---------------------------------------------------
 // Solid fill in the *screen's* 0x00RRGGBB colour, accelerating what the
