@@ -24,6 +24,12 @@
 #include "ime_dict.h"     // pinyin -> Hanzi dictionary for IME
 #include "win32.h"        // Win32 subsystem: registry, PE32 loader, GDI display list
 #include "addrman.h"       // Address Management Registry (single source of truth)
+
+// Service-registry callback type (matches plugins/plugin_manager.h).  gui.cpp
+// cannot include that header (not on the kernel include path), so we declare
+// the compatible typedef + the lookup entry point we need.
+typedef int (*svc_fn)(void* args, void* out, int outcap);
+extern "C" svc_fn svc_lookup(const char* name);
 #include "font_vec.h"       // runtime vector font rasterizer (stb_truetype)
 
 // ---- Precomputed sRGB <-> linear (gamma 2.4) lookup tables ----
@@ -156,6 +162,24 @@ static int    g_remote_btn_x = 0, g_remote_btn_y = 0, g_remote_btn_w = 0, g_remo
 extern "C" void gui_remote_end(void);                    // defined below, called by handle_mouse_down
 extern "C" void draw_remote_guard(void);                 // defined below (inside extern "C"), called by render_all
 
+// ---- WSL2-style Linux Guest (backend-agnostic) ------------------------
+// The window no longer talks to VNC or linux_manager directly; it goes
+// through the LinuxGuestBackend interface (linux_guest_backend.h).  The
+// default backend is the VNC/linux_manager dev path; a built-in VMM backend
+// (Intel VT-x / AMD-V + shared framebuffer) can be selected with
+// lgb_set_backend() without touching any GUI code.
+#include "linux_guest_backend.h"
+
+// One-time backend init (resolve services, map guest RAM, ...).  Called once
+// at GUI bring-up.
+static bool g_lgb_inited = false;
+static void lg_ensure_init(void) {
+    if (g_lgb_inited) return;
+    lg_init();
+    lgb_use_vmm_if_available();   // on bare metal w/ VT-x/AMD-V, switch to VMM
+    g_lgb_inited = true;
+}
+
 // ---- AI Agent panel API (provided by ai_engine.cpp, C linkage) ----
 extern "C" int  agent_dispatch(const char* goal, char* output, int outsize, int use_cloud);
 extern "C" int  agent_trace_get(char* buf, int bufsize);
@@ -164,12 +188,18 @@ extern "C" void agent_trace_log(const char* tag, const char* msg);
 extern "C" void agent_abort(void);
 extern "C" int  agent_init(void);
 
-// Clipboard is owned by the kernel but shared with the GUI (terminal /
+// ClipIs owned by the kernel but shared with the GUI (terminal /
 // browser URL copy-paste) and the C# host bridge.
 extern char g_clipboard[256];
 extern int  g_clipboard_len;
 extern void clipboard_set(const char* text, int len);
 extern bool g_host_cursor_active;   // defined in kernel.cpp (VMMDev absolute-mouse flag)
+
+// Framebuffer-class allocator (PMM-backed, outside the fixed ~10 MiB kernel
+// heap).  The compositor's full-screen buffers (backbuffer + desktop snapshot,
+// 1024x768x4 = 3 MiB each) must not compete with the managed shell for heap.
+extern "C" void* bigbuf_alloc(uint32_t size);
+extern "C" void  bigbuf_free(void* ptr);
 
 // ---- Cursor backend --------------------------------------------------
 // The pointer can be presented three ways.  The choice is made once, when the
@@ -559,11 +589,27 @@ static bool g_gop_native = false;
 extern volatile uint16_t* VGA_MEMORY;
 
 // ---- Serial debug ----
-static void serial_puts(const char* s) {
-    while (*s) outb(0x3F8, (uint8_t)*s++);
+// Route through the kernel's shared COM1 lock + line buffer so concurrent
+// GUI/thread output stays line-atomic (see kernel.cpp g_sio_lock).
+extern "C" void serial_enter(void);
+extern "C" void serial_leave(void);
+#define GUI_LINEMAX 256
+static char g_gui_line[GUI_LINEMAX];
+static int  g_gui_len = 0;
+static void gui_sio_flush(void) {
+    if (g_gui_len <= 0) return;
+    serial_enter();
+    for (int i = 0; i < g_gui_len; i++) outb(0x3F8, (uint8_t)g_gui_line[i]);
+    serial_leave();
+    g_gui_len = 0;
 }
 static void serial_putc(char c) {
-    outb(0x3F8, (uint8_t)c);
+    if (g_gui_len >= GUI_LINEMAX - 1) gui_sio_flush();
+    g_gui_line[g_gui_len++] = c;
+    if (c == '\n') gui_sio_flush();
+}
+static void serial_puts(const char* s) {
+    while (*s) serial_putc(*s++);
 }
 static void serial_putdec(int v) {
     char buf[12]; int n = 0;
@@ -1799,8 +1845,11 @@ struct Graphics {
         serial_puts(", source: ");
         serial_puts(g_gop_native ? "UEFI-GOP\n" : "BIOS-VBE/BGA\n");
 
-        // Allocate backbuffer (off-screen buffer for double buffering)
-        backbuffer = (uint32_t*)kmalloc(width * height * 4);
+        // Allocate backbuffer (off-screen buffer for double buffering).
+        // Framebuffer-class buffer: use bigbuf (PMM-backed, outside the GUI
+        // heap) -- a 1024x768x4 = 3 MiB kmalloc cannot fit the 10 MiB heap
+        // alongside the managed shell's own allocations and used to OOM.
+        backbuffer = (uint32_t*)bigbuf_alloc((uint32_t)(width * height * 4));
         if (!backbuffer) {
             serial_puts("[GUI] Failed to allocate backbuffer\n");
             initialized = false;
@@ -3263,14 +3312,15 @@ enum AppType {
     APP_DEMO,           // button-shrink + reply "啥" demo window (managed)
     APP_NETTOOLS,        // network diagnostics console (managed)
     APP_AILAUNCHER,      // AI command console / natural-language launcher (managed)
+    APP_LINUX_GUEST,     // WSL2-style seamless Linux desktop (VNC viewer window)
     APP_START_MENU,      // Start menu: loaded into the window DB so it is
                          // composited & dirty-tracked like any other window
 };
 
-constexpr int MAX_WINDOWS = 10;   // +headroom: slot 0 is permanently the Start menu
+constexpr int MAX_WINDOWS = 12;   // +headroom: slot 0 is permanently the Start menu
 constexpr int TITLE_BAR_H = 32;
-constexpr int MAX_ICONS = 8;
-constexpr int MAX_START_ITEMS = 8;
+constexpr int MAX_ICONS = 9;
+constexpr int MAX_START_ITEMS = 9;
 
 // ---- Frosted-glass (姣涚幓鐠? blur helpers (file scope, not class members) ----
 // One reusable scratch buffer for the separable box blur; grown on demand.
@@ -3534,6 +3584,16 @@ struct Win11Window {
     // Pixel count of the last failed content-bitmap allocation (0 = none yet);
     // see content_buf() for why a failed size is remembered.
     int  cbmp_failed;
+
+    // WSL2-style Linux Guest view (VNC framebuffer + FIT letterbox mapping).
+    // lgv_fb points at the shared VncState::fb buffer owned by the vnc_client
+    // plugin; the compositor scales it into the window client area every frame.
+    struct {
+        uint32_t* fb;     // remote RFB pixels (row-major, NexOS 0x00RRGGBB) or 0
+        int w, h;         // remote framebuffer dimensions (0 until connected)
+        int off_x, off_y; // letterbox offset inside the client area (black bars)
+        int scale_w, scale_h; // drawn framebuffer size inside the client area
+    } lgv;
 
     // Animation state (Phase 2 visual polish)
     int anim_state;   // 0=none,1=opening,2=closing,3=minimizing,4=restoring
@@ -4514,8 +4574,9 @@ struct Win11Desktop {
             {"Browser",       APP_BROWSER,       0x0078D7, 'W'},
             {"Calculator",    APP_CALCULATOR,    0xCA5010, '#'},
             {"About",         APP_ABOUT,         0x0099BC, 'i'},
+            {"Linux",         APP_LINUX_GUEST,   0xE95420, 'L'},
         };
-        for (int i = 0; i < 8 && start_item_count < MAX_START_ITEMS; i++) {
+        for (int i = 0; i < 9 && start_item_count < MAX_START_ITEMS; i++) {
             strcpy_(start_items[start_item_count].label, start_defs[i].name);
             start_items[start_item_count].app = start_defs[i].app;
             start_items[start_item_count].color = start_defs[i].c;
@@ -5094,6 +5155,7 @@ struct Win11Desktop {
             case APP_ABOUT:           draw_about(id, cx, cy, cw, ch); break;
             case APP_BROWSER:         draw_browser(id, cx, cy, cw, ch); break;
             case APP_AIAGENT:         draw_agent(id, cx, cy, cw, ch); break;
+            case APP_LINUX_GUEST:     draw_linux_guest(id, cx, cy, cw, ch); break;
             case APP_WIN32:           draw_win32_app(id, rx + 2, ry + TITLE_BAR_H + 2,
                                                      rw - 4, rh - TITLE_BAR_H - 4); break;
             case APP_MANAGED: {
@@ -5250,8 +5312,8 @@ struct Win11Desktop {
         // every frame produced the same OOM forever and buried the boot
         // log in noise, so remember the failure and stop asking.
         if (g_snap_failed && n <= g_snap_failed) return;
-        if (g_snap) { kfree(g_snap); g_snap = nullptr; g_snap_cap = 0; }
-        g_snap = (uint32_t*)kmalloc((uint32_t)n * 4u);
+        if (g_snap) { bigbuf_free(g_snap); g_snap = nullptr; g_snap_cap = 0; }
+        g_snap = (uint32_t*)bigbuf_alloc((uint32_t)n * 4u);
         g_snap_cap = g_snap ? n : 0;
         if (!g_snap) g_snap_failed = n;
     }
@@ -6702,6 +6764,11 @@ struct Win11Desktop {
             mforms_close(windows[id].managed_app);
             windows[id].managed_app = -1;
         }
+        if (windows[id].app == APP_LINUX_GUEST) {
+            // Closing the Linux Guest window tears down the backend session AND
+            // the nested Linux VM (mirrors WSL2: close the distro window -> stop).
+            lg_shutdown();
+        }
         if (windows[id].cbmp) { kfree(windows[id].cbmp); windows[id].cbmp = nullptr; }
         windows[id].cbw = 0; windows[id].cbh = 0; windows[id].cvalid = false;
         windows[id].visible = false;
@@ -7205,12 +7272,97 @@ struct Win11Desktop {
         if (w.last_valid) dirty_add(w.last_rx, w.last_ry, w.last_rw, w.last_rh);
     }
 
+    // ---- WSL2-style Linux Guest (VNC viewer) content --------------------
+    // Scales the remote RFB framebuffer into the window's client area with a
+    // FIT letterbox (preserve aspect ratio, black bars for the remainder),
+    // then composites it via gfx.blit_rect (which is already clip-capable and
+    // will never write outside the VRAM backbuffer).
+    void draw_linux_guest(int id, int cx, int cy, int cw, int ch) {
+        Win11Window& win = windows[id];
+        // Black backdrop for the letterbox bars.
+        gfx.fill_rect(cx - 8, cy - (TITLE_BAR_H + 8), cw + 16, ch + (TITLE_BAR_H + 16), 0x000000);
+
+        // Refresh the shared framebuffer pointer/dimensions from the active
+        // backend (VNC dev path or built-in VMM shared framebuffer).
+        void* fb = nullptr; int fw = 0, fh = 0;
+        int ok = lg_read_fb(&fb, &fw, &fh);
+        uint32_t* fbp = (uint32_t*)fb;
+        win.lgv.fb = fbp;
+        win.lgv.w = fw; win.lgv.h = fh;
+
+        if (!ok || !fb || fw <= 0 || fh <= 0) {
+            // Not connected yet — show the status watermark.
+            const char* s = lg_status();
+            if (!s) s = "Connecting to Linux...";
+            gfx.draw_text_transparent(cx + cw / 2 - 80, cy + ch / 2 - 8, s, C_CLOSE_TEXT);
+            win.lgv.off_x = win.lgv.off_y = win.lgv.scale_w = win.lgv.scale_h = 0;
+            return;
+        }
+
+        // FIT: fit (fw,fh) into (cw,ch) preserving aspect ratio.
+        int avail_w = cw, avail_h = ch;
+        int scale_w, scale_h;
+        if ((int64_t)fw * avail_h <= (int64_t)avail_w * fh) {
+            scale_h = avail_h;
+            scale_w = (int)((int64_t)avail_h * fw / fh);
+        } else {
+            scale_w = avail_w;
+            scale_h = (int)((int64_t)avail_w * fh / fw);
+        }
+        if (scale_w <= 0) scale_w = 1;
+        if (scale_h <= 0) scale_h = 1;
+        int off_x = cx + (avail_w - scale_w) / 2;
+        int off_y = cy + (avail_h - scale_h) / 2;
+
+        win.lgv.off_x = off_x; win.lgv.off_y = off_y;
+        win.lgv.scale_w = scale_w; win.lgv.scale_h = scale_h;
+
+        // Nearest-neighbour scale from the remote fb into a temporary line
+        // buffer, then blit_rect (clip-capable) per source row.  This keeps the
+        // remote framebuffer fully bounded and never writes outside VRAM.
+        const int MAXLINE = 4096;
+        static uint32_t s_line[MAXLINE];
+        for (int sy = 0; sy < fh; sy++) {
+            int dy = off_y + (int64_t)sy * scale_h / fh;
+            int dy2 = off_y + (int64_t)(sy + 1) * scale_h / fh;
+            if (dy2 <= dy) dy2 = dy + 1;
+            if (dy >= cy + ch) break;
+            // Build one scaled source row.
+            int row_w = scale_w;
+            if (row_w > MAXLINE) row_w = MAXLINE;
+            for (int dx = 0; dx < row_w; dx++) {
+                int sx = (int64_t)dx * fw / scale_w;
+                if (sx < 0) sx = 0; if (sx >= fw) sx = fw - 1;
+                s_line[dx] = fbp[(uint64_t)sy * (uint64_t)fw + sx];
+            }
+            // Blit that row across its destination height span (clip-safe).
+            for (int yy = dy; yy < dy2 && yy < cy + ch; yy++) {
+                if (yy < cy) continue;
+                gfx.blit_rect(off_x, yy, row_w, 1, s_line);
+            }
+        }
+        // Remember the mapped client rect so input can be inverse-translated.
+        win.lgv.off_x = off_x; win.lgv.off_y = off_y;
+        win.lgv.scale_w = scale_w; win.lgv.scale_h = scale_h;
+    }
+
     void render_all() {
         if (!gfx.initialized) return;
         if (!gui_mode) return;   // never paint after gui_exit() (e.g. "Terminal" shortcut)
         frame_counter++;
         dirty_reset(gfx.width, gfx.height);   // begin damage tracking for this frame
         uint32_t tS = tick_ms_now();          // per-stage timing clock
+
+        // Drive the WSL2-style Linux Guest lifecycle (VM boot, connect, frame
+        // ingest) from the GUI tick via the backend-agnostic bridge.  Only tick
+        // while a Linux window is actually open: at boot (no session) the extra
+        // per-frame serial/network poll races the vmsvga scanout and blanks the
+        // screen on VirtualBox.  The state machine is non-blocking, so ticking
+        // only when active is still correct.
+        if (lg_active()) {
+            lg_ensure_init();
+            lg_poll(tS);
+        }
         // DIAG markers moved to AFTER the managed (C#) paint (see cyan/
         // yellow/magenta below) so they survive on screen -- the managed
         // desktop fills the whole framebuffer and would otherwise erase a
@@ -7781,6 +7933,13 @@ struct Win11Desktop {
         mouse_y = cursor.y;
         cursor_backend_sync(cursor.x, cursor.y);
 
+        // Forward pointer motion to the Linux Guest (no window-drag in progress).
+        if (!was_drag && !scroll_drag_win && !slider_drag && linux_guest_capture_input()) {
+            int rx = 0, ry = 0;
+            if (linux_guest_map(mouse_x, mouse_y, rx, ry))
+                linux_guest_send(rx, ry, mouse_left ? 1 : 0, 0);
+        }
+
         // A scrollbar drag pans the managed window's content (not the window).
         if (scroll_drag_win >= 0 && scroll_drag_win < window_count) {
             Win11Window& w = windows[scroll_drag_win];
@@ -7944,6 +8103,53 @@ struct Win11Desktop {
         return false;
     }
 
+    // ---- WSL2-style Linux Guest input interception ---------------------
+    // When the active window is the Linux Guest, translate the NexOS client
+    // coordinates into remote (RFB) coordinates and forward mouse/key via the
+    // vnc.input service.  Returns true if the event was consumed by the guest.
+    bool linux_guest_capture_input() {
+        if (active_window < 0) return false;
+        Win11Window& win = windows[active_window];
+        if (win.app != APP_LINUX_GUEST) return false;
+        // Only capture while the pointer is inside the letterboxed frame area.
+        if (!win.lgv.fb || win.lgv.w <= 0 || win.lgv.h <= 0) return false;
+        // A backend is always installed (default VNC), so just gate on a frame.
+        return true;
+    }
+    // Inverse-map a client pixel to guest coords; returns false if outside
+    // the drawn frame (i.e. inside the black letterbox bars).
+    bool linux_guest_map(int px, int py, int& rx, int& ry) {
+        Win11Window& win = windows[active_window];
+        int lx = px - win.lgv.off_x;
+        int ly = py - win.lgv.off_y;
+        if (lx < 0 || ly < 0 || lx >= win.lgv.scale_w || ly >= win.lgv.scale_h)
+            return false;
+        rx = (int)((int64_t)lx * win.lgv.w / win.lgv.scale_w);
+        ry = (int)((int64_t)ly * win.lgv.h / win.lgv.scale_h);
+        if (rx < 0) rx = 0; if (rx >= win.lgv.w) rx = win.lgv.w - 1;
+        if (ry < 0) ry = 0; if (ry >= win.lgv.h) ry = win.lgv.h - 1;
+        return true;
+    }
+    void linux_guest_send(int rx, int ry, int btn, int keysym) {
+        lg_send_input(rx, ry, btn, keysym);
+    }
+    // Map a delivered ASCII char to an RFB/X11 keysym.  Returns 0 if the char
+    // cannot (or should not) be forwarded.  Control keys are mapped to their
+    // X11 symbols so the guest sees real Enter/Backspace/Tab/Esc events.
+    int linux_guest_keysym(char ch) {
+        unsigned char c = (unsigned char)ch;
+        switch (ch) {
+            case 0x08: return 0xFF08; // Backspace
+            case 0x09: return 0xFF09; // Tab
+            case 0x0D: return 0xFF0D; // Enter (CR)
+            case 0x1B: return 0xFF1B; // Escape
+            case 0x7F: return 0xFF08; // DEL -> Backspace
+            default:
+                if (c >= 0x20 && c < 0x7F) return (int)c; // printable ASCII
+                return 0;
+        }
+    }
+
     void handle_mouse_down() {
         if (!gui_mode) return;
         // ---- Remote-control security guard: modal overlay ----
@@ -7959,6 +8165,25 @@ struct Win11Desktop {
         }
         mouse_left = true;
         start_menu_open = false; // close by default, reopen if clicked
+
+        // WSL2-style Linux Guest: a left-click inside its client area is
+        // forwarded to the nested Linux desktop (and does NOT hit-test our
+        // own desktop/taskbar/title-bar routing in a way that steals it).
+        // We still let the title bar (y < content_y()) drive drag/close so
+        // the user can move or close the window normally.
+        if (g_remote_active == false && linux_guest_capture_input() &&
+            mouse_y >= windows[active_window].content_y()) {
+            int rx = 0, ry = 0;
+            if (linux_guest_map(mouse_x, mouse_y, rx, ry)) {
+                linux_guest_send(rx, ry, 1, 0);   // button 1 = left down
+                render_all();
+                return;
+            }
+            // Click inside the window but in the letterbox bars -> ignore
+            // (do not let it fall through to NexOS desktop routing).
+            render_all();
+            return;
+        }
 
         // A Win32 popup menu is modal: a click selects the item under the
         // cursor (WM_COMMAND to its owner) or dismisses the menu.
@@ -8345,6 +8570,14 @@ struct Win11Desktop {
         slider_drag = 0;
         int dw = drag_window;
         drag_window = -1;
+
+        // Forward the pointer release to the Linux Guest (if its window is
+        // active and had captured the button).
+        if (linux_guest_capture_input()) {
+            int rx = 0, ry = 0;
+            if (linux_guest_map(mouse_x, mouse_y, rx, ry))
+                linux_guest_send(rx, ry, 0, 0);   // button 0 = all up
+        }
 
         if (dw >= 0 && gui_mode) {
             apply_snap(dw);
@@ -8981,6 +9214,10 @@ struct Win11Desktop {
                 ww = 640; wh = 560; title = "Net Tools"; break;
             case APP_AILAUNCHER:
                 ww = 640; wh = 480; title = "AI Launcher"; break;
+            case APP_LINUX_GUEST:
+                // WSL2-style seamless Linux desktop: a large window so the
+                // nested Linux GUI has room to breathe.
+                ww = 760; wh = 560; title = "Linux"; break;
             default: return;
         }
 
@@ -9010,7 +9247,7 @@ struct Win11Desktop {
         // form faults inside the CLR (Shell::Open(10)), and a CLR fault there
         // takes the whole managed desktop paint down with it -> black screen.
         // The native draw_agent renderer is complete (trace / buttons / input).
-        int mkind = (app == APP_AIAGENT) ? -1 : managed_kind_for(app);
+        int mkind = (app == APP_AIAGENT || app == APP_LINUX_GUEST) ? -1 : managed_kind_for(app);
         if (mkind >= 0 && mforms_ready()) {
             int mid = mforms_open(mkind);
             if (mid >= 0) {
@@ -9053,6 +9290,16 @@ struct Win11Desktop {
         if (app == APP_NOTEPAD) return;
         int id = create_window(wx, wy, ww, wh, title, app);
         if (id >= 0) windows[id].launch_kind = app;
+        if (id >= 0 && app == APP_LINUX_GUEST) {
+            // One-click seamless launch: the window opens immediately showing
+            // "Starting Linux...", and the active backend (driven from
+            // render_all) boots the nested Linux VM and connects in the
+            // background.  No blocking, no VM/VNC visible to the user.
+            windows[id].lgv.fb = nullptr;
+            windows[id].lgv.w = windows[id].lgv.h = 0;
+            lg_ensure_init();
+            lg_launch();
+        }
         if (id >= 0 && app == APP_TERMINAL) {
             // Initialize terminal
             Win11Window& win = windows[id];
@@ -9341,6 +9588,17 @@ struct Win11Desktop {
 
     bool handle_key(char ch) {
         if (!gui_mode) return false;
+
+        // WSL2-style Linux Guest: forward the keystroke to the nested Linux
+        // desktop.  Return true so no NexOS app/desktop sees the key.
+        if (linux_guest_capture_input()) {
+            int keysym = linux_guest_keysym(ch);
+            if (keysym != 0) linux_guest_send(0, 0, 0, keysym);   // press
+            if (keysym != 0) linux_guest_send(0, 0, 0, -keysym);  // release
+            render_all();
+            return true;
+        }
+
         // Start menu is modal and keyboard-navigable: Esc closes, Enter activates.
         if (mforms_desktop_menu_open()) {
             gui_invalidate_managed();
@@ -10310,6 +10568,15 @@ extern "C" void gui_blit_pixels(int x, int y, int w, int h, const uint32_t* src)
     g_wm.gfx.blit_rect(x, y, w, h, src);
 }
 
+// C entry point reporting the current NexOS screen size.  The VNC client
+// plugin uses this to boundary-check its framebuffer writes so a rectangle
+// larger than (or off-screen vs) the NexOS desktop can never scribble past
+// the backbuffer.  Either pointer may be NULL.
+extern "C" void gui_get_screen_size(int* w, int* h) {
+    if (w) *w = g_wm.gfx.initialized ? (int)g_wm.gfx.width  : 0;
+    if (h) *h = g_wm.gfx.initialized ? (int)g_wm.gfx.height : 0;
+}
+
 #ifdef FB_DIAG
 // =====================================================================
 //  Framebuffer diagnostic (white-line hunter)
@@ -10639,6 +10906,14 @@ void gui_enter(void) {
     // device -- an enabled SVGA device takes the surface size from its own
     // registers, so it must be told what the kernel is actually drawing.
     svga_mode_hint(g_wm.gfx.width, g_wm.gfx.height, g_wm.gfx.bpp, g_wm.gfx.pitch);
+    // The SVGA-II driver now enables itself by DEFAULT, but FAIL-SAFE: in
+    // sv_fifo_init() it writes the mode to the registers and reads them back,
+    // and only raises svga_scanout_enabled() when the negotiated width/height/
+    // bpp AND the framebuffer base match exactly what stage2/VBE set up.  If
+    // the device tries any format the firmware did not (e.g. vmsvga's 32bpp
+    // against a 16bpp VBE framebuffer) the enable is WITHHELD and the GUI
+    // keeps its CPU path -- so an enabled device can never stripe/blank the
+    // screen.  The painted-arrow cursor fallback always remains available.
     // The framebuffer is up by now: pick how the pointer will be presented
     // (GPU cursor plane / hypervisor cursor / painted arrow).
     select_cursor_backend();

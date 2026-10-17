@@ -210,7 +210,10 @@ PLUGIN_SRCS := plugins/plugin_manager.cpp plugins/plugins_boot.cpp \
                plugins/app_control_panel.cpp plugins/app_file_explorer.cpp \
                plugins/app_task_manager.cpp plugins/app_calculator.cpp \
                plugins/app_terminal.cpp plugins/app_browser.cpp plugins/theme_default.cpp \
-               plugins/linux_loader.cpp plugins/vnc_client.cpp
+               plugins/linux_loader.cpp plugins/vnc_client.cpp \
+                plugins/linux_manager.cpp \
+                 plugins/linux_guest_backend.cpp \
+                 plugins/vmm.cpp
 # All plugin objects live flat under $(BUILD)/ (no subdirs) so no mkdir needed.
 PLUGIN_OBJS := $(BUILD)/plugin_manager.o $(BUILD)/plugins_boot.o $(BUILD)/hello_world.o \
                $(BUILD)/src_view.o $(BUILD)/gfx_core.o $(BUILD)/gfx_glass.o \
@@ -220,7 +223,9 @@ PLUGIN_OBJS := $(BUILD)/plugin_manager.o $(BUILD)/plugins_boot.o $(BUILD)/hello_
                $(BUILD)/app_file_explorer.o $(BUILD)/app_task_manager.o \
                $(BUILD)/app_calculator.o $(BUILD)/app_terminal.o \
                $(BUILD)/app_browser.o $(BUILD)/theme_default.o \
-               $(BUILD)/linux_loader.o $(BUILD)/vnc_client.o
+               $(BUILD)/linux_loader.o $(BUILD)/vnc_client.o \
+                $(BUILD)/linux_manager.o $(BUILD)/linux_guest_backend.o \
+                 $(BUILD)/vmm.o
 
 # compile each plugin .cpp in place (header "plugin_manager.h" sits next to it)
 $(BUILD)/plugin_manager.o: plugins/plugin_manager.cpp plugins/plugin_manager.h | $(BUILD)
@@ -267,6 +272,12 @@ $(BUILD)/linux_loader.o: plugins/linux_loader.cpp plugins/plugin_manager.h | $(B
 	$(CC) $(CXXFLAGS) -c $< -o $@
 $(BUILD)/vnc_client.o: plugins/vnc_client.cpp plugins/plugin_manager.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/linux_manager.o: plugins/linux_manager.cpp plugins/plugin_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/linux_guest_backend.o: plugins/linux_guest_backend.cpp plugins/plugin_manager.h plugins/linux_guest_backend.h plugins/linux_manager.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/vmm.o: plugins/vmm.cpp plugins/vmm.h kernel/pmm.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/gguf.o: gguf.cpp gguf.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c gguf.cpp -o $@
@@ -278,7 +289,7 @@ $(BUILD)/distnet.o: distnet.cpp distnet.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c distnet.cpp -o $@
 
 $(BUILD)/gui.o: gui.cpp logo.h font_vec.h | $(BUILD)
-	$(CC) $(CXXFLAGS) -c gui.cpp -o $@
+	$(CC) $(CXXFLAGS) -Iplugins -c gui.cpp -o $@
 
 # Runtime vector font rasterizer (stb_truetype.h) - 32-bit and 64-bit.
 # Compiled as plain C (-x c) so its kmalloc/kfree calls use C linkage, matching
@@ -1133,6 +1144,34 @@ play: $(IMG)
 	$(GUIENV) $(QEMU) -drive format=raw,file=$(IMG) -m 4096 \
 		-vga std -display $(DISPLAY_BACKEND) -serial mon:stdio -no-reboot
 
+# =====================================================================
+#  WSL2-style "one-click Linux desktop in a NexOS window"
+#  Boots NexOS (QEMU#1) with:
+#    - COM1 -> diag log (mon:stdio, unchanged)
+#    - COM2 -> host control socket (127.0.0.1:15901) where
+#              tools/linux_orchestrator.py receives "start"/"stop"
+#    - user-net hostfwd 15900->15900 so NexOS reaches the orchestrator's
+#      VNC proxy at 10.0.2.2:15900 (which forwards to QEMU#2's :5900).
+#  The orchestrator is started in the background first; it spawns the
+#  nested Linux Guest (QEMU#2) on demand when the Linux window is opened.
+#    make play-linux  NEXOS_LINUX_IMAGE=/path/to/linux.qcow2
+# =====================================================================
+play-linux: $(IMG) tools/linux_orchestrator.py
+	$(call ensure-pkg, qemu-system-x86_64, $(PKG_QEMU))
+	@echo "=== NexOS + Linux Guest (WSL2-style) ==="
+	@echo "1) starting host orchestrator (control 15901 / VNC proxy 15900)"
+	@python3 tools/linux_orchestrator.py --ctrl-listen 127.0.0.1:15901 \
+		--vnc-listen 0.0.0.0:15900 $(if $(NEXOS_LINUX_IMAGE),--linux-image $(NEXOS_LINUX_IMAGE)) \
+		$(if $(NEXOS_LINUX_ISO),--linux-iso $(NEXOS_LINUX_ISO)) \
+		$(if $(NEXOS_LINUX_KVM),--linux-kvm "$(NEXOS_LINUX_KVM)") & \
+		echo "   orchestrator pid $$!"
+	@sleep 1
+	$(GUIENV) $(QEMU) -drive format=raw,file=$(IMG) -m 4096 \
+		-vga std -display $(DISPLAY_BACKEND) \
+		-serial mon:stdio \
+		-serial tcp:127.0.0.1:15901 \
+		-net nic,model=ne2k_isa -net user
+
 # Fallback for the rare box where even XWayland misbehaves: SDL instead of GTK.
 #   make play-sdl
 play-sdl: $(ISO)
@@ -1320,7 +1359,7 @@ $(BUILD)/smp64.o: .attic64/smp64.cpp .attic64/smp64.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c .attic64/smp64.cpp -o $@
 
 $(BUILD)/gui64.o: gui.cpp logo.h font_vec.h | $(BUILD)
-	$(CC64) $(CXX64FLAGS) -c gui.cpp -o $@
+	$(CC64) $(CXX64FLAGS) -I plugins -c gui.cpp -o $@
 
 $(BUILD)/ai_engine64.o: ai_engine.cpp | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c ai_engine.cpp -o $@

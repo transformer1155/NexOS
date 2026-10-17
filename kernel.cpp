@@ -52,12 +52,57 @@ static inline void outl(uint16_t p,uint32_t v){ __asm__ __volatile__("outl %0,%1
 // =====================================================================
 //  Serial debug output (port 0x3F8)  -  for UEFI boot tracing
 // =====================================================================
+// ---------------------------------------------------------------------
+//  Cross-emitter serial lock
+//  Three independent COM1 emitters exist (kernel.cpp, gui.cpp, svga.cpp)
+//  and several boot threads print concurrently, so without a lock their
+//  characters interleave in the host log and tokens like [SVGA] become
+//  unreadable.  We line-buffer each emitter and flush whole lines under a
+//  TAS spinlock taken with interrupts disabled, so every '\n'-terminated
+//  line is atomic.  svga.cpp / gui.cpp call serial_lock_acquire/release.
+// ---------------------------------------------------------------------
+volatile int g_sio_lock = 0;
+static unsigned sio_saved_flags;
+static inline unsigned sio_flags_save(void){ unsigned f; __asm__ __volatile__("pushf; pop %0":"=r"(f)); return f; }
+static inline void sio_flags_restore(unsigned f){ __asm__ __volatile__("push %0; popf"::"r"(f)); }
+extern "C" void serial_lock_acquire(void){
+    unsigned f = sio_flags_save();
+    __asm__ __volatile__("cli":::"memory");
+    while (__sync_lock_test_and_set(&g_sio_lock, 1)) { __asm__ __volatile__("pause":::"memory"); }
+    sio_saved_flags = f;
+}
+extern "C" void serial_lock_release(void){
+    unsigned f = sio_saved_flags;
+    __sync_lock_release(&g_sio_lock);
+    sio_flags_restore(f);
+}
+extern "C" void serial_enter(void){ serial_lock_acquire(); }
+extern "C" void serial_leave(void){ serial_lock_release(); }
+
+// ---------------------------------------------------------------------
+//  Serial debug output (port 0x3F8)  -  line buffered for atomicity
+// ---------------------------------------------------------------------
+#define SIO_LINEMAX 256
+static char g_sio_line[SIO_LINEMAX];
+static int  g_sio_len = 0;
+static void sio_flush_locked(void){
+    for (int i = 0; i < g_sio_len; i++){
+        while ((inb(0x3FD) & 0x20) == 0);
+        outb(0x3F8, (uint8_t)g_sio_line[i]);
+    }
+    g_sio_len = 0;
+}
 extern "C" void serial_putc(char c){
     // Wait for the transmit holding register to be empty before sending.
     // Without this, bursts of characters overrun the 16550A FIFO on emulators
     // (VirtualBox/QEMU) and bytes are dropped or corrupted in the host log.
-    while((inb(0x3FD) & 0x20) == 0);
-    outb(0x3F8, (uint8_t)c);
+    if (g_sio_len >= SIO_LINEMAX - 1) {        // overflow: force a flush
+        serial_lock_acquire(); sio_flush_locked(); serial_lock_release();
+    }
+    g_sio_line[g_sio_len++] = c;
+    if (c == '\n') {                            // flush whole lines atomically
+        serial_lock_acquire(); sio_flush_locked(); serial_lock_release();
+    }
 }
 extern "C" void serial_puts(const char* s){ while(*s) serial_putc(*s++); }
 // Print a non-negative integer in decimal to the serial port.
@@ -66,7 +111,7 @@ extern "C" void serial_puts_dec(int v){
     if (v < 0){ serial_puts("-"); v = -v; }
     char t[12]; int n = 0;
     while (v > 0 && n < 11){ t[n++] = (char)('0' + (v % 10)); v /= 10; }
-    for (int i = n - 1; i >= 0; i--) outb(0x3F8, (uint8_t)t[i]);
+    for (int i = n - 1; i >= 0; i--) serial_putc(t[i]);
 }
 extern "C" void serial_hex(uint32_t v){
     const char* H = "0123456789ABCDEF";
@@ -954,6 +999,9 @@ extern "C" {
     int  browser_status_code(void);
     // Synchronous HTTP GET for the managed Browser control.
     int  net_http_get(const char* url, char* out, int outsize);
+    // Bounded variant for best-effort boot probes (e.g. TZ lookup) so a
+    // stalled network can never hold up boot.  Poll budget, not wall-clock.
+    int  net_http_get_budget(const char* url, char* out, int outsize, int maxpolls);
     // Ask a question through the host-side LLM bridge (10.0.2.2:18080).
     int  net_ask_host(const char* question, char* out, int outsize);
     int  net_agent_execute(const char* goal, char* out, int outsize);
@@ -3031,7 +3079,10 @@ static Fat32  fat32;
 constexpr uint32_t PAGE_SIZE       = 4096;
 constexpr uint32_t PAGE_SHIFT      = 12;
 constexpr uint32_t PMM_BASE_ADDR   = 0x100000;     // 1 MiB – managed start
-constexpr uint32_t PMM_MAX_PAGES   = 65536;        // 256 MB / 4 KiB
+// 1 GiB / 4 KiB.  The bitmap grows to 32 KiB (32 pages) which is trivial next
+// to the 10+ MiB heap, and it lets the built-in VMM carve a large guest RAM
+// region (256 MiB+) out of real memory instead of being capped at 256 MiB.
+constexpr uint32_t PMM_MAX_PAGES   = 262144;       // 1 GiB / 4 KiB
 // The relocated .bss lives at 0x120000 and ends at 0x0097D9A4 (verified via
 // nm on kernel.elf).  Linking the plugin objects grew .bss substantially --
 // app_calculator's static SkillVM alone is ~530 KiB and plugin_manager's
@@ -3234,7 +3285,7 @@ extern "C" void pmm_free_page(uint32_t phys){
     }
 }
 
-static uint32_t pmm_alloc_range(uint32_t count){
+extern "C" uint32_t pmm_alloc_range(uint32_t count){
     // Contiguous allocation
     for (uint32_t i = 0; i <= pmm_total_pages - count; i++){
         bool ok = true;
@@ -3251,6 +3302,10 @@ static uint32_t pmm_alloc_range(uint32_t count){
         }
     }
     return 0;
+}
+
+extern "C" void pmm_free_range(uint32_t phys, uint32_t count){
+    for (uint32_t j = 0; j < count; j++) pmm_free_page(phys + j * PAGE_SIZE);
 }
 
 // =====================================================================
@@ -3687,6 +3742,147 @@ extern "C" void kfree(void* ptr){
         pb->size += sizeof(HeapBlock) + blk->size;
         pb->next = blk->next;
         if (blk->next) blk->next->prev = pb;
+    }
+}
+
+// =====================================================================
+//  Big-buffer allocator (bigbuf_alloc / bigbuf_free)
+// ---------------------------------------------------------------------
+//  The 32-bit GUI heap is intentionally tight (~10.3 MiB) and is fully
+//  consumed by the desktop, backbuffer, wallpaper and snapshot caches.
+//  Framebuffer-class allocations (VNC decode buffer, linux_manager guest
+//  mirror, transient HTTP screenshot buffers) are 3 MiB each and used to
+//  trigger the "[HEAP] OOM: request 00300000" diagnostic.  They are also
+//  allocated once and resized on resolution change, so fragmenting the
+//  GUI heap with them would be wasteful even if it fit.
+//
+//  Routed through PMM (contiguous physical pages, which land >= 32 MiB
+//  where RAM is plentiful) + a dedicated high virtual window, so they
+//  never touch the GUI heap and always succeed while RAM remains.
+// =====================================================================
+#define BIGBUF_WIN       0xFA000000u   // 64 MiB window: 0xFA000000..0xFE000000
+#define BIGBUF_WIN_END   0xFE000000u
+#define BIGBUF_MAGIC     0xB19B00Fu
+
+struct BigBufHdr {
+    uint32_t magic;       // BIGBUF_MAGIC
+    uint32_t phys_base;   // first page physical address
+    uint32_t pages;       // page count of the whole region
+    uint32_t va_base;     // virtual base of the whole region
+};
+
+struct BigBufSpan {
+    uint32_t     va;
+    uint32_t     pages;
+    BigBufSpan*  next;
+};
+
+static BigBufSpan* g_bigbuf_free = nullptr;   // free VA span list (sorted by va)
+static uint32_t    g_bigbuf_bump = BIGBUF_WIN;
+
+// Unmap one 4 KiB virtual page (clears the PTE present bit only).
+static void bigbuf_unmap_page(uint32_t v){
+    if (!vmm_our_paging) return;
+    uint32_t pd_idx = v >> 22;
+    uint32_t pt_idx = (v >> 12) & 0x3FF;
+    uint32_t pde = page_directory[pd_idx];
+    if (!(pde & PG_PRESENT)) return;
+    uint32_t* pt = (uint32_t*)(pde & 0xFFFFF000u);
+    pt[pt_idx] = 0;
+    invlpg(v);
+}
+
+extern "C" void* bigbuf_alloc(uint32_t size){
+    if (size == 0) return nullptr;
+
+    uint32_t pages = (size + sizeof(BigBufHdr) + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (pages == 0) pages = 1;
+
+    // --- reserve a contiguous VA region (free-list first-fit, else bump) ---
+    uint32_t va = 0;
+    BigBufSpan** pp = &g_bigbuf_free;
+    while (*pp) {
+        BigBufSpan* s = *pp;
+        if (s->pages >= pages) {
+            va = s->va;
+            if (s->pages > pages) {           // carve the head of the span
+                s->va    += pages * PAGE_SIZE;
+                s->pages -= pages;
+            } else {                          // exact fit: drop the span node
+                *pp = s->next;
+                kfree(s);
+            }
+            break;
+        }
+        pp = &s->next;
+    }
+    if (va == 0) {
+        if (g_bigbuf_bump + pages * PAGE_SIZE > BIGBUF_WIN_END) {
+            serial_puts("[BIGBUF] OOM: no VA window for ");
+            serial_hex(size);
+            serial_puts(" bytes\n");
+            return nullptr;
+        }
+        va = g_bigbuf_bump;
+        g_bigbuf_bump += pages * PAGE_SIZE;
+    }
+
+    uint32_t phys = pmm_alloc_range(pages);
+    if (phys == 0) {
+        // No physical pages: hand the VA region back to the free list.
+        BigBufSpan* ns = (BigBufSpan*)kmalloc(sizeof(BigBufSpan));
+        if (ns) { ns->va = va; ns->pages = pages; ns->next = g_bigbuf_free; g_bigbuf_free = ns; }
+        serial_puts("[BIGBUF] OOM: no contiguous RAM for ");
+        serial_hex(size);
+        serial_puts(" bytes\n");
+        return nullptr;
+    }
+
+    for (uint32_t i = 0; i < pages; i++)
+        vmm_map_page(va + i * PAGE_SIZE, phys + i * PAGE_SIZE, PG_PRESENT | PG_RW);
+
+    BigBufHdr* h = (BigBufHdr*)va;
+    h->magic     = BIGBUF_MAGIC;
+    h->phys_base = phys;
+    h->pages     = pages;
+    h->va_base   = va;
+    return (void*)(va + sizeof(BigBufHdr));
+}
+
+extern "C" void bigbuf_free(void* ptr){
+    if (!ptr) return;
+    BigBufHdr* h = (BigBufHdr*)((uint8_t*)ptr - sizeof(BigBufHdr));
+    if (h->magic != BIGBUF_MAGIC) { kfree(ptr); return; }  // not ours; fall through
+
+    // Unmap + free physical pages first (never leave a stale mapping).
+    for (uint32_t i = 0; i < h->pages; i++)
+        bigbuf_unmap_page(h->va_base + i * PAGE_SIZE);
+    pmm_free_range(h->phys_base, h->pages);
+
+    // Return the VA span to the free list, coalescing with neighbours.
+    BigBufSpan* ns = (BigBufSpan*)kmalloc(sizeof(BigBufSpan));
+    if (!ns) return;   // best-effort; VA address space leaks, no corruption
+    ns->va = h->va_base;
+    ns->pages = h->pages;
+    BigBufSpan** pp = &g_bigbuf_free;
+    while (*pp && (*pp)->va < ns->va) pp = &(*pp)->next;
+    ns->next = *pp;
+    *pp = ns;
+    // coalesce forward
+    if (ns->next && ns->next->va == ns->va + ns->pages * PAGE_SIZE) {
+        ns->pages += ns->next->pages;
+        BigBufSpan* nx = ns->next;
+        ns->next = nx->next;
+        kfree(nx);
+    }
+    // coalesce backward: find the span that ends exactly where ns begins
+    for (BigBufSpan* s = g_bigbuf_free; s; s = s->next) {
+        if (s->next == ns && s->va + s->pages * PAGE_SIZE == ns->va) {
+            s->pages += ns->pages;
+            s->next = ns->next;
+            kfree(ns);
+            break;
+        }
     }
 }
 
@@ -8575,8 +8771,12 @@ static void timezone_autodetect(void) {
     if (!g_net_initialized) return;
     static char buf[768];
     serial_puts("[TZ] querying ip-api.com for the local UTC offset...\n");
-    int n = net_http_get("http://ip-api.com/json/?fields=status,offset,timezone",
-                         buf, (int)sizeof(buf) - 1);
+    // Best-effort and BOUNDED by wall-clock time: a best-effort probe must
+    // never stall boot for minutes when the network is absent/misdetected.
+    // Cap the wait at 5 seconds and fall back to UTC if it does not answer.
+    int n = net_http_get_budget(
+                 "http://ip-api.com/json/?fields=status,offset,timezone",
+                 buf, (int)sizeof(buf) - 1, 5000);
     if (n <= 0) { serial_puts("[TZ] no response; keeping UTC\n"); return; }
     buf[n] = 0;
     int off = 0;

@@ -31,6 +31,8 @@
 extern "C" {
     void* kmalloc(uint32_t size);
     void  kfree(void* ptr);
+    void* bigbuf_alloc(uint32_t size);
+    void  bigbuf_free(void* ptr);
     void  net_poll(void);   // defined below; pumped by nexos_input_wait
     int   net_init(void);   // defined below (~line 2909); needed by net_guest_connect
 }
@@ -1705,6 +1707,80 @@ extern "C" void net_guest_close(void){
 }
 
 // =====================================================================
+//  Non-blocking guest TCP helpers (used by the VNC plugin so a single
+//  GUI frame tick can advance a connection WITHOUT ever blocking the
+//  desktop).  net_guest_connect() above spins up to 5M net_poll()
+//  iterations, which would freeze NexOS if called from the render
+//  loop; these primitives hand control back after one tick.
+// =====================================================================
+
+// Kick off a connect: send SYN and return immediately (state machine is
+// driven by net_poll on the receive path).  Returns 0 if the SYN was
+// queued, -1 if the NIC / network is unavailable.
+extern "C" int net_guest_connect_async(uint32_t ip, uint16_t port){
+    if (!g_net_up){
+        if (net_init() != 0) return -1;
+    }
+    if (!nic_present) return -1;
+    guest_tcp.remote_ip   = ip;
+    guest_tcp.remote_port = port;
+    guest_tcp.local_port  = guest_local_port++;
+    if (guest_local_port < 5200) guest_local_port = 5200;
+    guest_tcp.seq         = 0xABCDEF00;
+    guest_tcp.ack         = 0;
+    guest_tcp.rx_len      = 0;
+    guest_tcp.state       = TCPC_SYN_SENT;
+
+    tcp_send_raw(guest_tcp.remote_ip, guest_tcp.local_port, guest_tcp.remote_port,
+                 guest_tcp.seq, guest_tcp.ack, TCP_SYN, 0, 0);
+    guest_tcp.seq++;
+    return 0;
+}
+
+// Report the async connect progress: 0=idle, 1=connecting (SYN sent),
+// 2=established, -1=error (RST / failed).
+extern "C" int net_guest_connect_state(void){
+    switch (guest_tcp.state){
+        case TCPC_SYN_SENT:   return 1;
+        case TCPC_ESTABLISHED: return 2;
+        case TCPC_ERROR:      return -1;
+        default:              return 0;
+    }
+}
+
+// Abandon an in-flight async connect (e.g. on user cancel).
+extern "C" void net_guest_connect_abort(void){
+    guest_tcp.state  = TCPC_IDLE;
+    guest_tcp.rx_len = 0;
+}
+
+// Non-blocking peek: bytes currently buffered for reading.  Returns -1 when
+// the socket is not in a readable state, otherwise the buffered byte count.
+extern "C" int net_guest_peek(void){
+    if (guest_tcp.state != TCPC_ESTABLISHED && guest_tcp.state != TCPC_RECEIVING)
+        return -1;
+    return guest_tcp.rx_len;
+}
+
+// Non-blocking receive: copies up to len buffered bytes and returns the
+// count copied (0 if nothing is buffered yet).  Never pumps net_poll, so it
+// cannot block the caller.  Used by the VNC handshake to avoid freezing the
+// GUI while it waits for server bytes.
+extern "C" int net_guest_recv_nowait(void* buf, int len){
+    if (guest_tcp.state != TCPC_ESTABLISHED && guest_tcp.state != TCPC_RECEIVING)
+        return -1;
+    if (len <= 0) return 0;
+    if (guest_tcp.rx_len <= 0) return 0;
+    int chunk = guest_tcp.rx_len;
+    if (chunk > len) chunk = len;
+    net_memcpy((uint8_t*)buf, guest_tcp.rx_buf, chunk);
+    guest_tcp.rx_len -= chunk;
+    if (guest_tcp.rx_len > 0)
+        net_memmove(guest_tcp.rx_buf, guest_tcp.rx_buf + chunk, guest_tcp.rx_len);
+    return chunk;
+}
+
+// =====================================================================
 //  HTTP Client (async state machine)
 // =====================================================================
 
@@ -2231,6 +2307,45 @@ extern "C" int net_http_get(const char* url, char* out, int outsize)
     return n;
 }
 
+// Bounded variant of net_http_get() for non-interactive, best-effort boot
+// tasks (e.g. the timezone lookup).  The full net_http_get() only caps the
+// loop by 300,000,000 polls, which under TCG emulation -- or on real
+// hardware with a misdetected-but-unconnected NIC -- can stretch to minutes
+// of wall-clock and stall the whole boot.  This variant bounds the loop by
+// WALL-CLOCK time (TSC) so a best-effort probe can never hold up boot; a
+// failure is simply reported back and the caller keeps its default (here:
+// UTC).  The interactive Browser keeps the generous 300M guard untouched.
+//
+// The bound is TSC-based with a conservative per-ms tick assumption (we treat
+// the TSC as at most ~3 GHz).  On a slower TSC the deadline is reached a
+// little earlier in real time; on a faster one a little later -- but it is
+// always bounded to a few seconds, which is exactly what a best-effort probe
+// needs.  A poll-count cap is kept only as an absolute backstop.
+static inline uint64_t nhg_tsc(void) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi) : :);
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+extern "C" int net_http_get_budget(const char* url, char* out, int outsize, int max_ms)
+{
+    if (outsize > 0) out[0] = 0;
+    if (httpc_get(url) != 0) return -1;          // busy or malformed URL
+    // ~3 GHz assumption: 3,000,000 ticks per millisecond.  Bounded either way.
+    uint64_t deadline = nhg_tsc() + (uint64_t)max_ms * 3000000ULL;
+    int guard = 0;
+    while (httpc_state != HTTPC_COMPLETE && httpc_state != HTTPC_ERROR) {
+        net_poll();
+        if (g_net_idle_hook) g_net_idle_hook();   // keep the boot animation alive
+        if (++guard > 8000000) { httpc_state = HTTPC_ERROR; break; }
+        if ((int64_t)(nhg_tsc() - deadline) >= 0) { httpc_state = HTTPC_ERROR; break; }
+    }
+    int n = 0;
+    if (httpc_state == HTTPC_COMPLETE)
+        n = httpc_get_response((uint8_t*)out, outsize);
+    httpc_reset();
+    return n;
+}
+
 // Synchronous HTTP POST (OpenAI-compatible chat API etc.).  Mirrors
 // net_http_get() but sends a JSON body.  Returns bytes copied or -1 on error.
 extern "C" int net_http_post(const char* url, const char* body, char* out, int outsize)
@@ -2705,7 +2820,7 @@ static void http_screen(TcpConn* conn){
     uint32_t need = 16u + (uint32_t)fb.width * (uint32_t)fb.height * 5u + 256u;
     uint32_t cap  = 0x300000u;   // 3 MB cap
     if (need > cap) need = cap;
-    uint8_t* buf = (uint8_t*)kmalloc(need);
+    uint8_t* buf = (uint8_t*)bigbuf_alloc(need);
     if (!buf){
         const char* e = "{\"error\":\"alloc failed\"}";
         http_send_response(conn, "200 OK", "application/json", e, net_strlen(e));
@@ -2745,7 +2860,7 @@ static void http_screen(TcpConn* conn){
     if (p+2<=pend){ *p++=0; *p++=0; }   /* terminator */
     uint32_t len = (uint32_t)(p - buf);
     http_send_response(conn, "200 OK", "application/octet-stream", (char*)buf, (int)len);
-    kfree(buf);
+    bigbuf_free(buf);
 }
 
 static void http_handle_request(TcpConn* conn){
