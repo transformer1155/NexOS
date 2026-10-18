@@ -30,10 +30,12 @@
   <ItemGroup>
     <Compile Include="$(MSBuildThisFileDirectory)../NexOS.Core/Corelib.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)../NexOS.Core/Sys.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../NexOS.Core/SystemAlgo.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)../NexOS.Forms/Forms.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)../NexOS.Forms/Voice.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Shell.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Apps.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/TerminalApp.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Desktop.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Lang.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)../apps/Shell/Browser.cs" />
