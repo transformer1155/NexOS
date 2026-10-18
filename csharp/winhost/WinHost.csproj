@@ -59,9 +59,32 @@
          files themselves. -->
     <Compile Include="../NexOS.Core/AI.cs" />
     <Compile Include="../NexOS.Core/MCP.cs" />
+  <Compile Include="../NexOS.Core/McpSdk.cs" />
   </ItemGroup>
 
-  <!-- Local files (Backend.cs, Program.cs, ShellForm.cs, ShellForm.Designer.cs,
-       ShellForm.resx) are picked up automatically by the SDK's default glob. -->
+  <!-- Explicit Compile list above; disable the SDK's default recursive glob so
+       the tests/ subdir is not sucked in. -->
+  <PropertyGroup>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <EnableDefaultEmbeddedResourceItems>false</EnableDefaultEmbeddedResourceItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Local WinHost-only files. Everything else lives in ../ subdirs and is
+         listed in the ItemGroup above (before <PropertyGroup>). -->
+    <Compile Include="Backend.cs" />
+    <Compile Include="Program.cs" />
+    <Compile Include="ShellForm.cs" />
+    <Compile Include="ShellForm.Designer.cs" />
+    <Compile Include="PackageInstaller.cs" />
+    <Compile Include="PackageSupport.cs" />
+    <Compile Include="PackageIo.cs" />
+    <Compile Include="PackageService.cs" />
+    <Compile Include="NetStack.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="ShellForm.resx" />
+  </ItemGroup>
 
 </Project>

@@ -41,6 +41,7 @@ NexOS 是一个从零自研的 **x86 操作系统**：起点是一个支持 BIOS
 - **分布式算力**：`distnet.cpp` UDP 发现/调度 + `dcn/` 运行时（crypto/sched/transport），任务分片到多节点合并推理。
 - **兼容层**：自研 PE/Win32 子系统（`winloader.cpp`+`win32.cpp`，可跑自研 IE）；Linux 二进制兼容（`linux_compat.cpp`+`linux_root/`）；Mono 运行时移植（`mono_port/`）。
 - **网络**：NE2000 驱动 + TCP/IP + HTTP 服务器（`netstart` 后浏览器可访问）。
+- **应用生态**：`.nexpack` 第三方应用包格式 + `PackageInstaller`（解包 → 写 MKFS → 合并注册表 → 刷新桌面）+ **MCP SDK**（继承 `McpServerBase`、打 `[McpTool]`，构建期自动发现并注册到 MCP 总线）。详见 [`docs/NEXPACK.md`](docs/NEXPACK.md)。
 
 ## 顶层目录与子模块
 
@@ -55,7 +56,7 @@ NexOS 是一个从零自研的 **x86 操作系统**：起点是一个支持 BIOS
 | `distnet.cpp` `distnet.h`  | 内核内分布式算力网络：UDP 发现 + 任务调度 + 计算节点/Agent      |
 | `linux_compat.cpp` `linux_compat.h` `linux_root/` | Linux 二进制（ELF/动态链接）兼容层                  |
 | `uefi/bootuefi.c` `uefi/enter_kernel.S` `linker.ld` `linker64.ld` | UEFI 引导与 32/64 位链接脚本              |
-| `csharp/`                  | **C# 托管壳**：`NexOS.Core`/`NexOS.Forms` API + `apps/Shell`（桌面/窗口/浏览器/登录/AI Agent）+ `winhost` 宿主 |
+| `csharp/`                  | **C# 托管壳**：`NexOS.Core`/`NexOS.Forms` API + `apps/Shell`（桌面/窗口/浏览器/登录/AI Agent）+ `winhost` 宿主；`winhost/PackageInstaller.cs` 为 `.nexpack` 安装器，`NexOS.Core/McpSdk.cs` 为 MCP SDK |
 | `win11-ui/`               | **Web 控制台**：浏览器 Win11 桌面 + 分布式网络面板 + Agent Forge（`nexos-desktop.html`）+ WinUI 3 标准控件/令牌 |
 | `dcn/`                    | **分布式算力运行时**：`dcn_*`(crypto/discovery/sched/transport/wifi/kernel) + `rt/`(运行时) + `build_qemu/` |
 | `mono_port/`              | **Mono 运行时移植**：`pal/`(平台抽象层) + 构建产物，在 NexOS 上跑 .NET 托管代码 |
@@ -306,6 +307,133 @@ OVMF 退出后 monitor 读 VGA 返回 `0xFFFFFFFF`,改用 `screendump` 截图
 | `meminfo` / `memtest` / `pagetest` | 内存 / 页表诊断            |
 | `run xxx.bat/.exe/.ps1` | 通过 winloader 在 GUI 中打开并执行       |
 | `shutdown` / `reboot` | 关机 / 重启                               |
+
+## 应用生态：`.nexpack` 包格式 · 安装器 · MCP SDK
+
+对标 VS Code 插件体系，NexOS 提供一套第三方应用分发机制。
+完整规范见 [`docs/NEXPACK.md`](docs/NEXPACK.md)。
+
+### 三件交付物
+
+| 组件 | 路径 | 作用 |
+|------|------|------|
+| **包格式** | `docs/NEXPACK.md` + `tools/nexpack.py` | `.nexpack` = ZIP（**STORE 不压缩**），含 `app.mex` + `manifest.json` + `icon.png` |
+| **安装器** | `csharp/winhost/PackageInstaller.cs` | 解包 → 校验 → 写 MKFS → 合并注册表 → 建桌面快捷方式 → 刷新桌面 |
+| **MCP SDK** | `csharp/NexOS.Core/McpSdk.cs` + `tools/mcp_scan.py` | 继承 `McpServerBase`、打 `[McpTool("name")]`，构建期自动注册到 MCP 总线 |
+
+### 为什么成员必须是 STORE
+
+内核**没有 zlib/inflate**（`plugins/vnc_client.cpp:393` 明确注释），也没有二进制
+写原语（只有 `kern_fs_read`）。因此解包必须在宿主/托管侧完成，包内成员不压缩，
+内核若将来加解析器只需顺序扫本地文件头。
+
+### 打包一个应用
+
+```bash
+# 1. 构建期扫描 [McpTool]，产出工具描述符
+python tools/mcp_scan.py --src csharp/apps/examples/Weather \
+    --out mcp_tools.json \
+    --emit-dispatch csharp/apps/examples/Weather/WeatherTools.Dispatch.g.cs \
+    --class WeatherTools
+
+# 2. 把扫描结果并进 manifest.json（mcp_server 字段）
+
+# 3. 打包
+python tools/nexpack.py pack \
+    --mex sfs_files/Weather.mex \
+    --manifest manifest.json \
+    --icon icon.png \
+    --out dist/weather-1.0.0.nexpack
+
+# 4. 校验 / 检视 / 解包
+python tools/nexpack.py verify  dist/weather-1.0.0.nexpack
+python tools/nexpack.py inspect dist/weather-1.0.0.nexpack
+python tools/nexpack.py unpack  dist/weather-1.0.0.nexpack --out /tmp/x
+```
+
+### 写一个 MCP 服务端
+
+```csharp
+namespace Weather
+{
+    using NexOS.Mcp;
+
+    public sealed partial class WeatherTools : McpServerBase   // 必须 partial
+    {
+        public override string AppId { get { return "weather"; } }  // == .mex basename
+
+        [McpTool("get_weather", Description = "Return current weather for a location.")]
+        public static string GetWeather(string json_args)
+        {
+            string loc = ExtractString(json_args, "loc");
+            if (loc == null) return Error(2, "missing loc");
+            return Ok("{\"loc\":\"" + Escape(loc) + "\",\"temp_c\":21}");
+        }
+    }
+}
+```
+
+`tools/mcp_scan.py` 在**构建期**（不是运行期）扫描 `[McpTool]` 方法，
+生成 `manifest.json` 的 `mcp_server[]` 和一个 `partial` 的 `Invoke` 派发表。
+这样做是因为 MiniCLR **没有反射**——程序集被 `mex_pack.py` 扁平化成数组，
+没有 ECMA-335 元数据可枚举。
+
+### 安装与注册表合并
+
+```
+.nexpack → 校验(只读阶段) → 写盘(写入阶段)
+                │                    │
+                │                    ├─ mkfs/<app_id>.mex
+                │                    ├─ mkfs/<app_id>.icon
+                │                    ├─ mkfs/apps.overlay.json   ← 注册表 overlay
+                │                    └─ mkfs/Desktop/<Name>.lnk  ← 桌面快捷方式
+                └─ 任一校验失败 → 磁盘零改动
+```
+
+**注册表为什么是 overlay**：系统 `apps.json` 在只读的 SFS 卷上，运行时安装无法
+改写它。安装器把合并后的注册表写到 MKFS 的 `apps.overlay.json`，内核
+`ai_gateway_init` 启动时读取并**按 `app_id` 合并**（已存在则更新，不存在则新增），
+因此安装第三方应用不会破坏内置的 `weather` / `assistant`。
+
+> 文件名刻意不叫 `apps.json`：`kern_fs_read()` 是**扁平查找且 MKFS 优先**
+> （`kernel.cpp:6384`），同名会遮蔽 SFS 上的系统 manifest。
+
+### 安全约束
+
+| 威胁 | 缓解 |
+|------|------|
+| 路径穿越 | 归档成员必须是单段文件名，拒绝 `/`、`\`、`..` |
+| 压缩炸弹 | 成员必须 STORE；包 ≤ 4 MiB、`.mex` ≤ 2 MiB、图标 ≤ 64 KiB |
+| 覆盖内置应用 | `app_id` 属于保留集合（`weather`/`assistant`/`shell`/`nexos`）时拒绝，需 `--force` |
+| 冒充调用方 | 内核用 `g_current_app_id`（常驻 `.mex` basename）做 ACL，托管侧无法伪造 |
+| 半写入 | 先全部校验再落盘；写盘阶段失败会回滚已写文件 |
+
+### 验证
+
+```bash
+# 全部自动检查（包格式 / 扫描 / 安装器 / SDK / 内核合并逻辑 / WinHost 编译）
+python tools/verify_all.py
+
+# 内核 TU 编译（需要 WSL/Linux）
+wsl -d Ubuntu-24.04 -e bash /mnt/e/NexOS/NexOS/tools/check_kernel_ai.sh
+```
+
+`verify_all.py` 覆盖：
+
+- `.nexpack` 打包 → 校验 → 检视 → 解包 → 字节级一致（27 项）
+- `PackageInstaller` 安装 / 升级 / 拒绝恶意包 / 卸载 / 幂等（40 项）
+- `McpServerBase` 的 `Invoke` 派发与 JSON 处理（14 项）
+- 内核 `apps.overlay.json` 合并逻辑（17 项）
+
+### 已知限制
+
+- **MiniCLR 单常驻**：`clr_run_resident` 同时只常驻一个托管程序集，所以第三方应用的
+  MCP 工具只能在该应用**正在运行时**被派发；未运行时调用返回 `code:5`。这是单常驻
+  模型的固有限制，不是实现缺陷。
+- **Kind 是编译期常量**：`Desktop.cs` 的 `Kind` 为 `0..13`，第三方应用复用已有 Kind
+  或使用 `>= 100` 的扩展区，不能动态新增 Kind。
+- **安装器在宿主侧执行**：内核没有 ZIP 解包与二进制写能力，安装由 WinHost 宿主完成，
+  内核只读结果。
 
 ## AI 推理(GGUF / Qwen2)
 
