@@ -222,12 +222,37 @@
     .calc-grid button.op { background:var(--accent); color:#fff; border-color:var(--accent); }
     .calc-grid button.eq { background:#107C10; color:#fff; border-color:#107C10; }
 
-    /* Terminal */
+    /* Terminal (IDE-grade: ghost text + AST highlight + visual diff) */
     .term { background:#0C0C0C; color:#E8E8E8; font-family:'Cascadia Code','Consolas',monospace; font-size:13px; border-radius:8px; padding:10px; height:200px; overflow:auto; white-space:pre-wrap; }
     .term .err { color:#F87171; }
-    .term-input { display:flex; align-items:center; gap:6px; margin-top:8px; }
+    .term-input { display:flex; align-items:center; gap:6px; margin-top:8px; font-family:'Cascadia Code','Consolas',monospace; font-size:13px; }
     .term-input .prompt { color:#4EC9B0; font-family:monospace; font-size:13px; }
-    .term-input input { flex:1; background:transparent; border:0; outline:none; color:#E8E8E8; font-family:monospace; font-size:13px; }
+    .term-input .ti-wrap { position:relative; flex:1; min-width:60px; height:18px; }
+    .term-input .ti-highlight { position:absolute; left:0; top:0; right:0; pointer-events:none; white-space:pre; color:#E8E8E8; overflow:hidden; font:inherit; }
+    .term-input .ghost { position:absolute; left:0; top:0; pointer-events:none; color:#6E6E6E; white-space:pre; display:none; font:inherit; }
+    .term-input input#ti { position:absolute; left:0; top:0; width:100%; height:100%; background:transparent; border:0; outline:none; color:transparent; caret-color:#E8E8E8; padding:0; margin:0; font:inherit; }
+    .term-hint { color:#5A5A5A; font-size:11px; margin-top:6px; }
+    .ti-measure { position:absolute; visibility:hidden; white-space:pre; font-family:'Cascadia Code','Consolas',monospace; font-size:13px; left:-9999px; top:-9999px; }
+    /* token colors (dark, VS Code-ish) */
+    .tok-cmd { color:#4EC9B0; }
+    .tok-flag { color:#DCDCAA; }
+    .tok-str { color:#CE9178; }
+    .tok-comment { color:#6A9955; }
+    .tok-op { color:#D4D4D4; }
+    .tok-num { color:#B5CEA8; }
+    .tok-kw { color:#C586C0; }
+    .tok-bracket { color:#D4D4D4; }
+    .tok-bm { color:#FFD700; font-weight:bold; }
+    .tok-bad { color:#F85149; }
+    /* visual diff fix panel */
+    .term-diff { background:#1E1E1E; border:1px solid #333; border-radius:8px; padding:8px; margin-bottom:8px; font-family:'Cascadia Code','Consolas',monospace; font-size:12px; }
+    .term-diff .diff-head { color:#FFD700; margin-bottom:6px; font-size:12px; }
+    .term-diff .diff-cols { display:flex; gap:8px; }
+    .term-diff .diff-col { flex:1; background:#0C0C0C; border-radius:6px; padding:6px; overflow:auto; max-height:160px; }
+    .term-diff .diff-col pre { margin:0; white-space:pre-wrap; word-break:break-all; }
+    .term-diff .diff-cap { color:#888; font-size:11px; margin-bottom:4px; }
+    .term-diff .diff-del { background:rgba(248,81,73,.28); color:#F87171; }
+    .term-diff .diff-add { background:rgba(63,185,80,.28); color:#7EE787; }
 
     /* File explorer */
     .crumb { display:flex; flex-wrap:wrap; gap:2px; font-size:13px; margin-bottom:10px; }
@@ -657,8 +682,24 @@
       sock.send(cmd + '\n');
       setTimeout(()=>{ flush(); }, 6000);   // 兜底总超时
     }
+    async function aiRequest(prompt, mode){
+      mode = mode||1;
+      try {
+        const ctrl = new AbortController();
+        const to = setTimeout(()=>ctrl.abort(), 6000);
+        const r = await fetch('http://127.0.0.1:19387/ai', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({prompt:prompt, mode:mode}),
+          signal: ctrl.signal
+        });
+        clearTimeout(to);
+        const t = await r.text();
+        try { const o = JSON.parse(t); return (o && o.text != null) ? o.text : t; }
+        catch(e){ return t; }
+      } catch(e){ return null; }
+    }
     return {
-      exec, on: (fn)=>listeners.push(fn), off: (fn)=>{ const i=listeners.indexOf(fn); if(i>=0) listeners.splice(i,1); }, connect, disconnect, setServer, login, run,
+      exec, on: (fn)=>listeners.push(fn), off: (fn)=>{ const i=listeners.indexOf(fn); if(i>=0) listeners.splice(i,1); }, connect, disconnect, setServer, login, run, ai: aiRequest,
       get connected(){ return connected; }, get host(){ return host; }, get port(){ return port; },
       get mock(){ return mockMode; },
       get authed(){ return !!currentUser; },
@@ -940,19 +981,144 @@
   }
 
   /* === Terminal === */
+  /* ---------- Terminal app (IDE-grade: ghost text + AST highlight + visual diff fix) ---------- */
+  /* AST 级简易词法分析器：识别命令 / flag / 字符串 / 注释 / 运算符 / 括号，并自动配对括号、高亮未闭合括号。 */
+  const TOKEN_RE = [
+    ['comment', /#.*/],
+    ['str',     /"(?:[^"\\]|\\.)*"/],
+    ['str',     /'(?:[^'\\]|\\.)*'/],
+    ['num',     /\b\d+(?:\.\d+)?\b/],
+    ['kw',      /\b(?:if|then|else|fi|for|in|do|done|while|case|esac|function|return|export|set|echo|cd|exit|sudo|and|or|not)\b/],
+    ['op',      /(?:\|\||&&|[-<>|&])/],
+    ['bracket', /[(){}\[\]]/],
+    ['flag',    /(?:^|\s)(?:--?[A-Za-z0-9][\w-]*)/],
+    ['cmd',     /^[A-Za-z_][\w.\/-]*/],
+    ['ws',      /\s+/],
+    ['other',   /[^\s]/]
+  ];
+  const OPEN = {')':'(',']':'[','}':'{'};
+  const CLOSE = {'(':')','[':']','{':'}'};
+  function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function lexHighlight(line) {
+    const stack = [];
+    let i = 0, html = '', expectCmd = true;
+    const wrap = (cls, text) => { html += text ? `<span class="tok-${cls}">${escapeHtml(text)}</span>` : ''; };
+    while (i < line.length) {
+      let matched = false;
+      for (const [cls, re] of TOKEN_RE) {
+        if (cls === 'cmd' && !expectCmd) continue;       // 命令只着色于行首或运算符后
+        const m = re.exec(line.slice(i));
+        if (!m || m.index !== 0) continue;
+        const text = m[0];
+        if (cls === 'ws') { wrap('op', text); i += text.length; matched = true; break; }
+        if (cls === 'bracket') {
+          const ch = text;
+          if (CLOSE[ch]) { stack.push(ch); wrap('bracket', ch); }
+          else {
+            const peer = OPEN[ch], top = stack[stack.length-1];
+            wrap(top === peer ? 'bm' : 'bad', ch);
+            if (top === peer) stack.pop();
+          }
+          i += text.length; matched = true; break;
+        }
+        if (cls === 'cmd') wrap('cmd', text);
+        else if (cls === 'flag') wrap('flag', text);
+        else if (cls === 'kw') wrap('kw', text);
+        else if (cls === 'op') { wrap('op', text); expectCmd = (text === '|' || text === '&&' || text === '||'); }
+        else wrap(cls, text);
+        if (cls !== 'op') expectCmd = false;
+        i += text.length; matched = true; break;
+      }
+      if (!matched) { wrap('op', line[i]); i++; expectCmd = false; }
+    }
+    return html;
+  }
+
   function renderTerm(body){
     const promptStr = currentUser+'@nexos:~$';
-    body.innerHTML=`<div class="term" id="term"></div><div class="term-input"><span class="prompt">${promptStr}</span><input id="ti" autocomplete="off" /></div>`;
-    const term=$('#term',body), inp=$('#ti',body);
+    body.innerHTML=`<div class="term-diff" id="termDiff" style="display:none">
+        <div class="diff-head">⚠ AI 修复建议（按 <b>Y</b> 接受并后台重跑，<b>Esc</b> 忽略）</div>
+        <div class="diff-cols">
+          <div class="diff-col"><div class="diff-cap">原命令 / 错误</div><pre id="diffOrig"></pre></div>
+          <div class="diff-col"><div class="diff-cap">修复后</div><pre id="diffFixed"></pre></div>
+        </div>
+      </div>
+      <div class="term" id="term"></div>
+      <div class="term-input"><span class="prompt">${promptStr}</span>
+        <div class="ti-wrap"><div class="ti-highlight" id="tiHl"></div><div class="ghost" id="tiGhost"></div><input id="ti" autocomplete="off" spellcheck="false" /></div>
+      </div>
+      <div class="term-hint">Tab 采纳AI建议 · Y 接受修复 · ↑↓ 历史</div>`;
+    const term=$('#term',body), inp=$('#ti',body), tiHl=$('#tiHl',body), tiGhost=$('#tiGhost',body);
+    const diffBox=$('#termDiff',body), diffOrig=$('#diffOrig',body), diffFixed=$('#diffFixed',body);
     const hist=[]; let hi=0;
+    let ghostText='', ghostReqId=0, ghostTimer=null, lastCmd='', pendingFix=null;
+    const meas=document.createElement('div'); meas.className='ti-measure'; document.body.appendChild(meas);
+    const caretX=()=>{ meas.textContent=inp.value.slice(0,inp.selectionStart); return meas.offsetWidth; };
+
     const print=(t,cls)=>{ const d=document.createElement('div'); if(cls) d.className=cls; d.textContent=t; term.appendChild(d); term.scrollTop=term.scrollHeight; };
     print('NexOS Shell [Version 3.1.4]   user: '+currentUser);
     print('(c) 2026 NexOS. Connected to backend command bus.');
-    print('Type "help" for commands. Every line is sent to NexOS run_command().');
-    const onOut=(text)=>{ text.split('\n').forEach(l=>{ if(l!=='') print(l); }); };
+    print('IDE 终端：语法高亮 / 括号配对 / Tab 采纳AI建议 / 报错自动弹出 Diff 修复。');
+
+    function renderHighlight(){ tiHl.innerHTML = lexHighlight(inp.value); }
+    function renderGhost(){
+      if(ghostText && inp.selectionStart===inp.value.length){
+        tiGhost.style.display='inline-block'; tiGhost.style.left=caretX()+'px'; tiGhost.textContent=ghostText;
+      } else { clearGhost(); }
+    }
+    function clearGhost(){ ghostText=''; tiGhost.style.display='none'; tiGhost.textContent=''; }
+    function acceptGhost(){
+      if(!ghostText) return false;
+      const p=inp.selectionStart;
+      inp.value=inp.value.slice(0,p)+ghostText+inp.value.slice(p);
+      inp.selectionStart=inp.selectionEnd=p+ghostText.length;
+      clearGhost(); renderHighlight(); return true;
+    }
+    function requestGhost(){
+      const v=inp.value;
+      if(!v.trim()||!NexOS.connected){ clearGhost(); return; }
+      const myId=++ghostReqId; clearTimeout(ghostTimer);
+      ghostTimer=setTimeout(async()=>{
+        const s=await NexOS.ai('你是一个终端命令预测助手。只回复用户当前可能接下来要输入的剩余命令片段（最多40字符，不要重复已有内容、不要解释、不要引号、不要换行）。当前已输入：\n'+v,0);
+        if(myId!==ghostReqId) return;
+        if(!s) { clearGhost(); return; }
+        let g=s.trim().replace(/^[\n\r]+/,'');
+        if(g.startsWith(v)) g=g.slice(v.length);
+        g=g.replace(/\n.*$/,'');
+        if(!g||g===v){ clearGhost(); return; }
+        ghostText=g.slice(0,60); renderGhost();
+      },380);
+    }
+    async function maybeRequestFix(errLine){
+      if(!lastCmd||!NexOS.connected||pendingFix) return;
+      const fixed=await NexOS.ai('用户执行了 shell 命令但报错了。请只返回修复后的命令本身（不要解释、不要 markdown 代码块、不要引号）。\n命令：'+lastCmd+'\n错误：'+errLine,1);
+      if(!fixed) return;
+      let f=fixed.trim().replace(/^```(?:sh|bash|shell)?/i,'').replace(/```$/i,'').replace(/^["'\n]+|["'\n]+$/g,'').trim();
+      if(!f||f===lastCmd) return;
+      pendingFix={orig:lastCmd,fixed:f,err:errLine};
+      diffOrig.textContent=lastCmd+'\n\n# '+errLine;
+      diffFixed.textContent=f;
+      diffBox.style.display='block'; term.scrollTop=term.scrollHeight;
+    }
+    function acceptFix(){
+      if(!pendingFix) return;
+      const f=pendingFix.fixed;
+      print(promptStr+' '+f+'  (AI fix)');
+      NexOS.exec(f);
+      pendingFix=null; diffBox.style.display='none';
+    }
+
+    const onOut=(text)=>{ String(text||'').split('\n').forEach(l=>{
+      if(l==='') return;
+      const isErr=/error|fail|exception|not found|denied|unknown command|no such|traceback|abort/i.test(l);
+      print(l,isErr?'err':null);
+      if(isErr) maybeRequestFix(l);
+    }); };
     NexOS.on(onOut);
+
     const run=cmd=>{
       const c=cmd.trim(); if(!c) return;
+      lastCmd=c;
       print(promptStr+' '+c);
       const lc=c.toLowerCase();
       if(lc==='cls'||lc==='clear'){ term.innerHTML=''; return; }
@@ -963,13 +1129,20 @@
         print('[SECURITY] 系统已隔离：写入命令 "'+c+'" 已被拦截'); return; }
       NexOS.exec(c);   // forward to backend kernel run_command()
     };
+
+    inp.addEventListener('input',()=>{ renderHighlight(); requestGhost(); });
+    inp.addEventListener('keyup',e=>{ if(['ArrowLeft','ArrowRight','Home','End'].includes(e.key)) renderGhost(); });
+    inp.addEventListener('click',renderGhost);
     inp.addEventListener('keydown',e=>{
-      if(e.key==='Enter'){ hist.push(inp.value); hi=hist.length; run(inp.value); inp.value=''; }
-      else if(e.key==='ArrowUp'){ if(hi>0){ hi--; inp.value=hist[hi]||''; } }
-      else if(e.key==='ArrowDown'){ if(hi<hist.length){ hi++; inp.value=hist[hi]||''; } }
+      if(e.key==='Tab'){ if(acceptGhost()){ e.preventDefault(); return; } e.preventDefault(); }
+      else if(e.key==='Enter'){ const v=inp.value; inp.value=''; clearGhost(); renderHighlight(); if(v.trim()){ hist.push(v); hi=hist.length; run(v); } }
+      else if(e.key==='ArrowUp'){ if(hi>0){ hi--; inp.value=hist[hi]||''; renderHighlight(); clearGhost(); } e.preventDefault(); }
+      else if(e.key==='ArrowDown'){ if(hi<hist.length-1){ hi++; inp.value=hist[hi]||''; } else { hi=hist.length; inp.value=''; } renderHighlight(); clearGhost(); e.preventDefault(); }
+      else if(e.key==='y'||e.key==='Y'){ if(pendingFix&&diffBox.style.display!=='none'){ acceptFix(); e.preventDefault(); } }
+      else if(e.key==='Escape'){ if(pendingFix){ pendingFix=null; diffBox.style.display='none'; } }
     });
     setTimeout(()=>inp.focus(),50);
-    body.addEventListener('mousedown',()=>setTimeout(()=>inp.focus(),10));
+    body.addEventListener('mousedown',e=>{ if(e.target.closest('.term-diff')) return; setTimeout(()=>inp.focus(),10); });
   }
 
   /* === File Explorer (interactive: click dirs to cd, files to cat) === */
