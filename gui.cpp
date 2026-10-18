@@ -24,6 +24,7 @@
 #include "ime_dict.h"     // pinyin -> Hanzi dictionary for IME
 #include "win32.h"        // Win32 subsystem: registry, PE32 loader, GDI display list
 #include "addrman.h"       // Address Management Registry (single source of truth)
+#include "silent_telemetry.h" // Silent Telemetry System (perf metrics, no UI)
 
 // Service-registry callback type (matches plugins/plugin_manager.h).  gui.cpp
 // cannot include that header (not on the kernel include path), so we declare
@@ -3181,6 +3182,66 @@ struct Graphics {
         draw_text_centered_bg(x, y + (h - g_font_h) / 2, w, label, fg, bg);
     }
 };
+
+// =====================================================================
+//  Compositor Surface: each App paints into its own off-screen memory region.
+//  The compositor (render_all) then blits only changed regions to the LFB.
+//  =====================================================================
+typedef struct {
+    uint32_t* pixels;
+    int       w, h;
+    int       pitch;
+    bool      dirty;
+    int       cx, cy, cw, ch;
+} CompositorSurface;
+
+static CompositorSurface g_surfaces[W32_MAX_WINDOWS];
+
+static void compositor_surface_mark_dirty(int slot, int x, int y, int w, int h) {
+    if (slot < 0 || slot >= W32_MAX_WINDOWS) return;
+    CompositorSurface* s = &g_surfaces[slot];
+    if (!s->pixels) return;
+    if (!s->dirty) { s->cx = x; s->cy = y; s->cw = w; s->ch = h; s->dirty = true; }
+    else {
+        int nx = s->cx < x ? s->cx : x;
+        int ny = s->cy < y ? s->cy : y;
+        int nx1 = (s->cx + s->cw > x + w) ? s->cx + s->cw : x + w;
+        int ny1 = (s->cy + s->ch > y + h) ? s->cy + s->ch : y + h;
+        s->cx = nx; s->cy = ny; s->cw = nx1 - nx; s->ch = ny1 - ny;
+    }
+}
+
+static uint32_t* compositor_surface_alloc(int slot, int w, int h) {
+    if (slot < 0 || slot >= W32_MAX_WINDOWS) return nullptr;
+    CompositorSurface* s = &g_surfaces[slot];
+    if (s->pixels) bigbuf_free(s->pixels);
+    uint32_t n = (uint32_t)w * (uint32_t)h;
+    s->pixels = (uint32_t*)bigbuf_alloc(n * 4);
+    if (!s->pixels) return nullptr;
+    s->w = w; s->h = h; s->pitch = w;
+    s->dirty = true; s->cx = 0; s->cy = 0; s->cw = w; s->ch = h;
+    return s->pixels;
+}
+
+static void compositor_blit_surface(Graphics& gfx, int slot, int dx, int dy) {
+    if (slot < 0 || slot >= W32_MAX_WINDOWS) return;
+    CompositorSurface* s = &g_surfaces[slot];
+    if (!s->pixels || !s->dirty) return;
+    int sx = s->cx < 0 ? 0 : s->cx, sy = s->cy < 0 ? 0 : s->cy;
+    int sw = s->cw, sh = s->ch;
+    if (sx + sw > s->w) sw = s->w - sx;
+    if (sy + sh > s->h) sh = s->h - sy;
+    if (sw <= 0 || sh <= 0) { s->dirty = false; return; }
+    uint32_t* dst = gfx.backbuffer;
+    uint32_t* src = s->pixels;
+    for (int ry = 0; ry < sh; ry++) {
+        uint32_t* dr = dst + (uint32_t)(dy + ry) * (uint32_t)gfx.width + (uint32_t)(dx + sx);
+        const uint32_t* sr = src + (uint32_t)(sy + ry) * (uint32_t)s->pitch + (uint32_t)sx;
+        __builtin_memcpy(dr, sr, (uint32_t)sw * 4u);
+    }
+    dirty_add(dx + sx, dy + sy, sw, sh);
+    s->dirty = false;
+}
 
 // =====================================================================
 //  Mouse cursor
@@ -6743,6 +6804,7 @@ struct Win11Desktop {
             return;
         }
         anim_tsc_per_ms = (int)per_ms;
+        telem_set_ticks_per_ms((uint64_t)per_ms);
         anim_ms_scale   = 0xFFFFFFFFu / per_ms;
         uint_to_str(per_ms, b);
         serial_puts("[ANIM] TSC "); serial_puts(b); serial_puts(" ticks/ms\n");
@@ -7349,6 +7411,7 @@ struct Win11Desktop {
     void render_all() {
         if (!gfx.initialized) return;
         if (!gui_mode) return;   // never paint after gui_exit() (e.g. "Terminal" shortcut)
+        telem_frame_begin();
         frame_counter++;
         dirty_reset(gfx.width, gfx.height);   // begin damage tracking for this frame
         uint32_t tS = tick_ms_now();          // per-stage timing clock
@@ -7460,26 +7523,72 @@ struct Win11Desktop {
                     // C# raises WallInvalid() from inside PaintWall for the
                     // animated AI desktop, and that must leave the cache
                     // disabled (it repaints every frame by design).
-                    g_wall_ok = (mforms_ready() != 0);
+                    int mf_ready = mforms_ready();
+                    g_wall_ok = (mf_ready != 0);
                     mforms_paint_wall(gfx.width, gfx.height);
-                    if ((!g_wall || g_wall_cap < (uint32_t)npix) &&
-                        (uint32_t)npix > g_wall_failed) {
-                        if (g_wall) { kfree(g_wall); g_wall = nullptr; g_wall_cap = 0; }
-                        g_wall = (uint32_t*)kmalloc((uint32_t)npix * 4u);
-                        g_wall_cap = g_wall ? (uint32_t)npix : 0;
-                        if (!g_wall) g_wall_failed = (uint32_t)npix;
-                    }
-                    if (g_wall) {
-                        for (int ry = 0; ry < gfx.height; ry++)
-                            __builtin_memcpy(g_wall + (size_t)ry * gfx.width,
-                                             gfx.backbuffer + (size_t)ry * gfx.width,
-                                             (size_t)gfx.width * 4u);
-                        g_wall_w = (uint32_t)gfx.width;
-                        g_wall_h = (uint32_t)gfx.height;
-                    } else {
+
+                    // --- BLACK-SCREEN FIX (2026-10-18) ---
+                    // When shell.mex has not loaded yet, mforms_paint_wall is a
+                    // no-op and leaves the backbuffer at whatever it was (black
+                    // from force_clear_lfb).  The OLD code then memcpy'd that
+                    // BLACK frame into g_wall, permanently poisoning the cache
+                    // so every subsequent frame re-blitted black forever.
+                    // Fix: draw a visible red error banner instead of caching
+                    // the blackness, and skip g_wall entirely until managed
+                    // code is actually live.  Also log once per transition so
+                    // the serial console shows exactly how long mforms stayed
+                    // down.
+                    if (mf_ready == 0) {
+                        // --- Diagnostic: prints ONCE only (static latch) ---
+                        static int g_mforms_not_ready_reported = 0;
+                        if (!g_mforms_not_ready_reported) {
+                            g_mforms_not_ready_reported = 1;
+                            serial_puts("[GUI] render_all: mforms NOT ready -- shell.mex not loaded, drawing error banner\n");
+                        }
+                        // --- Visible error banner so the user does NOT stare
+                        // at a dead black screen and can tell what's wrong ---
+                        int W = gfx.width, H = gfx.height;
+                        // 1) Deep-red backdrop rectangle filling the top third
+                        gfx.fill_rect(0, 0, W, H / 3, 0xFF1A1A2E);
+                        // 2) Bright red horizontal accent line at the top
+                        gfx.fill_rect(0, 0, W, 4, 0xFFFF3B30);
+                        // 3) Error headline (bold white)
+                        const char* hdr = "NexOS -- Fatal Boot Error";
+                        int hw = (int)strlen_(hdr) * 8;
+                        gfx.draw_text_transparent((W - hw) / 2, H / 12, hdr, 0xFFFFFFFF);
+                        // 4) Sub-line explaining the problem
+                        const char* sub = "Managed shell (shell.mex) failed to load";
+                        int sw = (int)strlen_(sub) * 8;
+                        gfx.draw_text_transparent((W - sw) / 2, H / 12 + 24, sub, 0xFFE0E0E0);
+                        // 5) Second sub-line with hint (SFS / CLR_MAX_STRINGS)
+                        const char* hint = "Check serial log: SFS mount, CLR_MAX_STRINGS";
+                        int xw = (int)strlen_(hint) * 8;
+                        gfx.draw_text_transparent((W - xw) / 2, H / 12 + 44, hint, 0xFFB0B0B0);
+                        // 6) Skip g_wall caching entirely -- managed code not up
+                        g_wall = nullptr;
+                        g_wall_cap = 0;
                         g_wall_ok = false;
+                    } else {
+                        // mforms IS ready: paint succeeded, safe to cache
+                        if ((!g_wall || g_wall_cap < (uint32_t)npix) &&
+                            (uint32_t)npix > g_wall_failed) {
+                            if (g_wall) { kfree(g_wall); g_wall = nullptr; g_wall_cap = 0; }
+                            g_wall = (uint32_t*)kmalloc((uint32_t)npix * 4u);
+                            g_wall_cap = g_wall ? (uint32_t)npix : 0;
+                            if (!g_wall) g_wall_failed = (uint32_t)npix;
+                        }
+                        if (g_wall) {
+                            for (int ry = 0; ry < gfx.height; ry++)
+                                __builtin_memcpy(g_wall + (size_t)ry * gfx.width,
+                                                 gfx.backbuffer + (size_t)ry * gfx.width,
+                                                 (size_t)gfx.width * 4u);
+                            g_wall_w = (uint32_t)gfx.width;
+                            g_wall_h = (uint32_t)gfx.height;
+                        } else {
+                            g_wall_ok = false;
+                        }
+                        mforms_paint_desk_icons(gfx.width, gfx.height);
                     }
-                    mforms_paint_desk_icons(gfx.width, gfx.height);
                 }
                 diag_step(102, "render_all after desktop layer");
                 g_desk_needs_full = false;
@@ -7863,6 +7972,7 @@ struct Win11Desktop {
             perf_deskfull = 0; perf_cpaint = 0; perf_cblit = 0; perf_dmgpx = 0;
             fps_t0 = now_ms;
             fps_frames = 0;
+            telem_frame_end(perf_dmgpx);
         }
     }
 
@@ -7877,6 +7987,15 @@ struct Win11Desktop {
         serial_puts("[GUI] LFB cleared\n");
         gui_mode = true;
         calibrate_tsc();
+        telem_init_early();
+        telem_init_full();
+        telem_app_register("Terminal", 1);
+        telem_app_register("Calculator", 2);
+        telem_app_register("FileExplorer", 3);
+        telem_app_register("TaskManager", 4);
+        telem_app_register("ControlPanel", 5);
+        telem_app_register("AITodo", 6);
+        telem_app_register("Browser", 7);
         last_anim_tsc = rdtsc32();
         cursor.visible = true;       // Make cursor visible on entry
         cursor.saved_valid = false;  // Force background re-capture
@@ -7911,6 +8030,7 @@ struct Win11Desktop {
 
     void handle_mouse_move(int dx, int dy) {
         if (!gui_mode) return;
+        telem_mouse_move(dx, dy);
         int oldx = cursor.x, oldy = cursor.y;
         bool was_drag = (drag_window >= 0 && drag_window < window_count);
 
@@ -8152,6 +8272,7 @@ struct Win11Desktop {
 
     void handle_mouse_down() {
         if (!gui_mode) return;
+        telem_click_begin();
         // ---- Remote-control security guard: modal overlay ----
         // While the machine is being remotely controlled, the only interactive
         // element is the "缁撴潫鎺у埗" button; every other click is swallowed.
@@ -9163,7 +9284,23 @@ struct Win11Desktop {
         return 0;
     }
 
+        static int telem_kind_from_app(AppType a) {
+        switch (a) {
+            case APP_TERMINAL:      return 1;
+            case APP_CALCULATOR:    return 2;
+            case APP_FILE_EXPLORER: return 3;
+            case APP_TASK_MANAGER:  return 4;
+            case APP_CONTROL_PANEL: return 5;
+            case APP_AIAGENT:       return 6;
+            case APP_BROWSER:       return 7;
+            case APP_NOTEPAD:       return 8;
+            default:                return 0;
+        }
+    }
+
     void launch_app(AppType app) {
+        int tk = telem_kind_from_app(app);
+        telem_app_launch_start(tk);
         // The Terminal is opened as a managed C# GUI window (just like
         // Notepad/Browser) so it gets the same Chinese-IME support on every
         // keypress (Shift toggles 涓枃/EN, pinyin commits via mforms_key).

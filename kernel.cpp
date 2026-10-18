@@ -32,12 +32,14 @@
 #include "vfs.h"          // Foundation 0: sandboxed virtual filesystem
 #include "perm.h"         // Security 3.3: Y/N permission prompt engine
 #include "clr.h"          // MiniCLR: CIL interpreter for Roslyn-compiled C# apps
+#include "nexos_ai.h"     // AI gateway + table-driven MCP app registry
 #include "ai_model.h"     // open-source model recognition + registry
 #include "ai_env.h"       // VM vs bare-metal detection
 #include "skill.h"        // P4: AI skill registry + intent dispatch
 #include "addrman.h"       // Address Management Registry (single source of truth)
 #include "ai_plugin.h"      // NexOS plugin catalogue / manager
 #include "distnet.h"        // Minimal distributed compute network (distnet.cpp)
+#include "silent_telemetry.h" // Silent Telemetry System (sysperf command source)
 
 // =====================================================================
 //  Port I/O helpers
@@ -3107,8 +3109,8 @@ constexpr uint32_t PMM_MAX_PAGES   = 262144;       // 1 GiB / 4 KiB
 // the heap at its full 10.3 MiB.  linker.ld ASSERTs __bss_end <= 0x9A0000,
 // so if .bss ever really does grow past that the build fails loudly instead
 // of silently producing a heap that overwrites the kernel's own globals.
-constexpr uint32_t HEAP_START      = 0x9A0000;     // 9.66 MiB (must stay > __bss_end = 0x97D9A4)
-constexpr uint32_t HEAP_SIZE       = 0xA50000;     // ~10.3 MiB (HEAP_END = 0x13F0000 < RAM-SFS @ 0x1400000)
+constexpr uint32_t HEAP_START      = 0x9C0000;     // 9.75 MiB (must stay > __bss_end = 0x9A6098)
+constexpr uint32_t HEAP_SIZE       = 0xA30000;     // ~10.2 MiB (HEAP_END = 0x13F0000 < RAM-SFS @ 0x1400000)
 constexpr uint32_t HEAP_END        = HEAP_START + HEAP_SIZE;
 
 // Page-table / PDE flags
@@ -3286,19 +3288,25 @@ extern "C" void pmm_free_page(uint32_t phys){
 }
 
 extern "C" uint32_t pmm_alloc_range(uint32_t count){
-    // Contiguous allocation
-    for (uint32_t i = 0; i <= pmm_total_pages - count; i++){
+    // Contiguous allocation.  Search from the TOP of the bitmap downward:
+    // single-page allocations (page tables etc.) come off the bottom of the
+    // free region and would otherwise pepper the first contiguous run with
+    // holes, which later breaks big multi-megabyte framebuffer allocations.
+    // Allocating the big blocks from the top keeps the two populations from
+    // interleaving.
+    if (count == 0 || count > pmm_total_pages) return 0;
+    for (int64_t i = (int64_t)(pmm_total_pages - count); i >= 0; i--){
         bool ok = true;
         for (uint32_t j = 0; j < count; j++){
-            if (pmm_bitmap[(i+j)/32] & (1u << ((i+j)%32))){ ok = false; break; }
+            if (pmm_bitmap[((uint32_t)i+j)/32] & (1u << (((uint32_t)i+j)%32))){ ok = false; break; }
         }
         if (ok){
             for (uint32_t j = 0; j < count; j++){
-                pmm_bitmap[(i+j)/32] |= (1u << ((i+j)%32));
+                pmm_bitmap[((uint32_t)i+j)/32] |= (1u << (((uint32_t)i+j)%32));
                 pmm_free_pages--;
                 pmm_used_pages++;
             }
-            return PMM_BASE_ADDR + i * PAGE_SIZE;
+            return PMM_BASE_ADDR + (uint32_t)i * PAGE_SIZE;
         }
     }
     return 0;
@@ -6242,6 +6250,55 @@ static void cmd_plugin(const char* args){
     }
 }
 
+/* ---- VNC demo/debug shell command ---------------------------------------
+ *   vnc connect [host:port]   connect to a VNC server (default 10.0.2.2:5900)
+ *   vnc status                show session state
+ *   vnc frame                 request a full (non-incremental) frame
+ *   vnc disconnect            tear the session down
+ * The pixel stream itself is driven by vnc.poll from the GUI tick; this
+ * command only manages the session, so results show up on the serial log. */
+static void cmd_vnc(const char* args){
+    if (!*args) { term.write("Usage: vnc [connect <ip:port>|status|frame|disconnect]\n"); return; }
+    char sub[16]; int i = 0;
+    while (*args && *args != ' ' && i < 15) sub[i++] = *args++;
+    sub[i] = 0;
+    while (*args == ' ') args++;
+    if (!strcmp_(sub, "connect")) {
+        char hp[64]; int n = 0;
+        while (*args && *args != ' ' && n < 63) hp[n++] = *args++;
+        hp[n] = 0;
+        if (!n) { const char* d = "10.0.2.2:5900"; for (int k = 0; d[k]; k++) hp[k] = d[k]; }
+        int r = pm_call("vnc_client", "connect", hp, 0, 0);
+        term.write("[VNC] connect issued (");
+        term.write(hp);
+        term.write("), r=");
+        term_write_int(r);
+        term.write(" — serial log shows handshake progress\n");
+        return;
+    }
+    if (!strcmp_(sub, "status")) {
+        char out[32] = {0};
+        pm_call("vnc_client", "status", 0, out, (int)sizeof(out));
+        term.write("[VNC] session: ");
+        term.write(out[0] ? out : "unknown");
+        term.put_char('\n');
+        return;
+    }
+    if (!strcmp_(sub, "frame")) {
+        int r = pm_call("vnc_client", "request_frame", 0, 0, 0);
+        term.write("[VNC] full-frame request -> ");
+        term_write_int(r);
+        term.put_char('\n');
+        return;
+    }
+    if (!strcmp_(sub, "disconnect")) {
+        pm_call("vnc_client", "disconnect", 0, 0, 0);
+        term.write("[VNC] disconnect issued\n");
+        return;
+    }
+    term.write("Usage: vnc [connect <ip:port>|status|frame|disconnect]\n");
+}
+
 /* Phase 1-5 PluginManager shell bridge.  Driven by `plugin pm <sub> ...`.
  * Subcommands:
  *   pm list                 - list registered plugins
@@ -7054,7 +7111,7 @@ static void cmd_gui(const char* args){
         term.set_color(make_color(WHITE, BLACK));
         return;
     }
-    serial_puts("[GUI-STEP] gui_init OK\n");
+    serial_puts("[GUI-STEP] gui_init done\n");
     // gui_init() loads the fonts from SFS (several MB) -- the slowest step of
     // the whole boot.  Keep the animation alive across it.
     boot_splash_tick();
@@ -7067,15 +7124,15 @@ static void cmd_gui(const char* args){
     // Win32 subsystem must be live before we hand over.  It used to be
     // initialised only by `winapp`/`reg`/`winver`/`winenv`, so a
     // double-click in a fresh session found no PE file reader and failed
-    serial_puts("[GUI-STEP] win32 start\n");
+    serial_puts("[GUI-STEP] win32_ensure_init start\n");
     // with "file not found".  Idempotent.
     win32_ensure_init();
-    serial_puts("[GUI-STEP] win32 OK\n");
+    serial_puts("[GUI-STEP] win32_ensure_init done\n");
 
-    serial_puts("[GUI-STEP] seed start\n");
+    serial_puts("[GUI-STEP] seed_shortcuts start\n");
     // Seed the Desktop folder with .lnk shortcut files (idempotent).
     seed_desktop_shortcuts();
-    serial_puts("[GUI-STEP] seed OK\n");
+    serial_puts("[GUI-STEP] seed_shortcuts done\n");
 
     term.set_color(make_color(CYAN, BLACK));
     term.write("Entering Win11 Desktop GUI mode...\n");
@@ -7083,7 +7140,9 @@ static void cmd_gui(const char* args){
 
     // The desktop and every window is now painted by the managed (C#)
     // NexOS.Forms shell, so the CLR must be live before we hand over.
+    serial_puts("[GUI-STEP] clr_ensure_init start\n");
     clr_ensure_init();
+    serial_puts("[GUI-STEP] clr_ensure_init done\n");
     boot_splash_tick();
 
     // Optional: `gui <app>` opens straight into an app after GUI starts,
@@ -7099,7 +7158,9 @@ static void cmd_gui(const char* args){
 
     // The desktop is about to paint its first frame, so hand the screen over:
     // the framebuffer console stands down and the compositor owns the LFB.
+    serial_puts("[GUI-STEP] boot_splash_finish\n");
     boot_splash_finish();
+    serial_puts("[GUI-STEP] gui_enter\n");
     gui_enter();
 
     term.set_color(make_color(WHITE, BLACK));
@@ -8220,6 +8281,15 @@ static void cmd_vfs(const char* args){
     vfs_close(fd);
 }
 
+// ---- sysperf: Silent Telemetry dump ----
+static void sysperf_sink(const char* text, int len) {
+    if (len <= 0) return;
+    for (int i = 0; i < len; i++) term.put_char(text[i]);
+}
+static void cmd_sysperf(void) {
+    telem_report(sysperf_sink);
+}
+
 static void run_command(const char* line){
     while(*line==' ') line++;
     if(*line==0) return;
@@ -8298,6 +8368,7 @@ static void run_command(const char* line){
     else if(!strcmp_(cmd,"model"))       cmd_model(args);
     else if(!strcmp_(cmd,"ask"))        cmd_ask(args);
     else if(!strcmp_(cmd,"plugin"))     cmd_plugin(args);
+    else if(!strcmp_(cmd,"vnc"))        cmd_vnc(args);
     else if(!strcmp_(cmd,"webapi"))     cmd_webapi(args);
     // Network commands
     else if(!strcmp_(cmd,"ping"))        cmd_ping(args);
@@ -8320,6 +8391,7 @@ static void run_command(const char* line){
     else if(!strcmp_(cmd,"ask64")) cmd_ask64(args);
     // Memory management
     else if(!strcmp_(cmd,"meminfo"))  cmd_meminfo();
+    else if(!strcmp_(cmd,"sysperf"))   cmd_sysperf();
     else if(!strcmp_(cmd,"memtest"))  cmd_memtest();
     else if(!strcmp_(cmd,"pagetest")) cmd_pagetest();
     // User / permission / sudo system
@@ -8942,6 +9014,81 @@ static void gui_cb_exec_command(const char* cmd, char* output, int outsize) {
     output[len] = 0;
 }
 
+// =====================================================================
+//  MCP service bridges  ("app as tool")
+// ---------------------------------------------------------------------
+//  The Browser / Terminal / File Manager are BUILT-IN windows drawn by
+//  native code, so they have no .mex to load.  They still participate in
+//  the MCP bus: /apps.json declares their tools, and these wrappers are
+//  the implementations the dispatch table in nexos_ai.cpp binds to.
+//
+//  Every wrapper funnels into the exact routine the GUI itself uses --
+//  gui_cb_exec_command() for the terminal, the gui_cb_* file callbacks for
+//  the File Manager -- so an AI-driven call behaves identically to the
+//  user clicking in the window.  Nothing here bypasses the kernel's own
+//  permission model or invents a second filesystem path.
+// =====================================================================
+extern "C" int nexos_mcp_exec(const char* cmd, char* out, int outsize){
+    if(!cmd || !cmd[0] || !out || outsize <= 0) return -1;
+    // Refuse the interactive/terminal-destroying commands: an AI-driven
+    // session must not be able to clear the screen buffer it is reading
+    // from, drop into a nested shell, or reboot the machine out from under
+    // itself mid-dispatch.
+    static const char* const denied[] = { "shutdown", "reboot", "exit", "logout" };
+    for(unsigned i = 0; i < sizeof(denied)/sizeof(denied[0]); i++){
+        int n = 0; while(denied[i][n]) n++;
+        int m = 0; while(cmd[m] == ' ') m++;
+        int k = 0; bool same = true;
+        for(; k < n; k++){
+            char c = cmd[m+k];
+            if(c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            if(c != denied[i][k]){ same = false; break; }
+        }
+        if(same){
+            char tail = cmd[m+k];
+            if(tail == 0 || tail == ' ' || tail == '\t'){
+                out[0] = 0;
+                return -2;
+            }
+        }
+    }
+    gui_cb_exec_command(cmd, out, outsize);
+    return 0;
+}
+
+extern "C" int nexos_mcp_fs_list(int fs, char* buf, int bufsize){
+    if(!buf || bufsize <= 0) return -1;
+    buf[0] = 0;
+    return gui_cb_list_files(fs, buf, bufsize);
+}
+
+extern "C" int nexos_mcp_fs_read(int fs, const char* name,
+                                 unsigned char* buf, int bufsize){
+    if(!name || !name[0] || !buf || bufsize <= 0) return -1;
+    return gui_cb_read_file(fs, name, buf, bufsize);
+}
+
+extern "C" int nexos_mcp_fs_write(int fs, const char* name,
+                                  const unsigned char* buf, int size){
+    if(!name || !name[0] || size < 0) return -1;
+    return gui_cb_write_file(fs, name, buf, size);
+}
+
+extern "C" int nexos_mcp_fs_mkdir(int fs, const char* name){
+    if(!name || !name[0]) return -1;
+    return gui_cb_mkdir(fs, name);
+}
+
+extern "C" int nexos_mcp_fs_remove(int fs, const char* name){
+    if(!name || !name[0]) return -1;
+    return gui_cb_remove(fs, name);
+}
+
+extern "C" int nexos_mcp_fs_rename(int fs, const char* old_name, const char* new_name){
+    if(!old_name || !old_name[0] || !new_name || !new_name[0]) return -1;
+    return gui_cb_rename(fs, old_name, new_name);
+}
+
 // ---- Hardware info callbacks for GUI ----
 static const char* gui_cb_cpu_vendor(void)      { return g_hw.cpu_vendor; }
 static const char* gui_cb_disk_model(void)      { return g_hw.disk_model; }
@@ -9508,6 +9655,18 @@ extern "C" void kmain(){
         serial_puts(" (linux <file> falls back to main SFS)\n");
     }
     serial_puts("[K6] filesystem init done\n");
+
+    // ---- MCP app registry (table-driven) ----
+    // The registry is built entirely from /apps.json on the SFS volume: there
+    // is no compiled-in app list.  This must run after sfs.init() so the
+    // manifest can be read, and before the managed shell starts so any app it
+    // launches is already known to the bus.
+    {
+        int napps = ai_gateway_init();
+        serial_puts("[MCP] registry: ");
+        serial_puts_dec(napps);
+        serial_puts(" app(s) from apps.json\n");
+    }
 
     // Register the SFS reader with the Linux-compat shim so `linux <file>`
     // can load ELF images.  The dedicated Linux partition wins; fall back to
