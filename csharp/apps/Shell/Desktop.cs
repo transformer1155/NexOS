@@ -1949,6 +1949,10 @@ namespace NexOS.Forms
 
         public static void OnRightClick(int mx, int my)
         {
+            // Close any existing popup BEFORE opening a new one:
+            // prevents two ContextMenus from being simultaneously "open"
+            // (hit testing ambiguity) and clears stale owner state.
+            if (Popup.IsOpen()) Popup.Close();
             int w = Gfx.Width(), h = Gfx.Height();
             // Start menu is modal: a right-click inside its rect opens the
             // per-app Pin / Unpin context menu instead of the desktop menu.

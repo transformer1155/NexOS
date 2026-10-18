@@ -912,7 +912,20 @@ namespace NexOS.Forms
             if (Trim(cmd).Length == 0) return;
             if (t.histN == 0 || t.hist[t.histN - 1] != cmd)
             {
-                if (t.histN < HIST_MAX) { t.hist[t.histN] = cmd; t.histN++; }
+                // RING BUFFER (fix #4): history used to STOP accepting new
+                // entries once histN reached HIST_MAX (200).  Now it covers
+                // the oldest: shift everything left and append at the end.
+                // Users always see the most recent HIST_MAX commands.
+                if (t.histN < HIST_MAX)
+                {
+                    t.hist[t.histN] = cmd;
+                    t.histN++;
+                }
+                else
+                {
+                    for (int i = 0; i < HIST_MAX - 1; i++) t.hist[i] = t.hist[i + 1];
+                    t.hist[HIST_MAX - 1] = cmd;
+                }
             }
             t.histPos = t.histN;
             if (cmd == "exit" || cmd == "logout") { CloseTab(); return; }

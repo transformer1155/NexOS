@@ -69,6 +69,11 @@ namespace NexOS.Forms
         // clamped to the screen so the menu never runs off-edge.
         public static void Open(int o, int px, int py, string[] labs, int[] codes, int count)
         {
+            // CLOSE previous popup FIRST: otherwise two popups are both
+            // "open=true" and ContextClick dispatches hits to the wrong one
+            // (or ignores the second popup entirely).  This also clears
+            // stale owner/fileOwner/startRClickIdx state.
+            if (open) Close();
             if (count > CAP) count = CAP;
             int mw = 0;
             for (int i = 0; i < count; i++)
