@@ -45,12 +45,17 @@ namespace NexOS.Forms
         int  CardY() { return BoxY() + BoxH() + 16; }
 
         // Cap an exec transcript so we never exhaust the 512 KB bump heap.
+        // UTF-8 safe (FIX #4): rewinds over continuation bytes before cutting
+        // so emoji / CJK glyphs are never split mid-sequence.
         static string SafeCap(string res)
         {
             if (res == null) return "";
             if (res.Length <= 480) return res;
             int cut = 480;
-            while (cut > 0 && ((int)res[cut] & 0xC0) == 0x80) cut--;  // UTF-8 safe
+            // Skip all trailing continuation bytes (0x80-0xBF).  After this,
+            // cut lands on either ASCII or a multi-byte START byte (top-two
+            // bits != 0x80), so U.Sub(res, 0, cut) is always valid UTF-8.
+            while (cut > 0 && ((int)res[cut] & 0xC0) == 0x80) cut--;
             return U.Cat(U.Sub(res, 0, cut), "...");
         }
 

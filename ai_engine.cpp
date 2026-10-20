@@ -785,7 +785,7 @@ int ai_generate_code(const char* intent, char* out, int outsize){
 int ai_generate_stream(const char* prompt,
                        void (*callback)(const char*, void*),
                        void* user_data){
-    if (!g_ai.initialized || !prompt) return -1;
+    if (!g_ai.initialized || !prompt || !callback) return -1;
     int prompt_len = ai_strlen(prompt);
     char context[AI_CONTEXT_LEN + 1];
     int ctx_start = (prompt_len > AI_CONTEXT_LEN) ? prompt_len - AI_CONTEXT_LEN : 0;
@@ -1160,6 +1160,11 @@ static int agent_execute_tool(int task_idx){
         }
         if (nw == 0){
             ai_sprintf(g_tasks[task_idx].result, AGENT_MAX_MSG, "(empty shell command)");
+        } else if (g_agent_confirm) {
+            // Safety gate: shell execution blocked when agent confirm is ON
+            // (default). Model hallucinations producing "shell:evil" are blocked.
+            ai_sprintf(g_tasks[task_idx].result, AGENT_MAX_MSG,
+                       "(shell BLOCKED: agent confirm is ON; agent_set_confirm(0) to allow)");
         } else {
 #if !defined(__x86_64__)
             const char* av[33];
@@ -1189,8 +1194,8 @@ void agent_init(void){
     g_current_task = 0;
     g_agent_initialized = true;
     g_agent_aborted = false;
-    g_agent_confirm = false;
-    agent_log(0, "agent framework initialized (Planner/Actor/Critic)");
+    g_agent_confirm = true;
+    agent_log(0, "agent framework initialized (Planner/Actor/Critic; confirm ON by default)");
 }
 
 // Planner: decompose a goal into concrete tasks (Analyze -> Execute* -> Verify).

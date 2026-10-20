@@ -122,12 +122,16 @@ namespace NexOS.Forms
         }
 
         // Run the pipeline: make sure engine + framework are live, then ask
-        // the Planner to decompose the goal.
+        // the Planner to decompose the goal.  Trims whitespace so that a
+        // goal box containing only spaces / newlines is rejected cleanly
+        // (FIX #5, 2026-10-19), matching AiLauncher.DoRun's Trim behavior.
         void DoRun()
         {
             editMode = 0;
+            string goal = Trim(t.text);
+            if (goal.Length == 0) { output = "Enter a goal first."; return; }
             Host.Exec("agent init");                 // idempotent at AI level
-            output = SafeCap(Host.Exec(U.Cat("agent run ", t.text)));
+            output = SafeCap(Host.Exec(U.Cat("agent run ", goal)));
         }
 
         // Select the default open-source model (Qwen-1.7B) for the engine.
@@ -138,16 +142,28 @@ namespace NexOS.Forms
             envMsg = SafeCap(Host.Exec("model env"));
         }
 
-        // A `agent run` transcript can be several KB; the MiniCLR bump heap
-        // is only 512 KB with no GC, so an uncapped string exhausts it and
-        // takes the whole managed shell down (the AI desktop hit the same
-        // trap).  Cap every exec result we display.
+        // --- local text helpers (mirror AiLauncher.cs Trim, which AiAgent
+        // cannot share since Trim is private static there too) -----------
+        static string Trim(string s)
+        {
+            int a = 0, b = s.Length;
+            while (a < b) { int c = (int)s[a]; if (c == ' ' || c == '\t' || c == '\n' || c == '\r') a++; else break; }
+            while (b > a) { int c = (int)s[b - 1]; if (c == ' ' || c == '\t' || c == '\n' || c == '\r') b--; else break; }
+            return U.Sub(s, a, b - a);
+        }
+
+        // Cap an exec transcript so we never exhaust the 512 KB bump heap.
+        // UTF-8 safe (FIX #4): rewinds over continuation bytes before cutting
+        // so emoji / CJK glyphs are never split mid-sequence.
         static string SafeCap(string res)
         {
             if (res == null) return "";
             if (res.Length <= 480) return res;
             int cut = 480;
-            while (cut > 0 && ((int)res[cut] & 0xC0) == 0x80) cut--;  // UTF-8 safe
+            // Skip all trailing continuation bytes (0x80-0xBF).  After this,
+            // cut lands on either ASCII or a multi-byte START byte (top-two
+            // bits != 0x80), so U.Sub(res, 0, cut) is always valid UTF-8.
+            while (cut > 0 && ((int)res[cut] & 0xC0) == 0x80) cut--;
             return U.Cat(U.Sub(res, 0, cut), "...");
         }
 

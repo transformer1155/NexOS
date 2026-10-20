@@ -41,6 +41,13 @@
  */
 #include "nexos_ai.h"
 
+// Serial debug (port 0x3F8) - freestanding
+static void naslog(const char* s){
+    while(*s){
+        __asm__ __volatile__("outb %0,%1" :: "a"((unsigned char)*s++), "Nd"((unsigned short)0x3F8));
+    }
+}
+
 extern "C" void* kmalloc(unsigned int);
 extern "C" int   ai_reason(const char* prompt, char* out, int outsize);
 extern "C" int   ai_set_mode(int mode);
@@ -77,24 +84,34 @@ static void my_strncpy(char* d, const char* s, int n){
 }
 #include <stdarg.h>
 /* Minimal printf-style formatter (kernel is freestanding; no libc sprintf).
-   Supports %d %s %c %%.  Returns the number of bytes written. */
-static int my_sprintf(char* out, const char* fmt, ...){
+   Supports %d %s %c %%.  BOUNDED: never writes past out[size-1], always NUL-
+   terminates.  Returns the number of bytes written (excluding NUL).
+   my_snprintf replaces the old unbounded my_sprintf. */
+static int my_snprintf(char* out, int size, const char* fmt, ...){
+    if (!out || size <= 0) return 0;
     va_list ap; va_start(ap, fmt);
     char* p = out;
-    for(; fmt && *fmt; ++fmt){
-        if(*fmt != '%'){ *p++ = *fmt; continue; }
+    char* end = out + size - 1;   /* one slot reserved for NUL */
+    auto push = [&](char c){ if (p < end) *p++ = c; };
+    for (; fmt && *fmt; ++fmt) {
+        if (*fmt != '%') { push(*fmt); continue; }
         char spec = *(++fmt);
-        if(spec == '%'){ *p++='%'; continue; }
-        if(spec == 's'){ const char* s = va_arg(ap, const char*); if(!s) s="(null)"; while(*s) *p++=*s++; continue; }
-        if(spec == 'c'){ char ch=(char)va_arg(ap,int); *p++=ch; continue; }
-        if(spec == 'd'){
-            int v = va_arg(ap, int); char t[16]; int n=0;
-            if(v<0){ *p++='-'; v=-v; }
-            if(v==0) t[n++]='0'; else while(v){ t[n++]='0'+(v%10); v/=10; }
-            while(n) *p++=t[--n];
+        if (spec == '%') { push('%'); continue; }
+        if (spec == 's') {
+            const char* s = va_arg(ap, const char*);
+            if (!s) s = "(null)";
+            while (*s) push(*s++);
             continue;
         }
-        *p++='%'; if(spec) *p++=spec;   /* unknown spec: echo literally */
+        if (spec == 'c') { push((char)va_arg(ap, int)); continue; }
+        if (spec == 'd') {
+            int v = va_arg(ap, int); char t[16]; int n = 0;
+            if (v < 0) { push('-'); v = -v; }
+            if (v == 0) t[n++] = '0'; else while (v) { t[n++] = '0' + (v % 10); v /= 10; }
+            while (n) push(t[--n]);
+            continue;
+        }
+        push('%'); if (spec) push(spec);   /* unknown spec: echo literally */
     }
     *p = 0; va_end(ap);
     return (int)(p - out);
@@ -258,11 +275,11 @@ static int parse_fs(const char* json){
 static const char* impl_generic(const char* src, const char* tgt,
                                 const char* tool, const char* args){
     (void)src; (void)tgt;
-    int j = my_sprintf(g_out, "{\"tool\":\"");
+    int j = my_snprintf(g_out, (int)sizeof(g_out), "{\"tool\":\"");
     json_escape_into(g_out, &j, tool ? tool : "", (int)sizeof(g_out));
-    j += my_sprintf(g_out + j, "\",\"args\":\"");
+    j += my_snprintf(g_out + j, (int)sizeof(g_out) - j, "\",\"args\":\"");
     json_escape_into(g_out, &j, args ? args : "", (int)sizeof(g_out));
-    my_sprintf(g_out + j, "\",\"implemented\":0}");
+    my_snprintf(g_out + j, (int)sizeof(g_out) - j, "\",\"implemented\":0}");
     return g_out;
 }
 
@@ -271,11 +288,11 @@ static const char* impl_weather(const char* src, const char* tgt,
     (void)tgt; (void)tool;
     char loc[96];
     if(!json_get_str(args, "loc", loc, sizeof(loc))) loc[0]=0;
-    int j = my_sprintf(g_out, "{\"temp_c\":21,\"desc\":\"clear\",\"loc\":\"");
+    int j = my_snprintf(g_out, (int)sizeof(g_out), "{\"temp_c\":21,\"desc\":\"clear\",\"loc\":\"");
     json_escape_into(g_out, &j, loc, (int)sizeof(g_out));
-    j += my_sprintf(g_out + j, "\",\"source\":\"");
+    j += my_snprintf(g_out + j, (int)sizeof(g_out) - j, "\",\"source\":\"");
     json_escape_into(g_out, &j, src ? src : "", (int)sizeof(g_out));
-    my_sprintf(g_out + j, "\"}");
+    my_snprintf(g_out + j, (int)sizeof(g_out) - j, "\"}");
     return g_out;
 }
 
@@ -287,9 +304,9 @@ static const char* impl_browser_navigate(const char* src, const char* tgt,
     if(!json_get_str(args, "url", url, sizeof(url)) || !url[0])
         return "{\"ok\":0,\"error\":\"missing url\"}";
     int r = browser_navigate(url);
-    int j = my_sprintf(g_out, "{\"ok\":%d,\"url\":\"", r == 0 ? 1 : 0);
+    int j = my_snprintf(g_out, (int)sizeof(g_out), "{\"ok\":%d,\"url\":\"", r == 0 ? 1 : 0);
     json_escape_into(g_out, &j, url, (int)sizeof(g_out));
-    my_sprintf(g_out + j, "\"}");
+    my_snprintf(g_out + j, (int)sizeof(g_out) - j, "\"}");
     return g_out;
 }
 
@@ -300,10 +317,10 @@ static const char* impl_browser_get_text(const char* src, const char* tgt,
     if(n < 0) n = 0;
     if(n >= (int)sizeof(g_raw)) n = (int)sizeof(g_raw)-1;
     g_raw[n] = 0;
-    int j = my_sprintf(g_out, "{\"bytes\":%d,\"status\":%d,\"text\":\"",
+    int j = my_snprintf(g_out, (int)sizeof(g_out), "{\"bytes\":%d,\"status\":%d,\"text\":\"",
                        n, browser_status());
     json_escape_into(g_out, &j, g_raw, (int)sizeof(g_out));
-    my_sprintf(g_out + j, "\"}");
+    my_snprintf(g_out + j, (int)sizeof(g_out) - j, "\"}");
     return g_out;
 }
 
@@ -316,11 +333,11 @@ static const char* impl_terminal_exec(const char* src, const char* tgt,
         return "{\"ok\":0,\"error\":\"missing cmd\"}";
     g_raw[0] = 0;
     int r = nexos_mcp_exec(cmd, g_raw, (int)sizeof(g_raw));
-    int j = my_sprintf(g_out, "{\"ok\":%d,\"cmd\":\"", r == 0 ? 1 : 0);
+    int j = my_snprintf(g_out, (int)sizeof(g_out), "{\"ok\":%d,\"cmd\":\"", r == 0 ? 1 : 0);
     json_escape_into(g_out, &j, cmd, (int)sizeof(g_out));
-    j += my_sprintf(g_out + j, "\",\"output\":\"");
+    j += my_snprintf(g_out + j, (int)sizeof(g_out) - j, "\",\"output\":\"");
     json_escape_into(g_out, &j, g_raw, (int)sizeof(g_out));
-    my_sprintf(g_out + j, "\"}");
+    my_snprintf(g_out + j, (int)sizeof(g_out) - j, "\"}");
     return g_out;
 }
 
@@ -332,9 +349,9 @@ static const char* impl_fs_list(const char* src, const char* tgt,
     g_raw[0] = 0;
     int n = nexos_mcp_fs_list(fs, g_raw, (int)sizeof(g_raw));
     if(n < 0) n = 0;
-    int j = my_sprintf(g_out, "{\"fs\":%d,\"count\":%d,\"entries\":\"", fs, n);
+    int j = my_snprintf(g_out, (int)sizeof(g_out), "{\"fs\":%d,\"count\":%d,\"entries\":\"", fs, n);
     json_escape_into(g_out, &j, g_raw, (int)sizeof(g_out));
-    my_sprintf(g_out + j, "\"}");
+    my_snprintf(g_out + j, (int)sizeof(g_out) - j, "\"}");
     return g_out;
 }
 
@@ -348,10 +365,10 @@ static const char* impl_fs_read(const char* src, const char* tgt,
     int n = nexos_mcp_fs_read(fs, name, (unsigned char*)g_raw, (int)sizeof(g_raw)-1);
     if(n < 0) n = 0;
     g_raw[n] = 0;
-    int j = my_sprintf(g_out, "{\"ok\":%d,\"fs\":%d,\"bytes\":%d,\"data\":\"",
+    int j = my_snprintf(g_out, (int)sizeof(g_out), "{\"ok\":%d,\"fs\":%d,\"bytes\":%d,\"data\":\"",
                        n > 0 ? 1 : 0, fs, n);
     json_escape_into(g_out, &j, g_raw, (int)sizeof(g_out));
-    my_sprintf(g_out + j, "\"}");
+    my_snprintf(g_out + j, (int)sizeof(g_out) - j, "\"}");
     return g_out;
 }
 
@@ -365,10 +382,10 @@ static const char* impl_fs_write(const char* src, const char* tgt,
     if(!json_get_str(args, "data", data, sizeof(data))) data[0]=0;
     int n = my_strlen(data);
     int r = nexos_mcp_fs_write(fs, name, (const unsigned char*)data, n);
-    int j = my_sprintf(g_out, "{\"ok\":%d,\"fs\":%d,\"name\":\"",
+    int j = my_snprintf(g_out, (int)sizeof(g_out), "{\"ok\":%d,\"fs\":%d,\"name\":\"",
                        r == 0 ? 1 : 0, fs);
     json_escape_into(g_out, &j, name, (int)sizeof(g_out));
-    my_sprintf(g_out + j, "\",\"bytes\":%d}", n);
+    my_snprintf(g_out + j, (int)sizeof(g_out) - j, "\",\"bytes\":%d}", n);
     return g_out;
 }
 
@@ -380,10 +397,10 @@ static const char* impl_fs_mkdir(const char* src, const char* tgt,
     if(!json_get_str(args, "name", name, sizeof(name)) || !name[0])
         return "{\"ok\":0,\"error\":\"missing name\"}";
     int r = nexos_mcp_fs_mkdir(fs, name);
-    int j = my_sprintf(g_out, "{\"ok\":%d,\"fs\":%d,\"name\":\"",
+    int j = my_snprintf(g_out, (int)sizeof(g_out), "{\"ok\":%d,\"fs\":%d,\"name\":\"",
                        r == 0 ? 1 : 0, fs);
     json_escape_into(g_out, &j, name, (int)sizeof(g_out));
-    my_sprintf(g_out + j, "\"}");
+    my_snprintf(g_out + j, (int)sizeof(g_out) - j, "\"}");
     return g_out;
 }
 
@@ -395,10 +412,10 @@ static const char* impl_fs_remove(const char* src, const char* tgt,
     if(!json_get_str(args, "name", name, sizeof(name)) || !name[0])
         return "{\"ok\":0,\"error\":\"missing name\"}";
     int r = nexos_mcp_fs_remove(fs, name);
-    int j = my_sprintf(g_out, "{\"ok\":%d,\"fs\":%d,\"name\":\"",
+    int j = my_snprintf(g_out, (int)sizeof(g_out), "{\"ok\":%d,\"fs\":%d,\"name\":\"",
                        r == 0 ? 1 : 0, fs);
     json_escape_into(g_out, &j, name, (int)sizeof(g_out));
-    my_sprintf(g_out + j, "\"}");
+    my_snprintf(g_out + j, (int)sizeof(g_out) - j, "\"}");
     return g_out;
 }
 
@@ -412,12 +429,12 @@ static const char* impl_fs_rename(const char* src, const char* tgt,
     if(!json_get_str(args, "to", to, sizeof(to)) || !to[0])
         return "{\"ok\":0,\"error\":\"missing to\"}";
     int r = nexos_mcp_fs_rename(fs, from, to);
-    int j = my_sprintf(g_out, "{\"ok\":%d,\"fs\":%d,\"from\":\"",
+    int j = my_snprintf(g_out, (int)sizeof(g_out), "{\"ok\":%d,\"fs\":%d,\"from\":\"",
                        r == 0 ? 1 : 0, fs);
     json_escape_into(g_out, &j, from, (int)sizeof(g_out));
-    j += my_sprintf(g_out + j, "\",\"to\":\"");
+    j += my_snprintf(g_out + j, (int)sizeof(g_out) - j, "\",\"to\":\"");
     json_escape_into(g_out, &j, to, (int)sizeof(g_out));
-    my_sprintf(g_out + j, "\"}");
+    my_snprintf(g_out + j, (int)sizeof(g_out) - j, "\"}");
     return g_out;
 }
 
@@ -531,6 +548,10 @@ static void parse_apps_json(const char* json){
     g_app_registry_count = 0;
     g_toolpool_used       = 0;
     g_strpool_used        = 0;
+    for (int i = 0; i < NEXOS_AI_MAX_APPS; i++) {
+        g_new_tool_count[i] = 0;
+        for (int j = 0; j < NEXOS_AI_MAX_ACCESS; j++) g_access_pool[i][j] = 0;
+    }
     }
 
     const char* p = json;
@@ -572,6 +593,8 @@ static void parse_apps_json(const char* json){
                     e->mcp_client_access_count= 0;
                     e->loaded                 = 0;
                     g_new_tool_count[cur]     = 0;
+                } else {
+                    naslog("[AI] WARN: apps.json app count exceeds NEXOS_AI_MAX_APPS, truncating\n");
                 }
                 last_tool = 0;
             }
@@ -593,16 +616,20 @@ static void parse_apps_json(const char* json){
                 g_app_registry[cur].ai_mode_required = map_mode(tmp);
         } else if(match(&p, "\"tool_name\"")){
             skip_ws_colon(&p);
-            if(read_string(&p, tmp, sizeof(tmp)) && cur>=0 &&
-               g_toolpool_used < (int)(sizeof(g_toolpool)/sizeof(g_toolpool[0]))){
-                struct McpTool* t = &g_toolpool[g_toolpool_used++];
-                t->tool_name         = str_dup(tmp);
-                t->description       = "";
-                t->parameters_schema = "";
-                t->dispatch          = tool_impl_find(t->tool_name);
-                last_tool            = t;
-                if(g_new_tool_count[cur] < NEXOS_AI_MAX_TOOLS)
+            if(read_string(&p, tmp, sizeof(tmp)) && cur>=0){
+                if(g_toolpool_used >= (int)(sizeof(g_toolpool)/sizeof(g_toolpool[0]))){
+                    naslog("[AI] WARN: apps.json tool pool full, truncating tool\n");
+                } else if(g_new_tool_count[cur] >= NEXOS_AI_MAX_TOOLS){
+                    naslog("[AI] WARN: apps.json per-app tool count exceeds NEXOS_AI_MAX_TOOLS, truncating\n");
+                } else {
+                    struct McpTool* t = &g_toolpool[g_toolpool_used++];
+                    t->tool_name         = str_dup(tmp);
+                    t->description       = "";
+                    t->parameters_schema = "";
+                    t->dispatch          = tool_impl_find(t->tool_name);
+                    last_tool            = t;
                     g_new_tools[cur][g_new_tool_count[cur]++] = t;
+                }
             }
         } else if(match(&p, "\"description\"")){
             skip_ws_colon(&p);
@@ -629,8 +656,11 @@ static void parse_apps_json(const char* json){
                     skip_ws(&p);
                     if(*p != '"') break;
                     if(!read_string(&p, tmp, sizeof(tmp))) break;
-                    if(an < NEXOS_AI_MAX_ACCESS && cur >= 0)
+                    if(an >= NEXOS_AI_MAX_ACCESS){
+                        naslog("[AI] WARN: apps.json mcp_client_access exceeds NEXOS_AI_MAX_ACCESS, truncating\n");
+                    } else if(cur >= 0){
                         g_access_pool[cur][an++] = str_dup(tmp);
+                    }
                     skip_ws(&p);
                     if(*p == ','){ p++; continue; }
                     break;
@@ -667,8 +697,12 @@ int ai_gateway_init(void){
     if(n > 0){
         buf[n] = 0;
         /* Gateway tunables live in the same manifest. */
-        g_ai_gateway.gateway_port    = json_get_int((const char*)buf, "port", NEXOS_AI_GATEWAY_PORT);
-        g_ai_gateway.quota_remaining = json_get_int((const char*)buf, "quota_pool", 1000);
+        {   int p = json_get_int((const char*)buf, "port", NEXOS_AI_GATEWAY_PORT);
+            g_ai_gateway.gateway_port = (p > 0 && p <= 65535) ? p : NEXOS_AI_GATEWAY_PORT;
+        }
+        {   int q = json_get_int((const char*)buf, "quota_pool", 1000);
+            g_ai_gateway.quota_remaining = (q > 0) ? q : 0;
+        }
         parse_apps_json((const char*)buf);
     } else {
         /* No manifest -> empty registry.  Callers get MCP_ERR_NO_SRC/NO_TGT,
@@ -726,7 +760,7 @@ int ai_request(const char* prompt, int mode, char* out, int outsize){
         text = reason;
     } else {
         static char url[128];
-        my_sprintf(url, "http://127.0.0.1:%d/ai?mode=%d",
+        my_snprintf(url, (int)sizeof(url), "http://127.0.0.1:%d/ai?mode=%d",
                 g_ai_gateway.gateway_port, mode);
         int r = net_http_get(url, httpbuf, (int)sizeof(httpbuf)-1);
         if(r <= 0){ code = MCP_ERR_DISPATCH; text = ""; }
@@ -734,9 +768,9 @@ int ai_request(const char* prompt, int mode, char* out, int outsize){
         if(g_ai_gateway.quota_remaining > 0) g_ai_gateway.quota_remaining--;
     }
     if(out && outsize > 0){
-        int j = my_sprintf(out, "{\"code\":%d,\"text\":\"", code);
+        int j = my_snprintf(out, outsize, "{\"code\":%d,\"text\":\"", code);
         json_escape_into(out, &j, text, outsize);
-        my_sprintf(out + j, "\",\"mode\":%d,\"quotaLeft\":%d}",
+        my_snprintf(out + j, outsize - j, "\",\"mode\":%d,\"quotaLeft\":%d}",
                    used_mode, g_ai_gateway.quota_remaining);
     }
     return 0;
@@ -745,9 +779,9 @@ int ai_request(const char* prompt, int mode, char* out, int outsize){
 /* Wrap a tool result in the bus reply envelope.  Escapes inner_json directly
  * into g_env after the prefix, so no third buffer is needed. */
 static const char* build_mcp_result(int code, const char* inner_json){
-    int j = my_sprintf(g_env, "{\"code\":%d,\"json\":\"", code);
+    int j = my_snprintf(g_env, (int)sizeof(g_env), "{\"code\":%d,\"json\":\"", code);
     json_escape_into(g_env, &j, inner_json ? inner_json : "null", (int)sizeof(g_env));
-    my_sprintf(g_env + j, "\"}");
+    my_snprintf(g_env + j, (int)sizeof(g_env) - j, "\"}");
     return g_env;
 }
 
