@@ -83,6 +83,7 @@ namespace NexOS.Forms
             Voice.Init();           // allocate the voice registry / queue
             Desktop.Init();        // wallpaper / icon / taskbar tables
             Login.Init();          // lock screen (no-op if already signed in)
+            Login.BypassForHost();  // auto-GUI boot: skip lock screen for VM testing
             Toast.Init();          // transient notification stack
             Toast.Show("NexOS", "系统就绪", 3000);
             // Keep the overlay repainting every frame so the desktop telemetry
