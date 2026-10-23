@@ -1181,7 +1181,7 @@ namespace NexOS.Forms
                 if (t >= 0) { OpenTrayPopup(t, mx, my); return -1; }
                 int bx = GroupX(w);
                 int by = h - TaskH + (TaskH - BtnSz) / 2;
-                if (U.In(mx, my, bx, by, BtnSz, BtnSz)) { menuOpen = true; return -1; }
+                if (U.In(mx, my, bx, by, BtnSz, BtnSz)) { menuOpen = true; Host.SetAnim(1); return -1; }
                 for (int i = 0; i < tN; i++) {
                     if (tKind[i] < 0) continue;
                     int x = bx + (i + 1) * (BtnSz + BtnGap);
@@ -1363,8 +1363,13 @@ namespace NexOS.Forms
                 }
             }
 
-            // Keep the overlay repainting so the HUD stays live.
-            Host.SetAnim(1);
+            // Keep the overlay repainting while anything is transient / animating:
+            // telemetry HUD live meters, popup open/close transition, start-menu
+            // open/close transition.  This avoids the "empty menu until cursor
+            // moves" bug while still letting the host spin down to idle when
+            // nothing is animating (FIX #overlay-setanim, 2026-10-23).
+            if (Theme.WidgetsOn != 0 || Popup.IsOpen() || menuOpen)
+                Host.SetAnim(1);
         }
 
         public static void PaintOverlay(int w, int h)
@@ -1663,6 +1668,7 @@ namespace NexOS.Forms
         internal static void OpenStartMenu(int showAll, int w, int h)
         {
             menuOpen = true;
+            Host.SetAnim(1);   // kick open/close transition repaints
             startView = (showAll != 0) ? 1 : 0;
             startMenuW = MenuW(w); startMenuH = MenuH(h);
             startMenuX = MenuX(w); startMenuY = MenuY(h);
@@ -1789,7 +1795,7 @@ namespace NexOS.Forms
                 if (t >= 0) { OpenTrayPopup(t, mx, my); return -1; }
                 int bx = GroupX(w);
                 int by = h - TaskH + (TaskH - BtnSz) / 2;
-                if (U.In(mx, my, bx, by, BtnSz, BtnSz)) { menuOpen = true; return -1; }
+                if (U.In(mx, my, bx, by, BtnSz, BtnSz)) { menuOpen = true; Host.SetAnim(1); return -1; }
                 for (int i = 0; i < tN; i++)
                 {
                     int x = bx + (i + 1) * (BtnSz + BtnGap);
@@ -1814,7 +1820,7 @@ namespace NexOS.Forms
             }
             // Search bar -> open the Start menu (which has its own box).
             if (U.In(mx, my, pSearchX, pSearchY, pSearchW, pSearchH))
-            { menuOpen = true; return -1; }
+            { menuOpen = true; Host.SetAnim(1); return -1; }
             // Nav tabs (Home/Apps/System/Tools): select and consume.
             {
                 int tabW = 88, tabGap = 6, tabH = 30;

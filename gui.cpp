@@ -1378,7 +1378,7 @@ extern "C" void gui_wall_invalid(void) {
 enum { OVER_FORCE_FRAMES = 6,
        // Only the first few settling frames flush the whole screen; the rest
        // dirty just the taskbar strip (+ the Start-menu rect).  See render_all().
-       OVER_FORCE_WIDE = 2 };
+       OVER_FORCE_WIDE = 6 };
 static int g_over_force_n = 0;
 
 // Invalidate the cached managed layers.  The desktop and overlay layers are
@@ -7679,6 +7679,7 @@ struct Win11Desktop {
             // (toasts, network/AI indicators).
             static uint32_t g_over_sig  = 0xFFFFFFFFu;
             static int      g_over_idle = 0;
+            bool menu_up = mforms_desktop_menu_open();
             uint32_t osig = running_mask();
             osig ^= start_menu_open ? 0x5A5A5A5Au : 0u;
             // Taskbar hover highlight.  Deliberately skipped while a window is
@@ -7687,7 +7688,7 @@ struct Win11Desktop {
             // on every animation frame.  A hover state cannot change without a
             // new mouse event, and that event invalidates the overlay itself,
             // so nothing is lost by ignoring the position mid-animation.
-            if (!any_animating() && mouse_y >= gfx.height - MANAGED_TASKBAR_H)
+            if (!any_animating() && (mouse_y >= gfx.height - MANAGED_TASKBAR_H || menu_up))
                 osig ^= (uint32_t)mouse_x * 31u + (uint32_t)mouse_y * 17u;
             // With an animation pending (toasts, AI dots, the Start menu's
             // open transition) the overlay has to be repainted EVERY frame:
@@ -7711,7 +7712,7 @@ struct Win11Desktop {
                 // can live anywhere, and we cannot see their rect), then dirty
                 // exactly the taskbar strip plus the Start-menu rect, which is
                 // known because the menu is a window in the DB.
-                if (g_over_force_n > OVER_FORCE_WIDE)
+                if (g_mforms_anim != 0 || menu_up || g_over_force_n > 0)
                     dirty_add(0, 0, gfx.width, gfx.height);
                 else {
                     dirty_add(0, gfx.height - MANAGED_TASKBAR_H, gfx.width, MANAGED_TASKBAR_H);
@@ -8351,12 +8352,14 @@ struct Win11Desktop {
             // just dismisses it.
             if (mforms_desktop_menu_open()) {
                 int r = mforms_desktop_click(mouse_x, mouse_y);
+                gui_invalidate_managed();
                 if (r >= 0) launch_app(app_for_managed_kind(r));
                 render_all();
                 return;
             }
             if (mouse_y >= gfx.height - MANAGED_TASKBAR_H) {
                 int r = mforms_desktop_click(mouse_x, mouse_y);
+                gui_invalidate_managed();
                 if (r >= 0) taskbar_activate(app_for_managed_kind(r));
                 render_all();
                 return;
@@ -8380,6 +8383,7 @@ struct Win11Desktop {
             // click is a double-click when it lands on the same icon
             // within 500 ms.
             int r = mforms_desktop_click(mouse_x, mouse_y);
+            gui_invalidate_managed();
             if (r >= 0) {
                 // The Terminal shortcut drops straight to the text shell on
                 // a single click (task 1: "open terminal -> close GUI"),
@@ -8738,6 +8742,7 @@ struct Win11Desktop {
         // Taskbar strip or wallpaper -> the desktop / taskbar / tray menu.
         if (mouse_y >= gfx.height - MANAGED_TASKBAR_H) {
             mforms_desktop_rclick(mouse_x, mouse_y);
+            gui_invalidate_managed();
             render_all();
             return;
         }
@@ -8766,12 +8771,14 @@ struct Win11Desktop {
                 // the wrong file row.
                 mforms_rclick(win.managed_app, win.x + 1, win.content_y(),
                               win.w - 2, win.content_h(), mouse_x, mouse_y);
+                gui_invalidate_managed();   // force overlay repaint for managed popup
                 render_all();
                 return;
             }
         }
         // Fall back to the desktop menu (wallpaper).
         mforms_desktop_rclick(mouse_x, mouse_y);
+        gui_invalidate_managed();   // force overlay repaint for managed popup
         render_all();
     }
 

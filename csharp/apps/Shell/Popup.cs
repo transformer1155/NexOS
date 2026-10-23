@@ -61,7 +61,15 @@ namespace NexOS.Forms
         }
 
         public static bool IsOpen() { return open; }
-        public static void Close()  { open = false; }
+        public static void Close()
+        {
+            open = false;
+            // Kick a repaint so the 170ms slide-out transition completes.
+            // Without this, Close() would set open=false but the menu would
+            // stay painted until the next unrelated mouse/key event
+            // (FIX #popup-close, 2026-10-23).
+            Host.SetAnim(1);
+        }
         public static int  Owner()  { return owner; }
 
         // Build a menu from parallel label / action arrays.  `owner` lets
@@ -99,6 +107,12 @@ namespace NexOS.Forms
             x = px; if (x < 4) x = 4; if (x + w > W - 4) x = W - 4 - w;
             y = py; if (y < 4) y = 4; if (y + h > H - 4) y = H - 4 - h;
             open = true;
+            // Kick the 170ms open/close transition so the host repaints
+            // until the slide-in animation is complete.  Without this, the
+            // first Popup.Paint() frame after open=true would not be drawn
+            // until the next mouse event or click — the menu shows "empty"
+            // until the user wiggles the cursor (FIX #popup-open, 2026-10-23).
+            Host.SetAnim(1);
         }
 
         // Which item is under the cursor.  Returns the action code, or
