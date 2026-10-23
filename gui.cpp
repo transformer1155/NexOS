@@ -1375,10 +1375,10 @@ extern "C" void gui_wall_invalid(void) {
 // enough, so the shell keeps re-issuing it for a few frames after any managed
 // input.  While the countdown is running the whole screen is flushed, because
 // the menu covers an area above the taskbar that only C# knows about.
-enum { OVER_FORCE_FRAMES = 6,
+enum { OVER_FORCE_FRAMES = 12,   // FIX #menu-freeze: 12x16ms=192ms > 170ms max transition
        // Only the first few settling frames flush the whole screen; the rest
        // dirty just the taskbar strip (+ the Start-menu rect).  See render_all().
-       OVER_FORCE_WIDE = 6 };
+       OVER_FORCE_WIDE = 12 };
 static int g_over_force_n = 0;
 
 // Invalidate the cached managed layers.  The desktop and overlay layers are
@@ -7413,6 +7413,13 @@ struct Win11Desktop {
         if (!gui_mode) return;   // never paint after gui_exit() (e.g. "Terminal" shortcut)
         telem_frame_begin();
         frame_counter++;
+        // FIX #ghost-cursor (2026-10-23): blanket dirty rects (L7715 full-screen
+        // flush, BUG-C1 window rects) mark areas that were NOT actually rewritten
+        // this frame.  The cursor block must only skip restore_bg when the REAL
+        // background under the pointer was repainted (desktop full repaint),
+        // otherwise save_bg() bakes the previous frame's cursor pixels into the
+        // snapshot -> permanent ghost.  Set true only in the desktop repaint path.
+        bool bg_repainted_this_frame = false;
         dirty_reset(gfx.width, gfx.height);   // begin damage tracking for this frame
         uint32_t tS = tick_ms_now();          // per-stage timing clock
 
@@ -7594,6 +7601,7 @@ struct Win11Desktop {
                 g_desk_needs_full = false;
                 g_desk_refresh_pending = 0;   // consumed: next refresh waits a full interval
                 g_desk_sig = cur_sig;
+                bg_repainted_this_frame = true;   // FIX #ghost-cursor: real bg rewrite
                 dirty_add(0, 0, gfx.width, gfx.height);   // full-screen repaint
                 // Cache the freshly painted background (without windows) so a
                 // moving window can be erased by restoring its old rect.
@@ -7682,6 +7690,13 @@ struct Win11Desktop {
             bool menu_up = mforms_desktop_menu_open();
             uint32_t osig = running_mask();
             osig ^= start_menu_open ? 0x5A5A5A5Au : 0u;
+            // FIX #menu-freeze (2026-10-23): managed (C#) Start menu / popup state
+            // was invisible to this signature -- start_menu_open only tracks the
+            // native fallback.  A popup opened via right-click changed NO osig
+            // component, so once g_over_force_n drained the overlay was never
+            // repainted again (menu stuck half-drawn until a mouse event).
+            // menu_up comes from mforms_desktop_menu_open() (IsMenuOpen|ContextOpen).
+            osig ^= menu_up ? 0xA5A5A5A5u : 0u;
             // Taskbar hover highlight.  Deliberately skipped while a window is
             // animating: the pointer position feeding this hash changes as the
             // mouse moves, which forced a full C# taskbar repaint (~20-30 ms)
@@ -7698,7 +7713,7 @@ struct Win11Desktop {
             bool over_dirty = repaint_desk            // desktop overwrote the strip
                             || (g_mforms_anim != 0)   // animation: repaint EVERY frame (no down-sampling -> buttery motion)
                             || g_over_force_n > 0     // managed state settling
-                            || g_over_idle >= 30      // clock tick / safety net
+                            || g_over_idle >= 2       // FIX #menu-freeze: 2 idle keepalive calls ~= 1s fallback
                             || osig != g_over_sig;
             if (over_dirty) {
                 mforms_paint_overlay(gfx.width, gfx.height);
@@ -7833,17 +7848,18 @@ struct Win11Desktop {
             // control settles back to its steady state, and the next frame
             // captures clean pixels.
             bool intersects = false;
-            bool under_covered = false;
+            // FIX #ghost-cursor: a dirty rect only proves the area was FLIPPED,
+            // not that the backbuffer pixels under the pointer were REWRITTEN.
+            // The L7715 blanket full-screen flush and the BUG-C1 window rects
+            // mark unwritten regions; trusting them baked stale cursor pixels
+            // into save_bg() (permanent ghost after long-press / menu hover).
+            // Only a real desktop-layer repaint guarantees clean pixels.
+            bool under_covered = bg_repainted_this_frame;
             for (int n = g_dmg_head; n >= 0; n = g_dnode[n].next) {
                 DmgNode& r = g_dnode[n];
                 if (cx0 < r.x + r.w && cx0 + cw > r.x &&
                     cy0 < r.y + r.h && cy0 + ch > r.y)
                     intersects = true;
-                if (r.x <= cx0 && r.y <= cy0 &&
-                    r.x + r.w >= cx0 + cw && r.y + r.h >= cy0 + ch) {
-                    under_covered = true;
-                    break;
-                }
             }
             if (cursor.saved_valid && !under_covered) {
                 // Desktop layer retained: old cursor pixels may still linger in
@@ -11208,6 +11224,17 @@ void gui_tick(void) {
         // shell at 30 fps even after the compositor was optimised down to a
         // ~14 ms frame -- the cap, not the renderer, was the bottleneck.
         if ((uint32_t)(now - g_wm.last_ai_repaint_ms) >= 16) {
+            g_wm.last_ai_repaint_ms = now;
+            g_wm.render_all();
+        }
+    } else {
+        // FIX #menu-freeze: with anim==0 gui_tick never drove render_all, so
+        // g_over_idle could never reach its fallback count while the pointer
+        // was still -- a half-drawn menu stayed frozen forever.  A 2 Hz
+        // keepalive lets the overlay safety net fire within ~1 s; idle frames
+        // cost almost nothing (empty damage list -> no flip work).
+        uint32_t now = g_wm.tick_ms_now();
+        if ((uint32_t)(now - g_wm.last_ai_repaint_ms) >= 500) {
             g_wm.last_ai_repaint_ms = now;
             g_wm.render_all();
         }
