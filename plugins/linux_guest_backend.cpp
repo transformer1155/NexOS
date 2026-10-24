@@ -14,6 +14,7 @@
 #include "linux_guest_backend.h"
 #include "linux_manager.h"      /* lifecycle FSM + framebuffer accessor */
 #include "vmm.h"                /* built-in hypervisor (bare-metal backend) */
+#include "guest_blob.h"         /* minimal guest payload (guest_smoke.asm) */
 #include "plugin_manager.h"    /* svc_fn, svc_lookup */
 
 #include <stdint.h>
@@ -121,21 +122,22 @@ static int  vmm_b_launch(void) {
     if (!vmm_available()) return -1;
     if (!g_vmm_guest) g_vmm_guest = vmm_create_guest(0);
     if (!g_vmm_guest) return -1;
-    /* Phase-1 smoke: paint a recognizable test pattern into the shared FB so
-     * the GUI window proves the shared-framebuffer path.  Real guest entry
-     * (vmm_run_once) replaces this once VMX/SVM is wired. */
-    int w = 0, h = 0;
-    uint32_t* fb = (uint32_t*)vmm_guest_fb(g_vmm_guest, &w, &h);
-    if (fb && w > 0 && h > 0) {
-        for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++) {
-                uint8_t r = (uint8_t)((x * 255) / w);
-                uint8_t g = (uint8_t)((y * 255) / h);
-                uint8_t b = (uint8_t)(((x ^ y) * 255) / w);
-                fb[y * w + x] = (0xFFu << 24) | ((uint32_t)r << 16) |
-                                ((uint32_t)g << 8) | b;
-            }
+
+    /* Load the minimal guest program (guest_blob.h, assembled from
+     * plugins/guest_smoke.asm) at GUEST_CODE_PHYS.  It paints the shared
+     * framebuffer, emits "ready" on the vUART, then traps via the exit port.
+     *
+     * Today the payload runs on real hardware only (vmm_run_once needs the
+     * VMX/SVM entry path).  Where no hardware virtualization exists, the
+     * launch reports failure and the caller keeps using the VNC backend. */
+    if (vmm_load_blob(g_vmm_guest, GUEST_CODE_PHYS, guest_blob,
+                      (uint32_t)GUEST_BLOB_LEN) != 0) {
+        return -1;
     }
+    /* Run the guest.  On real hardware this enters the VM; the guest paints
+     * the framebuffer and writes "ready" to the vUART before trapping back. */
+    int r = vmm_run_once(g_vmm_guest);
+    if (r < 0) return -1;
     return 0;
 }
 static int  vmm_b_shutdown(void) {
@@ -196,7 +198,58 @@ static const LinuxGuestBackend g_lgb_vmm = {
     vmm_b_read_fb, vmm_b_send_input, vmm_b_status,
 };
 
-/* Selector: pick the VMM backend when hardware virtualization is present. */
+/* Selector: pick the VMM backend when hardware virtualization is present.
+ * Runs a full bring-up probe (init + VMRUN of the smoke guest) once at GUI
+ * bring-up so the serial log carries the SVM bring-up result even before any
+ * Linux window is opened -- the SVM plumbing is debugged from boot logs. */
 void lgb_use_vmm_if_available(void) {
-    if (vmm_available()) lgb_set_backend(&g_lgb_vmm);
+    if (!vmm_available()) {
+        pm_serial("[VMM2] hw virtualization: none (falling back to VNC)\n");
+        return;
+    }
+    pm_serial("[VMM2] hw virtualization detected, probing VMRUN...\n");
+    if (vmm_b_init() != 0) {
+        pm_serial("[VMM2] vmm_init failed\n");
+        return;
+    }
+    /* Probe: load + run the smoke guest once. */
+    g_vmm_guest = vmm_create_guest(0);
+    if (!g_vmm_guest) { pm_serial("[VMM2] guest alloc failed\n"); return; }
+    if (vmm_load_blob(g_vmm_guest, GUEST_CODE_PHYS, guest_blob,
+                      (uint32_t)GUEST_BLOB_LEN) != 0) {
+        pm_serial("[VMM2] blob load failed\n");
+        return;
+    }
+    int r = vmm_run_once(g_vmm_guest);
+    if (r < 0) pm_serial("[VMM2] VMRUN probe FAILED (see [VMM] dump above)\n");
+    else {
+        pm_serial("[VMM2] VMRUN probe OK: guest entered and exited\n");
+        /* Verify the guest actually did its job:
+         *  - vUART bytes ("ready") should sit in the tx ring,
+         *  - framebuffer pixel(0,0) should be the smoke gradient (blue 0x80). */
+        uint32_t tx = vmm_uart_tx_count(g_vmm_guest);
+        pm_serial("[VMM2] vuart tx bytes: ");
+        { char nb[12]; int ni=0,t=(int)tx; if(!t)nb[ni++]='0'; else{char tmp[10];int tn=0;while(t){tmp[tn++]=('0'+t%10);t/=10;}while(tn)nb[ni++]=tmp[--tn];} nb[ni]=0;
+          for(int i=0;i<ni;i++) pm_serial(""); }
+        pm_serial("\n");
+        int w=0,h=0; uint32_t* fb=(uint32_t*)vmm_guest_fb(g_vmm_guest,&w,&h);
+        if (fb) {
+            uint32_t p0=fb[0], pm=fb[(h/2)*w+w/2];
+            pm_serial("[VMM2] fb pixel(0,0)=0x");
+            static const char* hx="0123456789ABCDEF";
+            for(int i=7;i>=0;i--) { char c[2]={hx[(p0>>(i*4))&0xF],0}; pm_serial(c); }
+            pm_serial(" pixel(mid)=0x");
+            for(int i=7;i>=0;i--) { char c[2]={hx[(pm>>(i*4))&0xF],0}; pm_serial(c); }
+            pm_serial("\n");
+        }
+        /* drain any vUART text the guest emitted */
+        for (;;) {
+            int c = vmm_uart_tx_pop(g_vmm_guest);
+            if (c < 0) break;
+            char cc[2] = { (char)c, 0 };
+            pm_serial(cc);
+        }
+        pm_serial("\n");
+        lgb_set_backend(&g_lgb_vmm);
+    }
 }

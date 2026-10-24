@@ -342,6 +342,8 @@ namespace NexOS.Forms
         internal static Action<int> OpenAppHook;     // create a real window for a Kind
         internal static Action<int, int> WinActionHook;  // window geometry action (id, WAct)
         internal static Action ExitGuiHook;          // leave GUI mode
+        internal static Action RepaintHook;          // push the backbuffer now
+        internal static Action<int> WindowTransparentHook; // whole-window opacity
         internal static string FsRoot = "";
 
         static string[][] listing = new string[4][];
@@ -695,6 +697,45 @@ namespace NexOS.Forms
             if (WinActionHook != null) WinActionHook(id, code);
         }
 
+        // Push the already-painted backbuffer to the screen right now.        // The kernel Repaint() is a present-only internal call; here the
+        // WinForms harness owns the frame, so invalidate and let the paint
+        // handler blit immediately.  Safe to call from inside a paint.
+        public static void Repaint() { if (RepaintHook != null) RepaintHook(); }
+
+        // Toggle "whole window fully transparent" (the desktop shows through
+        // every window's glassy chrome).  On the WinForms host the opacity is
+        // applied by the shell form; 0 restores normal opacity.
+        public static void SetWindowTransparent(int on)
+        {
+            if (WindowTransparentHook != null) WindowTransparentHook(on);
+        }
+
+        // System load 0..100 from the GUI loop's idle accounting.  The
+        // WinForms host has no TSC idle counter; approximate with the
+        // process CPU time share since the previous sample.
+        static long s_cpuLastTicks;
+        static long s_cpuLastMs = Environment.TickCount;
+        public static int CpuLoad()
+        {
+            try
+            {
+                var p = System.Diagnostics.Process.GetCurrentProcess();
+                long cpu = p.TotalProcessorTime.Ticks;
+                long now = Environment.TickCount;
+                long wall = now - s_cpuLastMs;
+                if (wall <= 0) return 0;
+                long used = cpu - s_cpuLastTicks;
+                s_cpuLastTicks = cpu;
+                s_cpuLastMs = now;
+                // Ratio of CPU time to wall time, scaled to a 0..100 percent.
+                long pct = used * 100 / (wall * TimeSpan.TicksPerMillisecond);
+                if (pct < 0) pct = 0;
+                if (pct > 100) pct = 100;
+                return (int)pct;
+            }
+            catch { return 0; }
+        }
+
         public static void Log(string s) { Console.WriteLine("[shell] " + s); }
 
         // Persist a text body (dev harness: write to the working directory).
@@ -721,6 +762,128 @@ namespace NexOS.Forms
         // kernel framebuffer, so it is a no-op.  Kept for Theme.ApplyPixel
         // parity between the two build targets.
         public static void SetPixel(int mode, int scale, int scan) { }
+
+        // ---- network downloads ---------------------------------------
+        // Backing store for the three kernel-facing download InternalCalls.
+        // All real I/O is in NexOS.Net (NetStack.cs); these are thin,
+        // signature-stable shims because the kernel MiniCLR cannot await.
+        //
+        //   DownloadFile   : synchronous, SmartDownloadRouter (5MB split)
+        //   DownloadAsync  : fire-and-forget, MultiPathManager aggregation
+        //   DownloadStatus : JSON progress snapshot for either path
+        //   DownloadCancel : abort an in-flight DownloadAsync
+        static readonly System.Collections.Generic.Dictionary<string, System.Threading.CancellationTokenSource> s_dlCancel
+            = new System.Collections.Generic.Dictionary<string, System.Threading.CancellationTokenSource>();
+        static readonly object s_dlLock = new object();
+
+        // Resolve a managed destination path against the host FS root so a
+        // kernel-relative name like "mkfs/a.bin" lands under the mapped tree.
+        static string DlDest(string dest)
+        {
+            if (string.IsNullOrEmpty(dest)) return dest;
+            try
+            {
+                if (System.IO.Path.IsPathRooted(dest)) return dest;
+                string root = string.IsNullOrEmpty(FsRoot) ? AppContext.BaseDirectory : FsRoot;
+                return System.IO.Path.GetFullPath(System.IO.Path.Combine(root, dest));
+            }
+            catch { return dest; }
+        }
+
+        // Synchronous download through the router: files under 5MB take the
+        // single-socket fast path, larger ones get HTTP-Range sharding with
+        // IDM-style resume.  Returns bytes written, or a negative error code.
+        public static int DownloadFile(string url, string dest, int timeoutMs)
+        {
+            if (string.IsNullOrEmpty(url) || string.IsNullOrEmpty(dest)) return -1;
+            string path = DlDest(dest);
+            try
+            {
+                long n = NexOS.Net.SmartDownloadRouter
+                    .DownloadFileAsync(url, path, timeoutMs, null)
+                    .GetAwaiter().GetResult();
+                return n > int.MaxValue ? int.MaxValue : (int)n;
+            }
+            catch (Exception ex)
+            {
+                Log("[dl] DownloadFile failed: " + ex.Message);
+                return -2;
+            }
+        }
+
+        // Start an aggregated multi-NIC download in the background and return
+        // immediately (0 == started).  This is the body of the MCP tool
+        // "download_async".  Poll DownloadStatus(dest) for progress.
+        public static int DownloadAsync(string url, string dest)
+        {
+            if (string.IsNullOrEmpty(url) || string.IsNullOrEmpty(dest)) return -1;
+            string path = DlDest(dest);
+            var cts = new System.Threading.CancellationTokenSource();
+            lock (s_dlLock) { s_dlCancel[path] = cts; }
+
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                try
+                {
+                    NexOS.Net.MultiPathManager
+                        .DownloadAsync(url, path, null, cts.Token)
+                        .GetAwaiter().GetResult();
+                }
+                catch (Exception ex)
+                {
+                    Log("[dl] multipath failed: " + ex.Message);
+                }
+                finally
+                {
+                    lock (s_dlLock) { s_dlCancel.Remove(path); }
+                    cts.Dispose();
+                }
+            });
+            return 0;
+        }
+
+        // JSON progress snapshot.  Prefers the multipath registry, then the
+        // smart-downloader registry, then the persisted resume manifest, so a
+        // download that survived an app restart still reports its offsets.
+        public static string DownloadStatus(string dest)
+        {
+            if (string.IsNullOrEmpty(dest)) return "{\"code\":5}";
+            string path = DlDest(dest);
+            NexOS.Net.DownloadProgress p = null;
+            if (!NexOS.Net.MultiPathManager.s_progress.TryGetValue(path, out p) || p == null)
+                if (!NexOS.Net.SmartDownloadRouter.s_progress.TryGetValue(path, out p) || p == null)
+                    p = NexOS.Net.SmartDownloader.Peek(path);
+            if (p == null) return "{\"code\":4,\"state\":\"Idle\"}";
+            return "{\"code\":0"
+                 + ",\"state\":\"" + p.State + "\""
+                 + ",\"total\":" + p.Total
+                 + ",\"received\":" + p.Received
+                 + ",\"percent\":" + p.Percent
+                 + ",\"slices\":" + p.Slices
+                 + ",\"done\":" + p.DoneSlices
+                 + ",\"bps\":" + (long)p.ThroughputBps
+                 + ",\"error\":\"" + (p.Error ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""
+                 + "}";
+        }
+
+        // Abort a running DownloadAsync.  The resume manifest is left on disk,
+        // so a later DownloadFile to the same destination continues from the
+        // recorded per-slice offsets instead of restarting.
+        public static int DownloadCancel(string dest)
+        {
+            if (string.IsNullOrEmpty(dest)) return -1;
+            string path = DlDest(dest);
+            lock (s_dlLock)
+            {
+                System.Threading.CancellationTokenSource cts;
+                if (s_dlCancel.TryGetValue(path, out cts))
+                {
+                    try { cts.Cancel(); } catch { }
+                    return 0;
+                }
+            }
+            return -2;
+        }
     }
 }
 
@@ -767,5 +930,307 @@ namespace NexOS
         public static string IntToStr(int v) { return v.ToString(System.Globalization.CultureInfo.InvariantCulture); }
 
         public static int TickCount() { return Environment.TickCount; }
+    }
+}
+
+
+
+namespace NexOS.Forms
+{
+    // -----------------------------------------------------------------
+    //  Backend  --  WinHost implementations of the NexOS.AI / NexOS.MCP
+    //           internal calls.  The kernel build binds these names in
+    //           clr.cpp via ic_ai_* / ic_mcp_*; here we give them real
+    //           managed bodies on top of HttpClient so the *same* managed
+    //           app sources (NexOS.AI / NexOS.MCP) run unchanged on the
+    //           Windows host.  Signatures are referenced from AI.cs / MCP.cs
+    //           and must stay in lock-step.
+    // -----------------------------------------------------------------
+    using System.Net.Http;
+    using System.Threading.Tasks;
+
+    public static class Backend
+    {
+        // AI gateway host-side address (matches nexos_ai.h AIGateway).
+        const string GATEWAY = "http://127.0.0.1:19387";
+        static int    s_mode = 1; // Balanced by default
+
+        static readonly HttpClient s_http = new HttpClient();
+        static readonly object     s_lock = new object();
+
+        // ---- AI surface ----
+        public static int AICurrentMode { get { return s_mode; } }
+        public static void AISetMode(int m) { s_mode = m; }
+
+        public static int AIQuota()
+        {
+            try
+            {
+                string r = s_http.GetStringAsync(GATEWAY + "/quota").Result;
+                // naive int parse of "123" or {"quota":123}
+                int i = r.LastIndexOf(':');
+                if (i >= 0) r = r.Substring(i + 1).Trim('}', ' ', '"');
+                int v; return int.TryParse(r, out v) ? v : 1000;
+            }
+            catch { return 1000; }
+        }
+
+        public static Task<NexOS.AI.AIResponse> AIRequestAsync(string prompt, NexOS.AI.AIMode mode)
+        {
+            return Task.Run(() =>
+            {
+                var resp = new NexOS.AI.AIResponse();
+                try
+                {
+                    int m;
+                    if (mode == NexOS.AI.AIMode.Fast) m = 0;
+                    else if (mode == NexOS.AI.AIMode.Heavy) m = 2;
+                    else m = 1;
+                    s_mode = m;
+                    var c = new StringContent(
+                        "{\"prompt\":\"" + (prompt ?? "").Replace("\"", "\\\"") + "\",\"mode\":" + m + "}",
+                        System.Text.Encoding.UTF8, "application/json");
+                    var t = s_http.PostAsync(GATEWAY + "/ai", c).Result;
+                    string body = t.IsSuccessStatusCode
+                        ? t.Content.ReadAsStringAsync().Result
+                        : "";
+                    resp.code = t.IsSuccessStatusCode ? 0 : 5;
+                    resp.text = body;
+                    resp.mode = m;
+                    resp.quotaLeft = AIQuota();
+                }
+                catch (System.Exception ex)
+                {
+                    resp.code = 5;
+                    resp.text = ex.Message;
+                    resp.mode = s_mode;
+                    resp.quotaLeft = 0;
+                }
+                return resp;
+            });
+        }
+
+        // ---- MCP tool registry ---------------------------------------
+        // The resident identity on WinHost is just the assembly name. A real
+        // deployment would derive this from the booted .mex; for parity with
+        // the kernel it is read once at startup by ShellForm via SetMcpAppId.
+        static string s_myAppId = "winhost";
+
+        public static void SetMcpAppId(string id) { if (!string.IsNullOrEmpty(id)) s_myAppId = id; }
+        public static string McpMyAppId() { return s_myAppId; }
+
+        // Every host-served tool, in one table. This is the authoritative
+        // list on the WinHost side; the kernel-side mirror lives in
+        // apps.json (app_id "winhost") + g_mcp_impls[] in nexos_ai.cpp.
+        // Keep the three in sync -- see docs/MCP_TOOLS.md.
+        public sealed class McpToolSpec
+        {
+            public string Name;
+            public string Description;
+            public string ParametersSchema;   // JSON Schema literal
+        }
+
+        static readonly McpToolSpec[] s_localTools =
+        {
+            new McpToolSpec
+            {
+                Name = "download_file",
+                Description = "Download a URL to a local path synchronously. Files under 5MB use a single-socket fast path; larger files are split into HTTP Range shards with an IDM-style resume state machine. Returns bytes written, or a negative error code.",
+                ParametersSchema = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute http(s) URL\"},\"dest\":{\"type\":\"string\",\"description\":\"Destination file path\"},\"timeout_ms\":{\"type\":\"integer\",\"description\":\"Per-request timeout in ms (0 = default)\"}},\"required\":[\"url\",\"dest\"]}",
+            },
+            new McpToolSpec
+            {
+                Name = "download_async",
+                Description = "Start an aggregated multi-NIC download in the background and return immediately. Detects every usable WiFi/Ethernet link, binds one socket per NIC, gives each a disjoint byte range, and fetches them in parallel to aggregate physical bandwidth (bypassing TCP head-of-line blocking). Poll download_status for progress.",
+                ParametersSchema = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute http(s) URL\"},\"dest\":{\"type\":\"string\",\"description\":\"Destination file path\"}},\"required\":[\"url\",\"dest\"]}",
+            },
+            new McpToolSpec
+            {
+                Name = "download_status",
+                Description = "Report progress of a download started by download_file or download_async. Falls back to the persisted resume manifest so an interrupted (or restarted) download still reports its per-slice offsets.",
+                ParametersSchema = "{\"type\":\"object\",\"properties\":{\"dest\":{\"type\":\"string\",\"description\":\"Destination file path used when starting the download\"}},\"required\":[\"dest\"]}",
+            },
+            new McpToolSpec
+            {
+                Name = "download_cancel",
+                Description = "Abort a running download_async. The resume manifest is kept, so a later download_file to the same destination continues from the recorded per-slice offsets instead of restarting.",
+                ParametersSchema = "{\"type\":\"object\",\"properties\":{\"dest\":{\"type\":\"string\",\"description\":\"Destination file path\"}},\"required\":[\"dest\"]}",
+            },
+            new McpToolSpec
+            {
+                Name = "net_status",
+                Description = "Report the MCP bus connection state: whether the framed TCP bus is connected, last/min/max heartbeat round-trip latency in ms, heartbeat and reconnect counters, uptime, and how many requests are pending or queued for replay.",
+                ParametersSchema = "{\"type\":\"object\",\"properties\":{}}",
+            },
+        };
+
+        // The tool catalogue as a JSON array, so an AI agent (or a registry
+        // dump) can enumerate what this host exposes without guessing.
+        public static string McpListTools()
+        {
+            var sb = new StringBuilder("{\"code\":0,\"app_id\":\"");
+            sb.Append(Escape(s_myAppId)).Append("\",\"tools\":[");
+            for (int i = 0; i < s_localTools.Length; i++)
+            {
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"tool_name\":\"").Append(Escape(s_localTools[i].Name))
+                  .Append("\",\"description\":\"").Append(Escape(s_localTools[i].Description))
+                  .Append("\",\"parameters_schema\":").Append(s_localTools[i].ParametersSchema)
+                  .Append('}');
+            }
+            return sb.Append("]}").ToString();
+        }
+
+        static bool IsLocalTool(string name)
+        {
+            for (int i = 0; i < s_localTools.Length; i++)
+                if (s_localTools[i].Name == name) return true;
+            return false;
+        }
+
+        public static string McpCallTool(string target_app_id, string tool_name, string json_args)
+        {
+            // ---- local tools ------------------------------------------
+            // download_* and net_status are served by the host itself: the bus
+            // gateway has no network stack, and the whole point of
+            // download_async is that it binds the *local* WiFi/NIC sockets to
+            // aggregate bandwidth.
+            string local = McpLocalTool(target_app_id, tool_name, json_args);
+            if (local != null) return local;
+
+            try
+            {
+                var c = new StringContent(
+                    "{\"source_app_id\":\"" + s_myAppId.Replace("\"", "\\\"") +
+                    "\",\"tool_name\":\"" + (tool_name ?? "").Replace("\"", "\\\"") +
+                    "\",\"json_args\":" + (json_args ?? "null") + "}",
+                    System.Text.Encoding.UTF8, "application/json");
+                var t = s_http.PostAsync(GATEWAY + "/mcp/" + (target_app_id ?? ""), c).Result;
+                string body = t.IsSuccessStatusCode ? t.Content.ReadAsStringAsync().Result : "{\"code\":5}";
+                return body;
+            }
+            catch (System.Exception ex)
+            {
+                return "{\"code\":5,\"json\":\"" + ex.Message.Replace("\"", "\\\"") + "\"}";
+            }
+        }
+
+        // Host-served MCP tools.  Returns null when the tool is not ours so the
+        // caller falls through to the gateway bus.
+        static string McpLocalTool(string target_app_id, string tool_name, string json_args)
+        {
+            if (string.IsNullOrEmpty(tool_name)) return null;
+            string t = tool_name.Trim();
+
+            // Catalogue introspection: always answer, no parameters.
+            if (t == "tools_list" || t == "mcp_list_tools") return McpListTools();
+
+            if (!IsLocalTool(t)) return null;
+
+            string url = JsonStr(json_args, "url");
+            string dest = JsonStr(json_args, "dest");
+            if (string.IsNullOrEmpty(dest)) dest = JsonStr(json_args, "path");
+            if (string.IsNullOrEmpty(dest)) dest = JsonStr(json_args, "destination");
+
+            switch (t)
+            {
+                case "net_status":
+                    return NetStatusJson();
+
+                case "download_async":
+                {
+                    if (string.IsNullOrEmpty(url) || string.IsNullOrEmpty(dest))
+                        return "{\"code\":2,\"json\":\"missing url/dest\"}";
+                    int rc = NexOS.Forms.Host.DownloadAsync(url, dest);
+                    return "{\"code\":" + (rc == 0 ? 0 : 5) + ",\"json\":\"" +
+                           (rc == 0 ? "started" : "failed") + "\",\"dest\":\"" +
+                           Escape(dest) + "\"}";
+                }
+                case "download_file":
+                {
+                    if (string.IsNullOrEmpty(url) || string.IsNullOrEmpty(dest))
+                        return "{\"code\":2,\"json\":\"missing url/dest\"}";
+                    int n = NexOS.Forms.Host.DownloadFile(url, dest, 0);
+                    return "{\"code\":" + (n >= 0 ? 0 : 5) + ",\"bytes\":" + n + ",\"dest\":\"" + Escape(dest) + "\"}";
+                }
+                case "download_status":
+                    return NexOS.Forms.Host.DownloadStatus(dest);
+                default:
+                {
+                    int c = NexOS.Forms.Host.DownloadCancel(dest);
+                    return "{\"code\":" + (c == 0 ? 0 : 4) + ",\"json\":\"" + (c == 0 ? "cancelled" : "not running") + "\"}";
+                }
+            }
+        }
+
+        // Public wrappers used by NexOS.MCP.Net (MCP.cs).
+        public static string McpNetStatus() { return NetStatusJson(); }
+
+        // net_status payload: the MCP bus connection state plus heartbeat
+        // latency. An AI agent can use this to distinguish "connected and
+        // healthy" from "connected but the link is degrading" (rising RTT or
+        // missed heartbeats) without opening a socket itself.
+        static string NetStatusJson()
+        {
+            var st = NexOS.Net.McpBusHost.Status();
+            if (st == null) return "{\"code\":5,\"error\":\"no bus status\"}";
+
+            var sb = new StringBuilder("{\"code\":0");
+            sb.Append(",\"connected\":").Append(st.Connected ? "true" : "false");
+            sb.Append(",\"host\":\"").Append(Escape(st.Host)).Append('"');
+            sb.Append(",\"port\":").Append(st.Port);
+            sb.Append(",\"rtt_ms\":").Append(st.LastRttMs);
+            sb.Append(",\"rtt_min_ms\":").Append(st.MinRttMs);
+            sb.Append(",\"rtt_max_ms\":").Append(st.MaxRttMs);
+            sb.Append(",\"rtt_samples\":").Append(st.RttSamples);
+            sb.Append(",\"heartbeats_sent\":").Append(st.HeartbeatsSent);
+            sb.Append(",\"heartbeats_missed\":").Append(st.HeartbeatsMissed);
+            sb.Append(",\"connects\":").Append(st.ConnectCount);
+            sb.Append(",\"reconnects\":").Append(st.ReconnectCount);
+            sb.Append(",\"uptime_ms\":").Append(st.UptimeMs);
+            sb.Append(",\"pending_requests\":").Append(st.PendingRequests);
+            sb.Append(",\"outbox_depth\":").Append(st.OutboxDepth);
+            // Coarse health verdict so the model does not have to interpret
+            // raw counters itself.
+            string health;
+            if (!st.Connected) health = "down";
+            else if (st.LastRttMs < 0) health = "connected";           // no sample yet
+            else if (st.HeartbeatsMissed > 0) health = "degraded";
+            else if (st.LastRttMs > 500) health = "slow";
+            else health = "healthy";
+            sb.Append(",\"health\":\"").Append(health).Append('"');
+            return sb.Append('}').ToString();
+        }
+
+        // Minimal JSON string extractor (the args object is flat in practice).
+        static string JsonStr(string json, string key)
+        {
+            if (string.IsNullOrEmpty(json)) return null;
+            int i = json.IndexOf("\"" + key + "\"", StringComparison.Ordinal);
+            if (i < 0) return null;
+            int c = json.IndexOf(':', i);
+            if (c < 0) return null;
+            int q = json.IndexOf('"', c + 1);
+            if (q < 0) return null;
+            var sb = new StringBuilder();
+            for (int k = q + 1; k < json.Length; k++)
+            {
+                char ch = json[k];
+                if (ch == '\\' && k + 1 < json.Length)
+                {
+                    char nx = json[++k];
+                    sb.Append(nx == 'n' ? '\n' : nx == 't' ? '\t' : nx);
+                    continue;
+                }
+                if (ch == '"') break;
+                sb.Append(ch);
+            }
+            return sb.ToString();
+        }
+
+        static string Escape(string s)
+        {
+            return (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
     }
 }

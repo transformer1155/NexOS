@@ -18,6 +18,8 @@
 //      array    [0]=0xFFFFFFFD  [4]=count  [8]=elem size  [12..]=data
 // =====================================================================
 #include "clr.h"
+#include "nexos_ai.h"
+#include "systemalgo.h"
 
 extern "C" void* kmalloc(uint32_t size);
 
@@ -333,6 +335,114 @@ extern "C" int clr_register_icall(const char* fqname, clr_icall_fn fn) {
     return 0;
 }
 
+// ---- NexOS.AI / NexOS.MCP icalls (kernel side) ----
+// Trusted resident identity: the basename of the .mex booted by
+// clr_run_resident.  mcp_dispatch_request uses THIS as the caller id,
+// never the managed-side hint, so an app cannot spoof who it is.
+static char g_current_app_id[64] = {0};
+
+static int32_t ai_mk_cstr(const char* src) {
+    int n = 0; while (src && src[n]) n++;
+    uint8_t* o = heap_alloc(8 + (uint32_t)n + 1);
+    if (!o) return 0;
+    *(uint32_t*)o = OBJ_STRING;
+    *(uint32_t*)(o + 4) = (uint32_t)n;
+    if (n) mcpy_(o + 8, src, n);
+    o[8 + n] = 0;
+    return (int32_t)(uint32_t)o;
+}
+
+static int32_t ic_ai_get_mode(int32_t* a) { (void)a; return (int32_t)get_mode(); }
+
+static int32_t ic_ai_set_mode(int32_t* a) { set_mode(a[0]); return 0; }
+
+static int32_t ic_ai_quota(int32_t* a) { (void)a; return (int32_t)quota_remaining(); }
+
+static int32_t ic_ai_request(int32_t* a) {
+    const char* prompt = a[0] ? str_data(a[0]) : "";
+    int mode = a[1];
+    static char out[512];
+    ai_request(prompt, mode, out, (int)sizeof(out));
+    return ai_mk_cstr(out);
+}
+
+static int32_t ic_mcp_myid(int32_t* a) { (void)a; return ai_mk_cstr(g_current_app_id); }
+
+static int32_t ic_mcp_call(int32_t* a) {
+    const char* tgt  = a[0] ? str_data(a[0]) : "";
+    const char* tool = a[1] ? str_data(a[1]) : "";
+    const char* args = a[2] ? str_data(a[2]) : "";
+    const char* r = mcp_dispatch_request(g_current_app_id, tgt, tool, args);
+    return ai_mk_cstr(r);
+}
+
+
+// ---------------------------------------------------------------------
+//  NexOS.SystemAlgo  --  system-level algorithm service
+// ---------------------------------------------------------------------
+//  Managed int[] arguments arrive as a raw pointer to the object header:
+//    [0]=OBJ_ARRAY  [4]=count  [8]=elemSize  [12..]=int32 data
+//  Caller-supplied output arrays are written in place (the managed heap
+//  is reset every GUI frame, so icalls never return a fresh array).
+static inline int32_t arr_len(int32_t obj) {
+    return obj ? (int32_t)*(uint32_t*)((uint32_t)obj + 4) : 0;
+}
+static inline int32_t* arr_data(int32_t obj) {
+    return (int32_t*)((uint32_t)obj + 12);
+}
+
+static int32_t ic_sa_spatial_create(int32_t* a) {
+    return sa_spatial_create(a[0], a[1]);
+}
+static int32_t ic_sa_spatial_insert(int32_t* a) {
+    return sa_spatial_insert(a[0], a[1], a[2], a[3], a[4]);
+}
+static int32_t ic_sa_spatial_query(int32_t* a) {
+    return sa_spatial_query(a[0], a[1], a[2], a[3], a[4],
+                            a[5] ? arr_data(a[5]) : 0, a[6]);
+}
+static int32_t ic_sa_spatial_destroy(int32_t* a) {
+    sa_spatial_destroy(a[0]); return 0;
+}
+static int32_t ic_sa_astar(int32_t* a) {
+    return sa_astar(a[0], a[1], a[2] ? arr_data(a[2]) : 0,
+                    a[3], a[4], a[5], a[6],
+                    a[7] ? arr_data(a[7]) : 0, arr_len(a[7]));
+}
+static int32_t ic_sa_dot(int32_t* a) {
+    return sa_dot(a[0] ? arr_data(a[0]) : 0, arr_len(a[0]),
+                  a[1] ? arr_data(a[1]) : 0, arr_len(a[1]));
+}
+static int32_t ic_sa_cosine(int32_t* a) {
+    return sa_cosine(a[0] ? arr_data(a[0]) : 0, arr_len(a[0]),
+                     a[1] ? arr_data(a[1]) : 0, arr_len(a[1]));
+}
+static int32_t ic_sa_levenshtein(int32_t* a) {
+    return sa_levenshtein(a[0] ? str_data(a[0]) : 0, a[0] ? str_len(a[0]) : 0,
+                          a[1] ? str_data(a[1]) : 0, a[1] ? str_len(a[1]) : 0);
+}
+static int32_t ic_sa_bloom_create(int32_t* a) { return sa_bloom_create(a[0]); }
+static int32_t ic_sa_bloom_add(int32_t* a) {
+    sa_bloom_add(a[0], a[1] ? str_data(a[1]) : 0, a[1] ? str_len(a[1]) : 0);
+    return 0;
+}
+static int32_t ic_sa_bloom_contains(int32_t* a) {
+    return sa_bloom_contains(a[0], a[1] ? str_data(a[1]) : 0, a[1] ? str_len(a[1]) : 0);
+}
+static int32_t ic_sa_bloom_destroy(int32_t* a) { sa_bloom_destroy(a[0]); return 0; }
+static int32_t ic_sa_lru_create(int32_t* a) { return sa_lru_create(a[0]); }
+static int32_t ic_sa_lru_put(int32_t* a) { sa_lru_put(a[0], a[1], a[2]); return 0; }
+static int32_t ic_sa_lru_get(int32_t* a) { return sa_lru_get(a[0], a[1]); }
+static int32_t ic_sa_lru_contains(int32_t* a) { return sa_lru_contains(a[0], a[1]); }
+static int32_t ic_sa_lru_destroy(int32_t* a) { sa_lru_destroy(a[0]); return 0; }
+static int32_t ic_sa_sort(int32_t* a) {
+    if (a[0]) sa_sort(arr_data(a[0]), arr_len(a[0]));
+    return 0;
+}
+static int32_t ic_sa_topk(int32_t* a) {
+    return sa_topk(a[0] ? arr_data(a[0]) : 0, arr_len(a[0]), a[1],
+                   a[2] ? arr_data(a[2]) : 0, arr_len(a[2]));
+}
 static const IcallEntry g_icalls[] = {
     { "NexOS.Sys::Print",      ic_print       },
     { "NexOS.Sys::PrintInt",   ic_print_int   },
@@ -345,6 +455,31 @@ static const IcallEntry g_icalls[] = {
     { "NexOS.Sys::StrEq",      ic_str_eq      },
     { "NexOS.Sys::IntToStr",   ic_int_to_str  },
     { "NexOS.Sys::TickCount",  ic_tick_count  },
+    { "NexOS.AI::GetMode",           ic_ai_get_mode      },
+    { "NexOS.AI::SetMode",           ic_ai_set_mode      },
+    { "NexOS.AI::Request",           ic_ai_request       },
+    { "NexOS.AI::GetRemainingQuota", ic_ai_quota         },
+    { "NexOS.MCP::MyAppId",          ic_mcp_myid         },
+    { "NexOS.MCP::CallTool",         ic_mcp_call         },
+    { "NexOS.SystemAlgo::SpatialCreate",   ic_sa_spatial_create },
+    { "NexOS.SystemAlgo::SpatialInsert",   ic_sa_spatial_insert },
+    { "NexOS.SystemAlgo::SpatialQueryRadius", ic_sa_spatial_query },
+    { "NexOS.SystemAlgo::SpatialDestroy",  ic_sa_spatial_destroy },
+    { "NexOS.SystemAlgo::AStar",           ic_sa_astar },
+    { "NexOS.SystemAlgo::DotProduct",      ic_sa_dot },
+    { "NexOS.SystemAlgo::CosineSimilarity", ic_sa_cosine },
+    { "NexOS.SystemAlgo::Levenshtein",     ic_sa_levenshtein },
+    { "NexOS.SystemAlgo::BloomCreate",     ic_sa_bloom_create },
+    { "NexOS.SystemAlgo::BloomAdd",        ic_sa_bloom_add },
+    { "NexOS.SystemAlgo::BloomContains",   ic_sa_bloom_contains },
+    { "NexOS.SystemAlgo::BloomDestroy",    ic_sa_bloom_destroy },
+    { "NexOS.SystemAlgo::LruCreate",       ic_sa_lru_create },
+    { "NexOS.SystemAlgo::LruPut",          ic_sa_lru_put },
+    { "NexOS.SystemAlgo::LruGet",          ic_sa_lru_get },
+    { "NexOS.SystemAlgo::LruContains",     ic_sa_lru_contains },
+    { "NexOS.SystemAlgo::LruDestroy",      ic_sa_lru_destroy },
+    { "NexOS.SystemAlgo::Sort",            ic_sa_sort },
+    { "NexOS.SystemAlgo::TopK",            ic_sa_topk },
 };
 static const int G_ICALL_COUNT = (int)(sizeof(g_icalls) / sizeof(g_icalls[0]));
 
@@ -1047,6 +1182,11 @@ extern "C" int32_t clr_new_str(const char* s) {
 
 extern "C" const char* clr_last_report(void) { return g_report; }
 
+// Records the .mex basename as the trusted MCP identity and endorses it with
+// the bus.  Defined below (near the resident hosting API) and used by both
+// clr_run() and clr_load().
+static void note_resident_identity(const char* filename);
+
 extern "C" int clr_run(const char* filename) {
     g_fault = 0;
     g_steps = 0;
@@ -1058,6 +1198,10 @@ extern "C" int clr_run(const char* filename) {
         if (!g_report[0]) scpy_(g_report, "CLR: load failed", sizeof(g_report));
         return rc;
     }
+
+    // record trusted resident identity (basename of the .mex, no extension)
+    // and endorse it with the MCP bus so its ACL checks can pass.
+    note_resident_identity(filename);
 
     uint32_t entry = g_hdr->entry;
     if (entry >= g_hdr->n_methods) { fault("bad entry point"); return -2; }
@@ -1091,6 +1235,22 @@ extern "C" int clr_run(const char* filename) {
 // =====================================================================
 static int g_resident = 0;
 
+// Record the trusted resident identity for an image path: the basename of the
+// .mex with its extension stripped.  Both loaders (clr_run and clr_load) go
+// through this, so the ACL principal is correct no matter which path an app
+// arrived by.  The managed side never gets to influence this value.
+static void note_resident_identity(const char* filename) {
+    if (!filename) return;
+    const char* p = filename; const char* base = p;
+    while (*p) { if (*p=='/'||*p=='\\') base = p+1; p++; }
+    int i = 0;
+    while (base[i] && base[i]!='.' && i < 63) { g_current_app_id[i] = base[i]; i++; }
+    g_current_app_id[i] = 0;
+    // Endorse the identity with the MCP bus.  Until this runs the app is not
+    // in the trusted resident set and mcp_dispatch_request() will refuse it.
+    app_registry_note_resident(g_current_app_id);
+}
+
 extern "C" int clr_load(const char* filename) {
     g_fault = 0;
     g_steps = 0;
@@ -1105,6 +1265,9 @@ extern "C" int clr_load(const char* filename) {
         return rc;
     }
     g_resident = 1;
+    // A resident image becomes a first-class MCP citizen: its .mex basename is
+    // the identity the bus will check its outbound ACL against.
+    note_resident_identity(filename);
     scpy_(g_report, "CLR: ", sizeof(g_report));
     scat_(g_report, filename, sizeof(g_report));
     scat_(g_report, " resident", sizeof(g_report));

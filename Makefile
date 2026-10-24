@@ -155,13 +155,13 @@ HYBRID_IMG := $(BUILD)/os_hybrid.img
         test-all \
         play test-sec test-f0 test-fail test-w32 test-rclick inject \
         textboot \
-        csharp test-clr winhost winhost-shot
+        csharp test-clr winhost winhost-shot data-vdi
 
 # NOTE: default build reverted to the BIOS raw image (os.img) on 2026-08-12.
 # The CD/ISO path (boot_cd.asm) had an unresolved early-crash bug; the IMG
 # path (boot.asm -> stage2.asm) is the verified-good baseline, so it is the
 # default again until the CD path is fixed.  `make iso` still builds the ISO.
-all: $(IMG)
+all: $(IMG) $(BUILD)/data.vdi
 
 # =====================================================================
 #  BIOS boot path
@@ -226,6 +226,27 @@ PLUGIN_OBJS := $(BUILD)/plugin_manager.o $(BUILD)/plugins_boot.o $(BUILD)/hello_
                $(BUILD)/linux_loader.o $(BUILD)/vnc_client.o \
                 $(BUILD)/linux_manager.o $(BUILD)/linux_guest_backend.o \
                  $(BUILD)/vmm.o
+
+# ----- Hot-loadable driver framework (kernel side) ---------------------
+# driver_loader.c + driver_elf.c link INTO the kernel: they read .drv
+# images out of SFS and relocate them at run time.
+# Driver images (svm_driver.c) are NOT linked here -- they are separate
+# ELF32 REL .drv files loaded by name at run time.
+DRIVER_FW_OBJS := $(BUILD)/driver_loader.o $(BUILD)/driver_elf.o
+
+# NOTE: these are C files, so use gcc -- $(CC) is g++ and would compile them
+# as C++ (rejecting the C -> enum conversions and the .c idiom in general).
+DRIVER_C := gcc
+
+$(BUILD)/driver_loader.o: drivers/driver_loader.c drivers/driver_contract.h | $(BUILD)
+	$(DRIVER_C) -m32 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+		-fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra \
+		-Idrivers -c $< -o $@
+
+$(BUILD)/driver_elf.o: drivers/driver_elf.c drivers/driver_contract.h | $(BUILD)
+	$(DRIVER_C) -m32 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+		-fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra \
+		-Idrivers -c $< -o $@
 
 # compile each plugin .cpp in place (header "plugin_manager.h" sits next to it)
 $(BUILD)/plugin_manager.o: plugins/plugin_manager.cpp plugins/plugin_manager.h | $(BUILD)
@@ -393,8 +414,8 @@ $(BUILD)/knowledge_base.o: knowledge_base.c knowledge_base.h | $(BUILD)
 	$(CC) -m32 -ffreestanding -fno-stack-protector -fno-pic -fno-pie -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c knowledge_base.c -o $@
 
 # ----- Link kernel ELF (entry.o first => _start at image offset 0) -----
-$(BUILD)/kernel.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) linker.ld | $(BUILD)
-	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS)
+$(BUILD)/kernel.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS) linker.ld | $(BUILD)
+	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS)
 
 # ----- Extract flat kernel binary -----
 $(BUILD)/kernel.bin: $(BUILD)/kernel.elf | $(BUILD)
@@ -550,6 +571,7 @@ SHELL_SRC := csharp/apps/Shell/Shell.cs csharp/apps/Shell/Apps.cs \
              csharp/apps/Shell/Lang.cs \
              csharp/apps/Shell/Demo.cs \
              csharp/apps/Shell/NetTools.cs \
+             csharp/apps/Shell/NetDefenseApp.cs \
              csharp/apps/Shell/AiLauncher.cs \
              csharp/NexOS.Forms/Forms.cs csharp/NexOS.Forms/Voice.cs \
              csharp/apps/Shell/Shell.csproj
@@ -1131,6 +1153,20 @@ GUIENV := $(shell [ -d /mnt/wslg ] && echo GDK_BACKEND=x11 SDL_VIDEODRIVER=x11)
 # the intended path).  Override on the command line if you really want GTK:
 #   make play DISPLAY_BACKEND=gtk
 DISPLAY_BACKEND := $(shell [ -d /mnt/wslg ] && echo gtk || echo sdl)
+# QEMU display option actually passed to -display.  GTK draws a viewport
+# scrollbar and pans the ENTIRE guest (a window's title bar, close button and
+# transparent frame included) when the guest resolution (NexOS 1024x768) is
+# larger than the window.  Append zoom-to-fit=on so the guest scales to the
+# window and no scrollbar appears.  This is a qemu-display fix, NOT a NexOS GUI
+# (chrome) change -- the title bar / buttons are drawn correctly; the bug is
+# purely qemu's scrolled viewport ("就是qemu出的问题与chrome无关").
+QEMU_GTK := gtk,zoom-to-fit=on
+# Only GTK wraps the guest in a scrolled viewport; SDL sizes the window to the
+# guest already, so it is left untouched.  zoom-to-fit scales the 1024x768
+# NexOS framebuffer to the window so qemu shows no scrollbar (the bug where the
+# title bar / close button / transparent frame scrolled out of view was qemu's
+# viewport doing the panning, not NexOS chrome -- 就是qemu出的问题与chrome无关).
+QEMU_DISPLAY := $(if $(filter gtk,$(DISPLAY_BACKEND)),$(QEMU_GTK),$(DISPLAY_BACKEND))
 
 # ----- UEFI: run in a QEMU window (default target) -----
 run: $(UEFI_IMG)
@@ -1139,7 +1175,7 @@ run: $(UEFI_IMG)
 	cp $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
 	$(GUIENV) $(QEMU) -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
-		-drive format=raw,file=$(UEFI_IMG) -m 64M -display $(DISPLAY_BACKEND)
+		-drive format=raw,file=$(UEFI_IMG) -m 64M -display $(QEMU_DISPLAY)
 
 # ----- BIOS: run in a QEMU window (legacy) -----
 # NOTE: -m 4096 is used so the 64-bit kernel can map GB-scale model weights
@@ -1149,7 +1185,7 @@ run: $(UEFI_IMG)
 bios-run: $(IMG)
 	$(call ensure-pkg, qemu-system-x86_64, $(PKG_QEMU))
 	$(GUIENV) $(QEMU) -drive format=raw,file=$(IMG) -m 4096 \
-		-display $(DISPLAY_BACKEND) \
+		-display $(QEMU_DISPLAY) \
 		-net nic,model=ne2k_isa -net user,hostfwd=tcp::8080-:8080
 
 # =====================================================================
@@ -1164,7 +1200,7 @@ play: $(IMG)
 	@echo "try:   user | vfs /system/passwd | perm | perm reset | help"
 	@echo "quit:  close the window, or Ctrl-A X in the terminal"
 	$(GUIENV) $(QEMU) -drive format=raw,file=$(IMG) -m 4096 \
-		-vga std -display $(DISPLAY_BACKEND) -serial mon:stdio -no-reboot
+		-vga std -display $(QEMU_DISPLAY) -serial mon:stdio -no-reboot
 
 # =====================================================================
 #  WSL2-style "one-click Linux desktop in a NexOS window"
@@ -1189,7 +1225,7 @@ play-linux: $(IMG) tools/linux_orchestrator.py
 		echo "   orchestrator pid $$!"
 	@sleep 1
 	$(GUIENV) $(QEMU) -drive format=raw,file=$(IMG) -m 4096 \
-		-vga std -display $(DISPLAY_BACKEND) \
+		-vga std -display $(QEMU_DISPLAY) \
 		-serial mon:stdio \
 		-serial tcp:127.0.0.1:15901 \
 		-net nic,model=ne2k_isa -net user
@@ -1293,6 +1329,13 @@ iso-run: $(ISO)
 data-vhd: build/data.vhd
 build/data.vhd: tools/make_data_vhd.py
 	python3 tools/make_data_vhd.py 8
+
+# ----- Build-time VDI (VirtualBox fixed disk) wrapping the same MKFS payload -----
+# Hooked into `all` so a fresh `make` always regenerates build/data.vdi.
+data-vdi: $(BUILD)/data.vdi
+
+$(BUILD)/data.vdi: tools/make_data_vdi.py
+	$(PYTHON) tools/make_data_vdi.py 8
 
 # ----- ISO + data VHD: run with a persistent user disk (recommended) -----
 iso-run-data: $(ISO) build/data.vhd

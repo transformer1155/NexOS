@@ -38,7 +38,6 @@ namespace NexOS.Forms
         const int BtnGap = 6;
 
         // ---- palette (theme-aware; assigned by ShellTheme each frame) ----
-        static uint WallTop  = 0x218FD9;   // Win11 blue wallpaper gradient top
         static uint WallBot  = 0x05216B;   // Win11 deep-blue wallpaper base
         static uint Glow0    = 0x16314E;   // bloom rim
         static uint Glow1    = 0x2C86D6;   // bloom mid
@@ -66,14 +65,14 @@ namespace NexOS.Forms
         static void ShellTheme()
         {
             if (Theme.Dark != 0) {
-                WallTop = 0x218FD9; WallBot = 0x05216B; Glow0 = 0x145DA8; Glow1 = 0x2C86D6; GlowHi = 0x8CD1FF;
+                WallBot = 0x05216B; Glow0 = 0x145DA8; Glow1 = 0x2C86D6; GlowHi = 0x8CD1FF;
                 IconHot = 0x1D5A96;
                 Bar = 0x2B2B2B; BarLine = 0x3A3A3A; BarHot = 0x3F3F3F; Ink = 0xF3F3F3;
                 TaskBarBg = 0xFF202020; TaskBarInk = 0xFFE8EBF2; TaskBarLine = 0xFF3A3F4B;
                 MenuBg = 0x202020; MenuFoot = 0x2A2A2A; FieldBg = 0x2A2A2A; FieldEdge = 0x3A3A3A; Ghost = 0x9AA0A8;
                 DeskInk = 0xFFFFFFFF; DeskHalo = 0x10243C;
             } else {
-                WallTop = 0x5B86C4; WallBot = 0xCFE3FF; Glow0 = 0x9DC3F0; Glow1 = 0x2C86D6; GlowHi = 0xFFF4D6;
+                WallBot = 0xCFE3FF; Glow0 = 0x9DC3F0; Glow1 = 0x2C86D6; GlowHi = 0xFFF4D6;
                 IconHot = 0x2C6FB0;
                 Bar = 0xF3F3F3; BarLine = 0xD5DDE8; BarHot = 0xE1EAF6; Ink = 0x1B1B1B;
                 TaskBarBg = 0xFFF3F3F3; TaskBarInk = 0xFF1B1B1B; TaskBarLine = 0xFFD5DDE8;
@@ -107,7 +106,7 @@ namespace NexOS.Forms
         // truth lives in a MKFS file ("installed.cfg") so the Control Panel
         // "Apps" page and the shell share one source of state across boots.
         static bool[]   Installed;        // index == Kind value (0..11)
-        const  int     KINDS = 14;
+        const  int     KINDS = 15;
         // Public count so other apps (Control Panel "Apps & features") can
         // enumerate every registered Kind without a magic number.
         public static int KindCount { get { return KINDS; } }
@@ -131,7 +130,27 @@ namespace NexOS.Forms
         static int menuSel   = 0;         // keyboard-highlighted item (Win key / arrows)
         static int startMenuX, startMenuY, startMenuW, startMenuH;
         static int startRClickIdx = -1;   // tile / all-apps row under right-click
+
+        // P0-1: desktop icon selection state (-1 = none, 0..dN-1 = selected)
+        // single-click sets, blank click clears, ESC clears.
+        static int selIdx = -1;
+
+        // P0-3: Start-menu All-apps scroll offset (rows hidden above the top).
+        static int allScroll = 0;
+
+        // P1-11: power confirm dialog state (0 = Shutdown, 1 = Reboot).
+        static int confirmKind = 0;
+        // P1-11: confirm popup action codes.
+        const int A_POWER_YES = 500;   // proceed
+        const int A_POWER_NO  = -3;    // reuse dialog-close sentinel for Cancel
+
+        // P2-15: Start-menu Pinned tile drag state.
+        static int  dragKind = -1;   // Kind of the tile being dragged (-1 = none)
+        static int  dragSrc  = -1;   // source index in dKind[]
+        static bool dragging = false;
         const int START_KEY = 0x51ED270B; // stable Anim key for Start-menu open/close
+        const int SCROLL_KEY = 0x6E1A2B3C;  // P0-3: eased All-apps list scroll offset
+        const int DROP_KEY   = 0x4D2C0E1F;  // P2/1757: dropped-tile scale-pop
 
         // ---- AI virtual-desktop chat (feature B) ----
         // No static initialisers under MiniCLR, so the buffers are allocated
@@ -455,7 +474,7 @@ namespace NexOS.Forms
         static int deskShowIcons = 1;   // show desktop icons
         static int deskAuto      = 0;   // auto-arrange
         static int deskGrid      = 1;   // align to grid
-        static int jumpRecentSel = -1;  // last jump-list recent index (unused placeholder)
+
         static int winOwner = -1;      // app that opened the generic window menu
         static int taskWinKind = -1;   // kind of the window the taskbar menu targets
         static int jumpKind = -1;      // kind of the window the jump list targets
@@ -506,7 +525,7 @@ namespace NexOS.Forms
             kName[3] = "Calculator";   kName[4] = "Task Mgr";   kName[5] = "Optimizer";
             kName[6] = "Notepad";      kName[7] = "About";      kName[8] = "Browser";
             kName[9] = "AI Setup";     kName[10] = "AI Agent";  kName[11] = "Demo";
-            kName[12] = "Net Tools";   kName[13] = "AI 命令台";
+            kName[12] = "Net Tools";   kName[13] = "AI 命令台";   kName[14] = "NetDefense";
 
             Popup.Init();
 
@@ -569,6 +588,7 @@ namespace NexOS.Forms
             Put(11, Kind.Demo,        "Demo",       0x8A5CF6, 'D');
             Put(12, Kind.NetTools,    "Net Tools",  0x1FB85A, 'W');
             Put(13, Kind.AiLauncher,  "AI 命令台",  0x9B6BFF, 'K');
+            Put(14, Kind.NetDefense,   "NetDefense", 0x00C8C8, 'N');
         }
 
         static void Put(int i, int k, string n, int c, int l)
@@ -596,6 +616,7 @@ namespace NexOS.Forms
             else if (kind == Kind.Demo)   { gCol = 0x8A5CF6; gLet = 'D'; }
             else if (kind == Kind.NetTools)   { gCol = 0x1FB85A; gLet = 'W'; }
             else if (kind == Kind.AiLauncher) { gCol = 0x9B6BFF; gLet = 'K'; }
+            else if (kind == Kind.NetDefense)  { gCol = 0x00C8C8; gLet = 'N'; }
             else { gCol = 0x888888; gLet = '?'; }
         }
 
@@ -938,6 +959,7 @@ namespace NexOS.Forms
             if (k == Kind.Demo)         return "演示";
             if (k == Kind.NetTools)     return "网络";
             if (k == Kind.AiLauncher)   return "命令台";
+            if (k == Kind.NetDefense)   return "网络防御";
             return "";
         }
 
@@ -1113,6 +1135,13 @@ namespace NexOS.Forms
                 if (hot)
                     Gfx.FillRound(x + 2, y + 2, Cell - 4, Cell - 4, 8, IconHot);
 
+                // P0-1: selected icon highlight now fades in/out via Anim (no hard snap).
+                {
+                    int selAmt = (int)Anim.Hover(Anim.Key(x, y, Cell, Cell), (selIdx == i) ? 1 : 0);
+                    if (selAmt > 0)
+                        Gfx.FillRound(x + 2, y + 2, Cell - 4, Cell - 4, 8, U.Fade(Theme.Accent, selAmt));
+                }
+
                 int tx = x + (Cell - IcoSz) / 2;
                 int ty = y + 12;
                 // Desktop icons use the same AI textures as the taskbar /
@@ -1158,7 +1187,7 @@ namespace NexOS.Forms
         public static void SwitchDesktop(int d) {
             if (d == CurrentDesktop) return;
             CurrentDesktop = d;
-            menuOpen = false;
+            menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1);
             Host.Log(U.Cat("[DESK] switched to ", U.I(d), "\n"));
             // Keep (or stop) requesting animation repaints: the typewriter
             // pauses while the user is on the other desktop and resumes on
@@ -1181,7 +1210,7 @@ namespace NexOS.Forms
                 if (t >= 0) { OpenTrayPopup(t, mx, my); return -1; }
                 int bx = GroupX(w);
                 int by = h - TaskH + (TaskH - BtnSz) / 2;
-                if (U.In(mx, my, bx, by, BtnSz, BtnSz)) { menuOpen = true; Host.SetAnim(1); return -1; }
+                if (U.In(mx, my, bx, by, BtnSz, BtnSz)) { menuOpen = true; Host.SetAnim(1); Anim.Set(START_KEY, 1000, Anim.DUR_SLIDE, 1); return -1; }
                 for (int i = 0; i < tN; i++) {
                     if (tKind[i] < 0) continue;
                     int x = bx + (i + 1) * (BtnSz + BtnGap);
@@ -1539,8 +1568,8 @@ namespace NexOS.Forms
 
         static void StartMenu(int w, int h)
         {
-            // open/close transition: slide up + fade in, Back overshoot.
-            Anim.Set(START_KEY, menuOpen ? 1000 : 0, 150, 1);
+            // open/close transition is now event-driven (Menu()/open/close sites),
+            // so we only READ the tween here instead of (re)arming it during Paint.
             int enter = (int)Anim.Get(START_KEY);
             if (!menuOpen && enter == 0) return;
 
@@ -1595,6 +1624,14 @@ namespace NexOS.Forms
                     int tx = gx + col * tw, ty = gy + row * th;
                     if (W.Hot(tx, ty, tw - 6, th - 6) || i == menuSel)
                         Gfx.FillRound(tx, ty, tw - 6, th - 6, 6, 0xE7EEF8);
+                    // P2: drop-target highlight while dragging a tile.
+                    if (dragging && dragHover == i)
+                    {
+                        int r = i / 4, c = i - r * 4;
+                        int tx2 = gx + c * tw, ty2 = gy + r * th;
+                        int a = (int)Anim.Get(Anim.Key(tx2, ty2, tw, th));
+                        Gfx.DrawRound(tx2, ty2, tw - 6, th - 6, 6, U.Fade(Theme.Accent, a));
+                    }
                     if (Gfx.HasImage(Tex.Icon + dKind[i]) != 0)
                         Gfx.Image(Tex.Icon + dKind[i], tx + (tw - 6 - 32) / 2, ty + 10, 32, 32);
                     else
@@ -1606,20 +1643,28 @@ namespace NexOS.Forms
                         W.Voice(vaM,      tx, ty, tw - 6, th - 6);
                         W.Voice(dName[i], tx, ty, tw - 6, th - 6);
                     }
+                    // P2/1757: scale-pop overlay on the just-dropped tile.
+                    if (i == dropIdx)
+                    {
+                        int da = (int)Anim.Get(DROP_KEY);
+                        if (da > 0) Gfx.FillRound(tx, ty, tw - 6, th - 6, 6, U.Fade(Theme.Accent, da));
+                    }
                 }
             }
             else
             {
                 // All apps list: every installed kind, alphabetical-ish order.
+                // P0-3: allScroll scrolls the list vertically; sel counts installed kinds.
                 int rowH = 22, lx = x + 28, ly = y + 94, listW = mw - 56;
                 int fyEnd = FootY(y, mh);
-                int sel = 0;                          // running index over installed kinds
+                int sel = 0;
                 for (int i = 0; i < KINDS; i++)
                 {
-                    int ry = ly + i * rowH;
+                    if (IsInstalled(i) == 0) continue;
+                    if (sel < allScroll) { sel++; continue; }  // skip scrolled-off items
+                    int ry = ly + (sel - allScroll) * rowH;
                     if (ry + rowH > fyEnd - 4) break;
-                    if (IsInstalled(i) == 0) continue;   // hidden when uninstalled
-                    int kind = i;   // Kind order; good enough for the shell
+                    int kind = i;
                     if (W.Hot(lx, ry, listW, rowH - 1) || sel == menuSel)
                         Gfx.FillRound(lx, ry, listW, rowH - 1, 4, BarHot);
                     if (Gfx.HasImage(Tex.Icon + kind) != 0)
@@ -1665,13 +1710,138 @@ namespace NexOS.Forms
 
         // WinHost screenshot harness helper: open the Start menu and (optionally)
         // jump straight to the All apps list so the menu can be captured.
+        // P2-15: desktop drag state (pinned tile reorder).
+        static int  pendingClickIdx = -1;  // index of last Pinned-tile click
+        static int  pendingClickX = 0, pendingClickY = 0;
+        static int  dropIdx = -1;        // P2/1757: index of just-dropped tile (for pop)
+        static int  dragHover = -1;      // P2: last hovered drop-target tile
+
+        // P2-15: mouse move tracking for tile drag.  Returns true if consumed.
+        public static bool DragMove(int mx, int my)
+        {
+            if (dragging)
+            {
+                // P2: track the tile under the cursor as the drop target.
+                int tw = TileW(MenuW(Gfx.ScreenW())), th = 84;
+                int gx = MenuX(Gfx.ScreenW()) + 28, gy = MenuY(Gfx.ScreenH()) + 94;
+                int over = -1;
+                for (int i = 0; i < dN; i++)
+                {
+                    int row = i / 4, col = i - row * 4;
+                    int tx = gx + col * tw, ty = gy + row * th;
+                    if (U.In(mx, my, tx, ty, tw - 6, th - 6)) { over = i; break; }
+                }
+                if (over != dragHover)
+                {
+                    if (dragHover >= 0) { int r = dragHover / 4, c = dragHover - r * 4; Anim.Hover(Anim.Key(gx + c * tw, gy + r * th, tw, th), 0); }
+                    if (over >= 0)      { int r = over / 4,      c = over - r * 4;      Anim.Hover(Anim.Key(gx + c * tw, gy + r * th, tw, th), 1); }
+                    dragHover = over;
+                }
+                return true;
+            }
+            // Threshold 3px before drag activates.
+            if (pendingClickIdx >= 0 && menuOpen && startView == 0)
+            {
+                int dx = mx - pendingClickX, dy = my - pendingClickY;
+                if (dx * dx + dy * dy > 9)
+                {
+                    dragging = true;
+                    dragKind = dKind[pendingClickIdx];
+                    dragSrc  = pendingClickIdx;
+                    pendingClickIdx = -1;
+                }
+            }
+            return false;
+        }
+
+        // P2-15: drop tile at current mouse position.  Returns true if consumed.
+        public static bool DragEnd(int mx, int my)
+        {
+            if (!dragging) { pendingClickIdx = -1; return false; }
+            dragging = false;
+            // Find which Pinned tile the cursor is over.
+            int droppedTo = -1;
+            int w = Gfx.ScreenW(), h = Gfx.ScreenH();
+            int mw = MenuW(w), x = MenuX(w), y = MenuY(h);
+            int tw = TileW(mw), th = 84;
+            int gx = x + 28, gy = y + 94;
+            for (int i = 0; i < dN; i++)
+            {
+                int row = i / 4, col = i - row * 4;
+                int tx = gx + col * tw, ty = gy + row * th;
+                if (U.In(mx, my, tx, ty, tw - 6, th - 6)) { droppedTo = i; break; }
+            }
+            // Reorder: move from dragSrc to droppedTo.
+            if (droppedTo >= 0 && droppedTo != dragSrc)
+            {
+                int kind = dragKind;
+                if (dragSrc < droppedTo)
+                {
+                    for (int i = dragSrc; i < droppedTo; i++) dKind[i] = dKind[i + 1];
+                }
+                else
+                {
+                    for (int i = dragSrc; i > droppedTo; i--) dKind[i] = dKind[i - 1];
+                }
+                dKind[droppedTo] = kind;
+                // Persist the new order.
+                SavePinned();
+                // P2/1757: brief scale-pop on the dropped tile (reflow feedback).
+                dropIdx = droppedTo;
+                Anim.Snap(DROP_KEY, 1000);
+                Anim.Set(DROP_KEY, 0, Anim.DUR_SOFT, 0);
+                if (dragHover >= 0) { int r = dragHover / 4, c = dragHover - r * 4; int ptw = TileW(MenuW(Gfx.ScreenW())); Anim.Hover(Anim.Key(MenuX(Gfx.ScreenW()) + 28 + c * ptw, MenuY(Gfx.ScreenH()) + 94 + r * th, ptw, th), 0); dragHover = -1; }
+                Host.SetAnim(1);  // force repaint of reordered tiles
+            }
+            dragKind = -1; dragSrc = -1;
+            return true;
+        }
+
+        // P2-15: persist dKind[] order to pinned.cfg.
+        static void SavePinned()
+        {
+            string cfg = "";
+            for (int i = 0; i < dN; i++) cfg = U.Cat(cfg, U.I(dKind[i]), ",");
+            Host.WriteText(CFG_FS, "pinned.cfg", cfg);
+        }
+
+        // P0-3: scroll the All-apps list by wheel.  Returns true if consumed.
+        public static bool WheelAllApps(int dy)
+        {
+            if (!menuOpen || startView != 1) return false;
+            if (dy == 0) return false;
+            // Each wheel notch = WHEEL_DELTA (120); step 1 row per notch.
+            int step = dy > 0 ? -1 : 1;
+            int notches = dy > 0 ? dy / 120 : (-dy) / 120;
+            if (notches < 1) notches = 1;
+            // Clamp allScroll to [0, installedCount - visibleRows]
+            int visibleRows = 8;  // enough to fill visible area above footer
+            int totalInstalled = 0;
+            for (int i = 0; i < KINDS; i++) if (IsInstalled(i) != 0) totalInstalled++;
+            int maxScroll = totalInstalled > visibleRows ? totalInstalled - visibleRows : 0;
+            for (int k = 0; k < notches; k++)
+            {
+                int ns = allScroll + step;
+                if (ns < 0) ns = 0;
+                if (ns > maxScroll) ns = maxScroll;
+                allScroll = ns;
+                // P0-3: drive the list scroll through an Anim tween (read in Paint).
+                Anim.Set(SCROLL_KEY, ns, Anim.DUR_SOFT, 0);
+            }
+            return true;
+        }
+
         internal static void OpenStartMenu(int showAll, int w, int h)
         {
             menuOpen = true;
             Host.SetAnim(1);   // kick open/close transition repaints
+            Anim.Set(START_KEY, 1000, Anim.DUR_SLIDE, 1);   // real open tween (event-driven)
             startView = (showAll != 0) ? 1 : 0;
             startMenuW = MenuW(w); startMenuH = MenuH(h);
             startMenuX = MenuX(w); startMenuY = MenuY(h);
+            // FIX: reload Installed[] from installed.cfg so the All-apps list
+            // reflects newly installed / uninstalled apps on every open.
+            LoadInstalled();
         }
 
         // Resolve which Start-menu entry (pinned tile or All-apps row) sits
@@ -1785,6 +1955,10 @@ namespace NexOS.Forms
             int w = Gfx.Width(), h = Gfx.Height();
             if (CurrentDesktop == 1) return AiDesktopClick(mx, my, w, h);
 
+            // P0-2: click on toast dismisses it (hit-test before other routing).
+            int ts = Toast.Hit(w, h, mx, my);
+            if (ts >= 0) { Toast.Dismiss(ts); return -1; }
+
             if (Popup.IsOpen()) return ContextClick(mx, my);
 
             if (menuOpen) return MenuClick(mx, my, w, h);
@@ -1795,7 +1969,7 @@ namespace NexOS.Forms
                 if (t >= 0) { OpenTrayPopup(t, mx, my); return -1; }
                 int bx = GroupX(w);
                 int by = h - TaskH + (TaskH - BtnSz) / 2;
-                if (U.In(mx, my, bx, by, BtnSz, BtnSz)) { menuOpen = true; Host.SetAnim(1); return -1; }
+                if (U.In(mx, my, bx, by, BtnSz, BtnSz)) { menuOpen = true; Host.SetAnim(1); Anim.Set(START_KEY, 1000, Anim.DUR_SLIDE, 1); return -1; }
                 for (int i = 0; i < tN; i++)
                 {
                     int x = bx + (i + 1) * (BtnSz + BtnGap);
@@ -1814,13 +1988,14 @@ namespace NexOS.Forms
                     int r = ClassicRect(i, w, h);
                     int x = (r >> 16) & 0xFFFF;
                     int y = r & 0xFFFF;
-                    if (U.In(mx, my, x, y, Cell, Cell)) return dKind[i];
+                    if (U.In(mx, my, x, y, Cell, Cell)) { selIdx = i; return dKind[i]; }
                 }
+                selIdx = -1;   // P0-1: blank click clears selection
                 return -2;
             }
             // Search bar -> open the Start menu (which has its own box).
             if (U.In(mx, my, pSearchX, pSearchY, pSearchW, pSearchH))
-            { menuOpen = true; Host.SetAnim(1); return -1; }
+            { menuOpen = true; Host.SetAnim(1); Anim.Set(START_KEY, 1000, Anim.DUR_SLIDE, 1); return -1; }
             // Nav tabs (Home/Apps/System/Tools): select and consume.
             {
                 int tabW = 88, tabGap = 6, tabH = 30;
@@ -1848,12 +2023,13 @@ namespace NexOS.Forms
             int mw = MenuW(w), mh = MenuH(h);
             int x  = MenuX(w),  y = MenuY(h);
 
-            if (!U.In(mx, my, x, y, mw, mh)) { menuOpen = false; return -1; }
+            if (!U.In(mx, my, x, y, mw, mh)) { menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1); return -1; }
 
             int fy = FootY(y, mh);
             int px = PowerX(x, mw), rx = px - 48, py = fy + 4;
-            if (U.In(mx, my, px, py, 40, 40)) { menuOpen = false; Host.Shutdown(); return -1; }
-            if (U.In(mx, my, rx, py, 40, 40)) { menuOpen = false; Host.Reboot();   return -1; }
+            // P1-11: confirm dialog instead of immediate shut/reboot.
+            if (U.In(mx, my, px, py, 40, 40)) { OpenPowerConfirm(0); return -1; }   // 0 = Shutdown
+            if (U.In(mx, my, rx, py, 40, 40)) { OpenPowerConfirm(1); return -1; }   // 1 = Reboot
 
             int swx = x + 130, swy = fy + 8, swbw = 130, swbh = 32;
             if (U.In(mx, my, swx, swy, swbw, swbh))
@@ -1883,19 +2059,29 @@ namespace NexOS.Forms
                     int row = i / 4;
                     int col = i - row * 4;
                     int tx = gx + col * tw, ty = gy + row * th;
-                    if (U.In(mx, my, tx, ty, tw - 6, th - 6)) { menuOpen = false; return dKind[i]; }
+                    if (U.In(mx, my, tx, ty, tw - 6, th - 6)) {
+                        // P2-15: record click position for drag-threshold detection.
+                        pendingClickIdx = i;
+                        pendingClickX = mx; pendingClickY = my;
+                        menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1); return dKind[i];
+                    }
                 }
             }
             else
             {
-                // All apps list rows.
+                // All apps list rows.  P0-3: same allScroll scroll as Paint.
                 int rowH = 22, lx = x + 28, ly = y + 94, listW = mw - 56;
                 int fy2 = FootY(y, mh);
+                int sel = 0;
+                int sc = (int)Anim.Get(SCROLL_KEY);   // P0-3: eased scroll offset
                 for (int i = 0; i < KINDS; i++)
                 {
-                    int ry = ly + i * rowH;
+                    if (IsInstalled(i) == 0) continue;
+                    if (sel < sc) { sel++; continue; }
+                    int ry = ly + (sel - sc) * rowH;
                     if (ry + rowH > fy2 - 4) break;
-                    if (U.In(mx, my, lx, ry, listW, rowH - 1)) { menuOpen = false; return i; }
+                    if (U.In(mx, my, lx, ry, listW, rowH - 1)) { menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1); return i; }
+                    sel++;
                 }
             }
             return -1;
@@ -1912,11 +2098,15 @@ namespace NexOS.Forms
             {
                 menuOpen = !menuOpen;
                 menuSel = 0;
+                // FIX: snap START_KEY so first Paint frame renders visibly
+                // (same anim race as Popup — Anim.Set only sets target,
+                //  Tick may not have run yet when render_all() fires).
+                Anim.Set(START_KEY, menuOpen ? 1000 : 0, Anim.DUR_SLIDE, 1);
                 Host.SetAnim(1);                 // keep the open/close transition animating
                 return -1;
             }
             if (!menuOpen) return -1;
-            if (code == 4) { menuOpen = false; Host.SetAnim(1); return -1; }
+            if (code == 4) { menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1); Host.SetAnim(1); return -1; }
 
             int n = (startView == 0) ? dN : InstalledCount();
             if (n <= 0) return -1;
@@ -1928,6 +2118,7 @@ namespace NexOS.Forms
             {
                 int kind = (startView == 0) ? dKind[menuSel] : InstalledKindAt(menuSel);
                 menuOpen = false;
+                Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1);   // animate menu closed on activate
                 Host.SetAnim(1);
                 return kind;
             }
@@ -1955,6 +2146,10 @@ namespace NexOS.Forms
 
         public static void OnRightClick(int mx, int my)
         {
+            // P0-2: right-click on toast also dismisses it.
+            int ts = Toast.Hit(Gfx.ScreenW(), Gfx.ScreenH(), mx, my);
+            if (ts >= 0) { Toast.Dismiss(ts); return; }
+
             // Close any existing popup BEFORE opening a new one:
             // prevents two ContextMenus from being simultaneously "open"
             // (hit testing ambiguity) and clears stale owner state.
@@ -2060,6 +2255,13 @@ namespace NexOS.Forms
         static void HandleAction(int code)
         {
             int c = code & ~Popup.DangerBit;
+            // P1-11: power confirm dialog Yes button.
+            if (c == A_POWER_YES)
+            {
+                if (confirmKind == 0) Host.Shutdown();
+                else Host.Reboot();
+                return;
+            }
             // Taskbar window menu.
             if (c == A_WIN_CLOSE || c == A_WIN_END) { Shell.CloseApp(taskWinKind); return; }
             // Desktop "Open with..." submenu targets.  The kernel must
@@ -2225,6 +2427,24 @@ namespace NexOS.Forms
         // "> " marks a cascading flyout; "* " marks the current selection.
         // Order: View > / Sort by > / Refresh / New > / Display settings /
         // Personalize / Show more options.
+        // P1-11: confirm Shutdown/Reboot via a small popup dialog.
+        static void OpenPowerConfirm(int kind)
+        {
+            confirmKind = kind;
+            int w = Gfx.ScreenW(), h = Gfx.ScreenH();
+            int cx = (w - 280) / 2, cy = (h - 130) / 2;
+            string msg = kind == 0 ? "Shut down NexOS?" : "Restart NexOS?";
+            string[] labs = new string[2];
+            int[] acts = new int[2];
+            labs[0] = msg;
+            acts[0] = A_POWER_YES;
+            labs[1] = "Cancel";
+            acts[1] = A_POWER_NO;
+            Popup.Open(OWNER_DESKTOP, cx, cy, labs, acts, 2);
+            // P1-11: confirm dialog is a Popup, so its fade/slide-in is driven by
+            // Popup.cs (Anim.Set/Get on POPUP_KEY). No extra work needed here.
+        }
+
         static void OpenDesktopPopup(int mx, int my)
         {
             int cap = 8;
@@ -2593,7 +2813,18 @@ namespace NexOS.Forms
             if (ch == -8) { SwitchDesktop(1); return; }
             if (ch == -9) { if (CurrentDesktop == 0) SwitchDesktop(1); else SwitchDesktop(0); return; }
             if (CurrentDesktop == 1) { AiDesktopKey(ch); return; }
+
+            // P1-9: popup keyboard navigation (ESC close, Enter activate,
+            // Up/Down move selection via Popup.MenuSel proxy in Desktop).
+            if (Popup.IsOpen()) { if (ch == 27) { Popup.Close(); return; } }
+
+            // P0-1: ESC clears desktop icon selection (when no popup active).
+            if (ch == 27 && selIdx >= 0) { selIdx = -1; return; }
+
             if (renameIdx < 0) return;
+
+            // P1-10: ESC cancels inline rename (restore original name, no-op commit).
+            if (ch == 27) { renameBuf = renameOld; CommitRename(); return; }
             if (ch == '\n' || ch == '\r' || ch == -2) { CommitRename(); return; }
             if (ch == -3)                              // Ctrl+C: copy whole name
             {

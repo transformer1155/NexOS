@@ -124,9 +124,13 @@ start:
     out dx, al
 
     ; ---- Step 3: Iterate through mode list ----
-    ; Best match tracking: prefer higher resolutions
-    ; Score: 7=1920x1080, 6=1600x900, 5=1366x768, 4=1280x1024/1280x720,
-    ;        3=1024x768, 2=800x600, 1=640x480
+    ; Best match tracking: prefer 1024x768 FIRST.  The GUI heap+bigbuf budget
+    ; tops out at 3 MiB contiguous for the backbuffer (1024*768*4); anything
+    ; larger (1280x720 = 3.7 MiB, 1920x1080 = 8.3 MiB) fails the allocation
+    ; and blank-boxes the boot.  Only score a mode above 1024x768 when no
+    ; 1024x768 mode exists in the list.
+    ; Score: 3=1024x768 (preferred), 4=1280x720, 5=1280x1024, 6=800x600,
+    ;        7=640x480 (fallbacks, higher score = lower priority)
     mov word [vbe_best_mode], 0xFFFF   ; no match yet
     mov word [vbe_best_score], 0       ; 0=no match
 
@@ -203,9 +207,9 @@ start:
 .vbe_check_1920_y:
     cmp word [0x5300 + 20], 1080
     jne .vbe_enum_skip
-    cmp word [vbe_best_score], 7
+    cmp word [vbe_best_score], 6
     jae .vbe_enum_skip
-    mov word [vbe_best_score], 7
+    mov word [vbe_best_score], 6
     pop cx
     push cx
     mov [vbe_best_mode], cx
@@ -214,9 +218,9 @@ start:
 .vbe_check_1600_y:
     cmp word [0x5300 + 20], 900
     jne .vbe_enum_skip
-    cmp word [vbe_best_score], 6
+    cmp word [vbe_best_score], 5
     jae .vbe_enum_skip
-    mov word [vbe_best_score], 6
+    mov word [vbe_best_score], 5
     pop cx
     push cx
     mov [vbe_best_mode], cx
@@ -241,9 +245,9 @@ start:
     jmp .vbe_enum_skip
 
 .vbe_check_1280_1024:
-    cmp word [vbe_best_score], 4
+    cmp word [vbe_best_score], 5
     jae .vbe_enum_skip
-    mov word [vbe_best_score], 4
+    mov word [vbe_best_score], 5
     pop cx
     push cx
     mov [vbe_best_mode], cx
@@ -261,9 +265,9 @@ start:
 .vbe_check_1024_y:
     cmp word [0x5300 + 20], 768
     jne .vbe_enum_skip
-    cmp word [vbe_best_score], 3
+    cmp word [vbe_best_score], 8
     jae .vbe_enum_skip
-    mov word [vbe_best_score], 3
+    mov word [vbe_best_score], 8
     pop cx
     push cx
     mov [vbe_best_mode], cx
@@ -272,9 +276,9 @@ start:
 .vbe_check_800_y:
     cmp word [0x5300 + 20], 600
     jne .vbe_enum_skip
-    cmp word [vbe_best_score], 2
+    cmp word [vbe_best_score], 6
     jae .vbe_enum_skip
-    mov word [vbe_best_score], 2
+    mov word [vbe_best_score], 6
     pop cx
     push cx
     mov [vbe_best_mode], cx
@@ -283,9 +287,9 @@ start:
 .vbe_check_640_y:
     cmp word [0x5300 + 20], 480
     jne .vbe_enum_skip
-    cmp word [vbe_best_score], 1
+    cmp word [vbe_best_score], 7
     jae .vbe_enum_skip
-    mov word [vbe_best_score], 1
+    mov word [vbe_best_score], 7
     pop cx
     push cx
     mov [vbe_best_mode], cx
@@ -319,7 +323,10 @@ start:
     out dx, al
 
     ; ---- Fallback: try hardcoded VESA/Bochs mode numbers ----
-    ; Try higher resolutions first, then standard modes
+    ; 1024x768x32 FIRST (backbuffer fits bigbuf; see score table above).
+    mov cx, 0x144                  ; Bochs: 1024x768x32
+    call vbe_query_only
+    jnc .vbe_settled
     mov cx, 0x14A                  ; Bochs: 1920x1080x32
     call vbe_query_only
     jnc .vbe_settled
@@ -330,9 +337,6 @@ start:
     call vbe_query_only
     jnc .vbe_settled
     mov cx, 0x147                  ; Bochs: 1280x720x32
-    call vbe_query_only
-    jnc .vbe_settled
-    mov cx, 0x144                  ; Bochs: 1024x768x32
     call vbe_query_only
     jnc .vbe_settled
     mov cx, 0x143                  ; Bochs: 800x600x32

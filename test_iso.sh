@@ -43,7 +43,7 @@ echo "==> ISO BIOS boot test: booting from CD..."
   echo "memsave 0xb8000 0x1000 $D2"; sleep 0.5
 
   echo "quit"
-) | qemu-system-x86_64 -cdrom "$ISO" -boot d -m 64M -display none -no-reboot \
+) | qemu-system-x86_64 -cdrom "$ISO" -boot d -m 512M -display none -no-reboot \
      -monitor stdio > "$OUT" 2>&1 || true
 
 decode(){ python3 - "$1" <<'PY'

@@ -10728,6 +10728,37 @@ extern "C" void gui_blit_pixels(int x, int y, int w, int h, const uint32_t* src)
     g_wm.gfx.blit_rect(x, y, w, h, src);
 }
 
+// C entry point for the mforms Host.LinuxInput icall.
+// Forwards mouse/key events from the managed shell's WebView host directly
+// to the VNC backend via lg_send_input.  'buttons' is the RFB button bitmask
+// (bit0=left, bit1=middle, bit2=right, 0=all-up); 'key' is an ASCII char
+// (0 = no key event).  Negative keysym in the caller was already expanded to
+// press+release by mforms.
+extern "C" int gui_linux_input(int mx, int my, int buttons, int key) {
+    if (buttons != 0 || buttons == 0) {
+        /* mouse event */
+        lg_send_input(mx, my, buttons, 0);
+    }
+    if (key != 0) {
+        /* keyboard: convert ASCII to RFB keysym */
+        int ks = 0;
+        switch (key) {
+            case 0x08: ks = 0xFF08; break;
+            case 0x09: ks = 0xFF09; break;
+            case 0x0D: ks = 0xFF0D; break;
+            case 0x1B: ks = 0xFF1B; break;
+            case 0x7F: ks = 0xFF08; break;
+            default:
+                if ((unsigned char)key >= 0x20 && (unsigned char)key < 0x7F) ks = (unsigned char)key;
+        }
+        if (ks != 0) {
+            lg_send_input(mx, my, buttons, ks);   // press
+            lg_send_input(mx, my, buttons, -ks);  // release
+        }
+    }
+    return 1;
+}
+
 // C entry point reporting the current NexOS screen size.  The VNC client
 // plugin uses this to boundary-check its framebuffer writes so a rectangle
 // larger than (or off-screen vs) the NexOS desktop can never scribble past

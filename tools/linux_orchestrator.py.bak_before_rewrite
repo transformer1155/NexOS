@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+# =====================================================================
+#  linux_orchestrator.py  -  Host-side WSL2-style Linux Guest orchestrator
+# =====================================================================
+#
+#  This is the "control plane" that lives on the REAL machine (not inside
+#  NexOS).  NexOS itself is a QEMU guest (QEMU#1) and cannot spawn a sibling
+#  VM, so the actual nested-Linux-VM boot/teardown is delegated here.
+#
+#  NexOS talks to this script over a *serial* control channel.  In the
+#  kernel, linux_manager.cpp drives COM2 (I/O port 0x2F8).  We wire QEMU#1's
+#  second serial port to a host TCP socket (127.0.0.1:15901 by default) so
+#  this script can read the kernel's "start"/"stop" commands and answer
+#  "ready"/"down".  The line protocol is byte-identical to a future
+#  virtio-serial backend; only the transport below swaps.
+#
+#  The VNC path is separate.  linux_manager connects to 10.0.2.2:15900.
+#  10.0.2.2 is QEMU#1's SLIRP gateway == the host, so the kernel reaches a
+#  host TCP listener on 15900.  This script runs a transparent TCP proxy:
+#       NexOS  ->  10.0.2.2:15900  ->  host:15900 (proxy)
+#              ->  forwards to QEMU#2's VNC (host:5900 by default).
+#  QEMU#2 is launched with `-net user,hostfwd=tcp::5900-:5900` so the Linux
+#  Guest's VNC (x11vnc :5900, or QEMU's own -vnc :0) is reachable at
+#  host:5900.  The proxy then makes it appear at host:15900 for NexOS.
+#
+#  Topology:
+#     [NexOS window / VNC viewer] --RFB-> 10.0.2.2:15900
+#        -> host proxy :15900 -> host :5900 -> QEMU#2 guest :5900 (x11vnc)
+#     [NexOS linux_manager] --serial COM2 0x2F8--> QEMU#1 2nd serial
+#        -> host ctrl socket :15901 -> this script
+#
+#  Usage:
+#     ./tools/linux_orchestrator.py &
+#     make play-linux          # launches QEMU#1 (NexOS) with COM2 wired
+#
+#  All knobs are env-overridable; see parse_args().
+# =====================================================================
+
+import argparse
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+# ---- defaults (override on the command line) --------------------------
+DEF_CTRL_LISTEN  = "127.0.0.1:15901"   # QEMU#1 COM2 control channel (host side)
+DEF_VNC_LISTEN   = "0.0.0.0:15900"     # what NexOS connects to (10.0.2.2:15900)
+DEF_LINUX_VNC    = "127.0.0.1:5900"    # QEMU#2's VNC, reachable from the host
+DEF_QEMU2        = "qemu-system-x86_64"
+DEF_LINUX_MEM    = "2048"
+DEF_LINUX_IMAGE  = os.environ.get("NEXOS_LINUX_IMAGE", "")
+DEF_LINUX_ISO    = os.environ.get("NEXOS_LINUX_ISO", "")
+DEF_LINUX_KVM    = ""                  # set to "-enable-kvm" if your host supports it
+
+
+class LinuxOrchestrator:
+    def __init__(self, args):
+        self.ctrl_listen = args.ctrl_listen
+        self.vnc_listen  = args.vnc_listen
+        self.linux_vnc   = args.linux_vnc
+        self.qemu2       = args.qemu2
+        self.linux_mem   = args.linux_mem
+        self.linux_image = args.linux_image
+        self.linux_iso   = args.linux_iso
+        self.linux_kvm   = args.linux_kvm
+        self.qemu2_proc  = None
+        self.lock        = threading.RLock()
+        self.guest_up    = False
+        self.stop_ev     = threading.Event()
+
+    # ---- VNC transparent proxy (15900 <-> QEMU#2 VNC) -----------------
+    def _proxy_one(self, c2vnc, vnc):
+        """Bidirectional byte pump between a client and the real VNC server."""
+        try:
+            while True:
+                rdy = select_recv([c2vnc, vnc], 1.0)
+                if not rdy:
+                    continue
+                if c2vnc in rdy:
+                    buf = c2vnc.recv(65536)
+                    if not buf:
+                        break
+                    vnc.sendall(buf)
+                if vnc in rdy:
+                    buf = vnc.recv(65536)
+                    if not buf:
+                        break
+                    c2vnc.sendall(buf)
+        except (OSError, ConnectionError):
+            pass
+        finally:
+            try: c2vnc.close()
+            except Exception: pass
+            try: vnc.close()
+            except Exception: pass
+
+    def _vnc_acceptor(self):
+        host, port = self.vnc_listen.split(":")
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((host, int(port)))
+        srv.listen(8)
+        print(f"[orch] VNC proxy listening on {self.vnc_listen} -> {self.linux_vnc}")
+        while not self.stop_ev.is_set():
+            try:
+                c2vnc, _ = srv.accept()
+            except OSError:
+                break
+            # connect to QEMU#2's VNC
+            try:
+                vh, vp = self.linux_vnc.split(":")
+                vnc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                vnc.settimeout(4.0)
+                vnc.connect((vh, int(vp)))
+                vnc.settimeout(None)
+            except (OSError, ValueError) as e:
+                print(f"[orch] VNC upstream {self.linux_vnc} unreachable: {e}")
+                c2vnc.close()
+                continue
+            threading.Thread(target=self._proxy_one, args=(c2vnc, vnc),
+                            daemon=True).start()
+        srv.close()
+
+    # ---- control channel (QEMU#1 COM2 -> this script) ----------------
+    def _ctrl_acceptor(self):
+        host, port = self.ctrl_listen.split(":")
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((host, int(port)))
+        srv.listen(4)
+        print(f"[orch] control channel (COM2) listening on {self.ctrl_listen}")
+        while not self.stop_ev.is_set():
+            try:
+                cli, _ = srv.accept()
+            except OSError:
+                break
+            threading.Thread(target=self._ctrl_session, args=(cli,),
+                            daemon=True).start()
+        srv.close()
+
+    def _ctrl_send(self, cli, line):
+        try:
+            cli.sendall((line + "\n").encode("ascii", "replace"))
+        except OSError:
+            pass
+
+    def _ctrl_session(self, cli):
+        buf = b""
+        print("[orch] control: kernel attached")
+        while not self.stop_ev.is_set():
+            try:
+                cli.settimeout(1.0)
+                chunk = cli.recv(256)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            # process line by line (kernel sends "start\n", "stop\n", ...)
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                cmd = line.strip().decode("ascii", "replace").strip().lower()
+                if not cmd:
+                    continue
+                print(f"[orch] control: <- kernel '{cmd}'")
+                self._handle_cmd(cli, cmd)
+        cli.close()
+
+    def _handle_cmd(self, cli, cmd):
+        if cmd == "start":
+            if self.guest_up:
+                self._ctrl_send(cli, "ready")
+                return
+            self._ctrl_send(cli, "busy")  # we are bringing it up
+            self._launch_guest()
+            # wait until the upstream VNC is reachable before declaring ready
+            if self._wait_vnc_up(timeout=120):
+                self.guest_up = True
+                self._ctrl_send(cli, "ready")
+                print("[orch] control: guest ready")
+            else:
+                self._ctrl_send(cli, "error")
+                print("[orch] control: guest VNC did not come up", file=sys.stderr)
+        elif cmd == "stop":
+            self._teardown_guest()
+            self.guest_up = False
+            self._ctrl_send(cli, "down")
+            print("[orch] control: guest torn down")
+        elif cmd == "status":
+            self._ctrl_send(cli, "ready" if self.guest_up else "down")
+        else:
+            self._ctrl_send(cli, "error")
+
+    # ---- nested Linux Guest (QEMU#2) lifecycle -----------------------
+    def _build_qemu2_cmd(self):
+        extras = []
+        if self.linux_image:
+            extras += ["-drive", f"format=qcow2,file={self.linux_image}"]
+        if self.linux_iso:
+            extras += ["-cdrom", self.linux_iso, "-boot", "d"]
+        # Forward the guest VNC (x11vnc :5900 or QEMU -vnc :0) to host:5900.
+        cmd = [
+            self.qemu2, "-m", self.linux_mem,
+            "-net", "nic,model=ne2k_isa",
+            "-net", "user,hostfwd=tcp::5900-:5900",
+        ]
+        if self.linux_kvm:
+            cmd += self.linux_kvm.split()
+        cmd += extras
+        # If no image/iso is given we still launch a tiny loop so the user
+        # sees *something* in the window; replace with a real Linux disk.
+        if not self.linux_image and not self.linux_iso:
+            print("[orch] WARNING: no NEXOS_LINUX_IMAGE/NEXOS_LINUX_ISO set; "
+                  "QEMU#2 will boot to its default (likely SeaBIOS). "
+                  "Set one to run a real Linux desktop.", file=sys.stderr)
+        return cmd
+
+    def _launch_guest(self):
+        with self.lock:
+            if self.qemu2_proc and self.qemu2_proc.poll() is None:
+                return
+            cmd = self._build_qemu2_cmd()
+            print("[orch] launching QEMU#2 (Linux Guest):", " ".join(cmd))
+            self.qemu2_proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _teardown_guest(self):
+        with self.lock:
+            if self.qemu2_proc and self.qemu2_proc.poll() is None:
+                print("[orch] stopping QEMU#2")
+                self.qemu2_proc.terminate()
+                try:
+                    self.qemu2_proc.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    self.qemu2_proc.kill()
+            self.qemu2_proc = None
+
+    def _wait_vnc_up(self, timeout=120):
+        vh, vp = self.linux_vnc.split(":")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.stop_ev.is_set():
+                return False
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1.0)
+                s.connect((vh, int(vp)))
+                s.close()
+                return True
+            except OSError:
+                time.sleep(1.0)
+        return False
+
+    # ---- main loop ----------------------------------------------------
+    def run(self):
+        t_vnc = threading.Thread(target=self._vnc_acceptor, daemon=True)
+        t_ctrl = threading.Thread(target=self._ctrl_acceptor, daemon=True)
+        t_vnc.start()
+        t_ctrl.start()
+        print("[orch] orchestrator running. Start a Linux window in NexOS.")
+        try:
+            while not self.stop_ev.is_set():
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\n[orch] shutting down")
+        finally:
+            self._teardown_guest()
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="NexOS Linux Guest orchestrator")
+    p.add_argument("--ctrl-listen", default=os.environ.get("NEXOS_CTRL_LISTEN", DEF_CTRL_LISTEN))
+    p.add_argument("--vnc-listen",  default=os.environ.get("NEXOS_VNC_LISTEN",  DEF_VNC_LISTEN))
+    p.add_argument("--linux-vnc",    default=os.environ.get("NEXOS_LINUX_VNC",    DEF_LINUX_VNC))
+    p.add_argument("--qemu2",        default=os.environ.get("NEXOS_QEMU2",         DEF_QEMU2))
+    p.add_argument("--linux-mem",    default=os.environ.get("NEXOS_LINUX_MEM",     DEF_LINUX_MEM))
+    p.add_argument("--linux-image",  default=DEF_LINUX_IMAGE)
+    p.add_argument("--linux-iso",    default=DEF_LINUX_ISO)
+    p.add_argument("--linux-kvm",    default=DEF_LINUX_KVM,
+                  help="e.g. -enable-kvm (host must support KVM)")
+    return p.parse_args()
+
+
+def select_recv(socks, timeout):
+    import select
+    r, _, _ = select.select(socks, [], [], timeout)
+    return r
+
+
+if __name__ == "__main__":
+    orch = LinuxOrchestrator(parse_args())
+    orch.run()

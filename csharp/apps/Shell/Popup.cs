@@ -26,18 +26,20 @@ namespace NexOS.Forms
         static uint   BG    = 0xF227272B;  // menu surface rgba(39,39,43,0.97)
         static uint   Edge  = 0x3A3A3A;    // hairline border (opaque-dark; VM-safe)
         static uint   Ink   = 0xEAEAEA;    // label ink (design #EAEAEA)
-        static uint   Sub   = 0x9AA0A6;    // secondary / prefix
         static uint   Hover = 0xFF3A3A40;  // row hover rgba(58,58,64,1)
         static uint   Danger= 0xC42B1C;    // destructive action ink
+
+        // Stable Anim key for popup open/close transition (Back overshoot, 170ms).
+        const int POPUP_KEY = unchecked((int)0x5E3779B1);
 
         // Match the desktop shell palette so the right-click menu switches
         // with Theme.Dark (dark wallpaper + dark taskbar => dark menu).
         static void Shell()
         {
             if (Theme.Dark != 0) {
-                BG = 0xF227272B; Edge = 0x3A3A3A; Ink = 0xEAEAEA; Sub = 0x9AA0A6; Hover = 0xFF3A3A40;
+                BG = 0xF227272B; Edge = 0x3A3A3A; Ink = 0xEAEAEA; Hover = 0xFF3A3A40;
             } else {
-                BG = 0xF7F9FC; Edge = 0xD5DDE8; Ink = 0x1B1B1B; Sub = 0x606060; Hover = 0xE7EEF8;
+                BG = 0xF7F9FC; Edge = 0xD5DDE8; Ink = 0x1B1B1B; Hover = 0xE7EEF8;
             }
         }
 
@@ -61,16 +63,17 @@ namespace NexOS.Forms
         }
 
         public static bool IsOpen() { return open; }
+        public static int  Owner()  { return owner; }
+
+        // Close the popup.  Sets open=false and kick-starts the close
+        // transition (Popup.Paint next frame animates POPUP_KEY towards 0).
         public static void Close()
         {
+            if (!open) return;
             open = false;
-            // Kick a repaint so the 170ms slide-out transition completes.
-            // Without this, Close() would set open=false but the menu would
-            // stay painted until the next unrelated mouse/key event
-            // (FIX #popup-close, 2026-10-23).
             Host.SetAnim(1);
+            // ANIM: close transition handled by Paint's Anim.Set(POPUP_KEY,0,...)
         }
-        public static int  Owner()  { return owner; }
 
         // Build a menu from parallel label / action arrays.  `owner` lets
         // the click handler know which surface spawned it.  Position is
@@ -107,11 +110,13 @@ namespace NexOS.Forms
             x = px; if (x < 4) x = 4; if (x + w > W - 4) x = W - 4 - w;
             y = py; if (y < 4) y = 4; if (y + h > H - 4) y = H - 4 - h;
             open = true;
-            // Kick the 170ms open/close transition so the host repaints
-            // until the slide-in animation is complete.  Without this, the
-            // first Popup.Paint() frame after open=true would not be drawn
-            // until the next mouse event or click — the menu shows "empty"
-            // until the user wiggles the cursor (FIX #popup-open, 2026-10-23).
+            // FIX: snap the open/close anim to 1000 so the first Paint frame
+            // draws a fully visible menu instead of a blank transparent one
+            // (Anim.Set only sets the target; Anim.Tick is driven by the
+            //  paint loop and may not have run yet when render_all() fires
+            //  immediately after Open).  Anim.Paint's Anim.Set(POPUP_KEY,
+            //  open?1000:0,...) then keeps it at 1000 until Close.
+            Anim.Snap(POPUP_KEY, 1000);
             Host.SetAnim(1);
         }
 
@@ -128,8 +133,6 @@ namespace NexOS.Forms
             if (s_act[idx] == -1) return -2;     // separator
             return s_act[idx];
         }
-
-        const int POPUP_KEY = unchecked((int)0x5E3779B1);   // stable Anim key for open/close transition
 
         public static void Paint(int W, int H)
         {
@@ -168,7 +171,20 @@ namespace NexOS.Forms
                     Gfx.FillRound(px + 4, iy + 1, w - 8, ItemH - 2, 4, Hover);
                 bool danger = (s_act[i] & DangerBit) != 0;
                 uint col = danger ? Danger : Ink;
-                Gfx.Text(px + 16, iy + (ItemH - 16) / 2, s_lab[i], col);
+                // P2-14: split label\tshortcut so the shortcut column aligns
+                // to the right edge (Ghost-dim colour), Windows-menu style.
+                string lab = s_lab[i];
+                string hint = null;
+                if (lab != null)
+                {
+                    // find the tab that separates label from shortcut hint
+                    int t = -1;
+                    for (int j = 0; j < lab.Length; j++) if ((int)lab[j] == '\t') { t = j; break; }
+                    if (t >= 0) { hint = NexOS.Sys.StrSub(lab, t + 1, lab.Length - t - 1); lab = NexOS.Sys.StrSub(lab, 0, t); }
+                }
+                Gfx.Text(px + 16, iy + (ItemH - 16) / 2, lab, col);
+                if (hint != null && hint.Length > 0)
+                    Gfx.Text(px + w - 16 - Gfx.Measure(hint), iy + (ItemH - 16) / 2, hint, 0x606060);
             }
         }
     }

@@ -1,19 +1,3 @@
-// =====================================================================
-//  Anim.cs  -  NexOS.Forms animation framework
-// ---------------------------------------------------------------------
-//  Tiny integer-only tween engine.  Constraints (MiniCLR interpreter):
-//    * NO floating point, NO generics, NO interfaces, NO string.Format
-//    * static field initialisers do NOT run -> arrays are allocated in
-//      Ensure() (called lazily on first use), never via field initialisers
-//    * the managed heap is rewound every frame -> we keep all tween state
-//      in static fields (the static area is NOT rewound), and never `new`
-//      inside Paint()
-//
-//  Everything is expressed as a 0..1000 integer "amount" so callers can
-//  lerp colours and scales without any float math.
-// =====================================================================
-using System.Runtime.CompilerServices;
-
 namespace NexOS.Forms
 {
     public static class Anim
@@ -102,11 +86,41 @@ namespace NexOS.Forms
             return free;
         }
 
-        // Current animated value for a key (0..1000), advanced to `now`.
+        // Advance one slot to its eased value at time `now`.  Shared by Tick()
+        // (batch) and Get() (lazy read).  Idempotent: a slot settled at 0 is
+        // freed; a slot settled at a non-zero rest value is kept (so Get keeps
+        // returning it) but then no longer drives the repaint loop.
+        static void Advance(int i, int now)
+        {
+            if (K[i] < 0) return;
+            int t = now - Start[i];
+            if (t >= Dur[i])
+            {
+                V[i] = To[i];
+                if (To[i] == 0) K[i] = -1;   // settled at rest -> free slot
+            }
+            else
+            {
+                int p = (t * 1000) / Dur[i];          // 0..1000
+                int e = (Ez[i] == 1) ? EaseBack(p) : EaseCubic(p);
+                V[i] = From[i] + ((To[i] - From[i]) * e) / 1000;
+            }
+        }
+
+        // Current animated value for a key (0..1000).  Lazily advances the slot
+        // to the present time so the returned value is always live regardless of
+        // whether Tick() has run since Set().  This is the root-cause fix for the
+        // "blank first frame / menu never animates" bug: an open transition
+        // becomes visible on the very first frame after Set() fired, instead of
+        // freezing at V=0 waiting for the next frame's Tick.
         public static int Get(int key)
         {
             Ensure();
-            for (int i = 0; i < CAP; i++) if (K[i] == key) return V[i];
+            int now = Host.TickMs();
+            for (int i = 0; i < CAP; i++)
+            {
+                if (K[i] == key) { Advance(i, now); return V[i]; }
+            }
             return 0;
         }
 
@@ -123,11 +137,10 @@ namespace NexOS.Forms
         // frame from a Paint() must NOT reset the tween clock.  ez: 0=Cubic,
         // 1=Back(overshoot).
         //
-        // Without this guard, the Start menu / popup / toggle / progress-bar
-        // animations never play: an open tween snaps straight to its end value
-        // (no slide or fade) because From=V is already at the target, while a
-        // closing tween stalls for seconds because its easing clock is re-zeroed
-        // on every frame -- the exact "start menu animation is broken" symptom.
+        // The guard `if (To[s] == target && Ez[s] == ez) return;` is load-bearing:
+        // without it the Start menu / popup / toggle / progress-bar animations
+        // never play (opening tweens snap to end, closing tweens stall because
+        // their clock is re-zeroed each frame).  DO NOT REMOVE.
         public static void Set(int key, int target, int durMs, int ez)
         {
             int s = Slot(key);
@@ -138,6 +151,28 @@ namespace NexOS.Forms
             Dur[s] = (durMs < 1) ? 1 : durMs;
             Start[s] = now;
             Ez[s] = ez;
+            // Keep the repaint loop alive.  Set() usually runs during Paint,
+            // AFTER this frame's Anim.Tick() already executed (Tick sits at the
+            // top of PaintDesktop, before Popup/StartMenu call Set).  Without
+            // re-arming, a brand-new slot would never get ticked again and the
+            // menu would freeze at V=0.  Re-arming guarantees the open/close
+            // transition actually plays -- this is what removes the need for
+            // Anim.Snap as a workaround.
+            Host.SetAnim(1);
+        }
+
+        // Force a key to an explicit value immediately (bypasses tween clock).
+        // Extreme fallback only: prefer Set()+Tick() real easing.  Retained for
+        // the few callers (e.g. Popup.Open) that still need an instant state.
+        public static void Snap(int key, int value)
+        {
+            int s = Slot(key);
+            int now = Host.TickMs();
+            V[s] = value;
+            From[s] = value;
+            To[s] = value;
+            Start[s] = now;
+            Host.SetAnim(1);   // keep loop consistent with Set()
         }
 
         public static void Set(int key, int target, int durMs)
@@ -171,21 +206,11 @@ namespace NexOS.Forms
             for (int i = 0; i < CAP; i++)
             {
                 if (K[i] < 0) continue;
-                int t = now - Start[i];
-                if (t >= Dur[i])
-                {
-                    V[i] = To[i];
-                    // settled: if at rest (0) we can free the slot to save scans
-                    if (To[i] == 0) { K[i] = -1; }
-                    else active = 1;
-                }
-                else
-                {
-                    int p = (t * 1000) / Dur[i];          // 0..1000
-                    int e = (Ez[i] == 1) ? EaseBack(p) : EaseCubic(p);
-                    V[i] = From[i] + ((To[i] - From[i]) * e) / 1000;
-                    active = 1;
-                }
+                Advance(i, now);
+                // Only keep the loop alive while the slot is still moving; a
+                // settled slot (even at a non-zero rest value) stops driving
+                // frames so the UI can go idle instead of repainting forever.
+                if (K[i] >= 0 && (now - Start[i]) < Dur[i]) active = 1;
             }
             Host.SetAnim(active);
         }

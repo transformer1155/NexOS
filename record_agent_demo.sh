@@ -35,7 +35,7 @@ PROXY_PID=$!
 sleep 1
 
 # ---- 3. QEMU: desktop on Xvfb, serial accepts commands, networking up ----
-DISPLAY=:1 qemu-system-x86_64 -drive format=raw,file="$IMG" -m 64M \
+DISPLAY=:1 qemu-system-x86_64 -drive format=raw,file="$IMG" -m 512M \
   -display sdl -vga std -no-reboot \
   -monitor none \
   -serial tcp:127.0.0.1:$SERIAL_PORT,server,nowait \

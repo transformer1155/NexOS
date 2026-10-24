@@ -188,6 +188,43 @@ namespace NexOS.Forms
         // Toggle "whole window fully transparent":  on != 0 drops every window's
         // glassy chrome to zero opacity so the desktop shows straight through it.
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void   SetWindowTransparent(int on);
+
+        // ---- network downloads ---------------------------------------
+        // SmartDownloadRouter: files under 5MB take a single-socket fast
+        // path; larger files are sharded with HTTP Range plus an IDM-style
+        // resume state machine (per-slice Offset persisted to <dest>.resume).
+        // Returns bytes written (>=0) or a negative error code.  Blocking:
+        // callers should Repaint() a busy placeholder first.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int    DownloadFile(string url, string dest, int timeoutMs);
+        // MultiPathManager: detect and bind every usable WiFi / NIC socket,
+        // give each a disjoint byte range of the file, fetch concurrently and
+        // stitch -- bypassing TCP head-of-line blocking to aggregate the
+        // physical bandwidth of all links.  Returns 0 when the background
+        // transfer started; poll DownloadStatus(dest) for progress.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int    DownloadAsync(string url, string dest);
+        // JSON progress snapshot: {"code","state","total","received",
+        // "percent","slices","done","bps","error"}.  Falls back to the
+        // persisted resume manifest so a restarted download still reports.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern string DownloadStatus(string dest);
+        // Abort a running DownloadAsync; the resume manifest is kept so a
+        // later DownloadFile continues from the recorded slice offsets.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int    DownloadCancel(string dest);
+
+        // ---- Linux guest / VNC framebuffer (WebView control backbone) ---------
+        // MiniCLR returns scalars only (no out/ref/struct), so we expose four
+        // separate readers for the framebuffer metadata.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int LinuxStart(string url);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void LinuxStop();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int LinuxActive();
+        // LinuxFb: returns raw uint32* framebuffer ptr (cast to int, 32-bit VM).
+        // Returns 0 when no framebuffer is ready yet.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int LinuxFb();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int LinuxFbW();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int LinuxFbH();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int LinuxFbCap();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int LinuxInput(int mx, int my, int buttons, int key);
+        // LinuxBlit: host-side row-by-row blit from LinuxGuestFB into managed window.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int LinuxBlit(int dstX, int dstY, int dstW, int dstH, int srcX, int srcY);
     }
 #endif // !WINHOST
 
@@ -468,6 +505,9 @@ namespace NexOS.Forms
             cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(TermBgMode));
             cfg = NexOS.Sys.StrConcat(cfg, "\n");
             Host.WriteText(0, CfgName, cfg);
+            // P2-17: force immediate repaint so Theme changes (wallpaper, accent,
+            // dark/light) are visible without waiting for the next mouse event.
+            Host.Repaint();
         }
 
         public static void Load()
@@ -571,7 +611,7 @@ namespace NexOS.Forms
         public static uint Alpha(uint c, int a)
         {
             if (a < 0) a = 0; if (a > 255) a = 255;
-            return (uint)((a << 24) | (c & 0x00FFFFFF));
+            return (uint)(((uint)a << 24) | (c & 0x00FFFFFF));
         }
 
         // Fade a colour by `t` (0..1000) from fully transparent -> opaque,
@@ -582,7 +622,7 @@ namespace NexOS.Forms
             if (t >= 1000) return c;
             int a = (int)((c >> 24) & 0xFF);
             int na = (a * t) / 1000;
-            return (uint)((na << 24) | (c & 0x00FFFFFF));
+            return (uint)(((uint)na << 24) | (c & 0x00FFFFFF));
         }
 
         public static string Cat(string a, string b) { return NexOS.Sys.StrConcat(a, b); }

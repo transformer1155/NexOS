@@ -48,6 +48,19 @@ int     vmm_init(void);
  * guest handle (opaque) or 0 on failure.  The guest is NOT running yet. */
 void*   vmm_create_guest(uint32_t guest_pages);
 
+/* Load a flat binary payload into guest RAM at `guest_phys` (must be inside
+ * the guest region).  Returns 0 on success.  The Phase-1 smoke guest
+ * (guest_blob.h) is placed at 0x1000 this way. */
+int     vmm_load_blob(void* g, uint32_t guest_phys, const void* data, uint32_t len);
+
+/* Read back a guest-physical dword (used by tests to verify the guest really
+ * wrote to shared memory).  Returns 0 if the address is out of range. */
+uint32_t vmm_read_guest32(void* g, uint32_t guest_phys);
+
+/* Translate a guest-physical address to a host pointer inside the guest RAM
+ * region, or NULL if out of range.  Used for zero-copy framebuffer access. */
+void*   vmm_guest_ptr(void* g, uint32_t guest_phys);
+
 /* Map the guest's shared framebuffer region for the GUI to read.  Returns a
  * kernel-virtual pointer and fills w/h (set at guest creation).  NULL if no
  * guest/framebuffer. */

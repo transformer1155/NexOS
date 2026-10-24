@@ -17,6 +17,14 @@
 #include "mforms.h"
 #include "clr.h"
 
+// ---- Linux guest backend (WebView control) ----
+// linux_manager.h gives us LinuxGuestFB + lifecycle functions.
+// linux_guest_backend.h wraps vnc_client + linux_manager behind an interface.
+extern "C" {
+#include "plugins/linux_manager.h"
+#include "plugins/linux_guest_backend.h"
+}
+
 // Clipboard is shared with the kernel (terminal copy/paste) so that text
 // copied in a managed app can be pasted into the text terminal and vice
 // versa.
@@ -749,6 +757,81 @@ int32_t h_clip_set(int32_t* a) {
 }
 
 // =====================================================================
+//  Linux guest / VNC framebuffer (WebView icalls)
+// =====================================================================
+
+// Host.LinuxStart(url): kick the linux_manager lifecycle.
+int32_t h_linux_start(int32_t* a) {
+    const char* url = clr_str(a && a[0] ? a[0] : 0);
+    (void)url;  // reserved for future URL hint, currently ignored
+    linux_manager_start();
+    return 1;
+}
+
+// Host.LinuxStop(): shutdown the lifecycle.
+int32_t h_linux_stop(int32_t* a) {
+    linux_manager_stop();
+    return 0;
+}
+
+// Host.LinuxActive(): returns 1 when LinuxGuestFB has a live frame.
+int32_t h_linux_active(int32_t* a) {
+    return linux_manager_active();
+}
+
+// Host.LinuxFb(): read the LinuxGuestFB shared struct.
+// Returns 1 when ready, 0 when no framebuffer yet.
+// Also writes 4 global statics that C# reads after the call.
+extern "C" { int g_webview_fbptr = 0; int g_webview_fbw = 0; int g_webview_fbh = 0; int g_webview_fbcap = 0; }
+int32_t h_linux_fb(int32_t* a) {
+    LinuxGuestFB* fb = linux_manager_fb();
+    if (!fb || !fb->have_frame) { g_webview_fbptr = 0; g_webview_fbw = 0; g_webview_fbh = 0; g_webview_fbcap = 0; return 0; }
+    g_webview_fbptr = (int)(intptr_t)fb->fb_buf;
+    g_webview_fbw    = fb->fb_w;
+    g_webview_fbh    = fb->fb_h;
+    g_webview_fbcap  = fb->cap;
+    return 1;
+}
+
+// Host.LinuxFbW/H/Cap: cached FB dimension readers (called after LinuxFb).
+int32_t h_linux_fbw(int32_t* a)   { (void)a; return g_webview_fbw;   }
+int32_t h_linux_fbh(int32_t* a)   { (void)a; return g_webview_fbh;   }
+int32_t h_linux_fbcap(int32_t* a) { (void)a; return g_webview_fbcap; }
+
+// Host.LinuxInput(mx,my,buttons,key): forward a mouse/key event to VNC.
+extern "C" { int gui_linux_input(int mx, int my, int buttons, int key); }
+int32_t h_linux_input(int32_t* a) {
+    if (!a) return 0;
+    return gui_linux_input(a[0], a[1], a[2], a[3]);
+}
+
+// Host.LinuxBlit(dstX,dstY,dstW,dstH,srcX,srcY): blit rect from LinuxGuestFB
+// into window client area at (dstX,dstY).  srcX/srcY is the top-left offset
+// within the framebuffer.  Calls gui_blit_pixels (already exposed by gui.cpp).
+extern "C" { void gui_blit_pixels(int x, int y, int w, int h, const uint32_t* src); }
+int32_t h_linux_blit(int32_t* a) {
+    if (!a) return 0;
+    LinuxGuestFB* fb = linux_manager_fb();
+    if (!fb || !fb->fb_buf) return 0;
+    int dx = a[0], dy = a[1], dw = a[2], dh = a[3];
+    int sx = a[4], sy = a[5];
+    int cap = fb->fb_w * fb->fb_h;
+    if (dw <= 0 || dh <= 0) return 0;
+    if (sx < 0) sx = 0;
+    if (sy < 0) sy = 0;
+    if (sx + dw > fb->fb_w) dw = fb->fb_w - sx;
+    if (sy + dh > fb->fb_h) dh = fb->fb_h - sy;
+    if (dw <= 0 || dh <= 0) return 0;
+    // Blit row by row to respect the VNC framebuffer's strided layout.
+    for (int r = 0; r < dh; r++)
+    {
+        const uint32_t* row = fb->fb_buf + (sy + r) * fb->fb_w + sx;
+        gui_blit_pixels(dx, dy + r, dw, 1, row);
+    }
+    return 1;
+}
+
+// =====================================================================
 //  registration
 // =====================================================================
 struct Reg { const char* name; clr_icall_fn fn; };
@@ -839,6 +922,16 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::SetPixel",     h_set_pixel   },
     { "NexOS.Forms.Host::SetPerf",      h_set_perf    },
     { "NexOS.Forms.Host::SetWindowTransparent", h_set_window_transparent },
+    // ---- Linux guest / VNC framebuffer ----
+    { "NexOS.Forms.Host::LinuxStart",    h_linux_start    },
+    { "NexOS.Forms.Host::LinuxStop",     h_linux_stop     },
+    { "NexOS.Forms.Host::LinuxActive",   h_linux_active   },
+    { "NexOS.Forms.Host::LinuxFb",       h_linux_fb       },
+    { "NexOS.Forms.Host::LinuxInput",    h_linux_input    },
+    { "NexOS.Forms.Host::LinuxBlit",     h_linux_blit     },
+    { "NexOS.Forms.Host::LinuxFbW",       h_linux_fbw      },
+    { "NexOS.Forms.Host::LinuxFbH",       h_linux_fbh      },
+    { "NexOS.Forms.Host::LinuxFbCap",     h_linux_fbcap    },
 };
 const int G_REG_COUNT = (int)(sizeof(g_regs) / sizeof(g_regs[0]));
 

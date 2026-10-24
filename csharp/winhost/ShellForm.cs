@@ -66,6 +66,10 @@ namespace NexOS.WinHost
         int nextId = 0;
         int cascade = 0;
 
+        // Host.SetWindowTransparent: when set, every window's glassy chrome
+        // drops to zero opacity so the desktop shows straight through it.
+        static bool g_windowTransparent;
+
         WinRec drag; int dragDX, dragDY;
         int hoverBtnWin = -1, hoverBtnIdx = -1;
         int mouseX = -1, mouseY = -1;
@@ -109,6 +113,16 @@ namespace NexOS.WinHost
                 Invalidate();
             };
             Host.ExitGuiHook = () => Close();
+            // Repaint(): the kernel presents its backbuffer immediately; here
+            // force a synchronous WM_PAINT so a busy placeholder drawn before
+            // a long blocking call is on screen for the whole stall.
+            Host.RepaintHook = () => { Invalidate(); Update(); };
+            // Whole-window transparency toggle (glass chrome off).
+            Host.WindowTransparentHook = (on) =>
+            {
+                g_windowTransparent = (on != 0);
+                Invalidate();
+            };
             // Shared context-menu actions (OpenApp) must land as real
             // windows, exactly like gui.cpp's launch_app does in the VM.
             Host.OpenAppHook = LaunchOrFocus;
@@ -117,6 +131,23 @@ namespace NexOS.WinHost
             Shell.Init();
             LoadTextures();
             Host.StartTimeSync();   // network-accurate clock (fire-and-forget)
+
+            // Bring up the MCP bus so net_status has a live object to report on.
+            // Default host/port match apps.json gateway conventions; set
+            // NEXOS_MCPBUS_HOST / NEXOS_MCPBUS_PORT environment variables to
+            // override.
+            string busHost = Environment.GetEnvironmentVariable("NEXOS_MCPBUS_HOST");
+            string busPortStr = Environment.GetEnvironmentVariable("NEXOS_MCPBUS_PORT");
+            int busPort; int.TryParse(busPortStr, out busPort);
+            NexOS.Net.McpBusHost.Ensure(true,
+                string.IsNullOrEmpty(busHost) ? null : busHost,
+                busPort);
+            if (NexOS.Net.McpBusHost.Current != null)
+            {
+                var busTask = NexOS.Net.McpBusHost.Current.WaitUntilReadyAsync(TimeSpan.FromSeconds(3));
+                try { busTask.Wait(TimeSpan.FromSeconds(3)); } catch { }
+            }
+
             if (ShotRequested) Login.BypassForHost();   // headless preview skips the lock screen
 
             var t = new System.Windows.Forms.Timer { Interval = 40 };   // ~25 fps

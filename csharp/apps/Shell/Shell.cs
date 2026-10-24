@@ -28,6 +28,8 @@ namespace NexOS.Forms
         public const int Demo         = 11;  // button-shrink + reply demo window
         public const int NetTools     = 12;  // network diagnostics (ipconfig/netstat/ping)
         public const int AiLauncher   = 13;  // AI command console / launcher
+        public const int NetDefense    = 14;  // network routing & attack-defense sim
+        public const int WebView       = 15;  // Linux guest VNC framebuffer viewer
     }
 
     public static class Shell
@@ -125,6 +127,8 @@ namespace NexOS.Forms
             if (kind == Kind.Demo)         return new DemoApp();
             if (kind == Kind.NetTools)     return new NetToolsApp();
             if (kind == Kind.AiLauncher)   return new AiLauncherApp();
+            if (kind == Kind.NetDefense)   return new NetDefenseApp();
+            if (kind == Kind.WebView)      return new WebViewApp();
             return null;
         }
 
@@ -194,7 +198,12 @@ namespace NexOS.Forms
         }
         public static int MouseUp(int id, int btn, int mx, int my)
         {
-            if (id < 0 || id >= MAX) return 0;
+            if (id < 0)
+            {
+                // P2-15: finish a Start-menu tile drag.
+                return Desktop.DragEnd(mx, my) ? 1 : 0;
+            }
+            if (id >= MAX) return 0;
             App a = apps[id];
             if (a == null) return 0;
             App.Current = a;
@@ -203,7 +212,12 @@ namespace NexOS.Forms
         }
         public static int MouseMove(int id, int mx, int my)
         {
-            if (id < 0 || id >= MAX) return 0;
+            if (id < 0)
+            {
+                // P2-15: tile drag tracking when no window has focus.
+                return Desktop.DragMove(mx, my) ? 1 : 0;
+            }
+            if (id >= MAX) return 0;
             App a = apps[id];
             if (a == null) return 0;
             App.Current = a;
@@ -212,7 +226,13 @@ namespace NexOS.Forms
         }
         public static int Wheel(int id, int dy)
         {
-            if (id < 0 || id >= MAX) return 0;
+            if (id < 0)
+            {
+                // P0-3: wheel scrolls Start menu All-apps list when no window
+                // has focus but the menu is open in All-apps view.
+                return Desktop.WheelAllApps(dy) ? 1 : 0;
+            }
+            if (id >= MAX) return 0;
             App a = apps[id];
             if (a == null) return 0;
             App.Current = a;

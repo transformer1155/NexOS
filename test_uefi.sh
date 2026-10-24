@@ -48,7 +48,7 @@ fi
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file=build/ovmf_vars_test.fd \
     $DRIVE_ARGS \
-    -m 128M -display none -no-reboot \
+    -m 512M -display none -no-reboot \
     -serial file:"$SER" \
     -monitor stdio > "$OUT" 2>&1 || true
 

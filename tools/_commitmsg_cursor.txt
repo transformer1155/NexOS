@@ -1,0 +1,59 @@
+fix(gui): cursor snapshot must remember its own origin, or the pointer leaves a ghost
+
+Reported: "when the mouse is behind a UI control, first there is a bug behind
+it, then it replays" -- i.e. moving the pointer across UI controls left stale
+cursor pixels pinned on screen.
+
+Two defects, both in the software-cursor erase/redraw path.
+
+--- Root cause 1: the snapshot had no position ---
+
+MouseCursor::save_bg() captured the 32x32 pixels under the cursor, and
+restore_bg() wrote them back -- both indexed with the live cursor.x/y.  That is
+only valid while the cursor has not moved.  render_all()'s cursor block can run
+after the pointer has already advanced, so restore_bg() wrote the OLD
+background at the NEW position: the old cursor pixels were never erased (the
+ghost) and the fresh pixels just painted there were destroyed.
+
+Measured on the host (tools/_saved_origin.c), pointer 200,200 -> 260,260:
+
+                    stale cursor px   fresh content kept
+    OLD (live x/y)        216              576 / 1384
+    FIXED (saved origin)    0             1384 / 1384
+
+Fix: record saved_x/saved_y at snapshot time and have restore_bg() write back
+at that origin.  The three call sites (render_all, handle_mouse_move,
+set_mouse_position) now report damage for the snapshot's origin rather than the
+current position.
+
+--- Root cause 2: "covered" meant "intersects", so the restore was skipped ---
+
+render_all() skipped the restore whenever any damage rect merely TOUCHED the
+32x32 cursor box.  A hover highlight on a button damages only the control's own
+rect (e.g. 60x24), which sits entirely INSIDE the cursor box -- so the code
+concluded "covered" and left the cursor pixels outside the control rect
+permanently on screen.
+
+Measured (tools/_cursor_ghost.c), moving onto and then off a control:
+    frame 1 (plain desktop)  : 216 cursor px
+    frame 2 (over control)   : 363   <- +147 stale
+    frame 3 (moved off)      : 363   <- never erased
+
+Fix: require the damage to fully CONTAIN the cursor box before skipping the
+restore (tools/_cursor_fix2.c: after the fix the count stays 216 across all
+frames, and the full-coverage case still correctly skips the restore so a window
+sliding under the pointer keeps its fresh pixels).
+
+--- Test harness ---
+
+Added a `gt move <x> <y>` verb to the serial test harness so the soft cursor
+can be driven over the same delta path the PS/2 handler uses, without needing a
+physical mouse.  (VBox 7.2's controlvm has no mouse-injection verb and the
+tcpserver/named-pipe serial modes do not bind on this guest, so a keyboard-free
+serial verb is the only way to exercise this from a script.)
+
+Verification (VirtualBox, IDE disk, fresh image, 1024x768):
+- Desktop still boots to the lock screen; Chinese labels crisp; login card free
+  of the earlier banding (the f4b413e AVX2 fix).
+- Cursor renders normally and the desktop is otherwise unchanged.
+- Host unit tests for all three invariants are committed under tools/.

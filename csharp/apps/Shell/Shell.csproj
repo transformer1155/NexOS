@@ -28,7 +28,7 @@
     <DebugType>none</DebugType>
     <Optimize>true</Optimize>
     <Deterministic>true</Deterministic>
-    <NoWarn>CS0626;CS0649;CS8021;CS1591;CS0169</NoWarn>
+    <NoWarn>CS0626;CS0649;CS8021;CS1591;CS0169;CS0414</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -48,6 +48,7 @@
     <Compile Include="AiAgent.cs" />
     <Compile Include="Demo.cs" />
     <Compile Include="NetTools.cs" />
+    <Compile Include="NetDefenseApp.cs" />
     <Compile Include="AiLauncher.cs" />
     <Compile Include="Popup.cs" />
     <Compile Include="Toast.cs" />

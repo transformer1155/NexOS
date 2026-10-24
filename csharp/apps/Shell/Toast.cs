@@ -63,6 +63,38 @@ namespace NexOS.Forms
 
         public static void Show(string t, string b) { Show(t, b, 2600); }
 
+        // P0-2: hit-test toast notifications.  Returns slot (0..CAP-1)
+        // of the toast under (mx,my), or -1 if none.
+        public static int Hit(int w, int h, int mx, int my)
+        {
+            Init();
+            int baseY = h - Desktop.TaskH - 16;
+            for (int i = 0; i < CAP; i++)
+            {
+                if (life[i] <= 1) continue;
+                int d = (int)Anim.Get(TOAST_KEY + i);
+                if (d <= 0) continue;
+                int x = w - TW - 16 + ((1000 - d) * PAD) / 1000;
+                int y = baseY - i * (TH + GAP);
+                if (mx >= x && mx < x + TW && my >= y && my < y + TH) return i;
+            }
+            return -1;
+        }
+
+        // P0-2: dismiss a toast by slot.  Sets lifetime to 0 so the next
+        // Paint frame slides it out and frees the slot.  Pure state change;
+        // slide-out animation is handled by the existing age>life branch.
+        public static void Dismiss(int slot)
+        {
+            Init();
+            if (slot < 0 || slot >= CAP) return;
+            if (life[slot] <= 1) return;
+            // Force age>life immediately: t0 backdate by 1ms.
+            t0[slot] = Host.TickMs() - life[slot] - 1;
+            // P0-2: explicit slide-out tween (the age>life branch in Paint also covers it).
+            Anim.Set(TOAST_KEY + slot, 0, Anim.DUR_SLIDE, 1);
+        }
+
         public static void Paint(int w, int h)
         {
             Init();

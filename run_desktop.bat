@@ -12,7 +12,7 @@ start "" cmd /c "C:\Users\trans\AppData\Local\Programs\Python\Python310\python.e
 ping -n 2 127.0.0.1 >nul
 
 REM --- start real kernel VM ---
-start "" D:\qemu\qemu-system-x86_64.exe -m 250 -accel tcg,tb-size=128 -display none -no-reboot -hda build/os_v2.img -serial tcp:127.0.0.1:4321,server
+start "" D:\qemu\qemu-system-x86_64.exe -m 512 -accel tcg,tb-size=128 -display none -no-reboot -hda build/os_v2.img -serial tcp:127.0.0.1:4321,server
 
 REM --- wait for kernel to reach GUI mode ---
 echo Waiting ~45s for guest to boot to GUI ...

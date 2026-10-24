@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>NexOS Developer Toolkit</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: "Segoe UI", system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
+  .tab-active { background: #1e293b; border-bottom: 2px solid #38bdf8; color: #38bdf8; }
+  .tab { padding: 12px 20px; cursor: pointer; color: #94a3b8; transition: all .15s; }
+  .tab:hover { color: #e2e8f0; background: #1e293b; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  .log { background: #020617; color: #a3e635; font-family: Consolas, monospace; font-size: 12px; padding: 12px; border-radius: 8px; height: 300px; overflow-y: auto; white-space: pre-wrap; }
+  .btn { padding: 8px 16px; border-radius: 6px; font-weight: 500; }
+  .btn-primary { background: #0284c7; color: white; }
+  .btn-primary:hover { background: #0369a1; }
+  .btn-primary:disabled { background: #475569; cursor: not-allowed; }
+  .btn-success { background: #16a34a; color: white; }
+  .btn-success:hover { background: #15803d; }
+  .btn-danger { background: #dc2626; color: white; }
+  .btn-danger:hover { background: #b91c1c; }
+  .input { background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 8px 12px; color: #e2e8f0; width: 100%; }
+  .input:focus { outline: none; border-color: #38bdf8; }
+  .card { background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
+  .ok-badge { background: #14532d; color: #86efac; padding: 4px 10px; border-radius: 12px; font-size: 12px; }
+  .err-badge { background: #7f1d1d; color: #fca5a5; padding: 4px 10px; border-radius: 12px; font-size: 12px; }
+  .warn-badge { background: #713f12; color: #fde047; padding: 4px 10px; border-radius: 12px; font-size: 12px; }
+</style>
+</head>
+<body class="min-h-screen">
+<header class="border-b border-slate-700 px-6 py-4 flex items-center justify-between">
+  <div class="flex items-center gap-3">
+    <div class="w-10 h-10 bg-gradient-to-br from-cyan-400 to-blue-600 rounded-lg flex items-center justify-center font-bold text-lg">N</div>
+    <div><h1 class="text-xl font-bold">NexOS Developer Toolkit</h1><p class="text-xs text-slate-400">WebView2</p></div>
+  </div>
+  <span id="gw-indicator" class="warn-badge">checking gateway...</span>
+</header>
+<nav class="flex border-b border-slate-700 bg-slate-900">
+  <div class="tab tab-active" data-tab="new">New Project</div>
+  <div class="tab" data-tab="build">Build</div>
+  <div class="tab" data-tab="verify">Verify</div>
+  <div class="tab" data-tab="deploy">Deploy</div>
+  <div class="tab" data-tab="gateway">Gateway</div>
+</nav>
+<main class="p-6 max-w-5xl mx-auto">
+
+<section id="panel-new" class="panel active">
+<div class="card"><h2 class="text-lg font-semibold mb-4">Create MiniCLR Project</h2>
+<div class="space-y-4">
+  <div><label class="text-sm text-slate-400">App ID</label><input id="new-name" class="input mt-1" placeholder="e.g. my_notepad"></div>
+  <div><label class="text-sm text-slate-400">Base Directory</label>
+    <div class="flex gap-2 mt-1"><input id="new-dir" class="input flex-1"><button class="btn bg-slate-700" onclick="pickNewDir()">...</button></div></div>
+  <button class="btn btn-primary" onclick="doNew()">Create Project</button>
+  <div id="new-result"></div>
+</div></div></section>
+
+<section id="panel-build" class="panel">
+<div class="card"><h2 class="text-lg font-semibold mb-4">Build & Pack</h2>
+<div class="space-y-4">
+  <div><label class="text-sm text-slate-400">Project Directory</label>
+    <div class="flex gap-2 mt-1"><input id="build-dir" class="input flex-1"><button class="btn bg-slate-700" onclick="pickBuildDir()">...</button></div></div>
+  <div id="build-projects" class="text-sm text-slate-400"></div>
+  <button id="build-btn" class="btn btn-primary" onclick="doBuild()">Build (dotnet → mex → nexpack)</button>
+  <div id="build-log" class="log"></div>
+</div></div></section>
+
+<section id="panel-verify" class="panel">
+<div class="card"><h2 class="text-lg font-semibold mb-4">Verify .nexpack</h2>
+<div class="space-y-4">
+  <div class="flex gap-2"><input id="verify-path" class="input flex-1"><button class="btn bg-slate-700" onclick="pickVerifyFile()">...</button></div>
+  <button class="btn btn-primary" onclick="doVerify()">Verify</button>
+  <div id="verify-result"></div>
+</div></div></section>
+
+<section id="panel-deploy" class="panel">
+<div class="card"><h2 class="text-lg font-semibold mb-4">Deploy to VM Gateway</h2>
+<div class="space-y-4">
+  <div class="flex gap-2"><input id="deploy-path" class="input flex-1" placeholder="path to .nexpack"><button class="btn bg-slate-700" onclick="pickDeployFile()">...</button></div>
+  <div class="grid grid-cols-2 gap-4">
+    <div><label class="text-sm text-slate-400">Host</label><input id="deploy-host" class="input mt-1" value="127.0.0.1"></div>
+    <div><label class="text-sm text-slate-400">Port</label><input id="deploy-port" class="input mt-1" value="19387" type="number"></div>
+  </div>
+  <button class="btn btn-success" onclick="doDeploy()">Deploy</button>
+  <div id="deploy-result"></div>
+</div></div></section>
+
+<section id="panel-gateway" class="panel">
+<div class="card"><h2 class="text-lg font-semibold mb-4">Gateway Manager</h2>
+<div class="space-y-4">
+  <div class="p-4 rounded-lg bg-slate-800 flex items-center justify-between">
+    <div><div class="text-sm text-slate-400">Status</div><div id="gw-status-text" class="text-lg">checking...</div></div>
+    <div id="gw-actions" class="flex gap-2"></div>
+  </div>
+  <div class="grid grid-cols-2 gap-4">
+    <div><label class="text-sm text-slate-400">Port</label><input id="gw-port" class="input mt-1" value="19387" type="number"></div>
+    <div><label class="text-sm text-slate-400">Package Dir</label><input id="gw-pkgdir" class="input mt-1"></div>
+  </div>
+</div></div></section>
+
+</main>
+<script>
+document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('tab-active'));
+  document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+  t.classList.add('tab-active');
+  document.getElementById('panel-' + t.dataset.tab).classList.add('active');
+}));
+function badge(type, text) {
+  const cls = { ok: 'ok-badge', err: 'err-badge', warn: 'warn-badge' }[type];
+  return '<span class="' + cls + '">' + text + '</span>';
+}
+async function bridge(method, args) {
+  if (!args) args = [];
+  return await window.pywebview.api[method](...args);
+}
+async function doNew() {
+  const name = document.getElementById('new-name').value.trim();
+  const dir  = document.getElementById('new-dir').value.trim();
+  const r = await bridge('new_project', [name, dir]);
+  document.getElementById('new-result').innerHTML = r.ok
+    ? '<div class="mt-3 p-3 rounded-lg bg-slate-800">' + badge('ok', 'OK') + ' Created: <code>' + r.path + '</code></div>'
+    : '<div class="mt-3 p-3 rounded-lg bg-red-900/40">' + badge('err', 'FAIL') + ' ' + r.message + '</div>';
+}
+async function pickNewDir() { const d = await bridge('pick_dir', []); if (d) document.getElementById('new-dir').value = d; }
+async function pickBuildDir() { const d = await bridge('pick_dir', []); if (d) { document.getElementById('build-dir').value = d; listProjs(d); } }
+async function listProjs(d) {
+  const r = await bridge('list_projects', [d]);
+  document.getElementById('build-projects').textContent = r.ok ? 'Found: ' + r.projects.join(', ') : r.error;
+}
+let buildPoll = null;
+async function doBuild() {
+  const dir = document.getElementById('build-dir').value.trim();
+  const btn = document.getElementById('build-btn');
+  const log = document.getElementById('build-log');
+  log.textContent = ''; btn.disabled = true;
+  const r = await bridge('build_start', [dir]);
+  buildPoll = setInterval(async () => {
+    const st = await bridge('get_job', [r.job_id]);
+    log.textContent = (st.log || []).join('
+');
+    log.scrollTop = log.scrollHeight;
+    if (st.status === 'done') {
+      clearInterval(buildPoll); btn.disabled = false;
+      log.textContent += '
+
+' + (st.ok ? 'SUCCESS: ' + st.nexpack + ' (' + st.size + ' bytes)
+SHA256: ' + st.sha256 : '
+
+FAIL: ' + st.error);
+    }
+  }, 500);
+}
+async function pickVerifyFile() { const f = await bridge('pick_file', ['*.nexpack']); if (f) document.getElementById('verify-path').value = f; }
+async function doVerify() {
+  const p = document.getElementById('verify-path').value.trim();
+  const r = await bridge('verify', [p]);
+  document.getElementById('verify-result').innerHTML = r.ok
+    ? '<div class="mt-3 p-3 rounded-lg bg-slate-800">' + badge('ok', 'VALID') + '<br><span class="text-xs text-slate-400">' + r.message + '</span></div>'
+    : '<div class="mt-3 p-3 rounded-lg bg-red-900/40">' + badge('err', 'INVALID') + ' ' + r.message + '</div>';
+}
+async function pickDeployFile() { const f = await bridge('pick_file', ['*.nexpack']); if (f) document.getElementById('deploy-path').value = f; }
+async function doDeploy() {
+  const p = document.getElementById('deploy-path').value.trim();
+  const h = document.getElementById('deploy-host').value.trim();
+  const port = parseInt(document.getElementById('deploy-port').value.trim());
+  const el = document.getElementById('deploy-result');
+  el.innerHTML = '<div class="p-3 text-slate-400">deploying...</div>';
+  const r = await bridge('deploy', [p, h, port]);
+  if (r.ok) {
+    const rep = r.report;
+    el.innerHTML = '<div class="mt-3 p-3 rounded-lg bg-slate-800">' + badge('ok', 'DEPLOYED')
+      + '<div class="text-xs text-slate-400 mt-2">app_id: <code>' + rep.app_id + '</code> | version: ' + rep.version + ' | mex: ' + rep.mex_size + ' bytes | sha256: <code>' + rep.sha256.substring(0,32) + '...</code></div></div>';
+  } else {
+    el.innerHTML = '<div class="mt-3 p-3 rounded-lg bg-red-900/40">' + badge('err', 'FAIL') + ' ' + (r.error || r.http) + '</div>';
+  }
+}
+async function refreshGwStatus() {
+  const st = await bridge('gw_status', []);
+  document.getElementById('gw-indicator').textContent = st.running ? 'RUNNING ' + st.host + ':' + st.port : 'STOPPED';
+  document.getElementById('gw-indicator').className = st.running ? 'ok-badge' : 'err-badge';
+  document.getElementById('gw-status-text').textContent = st.running ? 'Listening on ' + st.host + ':' + st.port : 'Not running';
+  const actions = document.getElementById('gw-actions');
+  if (st.running) {
+    actions.innerHTML = '<button class="btn btn-danger" onclick="doGwStop()">Stop</button><button class="btn bg-slate-700" onclick="refreshGwStatus()">Refresh</button>';
+  } else {
+    actions.innerHTML = '<button class="btn btn-success" onclick="doGwStart()">Start</button><button class="btn bg-slate-700" onclick="refreshGwStatus()">Refresh</button>';
+  }
+}
+async function doGwStart() {
+  const port = parseInt(document.getElementById('gw-port').value);
+  const pkgDir = document.getElementById('gw-pkgdir').value.trim() || null;
+  await bridge('gw_start', [port, pkgDir]);
+  setTimeout(refreshGwStatus, 1500);
+}
+async function doGwStop() { await bridge('gw_stop', []); setTimeout(refreshGwStatus, 500); }
+
+window.addEventListener('pywebviewready', async () => {
+  refreshGwStatus();
+});
+</script>
+</body>
+</html>

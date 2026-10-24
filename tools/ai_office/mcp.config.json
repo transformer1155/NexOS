@@ -1,0 +1,14 @@
+{
+  "name": "ai_office",
+  "description": "AI 办公并发执行 + 行号寻址协议 (生成/单行修复/并发执行/调试闭环)",
+  "command": "python",
+  "args": ["-m", "ai_office.mcp_server"],
+  "cwd": "E:\\NexOS\\NexOS\\tools",
+  "env": {
+    "AIO_BACKEND": "openai",
+    "AIO_MODEL": "deepseek-flash",
+    "AIO_BASE_URL": "https://api.deepseek.com/v1",
+    "AIO_API_KEY": "sk-c836b29ee6e64750a0689fd6d10522de"
+  },
+  "tools": ["ai_generate", "ai_fix_line", "ai_run"]
+}

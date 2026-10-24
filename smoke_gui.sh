@@ -10,7 +10,7 @@ Xvfb :3 -screen 0 1024x768x24 >/tmp/xvfb3.log 2>&1 &
 XVFB_PID=$!
 sleep 1
 echo "[smoke] Xvfb pid=$XVFB_PID"
-DISPLAY=:3 qemu-system-x86_64 -drive format=raw,file=build/os_v2.img -m 64M \
+DISPLAY=:3 qemu-system-x86_64 -drive format=raw,file=build/os_v2.img -m 512M \
   -display sdl -vga std -no-reboot -monitor none \
   -serial tcp:127.0.0.1:9997,server,nowait \
   -net nic,model=ne2k_isa -net user,hostfwd=tcp::8080-:8080 \

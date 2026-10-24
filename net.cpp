@@ -1592,14 +1592,34 @@ static void handle_guest_tcp(const IpHeader* ip, const TcpHeader* tcp,
                              TCP_ACK, 0, 0);
                 guest_tcp.state = TCPC_ESTABLISHED;
                 net_serial("[GUESTTCP] connection established\n");
+                /* The peer (or slirp) may push data in the SAME burst right
+                 * after the SYN-ACK (x11vnc writes its banner immediately).
+                 * If a data segment was processed BEFORE the SYN-ACK it was
+                 * silently dropped here; once in ESTABLISHED, recover by
+                 * accepting the NEXT in-order segment normally. */
             } else if (flags & TCP_RST){
                 guest_tcp.state = TCPC_ERROR;
                 net_serial("[GUESTTCP] RST received\n");
             }
+            /* Pure data segments arriving while SYN_SENT (rare reorder) are
+             * dropped here; the peer retransmits because we never ACK them,
+             * and the retransmission is then handled in ESTABLISHED. */
             break;
 
         case TCPC_ESTABLISHED:
         case TCPC_RECEIVING:
+            /* Duplicate / out-of-order segment filter.  The peer retransmits
+             * when our ACK is slow; without this check the retransmitted
+             * bytes are appended twice and the VNC handshake reads the
+             * banner's 'R' as a security-type count (nsec=0x52).  Accept a
+             * segment only when it starts exactly at the ack edge. */
+            if (payload_len > 0) {
+                if (seq + (uint32_t)payload_len <= guest_tcp.ack)
+                    break;                    /* fully-duplicate segment */
+                if (seq != guest_tcp.ack)
+                    break;                    /* out-of-order; drop, ACK re-arms peer */
+                net_serial("[GUESTTCP] data seg\n");
+            }
             guest_tcp.ack = seq + payload_len;
             if (payload_len > 0 &&
                 guest_tcp.rx_len + payload_len < TCP_CLIENT_RX_BUF){

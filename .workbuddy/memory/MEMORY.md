@@ -12,6 +12,15 @@
 - 改动后必须实测：构建 + 无头 QEMU serial 抓内核标记/截图，不能只编译过。
 - 完成先发"验证问答"，用户 OK 才收工。渐进式推进，不擅自跳阶段。
 
+## GUI 交互审查协作命令（用户强制，2026-10-11 起）
+- 任务来源：GUI 交互审查与优化代理，目标 = QEMU 内 NexOS GUI "像 Windows" 交互 + 鼠标移动绝对无重影/残影/双光标。
+- 工作流：**用户让我一次性把报告里所有 bug 都改掉**；改完后**用户逐个查看是否丢失/复现**。
+- 每修复一个 bug，代理**必须问用户一个问题**（确认该修复的验证结果 / 是否还有问题），**用户回答后代理才继续修下一个**；**禁止**不等回答就连续修多个。
+- 若某 bug **未修复成功**，用户会告知**出现了什么新问题**；代理据此继续，不擅自换方向。
+- 诊断报告固定存于 `GUI_BUG_DIAGNOSIS.md`（含 A 类=鼠标重影、B 类=卡顿、C 类=菜单渲染）。
+- 约束：不引入外部 GUI 库（LVGL/SDL2 等），继续帧缓冲自绘；不改 kernel64.cpp 核心逻辑；GUI 改动集中在 gui.cpp 与启动脚本；每次 git 提交 message 写明根因/修法/验证。
+- 注意：本机当前可用 **WSL（Ubuntu-24.04）** 构建（`wsl -e bash -lc "cd /mnt/e/NexOS/NexOS && make ..."` 已验证通过），与上文"纯 Windows 不用 WSL"的旧约定已变化——构建方式以实际可用为准。
+
 ## GUI 改动纪律（C# 优先，2026-08-20）
 - 真实 VM 桌面由 C# 托管壳渲染（gui.cpp render_all 内 managed_desk=true）；桌面/任务栏/菜单改 NexOS.Forms/apps/Shell/*，烤进 shell.mex→sfs.img→镜像。窗口 chrome 仍是原生 gui.cpp::draw_window。
 - 渲染按需：gui_tick() 仅 g_mforms_anim 时 render_all()，空闲零渲染。改共享源后 shell.mex 与 csharp/winhost 都要重编。

@@ -35,9 +35,11 @@ foreach ($a in $args) {
 if ($USE_GL -and $HEADLESS_GL) { $USE_GL = $true }
 
 # Configuration
-$QEMU_PATH  = "D:\qemu"
-$IMG_PATH   = "D:\MyOS\bootloader\build\os_v2.img"
-$BRIDGE_DIR = "D:\MyOS\bootloader\tools"
+# Resolve paths relative to this script so it runs from any checkout.
+$ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$QEMU_PATH  = if (Test-Path "D:\qemu") { "D:\qemu" } else { "qemu-system-x86_64" }
+$IMG_PATH   = Join-Path $ScriptDir "build\os_v2.img"
+$BRIDGE_DIR = Join-Path $ScriptDir "tools"
 $SERIAL_PORT = 4321
 $WS_PORT     = 8765
 $MIN_MEM = 512
@@ -164,8 +166,10 @@ function Start-NexOS {
     # The guest OS draws its own software cursor at its logical pointer position
     # (the only way to keep "what you see" aligned with "where clicks land" while
     # using a relative PS/2 mouse).  We therefore hide QEMU's host cursor so the
-    # two don't show side-by-side or drift apart.
-    if ($DisplayArg -like "*gtk*") { $DisplayArg = "$DisplayArg,show-cursor=off" }
+    # two don't show side-by-side or drift apart.  BUG-A2 fix: apply this to ALL
+    # display backends (gtk / egl-headless / sdl / ...), not just gtk, so a
+    # second (host) cursor can never be overlaid on the guest cursor.
+    if ($DisplayArg -notlike "*show-cursor=off*") { $DisplayArg = "$DisplayArg,show-cursor=off" }
     # Default to fullscreen; pass -Win to launch in a window instead.
     if ($DisplayArg -like "*gtk*" -and -not $WINDOWED) { $DisplayArg = "$DisplayArg,full-screen=on" }
     & $QEMU_EXE -drive format=raw,file="$IMG_PATH" -m $Mem -vga $VgaArg -display $DisplayArg -machine pc,mem-merge=off @SerialArg -accel tcg,tb-size=32 -no-reboot

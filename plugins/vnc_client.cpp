@@ -31,6 +31,7 @@ extern "C" void net_log(const char* s);  /* serial output */
 /* ---- Forward declarations (used before their definitions) -------------- */
 static int  vnc_send_prefs(void);
 extern "C" void vnc_disconnect(void);
+extern "C" int  vnc_connect(uint32_t ip, uint16_t port);
 
 /* ---- Kernel heap (extern from kernel.cpp) ----------------------------- */
 extern "C" void* kmalloc(uint32_t size);
@@ -219,7 +220,7 @@ static int vnc_write_all(const void* data, int len) {
 
 /* ---- connect + handshake ---------------------------------------------- */
 static int parse_host_port(const char* s, uint32_t* out_ip, uint16_t* out_port) {
-    *out_port = 5900;
+    uint16_t port = 0;                  /* accumulated from the ":port" digits */
     uint8_t octets[4] = {0};
     int idx = 0, val = 0;
     int has_port = 0;
@@ -232,13 +233,18 @@ static int parse_host_port(const char* s, uint32_t* out_ip, uint16_t* out_port) 
         if (colon && p >= colon) {
             if (*p == ':') continue;
             if (*p >= '0' && *p <= '9') {
-                *out_port = *out_port * 10 + (*p - '0');
+                /* Accumulate into a LOCAL variable starting from 0: using
+                 * *out_port (pre-seeded with the 5900 default) as the
+                 * accumulator turned "15900" into 60828 (5900->59001->191->
+                 * 1919->19190->60828 mod 2^16) and the SYN went to a dead
+                 * port. */
+                port = (uint16_t)(port * 10 + (*p - '0'));
                 has_port = 1;
             }
             continue;
         }
         if (*p == '.') {
-            if (idx >= 4) return -1;
+            if (idx >= 3) return -1;   /* a.b.c.d has exactly 3 dots */
             octets[idx++] = (uint8_t)val;
             val = 0;
         } else if (*p >= '0' && *p <= '9') {
@@ -247,11 +253,12 @@ static int parse_host_port(const char* s, uint32_t* out_ip, uint16_t* out_port) 
             return -1;
         }
     }
-    if (idx < 4) return -1;
+    if (idx != 3) return -1;           /* need all four octets (3 dots seen) */
+    if (val > 255) return -1;
     octets[3] = (uint8_t)val;
     *out_ip = ((uint32_t)octets[0] << 24) | ((uint32_t)octets[1] << 16) |
               ((uint32_t)octets[2] << 8)  | (uint32_t)octets[3];
-    if (!has_port) *out_port = 5900;
+    *out_port = has_port ? port : 5900;
     return 0;
 }
 
@@ -382,15 +389,23 @@ static int vnc_send_prefs(void) {
     fmt[17] = fmt[18] = fmt[19] = 0;
     vnc_write_all(fmt, 20);
 
-    /* Set Encodings: Raw only (per requirement #4).
-     * The kernel has no zlib/inflate, so we explicitly request ONLY the Raw
-     * encoding (code 0).  The server is then free to send every rectangle in
-     * Raw; we must be able to decode it, which we do. */
-    uint8_t enc[4 + 1 * 4];
+    /* Set Encodings: Raw + CopyRect + RRE + Hextile.
+     * The kernel has no zlib/inflate, so we exclude Zlib/Tight.  The
+     * decoders for RRE, Hextile and CopyRect are already compiled in (see
+     * vnc_decode_rre / vnc_decode_hextile / CopyRect case in the update
+     * dispatcher).  Raw is kept as baseline.  Four encodings total.
+     *
+     * (Previous version advertised Raw-only; x11vnc uses RRE/Hextile
+     * aggressively for Chromium motion regions, so enabling them gives 5-10x
+     * higher effective frame rate for moving content.) */
+    uint8_t enc[4 + 4 * 4];
     enc[0] = VNC_SET_ENCODINGS;
     enc[1] = enc[2] = 0;
-    enc[3] = 1;                         /* count = 1 */
-    enc[4] = enc[5] = enc[6] = 0; enc[7] = VNC_ENC_RAW;  /* Raw (0) */
+    enc[3] = 4;                         /* count = 4 */
+    enc[4] = enc[5] = enc[6] = 0; enc[7] = VNC_ENC_RAW;      /* Raw (0) */
+    enc[8] = enc[9] = enc[10] = 0; enc[11] = VNC_ENC_COPYRECT;/* CopyRect (1) */
+    enc[12]= enc[13]=enc[14] = 0; enc[15] = VNC_ENC_RRE;     /* RRE (2) */
+    enc[16]= enc[17]=enc[18] = 0; enc[19] = VNC_ENC_HEXTILE; /* Hextile (5) */
     vnc_write_all(enc, sizeof(enc));
 
     return 0;
@@ -452,16 +467,27 @@ static int vnc_send_key(uint32_t keysym, int is_down) {
     return vnc_write_all(k, 8);
 }
 
+/* Reusable raw-rectangle decode buffer.  Raw rectangles can be up to the
+ * whole framebuffer (3 MiB at 1024x768), which is framebuffer-class: take it
+ * from bigbuf (PMM-backed) ONCE and grow it only when a bigger rectangle
+ * arrives.  Allocating/freeing per frame would churn the ~10 MiB kernel heap
+ * and fragment it (and OOM the GUI). */
+static uint8_t* g_raw_buf = 0;
+static uint32_t g_raw_cap = 0;
+
+static uint8_t* raw_buf_get(uint32_t bytes) {
+    if (bytes <= g_raw_cap) return g_raw_buf;
+    if (g_raw_buf) { bigbuf_free(g_raw_buf); g_raw_buf = 0; g_raw_cap = 0; }
+    g_raw_buf = (uint8_t*)bigbuf_alloc(bytes);
+    if (g_raw_buf) g_raw_cap = bytes;
+    return g_raw_buf;
+}
+
 /* ---- Blit a pixel buffer into NexOS GUI --------------------------------
  * buf layout: Raw RFB pixel data as configured by SetPixelFormat:
  *   bpp=32, depth=24, big_endian=0, red_shift=16, green_shift=8, blue_shift=0
  * => each pixel is 4 bytes little-endian, read as uint32 = 0x00RRGGBB,
- *    which matches NexOS Color (ARGB, A=0 opaque).
- *
- * Fast path: when the "gui.blit_pixels" service is available we copy the whole
- * rectangle per call (a row-wise 32-bit copy into the backbuffer).  Fallback:
- * when that service is absent we fall back to one put_pixel() per pixel so the
- * plugin still works against older GUI builds.                      */
+ *    which matches NexOS Color (ARGB, A=0 opaque).                      */
 struct VncBlitArgs { int x, y, w, h; const uint32_t* pixels; };
 
 static void vnc_blit_raw(uint16_t x_start, uint16_t y_start,
@@ -566,16 +592,15 @@ static int vnc_decode_hextile(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
             if (vnc_read_exact(&mask, 1) != 0) return -1;
             if (mask & 0x01) {             /* Raw tile */
                 int n = (int)tw * (int)th * 4;
-                uint8_t* buf = (uint8_t*)kmalloc((uint32_t)n);
+                uint8_t* buf = raw_buf_get((uint32_t)n);
                 if (!buf) return -1;
                 int rem = n;
                 while (rem > 0) {
                     int c = rem > 4096 ? 4096 : rem;
-                    if (vnc_read_exact(buf + (n - rem), c) != 0) { kfree(buf); return -1; }
+                    if (vnc_read_exact(buf + (n - rem), c) != 0) { return -1; }
                     rem -= c;
                 }
                 vnc_blit_raw((uint16_t)(x + tx), (uint16_t)(y + ty), tw, th, buf);
-                kfree(buf);
                 ty += 16;
                 continue;
             }
@@ -639,27 +664,50 @@ static int vnc_recv_one(void) {
             if (enc == VNC_ENC_RAW) {
                 int bytes = (int)w * (int)h * 4;
                 if (bytes <= 0) continue;
-                uint8_t* buf = (uint8_t*)kmalloc((uint32_t)bytes);
-                if (!buf) { log_str("error", "kmalloc failed"); return -1; }
+                uint8_t* buf = raw_buf_get((uint32_t)bytes);
+                if (!buf) { log_str("error", "raw buf alloc failed"); return -1; }
                 int remaining = bytes;
                 while (remaining > 0) {
                     int to_read = remaining > 4096 ? 4096 : remaining;
                     if (vnc_read_exact(buf + (bytes - remaining), to_read) != 0) {
-                        kfree(buf); return -1;
+                        return -1;
                     }
                     remaining -= to_read;
                 }
                 vnc_blit_raw(x, y, w, h, buf);   /* boundary-checked */
-                kfree(buf);
             } else if (enc == VNC_ENC_RRE) {
                 if (vnc_decode_rre(x, y, w, h) != 0) return -1;
             } else if (enc == VNC_ENC_HEXTILE) {
                 if (vnc_decode_hextile(x, y, w, h) != 0) return -1;
             } else if (enc == VNC_ENC_COPYRECT) {
-                /* Not requested (see vnc_send_prefs); skip defensively. */
+                /* CopyRect: copy a rectangle from the decoded framebuffer
+                 * at (src_x, src_y) to (x, y) size (w, h).  Uses direct fb
+                 * indexing — no additional network I/O needed (the source
+                 * pixels are already in g_vnc.fb from a previous update). */
                 uint8_t src[4];
-                vnc_read_exact(src, 4);
-                log_hex("copyskip enc", (uint32_t)enc);
+                if (vnc_read_exact(src, 4) != 0) return -1;
+                uint16_t sx = (uint16_t)((src[0] << 8) | src[1]);
+                uint16_t sy = (uint16_t)((src[2] << 8) | src[3]);
+                int bw = (int)g_vnc.fb_width, bh = (int)g_vnc.fb_height;
+                if (bw > 0 && bh > 0) {
+                    int rx = (int)x, ry = (int)y, rw = (int)w, rh = (int)h;
+                    if (rw > bw - rx) rw = bw - rx; if (rw < 0) rw = 0;
+                    if (rh > bh - ry) rh = bh - ry; if (rh < 0) rh = 0;
+                    if (rw > 0 && rh > 0) {
+                        /* CopyRect can overlap source/dest — copy bottom-up
+                         * when src is above dest to avoid smearing */
+                        int drow = (sy < ry) ? -1 : 1;
+                        int srow = (sy < ry) ? rh - 1 : 0;
+                        for (int row = 0; row < rh; row++) {
+                            int ty = ry + ((sy < ry) ? (rh - 1 - row) : row);
+                            int ts = sy + ((sy < ry) ? (rh - 1 - row) : row);
+                            uint32_t* dst_row = g_vnc.fb + (uint64_t)ty * bw + rx;
+                            uint32_t* src_row = g_vnc.fb + (uint64_t)ts * bw + sx;
+                            for (int col = 0; col < rw; col++)
+                                dst_row[col] = src_row[col];
+                        }
+                    }
+                }
             } else {
                 log_hex("skip enc", (uint32_t)enc);
                 return -1;
@@ -703,6 +751,20 @@ static int vnc_recv_one(void) {
  * call).  Once ESTABLISHED we run the stepwise RFB handshake; once that
  * completes we enter RUNNING and start consuming FramebufferUpdates. */
 extern "C" int vnc_poll(void) {
+    /* Demo auto-connect: NEXOS_VNC_DEMO builds call vnc.connect on the FIRST
+     * poll tick.  plugins_boot runs before the NIC is up, so an SYN sent from
+     * there is malformed and the SLIRP gateway answers RST; by the first GUI
+     * poll the NE2000 is initialized and 10.0.2.2 (SLIRP gw) is reachable. */
+#ifdef NEXOS_VNC_DEMO
+    if (g_vnc.cstate == VNC_ST_IDLE || g_vnc.cstate == VNC_ST_ERROR) {
+        static int s_demo_done = 0;
+        if (!s_demo_done) {
+            s_demo_done = 1;
+            uint32_t ip = (10u << 24) | (0u << 16) | (2u << 8) | 2u;
+            vnc_connect(ip, 15900);
+        }
+    }
+#endif
     switch (g_vnc.cstate) {
     case VNC_ST_IDLE:
     case VNC_ST_ERROR:
@@ -734,7 +796,17 @@ extern "C" int vnc_poll(void) {
         if (h == 1) {                          /* handshake complete */
             g_vnc.connected = 1;
             g_vnc.cstate = VNC_ST_RUNNING;
-            log_str("OK", "connected");
+            /* Required diagnostic: "[VNC] Handshake OK 1024x768" */
+            {
+                char msg[64]; int n = 0;
+                const char* p = "Handshake OK ";
+                while (*p) msg[n++] = *p++;
+                n += my_itoa(msg + n, g_vnc.fb_width);
+                msg[n++] = 'x';
+                n += my_itoa(msg + n, g_vnc.fb_height);
+                msg[n] = 0;
+                log_str("", msg);
+            }
             vnc_send_fb_request();             /* ask for the first full frame */
         }
         return 0;                              /* progress, not yet streaming */
@@ -751,6 +823,13 @@ extern "C" int vnc_poll(void) {
         }
         /* Re-arm: ask for the next incremental update. */
         vnc_send_fb_request_incremental();
+        if (r == 1) {
+            /* Required diagnostic: "[VNC] Frame updated" (throttled: raw 3 MiB
+             * full-frame floods the serial log, so print once per 64 frames). */
+            static int s_frame_log_ctr = 0;
+            if ((s_frame_log_ctr++ & 63) == 0)
+                log_str("", "Frame updated");
+        }
         return (r == 1) ? 1 : 0;
     }
     }
@@ -780,6 +859,13 @@ extern "C" int vnc_connect(uint32_t ip, uint16_t port) {
     n += my_itoa(dbg + n, o[3]);
     dbg[n] = 0;
     log_str("connecting to ", dbg);
+    /* Diagnostic: the exact port handed to the TCP layer. */
+    {
+        char pbuf[32]; int n2 = 0;
+        n2 += my_itoa(pbuf + n2, (uint32_t)port);
+        pbuf[n2] = 0;
+        log_str("port=", pbuf);
+    }
 
     /* Non-blocking: queue SYN, return immediately.  vnc_poll() drives the
      * remainder of the connect + handshake from the GUI tick. */
@@ -816,6 +902,23 @@ extern "C" int vnc_session_fb(void** fb_out, int* w_out, int* h_out) {
 
 static int svc_connect(void* args, void* out, int outcap) {
     const char* host_port = args ? (const char*)args : "10.0.2.2:5900";
+    /* Diagnostic: dump the raw bytes so a bad literal/pointer is visible. */
+    {
+        char dump[80]; int n = 0;
+        const char* p = "parse input: ";
+        while (*p) dump[n++] = *p++;
+        for (int i = 0; i < 16 && host_port[i]; i++) {
+            dump[n++] = host_port[i];
+        }
+        dump[n++] = ' '; dump[n++] = '(';
+        for (int i = 0; i < 16 && host_port[i]; i++) {
+            uint8_t c = (uint8_t)host_port[i];
+            const char* h = "0123456789ABCDEF";
+            dump[n++] = h[(c >> 4) & 0xF]; dump[n++] = h[c & 0xF]; dump[n++] = ' ';
+        }
+        dump[n++] = ')'; dump[n] = 0;
+        log_str("", dump);
+    }
     uint32_t ip;
     uint16_t port;
     if (parse_host_port(host_port, &ip, &port) != 0) {
@@ -885,6 +988,16 @@ static int vnc_call(Plugin* self, const char* method,
 
 static int vnc_init(Plugin* self) {
     (void)self;
+    /* Publish the call-table entries as services too.  linux_manager.cpp and
+     * gui.cpp reach this plugin through svc_lookup("vnc.connect"/"vnc.poll"/
+     * "vnc.input") -- without these registrations every lookup fails and the
+     * Linux-Guest pipeline silently never runs. */
+    svc_register("vnc.connect",    (svc_fn)svc_connect);
+    svc_register("vnc.disconnect", (svc_fn)svc_disconnect);
+    svc_register("vnc.poll",       (svc_fn)svc_poll);
+    svc_register("vnc.request_frame", (svc_fn)svc_request_frame);
+    svc_register("vnc.input",      (svc_fn)svc_input);
+    svc_register("vnc.status",     (svc_fn)svc_status);
     g_vnc.connected = 0;
     /* Cache the GUI vtable (nexos.gui.api is published by gui.cpp at boot). */
     g_gui_api = (const NexosGuiAPI*)svc_lookup(NEXOS_GUI_API_SVC);

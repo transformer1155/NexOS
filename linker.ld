@@ -86,7 +86,7 @@ SECTIONS
      *  Kernel heap must sit clear of live globals  (added 2026-09-19)
      *
      *  HEAP_START is a compile-time constant in kernel.cpp, so the linker
-     *  cannot read it; keep the 0x9A0000 below in sync with that source
+     *  cannot read it; keep the 0x9C0000 below in sync with that source
      *  file (and shrink HEAP_SIZE by the same amount so HEAP_END stays at
      *  0x13F0000, below the RAM-SFS reserve at 0x1400000).  Linking the
      *  plugin objects grew .bss past the old HEAP_START (0x900000) and the
@@ -96,13 +96,13 @@ SECTIONS
      *
      *  This bound was briefly 0xAE0000 because kernel.cpp had raised
      *  HEAP_START to match.  That was based on a stale __bss_end; nm puts
-     *  the real one at 0x97D9A4, comfortably under 0x9A0000.  Because
+     *  the real one at 0x9A6098, comfortably under 0x9C0000.  Because
      *  HEAP_END is pinned at 0x13F0000, the higher floor cost the heap
      *  half its size (10.3 MiB -> 5.1 MiB) and starved the GUI into a
      *  "cannot allocate managed heap" black screen.  Keep this in sync
      *  with HEAP_START, and do not raise it without checking nm.
      * ----------------------------------------------------------------- */
-    ASSERT(__bss_end <= 0x9A0000,
+    ASSERT(__bss_end <= 0x9C0000,
         "kernel .bss runs into HEAP_START (kernel.cpp) -- raise HEAP_START and shrink HEAP_SIZE by the same amount")
 
     /* =================================================================

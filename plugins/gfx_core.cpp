@@ -31,6 +31,21 @@ static int gfx_blit_svc(void* args, void* out, int outcap) {
     return 0;
 }
 
+// Screen-size service: return the live NexOS framebuffer dimensions so
+// consumers (e.g. the VNC plugin) can boundary-check writes against VRAM.
+// out layout: int[2] = { width, height }.
+extern "C" void gui_get_screen_size(int* w, int* h);
+static int gfx_screen_size_svc(void* args, void* out, int outcap) {
+    (void)args;
+    int w = 0, h = 0;
+    gui_get_screen_size(&w, &h);
+    if (out && outcap >= (int)(sizeof(int) * 2)) {
+        int* o = (int*)out;
+        o[0] = w; o[1] = h;
+    }
+    return 0;
+}
+
 /* drawing service body: delegate to nexos.gui.api if gui published it,
  * otherwise succeed as a no-op (still verifiable via the serial log). */
 static int gfx_draw_svc(void* args, void* out, int outcap) {
@@ -51,6 +66,7 @@ static int gfx_core_init(Plugin* self) {
     svc_register("gfx.draw_line", gfx_draw_svc);
     svc_register("gfx.blend_pixel", gfx_draw_svc);
     svc_register("gui.blit_pixels", gfx_blit_svc);
+    svc_register("gui.screen_size", gfx_screen_size_svc);
     return 0;
 }
 static void gfx_core_exit(Plugin* self) {
@@ -73,7 +89,7 @@ static int gfx_core_call(Plugin* self, const char* method, void* args, void* out
 }
 extern const Plugin g_gfx_core = {
     "gfx_core", 0x0100,
-    "gfx.put_pixel,gfx.fill_rect,gfx.draw_rect,gfx.draw_line,gfx.blend_pixel,gui.blit_pixels",
+    "gfx.put_pixel,gfx.fill_rect,gfx.draw_rect,gfx.draw_line,gfx.blend_pixel,gui.blit_pixels,gui.screen_size",
     "",
     gfx_core_init, gfx_core_exit, gfx_core_call
 };

@@ -37,6 +37,8 @@ namespace NexOS.Forms
         static int cardX, cardY, cardW, cardH;
         static int fieldX, fieldW, fieldH;
         static int userY, passY, btnY, chipY;
+        // P1-12: power button layout fields
+        static int powerW, powerH, powerY, rebootX, shutX;
 
         // Palette.  The lock screen is always dark (like Windows) even
         // when the desktop is running the light theme.
@@ -99,6 +101,11 @@ namespace NexOS.Forms
             passY = cardY + 280;
             btnY  = cardY + 350;
             chipY = cardY + 436;
+            // P1-12: power buttons at bottom-right of the card (Shutdown + Reboot)
+            powerW = 40; powerH = 40;
+            powerY = btnY + fieldH + 48;  // below sign-in button, above chip row
+            rebootX = cardX + cardW - 2 * powerW - 36;
+            shutX   = cardX + cardW - powerW - 24;
         }
 
         // ---- painting --------------------------------------------------
@@ -179,6 +186,14 @@ namespace NexOS.Forms
             // ---- account chips (only worth drawing for >1 account) -----
             if (nuser > 1) Chips();
 
+            // P1-12: power buttons bottom-right of card (Shutdown + Reboot)
+            Gfx.FillRound(shutX,   powerY, powerW, powerH, 8, 0x232329);
+            Gfx.DrawRound(shutX,   powerY, powerW, powerH, 8, 0x33333A);
+            Gfx.FillRound(rebootX, powerY, powerW, powerH, 8, 0x232329);
+            Gfx.DrawRound(rebootX, powerY, powerW, powerH, 8, 0x33333A);
+            Gfx.Icon(shutX   + 5, powerY + 5, powerW - 10, 0xFFD16666, 'O', 0xFFFFFF);
+            Gfx.Icon(rebootX + 5, powerY + 5, powerW - 10, 0xFFF5A623, 'R', 0xFFFFFF);
+
             // After a couple of misses, remind the operator of the seeded
             // credentials instead of letting them lock themselves out of
             // their own VM.
@@ -252,6 +267,9 @@ namespace NexOS.Forms
                     }
                 }
             }
+            // P1-12: power button hits on lock screen
+            if (U.In(mx, my, shutX, powerY, powerW, powerH))   { Host.Shutdown(); return 1; }
+            if (U.In(mx, my, rebootX, powerY, powerW, powerH)) { Host.Reboot();   return 1; }
             return 1;   // swallow everything else
         }
 

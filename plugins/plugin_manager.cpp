@@ -9,6 +9,13 @@ extern "C" void* kmalloc(uint32_t size);
 extern "C" void  kfree(void* ptr);
 extern "C" int   kern_fs_read(const char* name, unsigned char* buf, int bufsize);
 
+/* ---- hot-loadable driver framework (drivers/driver_loader.c) -------------
+ * These are C functions, so they need C linkage here; declaring them at file
+ * scope keeps the boot hook readable. */
+extern "C" int  driver_subsystem_init(void);
+extern "C" int  driver_load(const char* path);
+extern "C" void driver_dump(void);
+
 /* ---- private serial (each freestanding TU owns its own; kernel's is static)*/
 static inline void pm_outb(uint16_t p, uint8_t v) {
     __asm__ __volatile__("outb %%al, %%dx" :: "a"(v), "d"(p));
@@ -272,6 +279,28 @@ void plugin_manager_boot(void) {
     svc_fn viewer = svc_lookup("src.view");
     if (viewer) viewer((void*)"src_gfx_core.skill", 0, 0);
     else pm_serial("[PM] src.view service missing\n");
+
+    /* ---- Hot-loadable driver framework ---------------------------------
+     * driver_loader.c + driver_elf.c are linked into the kernel (see
+     * DRIVER_FW_OBJS in the Makefile).  Driver images live in SFS as .drv
+     * files and are loaded by name at run time, so a driver can be replaced
+     * without relinking the kernel.  A missing or rejected driver must never
+     * block the boot: log it and continue.
+     */
+    {
+        driver_subsystem_init();
+        {
+            int drc = driver_load("svm.drv");
+            if (drc == 0) {
+                pm_serial("[PM] driver loaded: svm.drv\n");
+            } else {
+                pm_serial("[PM] driver svm.drv not loaded rc=");
+                pm_serial_byte((uint8_t)('0' + ((drc < 0 ? -drc : drc) % 10)));
+                pm_serial(" - continuing\n");
+            }
+        }
+        driver_dump();
+    }
 }
 
 /* ---- runtime reload hooks + hot reload (Phase 5) -------------------------- */

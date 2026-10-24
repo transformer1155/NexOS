@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Functional harness for the three network subsystems in NetStack.cs.
+       Runs on the real BCL (no WinForms), so it can exercise the framing,
+       the 5MB fast-path / Range-shard split, the IDM resume state machine
+       and the multi-NIC aggregation against a loopback HTTP server.
+
+       Run:  dotnet run (project: csharp/winhost/tests/NetStackTests.csproj) -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>NetStackTests</AssemblyName>
+    <RootNamespace>NetStackTests</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <NoWarn>CS0618</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The subsystem under test, compiled in place (no copy/fork). -->
+    <Compile Include="../NetStack.cs" />
+    <!-- Backend.cs supplies NexOS.Forms.Host.Log used by the bus logger; it
+         drags in the whole WinForms surface, so instead the test supplies a
+         tiny stub via StubHost.cs below. -->
+    <Compile Include="StubHost.cs" />
+    <Compile Include="Servers.cs" />
+    <Compile Include="Program.cs" />
+  </ItemGroup>
+
+</Project>

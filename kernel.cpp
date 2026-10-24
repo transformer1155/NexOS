@@ -418,10 +418,16 @@ static void detect_memory_e820(){
         //
         // NOTE: the custom boot path (NexOS does not chain through SeaBIOS)
         // leaves the extended-memory CMOS bytes (0x17/0x18 and 0x30/0x31)
-        // uninitialized (=0xFFFF).  In that case we cannot trust CMOS and fall
-        // back to a safe default.  256 MB covers everything we load and matches
-        // the QEMU -m 256 test target; under-reporting RAM is always safe, so
-        // this is also fine on real machines with >=256 MB.
+        // uninitialized (=0xFFFF), so we cannot trust CMOS and fall back to a
+        // fixed 256 MB.  256 MB covers everything we load and matches the
+        // QEMU -m 256 test target.
+        //
+        // WARNING: "under-reporting is always safe" is NO LONGER TRUE.  The
+        // supervisor kernel heap lives at 256-384 MiB (above this 256 MiB
+        // fallback), so the launchers MUST pass -m 512 (>= 384 MiB).  Because
+        // this function cannot see the real RAM size, heap_init() verifies the
+        // heap window with heap_probe_top() and refuses to use unbacked pages
+        // instead of trusting either this value or the -m flag.
         uint32_t base_kb     = cmos_read16(0x15);   // conventional memory (<=640 KB)
         uint32_t ext_kb      = cmos_read16(0x17);   // memory 1M..16M, in KB (0xFFFF if unset)
         uint32_t above16_64k = cmos_read16(0x30);   // memory >16M, in 64KB blocks (0xFFFF if unset)
@@ -3091,9 +3097,12 @@ constexpr uint32_t PMM_MAX_PAGES   = 262144;       // 1 GiB / 4 KiB
 // service table ~68 KiB -- so HEAP_START has to stay clear of live globals.
 //
 // HEAP_SIZE is the real constraint here, and it used to be got wrong.
-// HEAP_END must stay at 0x13F0000, just below the RAM-SFS reserve at
-// 0x1400000 (and well clear of .lmboot @ 0x1800000), so *every* byte that
-// HEAP_START gives up is a byte the heap loses.  An earlier revision raised
+// HEAP_END is 0x18000000 (384 MiB).  The heap now lives in the supervisor-only
+// window 256-384 MiB, ABOVE the live ring-3 USER region (64-128 MiB), ABOVE the
+// kexec/Linux load band (128-256 MiB), and ABOVE .lmboot (24-32 MiB) and the
+// RAM-SFS window (20-24 MiB).  That window is identity-mapped only after
+// vmm_init() maps PDE i=0x40..0x60 as supervisor, and is real RAM only when
+// QEMU is launched with -m 512 (>= 384 MiB).  An earlier revision raised
 // HEAP_START to 0xAE0000 on the belief that .bss had grown past 0x9A0000;
 // nm says __bss_end is 0x97D9A4, so that raised the floor by 1.25 MiB for
 // nothing and cut the heap from 10.3 MiB to 5.1 MiB.  The GUI needs far
@@ -3105,12 +3114,14 @@ constexpr uint32_t PMM_MAX_PAGES   = 262144;       // 1 GiB / 4 KiB
 // boot log filled with "[HEAP] OOM: request 00200000 ..." and ended in
 // "[CLR] fault: cannot allocate managed heap" with a black desktop.
 //
-// 0x9A0000 leaves ~137 KiB of head-room over the real __bss_end, and keeps
-// the heap at its full 10.3 MiB.  linker.ld ASSERTs __bss_end <= 0x9A0000,
-// so if .bss ever really does grow past that the build fails loudly instead
-// of silently producing a heap that overwrites the kernel's own globals.
-constexpr uint32_t HEAP_START      = 0x9C0000;     // 9.75 MiB (must stay > __bss_end = 0x9A6098)
-constexpr uint32_t HEAP_SIZE       = 0xA30000;     // ~10.2 MiB (HEAP_END = 0x13F0000 < RAM-SFS @ 0x1400000)
+// The heap now lives at 0x10000000-0x18000000 (256-384 MiB), far above
+// __bss_end (~0x9A6098) and above .lmboot (24-32 MiB), the RAM-SFS window
+// (20-24 MiB), the live USER region (64-128 MiB) and the kexec/Linux band
+// (128-256 MiB).  linker.ld still ASSERTs __bss_end <= 0x9C0000; if .bss ever
+// really does grow past that the build fails loudly instead of silently
+// producing a heap that overwrites the kernel's own globals.
+constexpr uint32_t HEAP_START      = 0x10000000;   // 256 MiB: supervisor heap window 256-384 MiB
+constexpr uint32_t HEAP_SIZE       = 0x08000000;   // 128 MiB (HEAP_END = 0x18000000 = 384 MiB)
 constexpr uint32_t HEAP_END        = HEAP_START + HEAP_SIZE;
 
 // Page-table / PDE flags
@@ -3207,7 +3218,7 @@ static void pmm_init(){
     pmm_free_pages = pmm_total_pages;
     pmm_used_pages = 0;
 
-    // Mark heap region (2-18 MiB) as used
+    // Mark the supervisor kernel heap (HEAP_START 0x10000000 .. HEAP_END 0x18000000 = 256-384 MiB) as used
     uint32_t heap_pages = HEAP_SIZE / PAGE_SIZE;
     for (uint32_t i = 0; i < heap_pages; i++) {
         uint32_t page_idx = (HEAP_START - PMM_BASE_ADDR) / PAGE_SIZE + i;
@@ -3260,6 +3271,20 @@ static void pmm_init(){
         serial_puts(" .. "); serial_hex(re); serial_puts("\n");
     }
     serial_puts("[PMM] Initialised\n");
+}
+
+/* nexos_cpuid - C-callable CPUID for plugins/drivers.
+ * Hardware-virtualization drivers need to probe vendor + SVM/VMX feature
+ * bits without carrying their own asm.  Any out-pointer may be NULL. */
+extern "C" void nexos_cpuid(uint32_t leaf, uint32_t sub,
+                            uint32_t* a, uint32_t* b, uint32_t* c, uint32_t* d){
+    uint32_t ra = leaf, rb = 0, rc = sub, rd = 0;
+    __asm__ __volatile__("cpuid"
+        : "+a"(ra), "=b"(rb), "+c"(rc), "=d"(rd));
+    if (a) *a = ra;
+    if (b) *b = rb;
+    if (c) *c = rc;
+    if (d) *d = rd;
 }
 
 extern "C" uint32_t pmm_alloc_page(){
@@ -3400,7 +3425,7 @@ static void vmm_init(){
     // Clear page directory
     for (int i = 0; i < 1024; i++) page_directory[i] = 0;
 
-    // Identity-map first 32 MiB with 4 MiB pages (covers kernel + 16 MiB heap)
+    // Identity-map first 32 MiB with 4 MiB pages (covers kernel .text/.bss and 32-bit boot scratch)
     for (int i = 0; i < 8; i++)
         page_directory[i] = (i * 0x400000u) | PG_PRESENT | PG_RW | PG_PSE;
 
@@ -3454,6 +3479,15 @@ static void vmm_init(){
         page_directory[i] = (i * 0x400000u) | PG_PRESENT | PG_RW | PG_USER | PG_PSE;
     serial_puts("[VMM] ring-3 user region 0x04000000-0x08000000 (PG_USER)\n");
 
+    // Supervisor kernel heap window (PG_RW, NOT PG_USER): identity-map 256-384 MiB
+    // as 4 MiB PSE pages so kmalloc() can serve the 128 MiB kernel heap the 32-bit
+    // GUI needs (backbuffer + wallpaper cache + CLR image/heap buffers).  This band
+    // sits above the live USER region (64-128 MiB) and above the kexec/Linux load
+    // band (128-256 MiB), so it is free for the supervisor heap.  QEMU must be
+    // launched with -m 512 (>= 384 MiB) for this RAM to actually exist.
+    for (int i = 0x40; i < 0x60; i++)
+        page_directory[i] = (i * 0x400000u) | PG_PRESENT | PG_RW | PG_PSE;
+
     // Enable PSE (CR4.PSE = bit 4)
     uint32_t cr4 = read_cr4();
     write_cr4(cr4 | 0x10);
@@ -3467,7 +3501,7 @@ static void vmm_init(){
 
     vmm_paging_on  = true;
     vmm_our_paging = true;
-    serial_puts("[VMM] Paging enabled (32 MiB identity-mapped, 4 MiB PSE)\n");
+    serial_puts("[VMM] Paging enabled (0-256 MiB + 256-384 MiB supervisor heap window identity-mapped, 4 MiB PSE)\n");
 }
 
 // Map a >4GB GOP framebuffer into a <4GB virtual window (FB_WIN_VA) using our
@@ -3613,7 +3647,9 @@ extern "C" uint32_t vmm_get_phys(uint32_t virt){
 // =====================================================================
 //  Kernel Heap (kmalloc / kfree)
 // =====================================================================
-//  Simple linked-list first-fit allocator on a fixed 1 MiB region.
+//  Simple linked-list first-fit allocator on a fixed identity-mapped window
+//  (HEAP_START..HEAP_END, 256-384 MiB); the exact usable size is resolved at
+//  runtime by heap_probe_top() so an under-sized -m is detected, not crashed.
 struct HeapBlock {
     uint32_t magic;       // 0xDEADBEEF = allocated, 0xFEEDFACE = free
     uint32_t size;        // user data size (excludes header, includes padding)
@@ -3630,9 +3666,34 @@ static uint32_t   heap_alloc_count   = 0;
 static uint32_t   heap_free_count    = 0;
 static uint32_t   heap_bytes_alloc   = 0;
 static uint32_t   heap_bytes_freed   = 0;
+// Actual usable window size, resolved in heap_init().  The heap window is
+// identity-mapped unconditionally, but those pages are only backed by RAM if
+// the machine really has that much.  This boot path never chains through
+// SeaBIOS's memory probe, so detect_memory_e820() falls back to a fixed
+// 256 MiB and cannot tell us the truth.  Probe instead, so an under-sized -m
+// degrades to a tiny (or zero) heap with a loud serial message rather than
+// writing into unbacked physical memory.
+static uint32_t   heap_size_rt       = 0;
+
+// Highest 4 MiB heap boundary whose RAM is actually present (write/read
+// sentinel).  Returns HEAP_START if not even the first page is backed.
+static uint32_t heap_probe_top(){
+    for (uint32_t end = HEAP_END; end > HEAP_START; end -= 0x400000u){
+        volatile uint32_t* p = (volatile uint32_t*)(uintptr_t)(end - 4);
+        uint32_t save = *p;
+        *p = 0xC0DE1234u;
+        bool ok = (*p == 0xC0DE1234u);
+        *p = save;
+        if (ok) return end;
+    }
+    return HEAP_START;
+}
 
 static void heap_init(){
-    // The 14 MiB region at HEAP_START is identity-mapped (first 32 MiB).
+    // The heap window (HEAP_START 0x10000000 .. HEAP_END 0x18000000, i.e. 256-384 MiB)
+    // is identity-mapped by the supervisor PDE band i=0x40..0x60 set in vmm_init().
+    // It sits above .bss, .lmboot (24-32 MiB), the RAM-SFS window (20-24 MiB), the
+    // live ring-3 USER region (64-128 MiB) and the kexec/Linux load band (128-256 MiB).
     // Guards: the heap must not overlap the relocated .bss (live globals) nor
     // the .lmboot scratch region (boot stacks + live long-mode page tables).
     // linker.ld already ASSERTs the layout at build time; these are runtime
@@ -3655,9 +3716,18 @@ static void heap_init(){
         serial_hex((uint32_t)(uintptr_t)__lmboot_end);
         serial_puts(" -- move .lmboot in linker.ld or shrink the heap\n");
     }
+    uint32_t heap_top = heap_probe_top();
+    heap_size_rt = heap_top - HEAP_START;
+    if (heap_size_rt < HEAP_SIZE){
+        serial_puts("[HEAP] FATAL: only ");
+        serial_hex(heap_top);
+        serial_puts(" of the 0x10000000-0x18000000 heap window is RAM-backed");
+        serial_puts(" -- launch QEMU with -m 512 (the heap needs >= 384 MiB)\n");
+    }
     heap_head = (HeapBlock*)HEAP_START;
     heap_head->magic = HEAP_MAGIC_FREE;
-    heap_head->size  = HEAP_SIZE - sizeof(HeapBlock);
+    heap_head->size  = (heap_size_rt > sizeof(HeapBlock))
+                     ? heap_size_rt - sizeof(HeapBlock) : 0;
     heap_head->next  = nullptr;
     heap_head->prev  = nullptr;
     heap_alloc_count = 0;
@@ -3665,7 +3735,7 @@ static void heap_init(){
     heap_bytes_alloc = 0;
     heap_bytes_freed = 0;
     serial_puts("[HEAP] Initialised: ");
-    { char kb[16]; uint_to_str(HEAP_SIZE / 1024, kb); serial_puts(kb); }
+    { char kb[16]; uint_to_str(heap_size_rt / 1024, kb); serial_puts(kb); }
     serial_puts(" KiB at ");
     serial_hex(HEAP_START);
     serial_puts("\n");
@@ -3717,7 +3787,7 @@ extern "C" void* kmalloc(uint32_t size){
         serial_puts(" bytes, live ");
         serial_hex(heap_bytes_alloc - heap_bytes_freed);
         serial_puts(" / ");
-        serial_hex(HEAP_SIZE);
+        serial_hex(heap_size_rt);
         serial_puts(" bytes, largest free ");
         serial_hex(biggest);
         serial_puts(" bytes in ");
@@ -3756,13 +3826,14 @@ extern "C" void kfree(void* ptr){
 // =====================================================================
 //  Big-buffer allocator (bigbuf_alloc / bigbuf_free)
 // ---------------------------------------------------------------------
-//  The 32-bit GUI heap is intentionally tight (~10.3 MiB) and is fully
-//  consumed by the desktop, backbuffer, wallpaper and snapshot caches.
-//  Framebuffer-class allocations (VNC decode buffer, linux_manager guest
-//  mirror, transient HTTP screenshot buffers) are 3 MiB each and used to
-//  trigger the "[HEAP] OOM: request 00300000" diagnostic.  They are also
-//  allocated once and resized on resolution change, so fragmenting the
-//  GUI heap with them would be wasteful even if it fit.
+//  The 32-bit GUI heap (HEAP_START 0x10000000 .. HEAP_END 0x18000000, i.e. 256-384 MiB,
+//  128 MiB) is now sized to hold the desktop, backbuffer, wallpaper and snapshot
+//  caches with head-room, after the old ~10 MiB heap triggered the
+//  "[HEAP] OOM: request 000A5EC0" C# desktop crash.  Framebuffer-class allocations
+//  (VNC decode buffer, linux_manager guest mirror, transient HTTP screenshot
+//  buffers) are 3 MiB each and are still routed through PMM (not the GUI heap)
+//  because they are allocated once and resized on resolution change; fragmenting
+//  the GUI heap with them would be wasteful even though 128 MiB would now fit.
 //
 //  Routed through PMM (contiguous physical pages, which land >= 32 MiB
 //  where RAM is plentiful) + a dedicated high virtual window, so they
@@ -3954,8 +4025,8 @@ static void cmd_meminfo(){
     // Heap stats
     term.write("Kernel Heap:\n");
     term.write("  Region:        "); term.write_hex(HEAP_START);
-    term.write(" - "); term.write_hex(HEAP_END);
-    term.write(" ("); term.write_dec(HEAP_SIZE / 1024); term.write(" KiB)\n");
+    term.write(" - "); term.write_hex(HEAP_START + heap_size_rt);
+    term.write(" ("); term.write_dec(heap_size_rt / 1024); term.write(" KiB)\n");
     term.write("  Allocations:   "); term.write_dec((int)heap_alloc_count); term.write("\n");
     term.write("  Frees:         "); term.write_dec((int)heap_free_count); term.write("\n");
     term.write("  Bytes alloc:   "); term.write_dec((int)heap_bytes_alloc); term.write("\n");
@@ -6392,6 +6463,13 @@ extern "C" int kern_fs_read(const char* name, unsigned char* buf, int bufsize){
     return n;
 }
 
+/* kern_fs_ready - is any filesystem mounted that kern_fs_read can serve?
+ * The hot-loadable driver loader asks this before trying to read a .drv
+ * image, so it can distinguish "no filesystem yet" from "file not found". */
+extern "C" int kern_fs_ready(void){
+    return (sfs.mounted || mkfs.mounted) ? 1 : 0;
+}
+
 static void cmd_agent(const char* args){
     if(!*args){
         char status[256];
@@ -8552,7 +8630,8 @@ static uint32_t gui_cb_total_pages(void)  { return pmm_total_pages; }
 static uint32_t gui_cb_heap_alloc_bytes(void) { return heap_bytes_alloc - heap_bytes_freed; }
 static uint32_t gui_cb_heap_free_bytes(void)  {
     uint32_t used = heap_bytes_alloc - heap_bytes_freed;
-    return (HEAP_SIZE - sizeof(HeapBlock)) > used ? (HEAP_SIZE - sizeof(HeapBlock)) - used : 0;
+    uint32_t cap  = heap_size_rt > sizeof(HeapBlock) ? heap_size_rt - sizeof(HeapBlock) : 0;
+    return cap > used ? cap - used : 0;
 }
 static uint32_t gui_cb_heap_alloc_count(void) { return heap_alloc_count - heap_free_count; }
 static uint32_t gui_cb_heap_free_count(void)  { return heap_free_count; }
