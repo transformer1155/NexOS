@@ -7401,6 +7401,37 @@ struct __attribute__((packed)) k64_handoff {
 };
 
 static void do_switch64(void){
+    // ---- Long mode availability gate ---------------------------------
+    // Entering IA-32e needs CPUID.80000001H:EDX[29] (LM).  Without it the
+    // wrmsr of EFER.LME is silently discarded, so the "long mode" code keeps
+    // running in legacy 32-bit PAE with CR4.PAE set and CR3 pointing at our
+    // 64-bit tables -- which the CPU interprets as a PDPT, faults on the
+    // first stack push (e=0x0002, CR2=.lmboot) and triple-faults.  A triple
+    // fault on a machine that simply cannot do 64-bit is a terrible way to
+    // report "unsupported", so check first and refuse loudly.
+    // This is exactly what qemu-system-i386 does: it is a 32-bit-only
+    // target that clears the LM bit, so the switch command used to kill the VM.
+    {
+        uint32_t a = 0, b = 0, c = 0, d = 0;
+        cpuid(0x80000000u, &a, &b, &c, &d);
+        if (a < 0x80000001u) {
+            serial_puts("[K32] 64-bit refused: no extended CPUID, no long mode\n");
+            term.set_color(make_color(RED, BLACK));
+            term.write("64-bit kernel unavailable: CPU has no long mode.\n");
+            term.set_color(make_color(WHITE, BLACK));
+            return;
+        }
+        cpuid(0x80000001u, &a, &b, &c, &d);
+        if (!(d & (1u << 29))) {
+            serial_puts("[K32] 64-bit refused: CPUID.80000001:EDX.LM=0 (no long mode; use qemu-system-x86_64)\n");
+            term.set_color(make_color(RED, BLACK));
+            term.write("64-bit kernel unavailable: this CPU/emulator has no long mode.\n");
+            term.write("Use qemu-system-x86_64 (qemu-system-i386 is 32-bit only).\n");
+            term.set_color(make_color(WHITE, BLACK));
+            return;
+        }
+    }
+
     // The 32-bit kernel's own ATA driver reads garbage (all zeros) under
     // UEFI, so BOOTX64.EFI preloads the 64-bit image and leaves a handoff
     // struct at 0x7000.  Prefer that; fall back to the disk read only when

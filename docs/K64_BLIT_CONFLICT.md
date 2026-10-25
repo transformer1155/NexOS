@@ -159,3 +159,106 @@ grep -aE 'kmain64|K64-1|entering long mode' /tmp/s.txt
 3. **常量会随体积增长而失效。** 本问题由三个"写死的地址/大小"共同造成：
    staging 上限 `0x02000000`、64 位栈 `0x1F0000`、blit 覆盖假设 `0x180000`。
    修复时应尽量改成**由构建期注入或由链接脚本导出**，避免再次静默失效。
+
+---
+
+## 7. 【重要更正】§3 的判断已被证伪 —— 真正的根因是另外两个
+
+> 本节由 `kernel-architect` 在 task-13 中实测得出，并**用二分法直接证伪了本文档 §3**。
+> §3 的「blit 覆盖 .bss」结论**不成立**，保留在文档中仅作为排查过程记录。
+
+### 证伪方法
+
+临时把 BIOS 路径的 blit 改成 `xor ecx,ecx`（一个字节都不拷贝），重建后串口输出
+**与原来完全一致**（`SdMPACELGG` + `0x60 0x10 0x10 0x10 0x10 0x60`）。
+若 blit 是根因，跳过它必然产生不同输出。故 `.bss`/`.lmboot` 被覆盖与本次失败**无关**。
+
+另更正 §3 的一处笔误：`0x100000..0x9A6204` 是 `.bss` 的**总大小**（9 MB），
+blit 与 `.bss` 的实际重叠是 **698,552 B ≈ 682 KiB**，与 `.lmboot` 重叠 **305,336 B ≈ 298 KiB**。
+
+### 真正的根因 A：`jmp 0x08:label` 的绝对偏移被算错 2 字节（仅 BIOS 路径）
+
+```
+nm kernel_textboot.elf -> long_mode_entry = 0x10344
+BIOS 路径汇编成   ea 46 03 01 00 08 00  = ljmp 0x08:0x10346   <- 差 2
+compat 路径汇编成 ea 44 03 01 00 08 00  = ljmp 0x08:0x10344   <- 正确
+```
+
+CPU 落在 `0x10346`，正好是 `mov dx,0x3FD`（`66 BA FD 03`）的第 3 个字节，
+从 `fd 03` 开始执行（`std` / `add esp,ebp`…），于是输出垃圾、`kmain64` 永不出现。
+**同一行源码出现两次，NASM 给出两个不同结果** —— 是「写死编码」陷阱的变种。
+
+**修法**（不改地址）：两处都改为基于重定位的 far transfer：
+```nasm
+push dword 0x08
+push dword long_mode_entry
+retf
+```
+目标地址成为普通 32 位绝对立即数（`R_386_32`），由链接器精确修补，不可能再差 2 字节。
+
+### 真正的根因 B（决定性）：`qemu-system-i386` 根本没有 long mode
+
+QEMU `-d int` 抓到的第一次异常就是答案：
+```
+v=0e e=0002 IP=0008:000101d6 SP=0010:0180fd8c CR2=0180fd88
+EFER=0000000000000000      <- LME 从未生效
+CS =0008 ... 00cf9a00 CS32  <- 仍在 32 位兼容段
+CR0=80000033 CR4=00000620   <- PG=1, PAE=1
+CR3=01810000                <- 指向我们的「PML4」
+然后 v=08(#DF) -> 三重点
+```
+
+`qemu-system-i386` 是**32 位专用 target**，CPU 模型不带 LM 位，`wrmsr(EFER.LME)` 被静默丢弃。
+CPU 于是以「legacy 32-bit + PAE」运行，把 64 位 PML4 当作 PAE 的 PDPT 解析：
+`PDPTE[0]=0x1811003` → 页目录在 `0x1811000`，其中 8 个 `0x83`（本意 1 GiB 页）被当成 PDE，
+只有 `PDE[0]` 有 `PS=1`，`PDE[12]`（24-26 MiB）为 0 → push 到 `.lmboot` 栈地址
+`0x180fd88` 时写时缺页（`e=0x0002`）→ `#DF` → 三重点。
+
+**这是比地址问题更根本的教训：验证命令本身用的是不能进 long mode 的模拟器。**
+历史上所有 `qemu-system-i386` 运行，无论代码对错，**都不可能成功**。
+
+### 为什么 A/B 两条路线都不用走
+
+```
+blit 目标       : 0x100000 .. 0x1CA8B8   (829,624 B)
+与 .bss 重叠    : 682 KiB
+与 .lmboot 重叠 : 298 KiB
+```
+
+但**目前完全无害**：blit 之后 32 位内核只再做三件事 —— 建页表、`lgdt`、跳 64 位。
+- 页表写在 `.lmboot`（`0x1810000` 起），是 blit **之后**才写的；
+- 64 位栈 `0x1828000` 也是 blit **之后**才赋值使用；
+- `gdt64` 在 `0x9a660`（< 1 MiB），根本不在 blit 范围内。
+
+`.bss` 被践踏的部分在跳转 64 位后永不访问。
+所以**改地址（路线 A）要同时改 `linker64.ld`/`entry64.asm`/UEFI 预载地址，收益为零、风险不小**；
+**迁移数据（路线 B）要精确枚举「blit 后仍使用」的全局，而这个集合现在是空集**。
+
+### 最终采用方案
+
+1. 修掉真正的编码错误（`push/retf` 替代 `jmp seg:label`）—— 两处；
+2. `kernel.cpp` `do_switch64()` 开头加 **long mode 可用性闸门**：
+   `CPUID.80000001:EDX[29]`(LM) 不存在时打印
+   `[K32] 64-bit refused: CPUID.80000001:EDX.LM=0 (no long mode; use qemu-system-x86_64)`
+   并正常返回，**不再三重点**（符合「失败只 LOG 不 Panic」契约）；
+3. `Makefile` 新增 `verify64` 目标（用 `qemu-system-x86_64`）。
+4. `tools/fastboot.sh` / `tools/fastverify.sh`：QEMU 可执行文件改为 `${QEMU_BIN:-qemu-system-i386}`，
+   64 位验证用 `QEMU_BIN=qemu-system-x86_64`。
+
+**地址一律未动**：`KERNEL64_ENTRY` / `linker64.ld` / `entry64.asm` / `uefi/bootuefi.c` / `linker.ld` 均保持原样。
+
+### 保留的隐患（记录备查）
+
+blit 长度受 2 MiB 暂存窗口约束（`0x100000 + 0x200000 = 0x300000`），`kernel64.bin` 现为 `0xCA8B8`。
+`Makefile` 的 K64 GUARD 已守住这个窗口，**暂时安全**。
+若将来真的涨到 2 MiB，再按路线 A 搬到 `0x2000000` 一类空档。
+
+### 实测结果（task-13）
+
+| 测试 | 结果 |
+|---|---|
+| 64 位（`qemu-system-x86_64` + 登录 + `switch`） | `SdMPACELG6aefgbcdHIJKL[K64-1] kmain64 entered` + `[K64-IDT] installed` + `[K64-FB] ...` + `[DRIVER] scan: 3 .drv` + `scan complete: 1 loaded` ✅ |
+| 32 位基线（`qemu-system-i386` GUI） | `scan complete: 1 loaded` + `hot-loaded 1` + `[GUI] Entered GUI mode` ✅ |
+| 32 位专用模拟器下 `switch` | `[K32] 64-bit refused: CPUID.80000001:EDX.LM=0` 优雅返回，**无三重点** ✅ |
+
+其中 `6aefgbcd` 正是 `entry64` 的 64 位标记序列 —— **此前从未出现过**。

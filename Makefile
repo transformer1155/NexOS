@@ -154,7 +154,7 @@ HYBRID_IMG := $(BUILD)/os_hybrid.img
         hybrid hybrid-run hybrid-run-uefi hybrid-test hybrid-test-uefi \
         test-all \
         play test-sec test-f0 test-fail test-w32 test-rclick inject \
-        textboot \
+        textboot verify64 \
         csharp test-clr winhost winhost-shot data-vdi
 
 # NOTE: default build reverted to the BIOS raw image (os.img) on 2026-08-12.
@@ -1128,6 +1128,31 @@ $(TEXTBOOT_IMG): $(BUILD)/boot.bin $(BUILD)/stage2.bin $(BUILD)/kernel_textboot.
 
 textboot: $(TEXTBOOT_IMG)
 	@echo "==> Text-boot image ready: $(TEXTBOOT_IMG)"
+
+# =====================================================================
+#  64-bit (long mode) verification
+# ---------------------------------------------------------------------
+#  USE qemu-system-x86_64, NOT qemu-system-i386.
+#
+#  qemu-system-i386 is a 32-bit-ONLY target: its CPU model advertises no
+#  long mode, so the kernel's wrmsr(EFER.LME) is silently discarded.  The
+#  CPU then stays in legacy 32-bit PAE with CR4.PAE=1 and CR3 pointing at
+#  the 64-bit tables -- which it decodes as a PDPT -- and the first stack
+#  push inside switch_to_64bit() page-faults (e=0x0002, CR2 in .lmboot)
+#  and triple-faults.  Every historical "64-bit works" claim came from an
+#  i386 run that could never have entered long mode at all; the kernel
+#  now checks CPUID.80000001:EDX.LM first and refuses with a clear message
+#  instead of dying.
+#
+#  Log in as root/admin, run "switch", then look for
+#      [K64-1] kmain64 entered
+# =====================================================================
+verify64: $(TEXTBOOT_IMG)
+	@echo "==> Booting text shell under qemu-system-x86_64 (long-mode capable)"
+	@echo "    log in as root/admin, then type: switch"
+	@echo "    serial log: $(BUILD)/serial64.txt"
+	qemu-system-x86_64 -m 512 -drive file=$(TEXTBOOT_IMG),format=raw,if=ide \
+	  -display none -serial file:$(BUILD)/serial64.txt -no-reboot
 
 # =====================================================================
 #  ISO build (BIOS no-emulation + UEFI for CD/DVD and USB)

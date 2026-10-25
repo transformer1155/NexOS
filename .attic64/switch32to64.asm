@@ -232,8 +232,16 @@ switch_to_64bit:
     SERIAL_DBG 'G'         ; GDT loaded
 
     ; ---- 8. Far jump to 64-bit code segment (0x08) ----
-    ; This switches from compat mode to true 64-bit mode
-    jmp 0x08:long_mode_entry
+    ; Enter true 64-bit mode.  NOTE: do NOT write `jmp 0x08:long_mode_entry`.
+    ; NASM resolves that operand as an assembly-time absolute offset and
+    ; emitted it 2 bytes too high for the reference below, so the CPU landed
+    ; at long_mode_entry+2 -- in the middle of `mov dx,0x3FD` -- and long mode
+    ; executed garbage (`SdMPACELGG`... on the serial port, no kmain64).
+    ; push/retf takes the target as an ordinary 32-bit absolute immediate
+    ; relocation (R_386_32), which the linker patches exactly.
+    push dword 0x08
+    push dword long_mode_entry
+    retf
 
 .compat_path:
     ; =================================================================
@@ -389,7 +397,17 @@ switch_to_64bit:
     SERIAL_DBG 'M'         ; iMage copied into place
 
     lgdt [gdt64_desc]
-    jmp 0x08:long_mode_entry
+    ; ---- 8. Far jump to 64-bit code segment (0x08) ----
+    ; Enter true 64-bit mode.  NOTE: do NOT write `jmp 0x08:long_mode_entry`.
+    ; NASM resolves that operand as an assembly-time absolute offset and
+    ; emitted it 2 bytes too high for the reference below, so the CPU landed
+    ; at long_mode_entry+2 -- in the middle of `mov dx,0x3FD` -- and long mode
+    ; executed garbage (`SdMPACELGG`... on the serial port, no kmain64).
+    ; push/retf takes the target as an ordinary 32-bit absolute immediate
+    ; relocation (R_386_32), which the linker patches exactly.
+    push dword 0x08
+    push dword long_mode_entry
+    retf
 
 ; =====================================================================
 ;  64-bit code entry point

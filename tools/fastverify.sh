@@ -56,7 +56,7 @@ if [ "$SZ" -lt 4000000 ]; then
 fi
 
 rm -f "$LOG"
-qemu-system-i386 -m 512 -drive file=build/os_v2.img,format=raw,if=ide \
+"${QEMU_BIN:-qemu-system-i386}" -m 512 -drive file=build/os_v2.img,format=raw,if=ide \
   -display none -serial file:"$LOG" -no-reboot &
 QP=$!
 

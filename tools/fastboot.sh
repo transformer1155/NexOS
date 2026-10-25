@@ -30,7 +30,7 @@ LOG="${LOG:-/mnt/e/NexOS/_fastboot.log}"
 if [ ! -f "$IMG" ]; then echo "fastboot: missing $IMG" >&2; exit 2; fi
 
 rm -f "$LOG"
-qemu-system-i386 -m 512 -drive file="$IMG",format=raw,if=ide \
+"${QEMU_BIN:-qemu-system-i386}" -m 512 -drive file="$IMG",format=raw,if=ide \
   -display none -serial file:"$LOG" -no-reboot &
 QP=$!
 
