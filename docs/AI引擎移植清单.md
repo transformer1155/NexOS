@@ -12,7 +12,7 @@
 | 0.3 | 建立文件读取适配层（mmap→fs_read） | — | `file_adapter.c` | 无 | [x] |
 
 > **阶段 0 验证记录（2026-08-16，QEMU 无头 + serial 抓取）**
-> - 构建：`tools/build_win.sh build/os.img`（MSYS2 工具链，kernel64.o 已含 `gguf_adapter_selftest`）。
+> - 构建：`tools/misc/build_win.sh build/os.img`（MSYS2 工具链，kernel64.o 已含 `gguf_adapter_selftest`）。
 > - 关键坑修复：① GGUF 头为 24 字节（magic4+version4+tensor_count8+kv_count8），KV 元数据从 **offset 24** 起（原误用 16 导致整段解析错位）；② `build/kernel64.o` 被陈旧产物 + 残留 QEMU 进程锁 `os.img` 双重干扰导致"改了源码 QEMU 仍跑旧逻辑"，已通过杀残留 QEMU + 彻底删 64 位对象后重建解决。
 > - serial 实测输出：
 >   ```

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # MiniOS user/permission/sudo E2E test via QEMU monitor sendkey.
-# Usage: python3 tools/_test_auth.py   (run inside WSL at /mnt/d/MyOS/bootloader)
+# Usage: python3 tools/verify/_test_auth.py   (run inside WSL at /mnt/d/MyOS/bootloader)
 import subprocess, socket, time, os, sys
 
 os.system("rm -f /tmp/mon.sock /tmp/shot.ppm /tmp/ser.txt")

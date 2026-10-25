@@ -41,7 +41,7 @@
    完成后拷回：`cp ~/nb/os_v2.img build/os_v2.img`。
 2. **改内核前先跑容量自检**：
    ```bash
-   bash tools/check_k64_fit.sh
+   bash tools/verify/check_k64_fit.sh
    ```
 3. 镜像布局涉及多处硬编码，**必须同步修改**，否则会静默错位：
    - `kernel.cpp`：`KERNEL64_SECTORS`、`SFS_ALT_LBA`、`SFS_LINUX_LBA`
@@ -78,7 +78,7 @@
 2. **64 位文本 shell 不接收串口输入**，因此只能在 64 位编译的功能无法交互式调用。
 3. **SLIRP（`-netdev user`）下宿主无法主动发 UDP 给 guest**，只有 guest 发起、
    宿主回包才通。所以分布式调度/推理的**编排器必须跑在 guest 侧**。
-   多 VM 广播发现需要 `tools/nexos_l2hub.py` 做 L2 帧洪泛。
+   多 VM 广播发现需要 `tools/net/nexos_l2hub.py` 做 L2 帧洪泛。
 4. **Windows UDP 陷阱**：给已挂掉的对端发过 UDP 后，下一次 `recvfrom()` 会抛
    `WSAECONNRESET`。收包循环必须捕获后 `continue`，否则节点一挂，进程就"失聪"。
 
@@ -89,7 +89,7 @@
 
 ## 六、提交前自检清单
 
-- [ ] `bash tools/check_k64_fit.sh` 通过
+- [ ] `bash tools/verify/check_k64_fit.sh` 通过
 - [ ] 32 位与 64 位均编译通过（无 error）
 - [ ] 若改动镜像布局，四处 LBA/扇区已同步
 - [ ] README 已更新

@@ -212,7 +212,7 @@ if (g_font_mode != 0 && vec_ready()) {
 
 ### 5.2 烘焙 AA Latin（32-bit 高质量路径，`gui.cpp:1997`）
 
-`font_la16.bin` 是离线用 `tools/bake_la16.c`（基于 stb_truetype + 微软雅黑子集）烘焙的 16px 灰度覆盖率位图，格式（`gui.cpp:1278`）：
+`font_la16.bin` 是离线用 `tools/font/bake_la16.c`（基于 stb_truetype + 微软雅黑子集）烘焙的 16px 灰度覆盖率位图，格式（`gui.cpp:1278`）：
 
 ```
 "LA16" + base(1B) + count(1B) + h(2B) + 每字形: [width(1B) | advance(1B) | h*h 灰度字节(行主序, 左起 MSB)]

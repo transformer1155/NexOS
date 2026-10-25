@@ -67,6 +67,20 @@ void scat(char* d, const char* s, int cap) {
     d[i] = 0;
 }
 
+// Substring test, freestanding (no libc strstr).  Used by the BUG-9
+// load-failure classifier to name which stage of clr_load() failed.
+bool contains_(const char* hay, const char* needle) {
+    if (!hay || !needle) return false;
+    int hn = slen(hay), nn = slen(needle);
+    if (nn == 0 || hn < nn) return false;
+    for (int i = 0; i + nn <= hn; i++) {
+        int j = 0;
+        while (j < nn && hay[i + j] == needle[j]) j++;
+        if (j == nn) return true;
+    }
+    return false;
+}
+
 // =====================================================================
 //  host table + paint context
 // =====================================================================
@@ -459,6 +473,61 @@ int32_t h_tick_ms(int32_t*) { return g_h.tick_ms ? (int32_t)g_h.tick_ms() : 0; }
 uint32_t g_run_mask = 0;
 int32_t h_run_mask(int32_t*) { return (int32_t)g_run_mask; }
 
+// ---- input method (IME) status --------------------------------------
+// BUG-7 fix: the pinyin IME language mode (Chinese / English) lives in
+// gui.cpp and was invisible to the managed shell, so neither the native
+// topbar indicator nor the C# taskbar could show it.  gui.cpp pushes the
+// mode here before every frame; the managed taskbar reads it back to draw
+// the "CN"/"EN" indicator, and it is ALSO what makes the native topbar
+// strip drawable at all (see gui.cpp: the indicator was gated on
+// !managed_desk, so it never showed in the normal managed-desktop case).
+// 1 = Chinese (pinyin) mode, 0 = English mode.
+uint32_t g_ime_mode = 0;
+int32_t h_ime_mode(int32_t*) { return (int32_t)g_ime_mode; }
+
+// ---- BUG-9: per-window paint-fault flags -----------------------------
+// One slot per managed window id.  mforms_paint sets 1 when the managed
+// OnPaint faulted (unbound icall, heap exhaustion, bad method) and 0 on a
+// successful frame.  The compositor reads it back through
+// mforms_paint_failed() to decide whether to fall back to the native drawer
+// instead of showing a transparent, empty client area.
+#define MFORMS_MAX_WIN 16
+static int g_paint_fail[MFORMS_MAX_WIN] = {0};
+extern "C" int mforms_paint_failed(int id) {
+    if (id < 0 || id >= MFORMS_MAX_WIN) return 0;
+    return g_paint_fail[id] ? 1 : 0;
+}
+
+// ---- display scaling (devicePixelRatio) -----------------------------
+// BUG-3: the shell asks for a device-pixel ratio so glyphs can be
+// supersampled (see font_vec.c vec_set_dpr) and the retro post-process can
+// keep full 8-bit anti-aliasing (g_text_aa in gui.cpp).  Both live in the
+// kernel / font_vec.c, so this just forwards the value and invalidates the
+// glyph cache, which is keyed on px alone and would otherwise keep serving
+// glyphs rasterised at the old factor.
+extern "C" void vec_set_dpr(int factor);
+extern "C" void gui_font_cache_clear(void);
+extern "C" void gui_set_text_aa(int on);
+extern "C" { int g_dpr = 1; int g_text_aa = 1; }
+// One icall covers both halves of the BUG-3 fix: the supersampling factor AND
+// the AA-preserving switch.  They are meaningless apart (a 2x rasterisation is
+// wasted if the retro pass then quantises the coverage away), so the shell sets
+// them together and there is no separate SetTextAa entry point to forget.
+int32_t h_set_dpi(int32_t* a) {
+    int d = (a && a[0] > 0) ? a[0] : 1;
+    if (d > 4) d = 4;
+    g_dpr = d;
+    vec_set_dpr(d);
+    gui_set_text_aa(1);        // keep 8-bit AA while the retro mode runs
+    gui_font_cache_clear();    // cache is keyed on px only -> drop old bitmaps
+    return 0;
+}
+
+// Called by gui.cpp once per frame with the IME language mode.  Keeping the
+// push here (rather than reading gui.cpp state directly) means the managed
+// side has a single, already-declared internal call to read.
+extern "C" void mforms_set_ime(int mode) { g_ime_mode = mode ? 1u : 0u; }
+
 // ---- file system -----------------------------------------------------
 //  list_files() hands back one entry per line, directories prefixed with
 //  "[D] ".  Parsing that in C# would need a string API we do not have,
@@ -547,7 +616,11 @@ int32_t h_file_refresh(int32_t*) { g_flist_fs = -1; return 0; }
 // way the terminal's mkdir / rm / copy do.
 int32_t h_file_mkdir(int32_t* a) {
     if (!g_h.mkdir) return -1;
-    return g_h.mkdir(a[0], clr_str(a[1]));   // a[0]=fs, a[1]=name
+    int r = g_h.mkdir(a[0], clr_str(a[1]));  // a[0]=fs, a[1]=name
+    // BUG #2: a created directory changes the listing even when the mkdir
+    // itself fails later in the chain, so drop the cache unconditionally.
+    g_flist_fs = -1;
+    return r;
 }
 int32_t h_file_delete(int32_t* a) {
     if (!g_h.remove) return -1;
@@ -614,6 +687,15 @@ int32_t h_read_hex(int32_t* a) {
 // storage.  Returns bytes written (>=0) or -1 on error.  Used by the
 // managed shell to save personalization settings ("nexos.cfg") and Notepad
 // documents.  Matches the read side's clr_str/a[] indexing convention.
+//
+// BUG #8 (SFS read-only penetration): the kernel's write_file callback
+// already refuses every volume except MKFS(0) and its Desktop folder(3) with
+// a dedicated EROFS code.  Surface that code verbatim so the managed shell
+// can report "read-only medium" instead of a generic failure.
+//
+// BUG #2 (ghost new file): after a successful write the cached directory
+// listing MUST be invalidated, otherwise FileCount()/FileName() keep serving
+// the pre-create snapshot and the new file never appears in the UI.
 int32_t h_write_text(int32_t* a) {
     if (!g_h.write_file) return -1;
     const char* s = clr_str(a[2]);
@@ -621,6 +703,7 @@ int32_t h_write_text(int32_t* a) {
     if (len > WRITE_MAX) len = WRITE_MAX;
     for (int i = 0; i < len; i++) g_textwrite[i] = s[i];
     int n = g_h.write_file(a[0], clr_str(a[1]), (const unsigned char*)g_textwrite, len);
+    if (n >= 0) g_flist_fs = -1;        // BUG #2: listing changed -> force re-read
     return (int32_t)n;
 }
 
@@ -754,6 +837,35 @@ int32_t h_clip_set(int32_t* a) {
     int len = slen(s);
     clipboard_set(s, len);
     return 0;
+}
+
+// ---- BUG-9: download icalls (previously unbound) ---------------------
+// The managed shell declares Host.DownloadFile / DownloadAsync /
+// DownloadStatus / DownloadCancel as InternalCall, but no native
+// implementation was ever registered.  An unbound icall makes call_icall()
+// fault, which aborts the managed method -- and when that happens inside a
+// paint the client area is left empty, i.e. the transparent-window symptom.
+// Register honest stubs instead: no HTTP client is wired to this bridge yet,
+// so report "unsupported" rather than taking the CLR down.  Host.HttpGet
+// remains the working network path.
+int32_t h_download_file(int32_t* a) {
+    (void)a;
+    serial_puts("[MFORMS] Host.DownloadFile requested but not wired to the kernel\n");
+    return -1;                      // -1 = unsupported
+}
+int32_t h_download_async(int32_t* a) {
+    (void)a;
+    serial_puts("[MFORMS] Host.DownloadAsync requested but not wired to the kernel\n");
+    return -1;
+}
+int32_t h_download_status(int32_t* a) {
+    (void)a;
+    // A JSON-ish snapshot the managed side can parse without a second call.
+    return clr_new_str("{\"code\":\"unsupported\",\"state\":\"idle\",\"total\":0,\"received\":0,\"percent\":0,\"slices\":0,\"done\":0,\"bps\":0}");
+}
+int32_t h_download_cancel(int32_t* a) {
+    (void)a;
+    return -1;
 }
 
 // =====================================================================
@@ -892,6 +1004,8 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::SetAnim",      h_set_anim    },
     { "NexOS.Forms.Host::Repaint",      h_repaint     },
     { "NexOS.Forms.Host::RunningMask",  h_run_mask    },
+    { "NexOS.Forms.Host::ImeMode",     h_ime_mode    },
+    { "NexOS.Forms.Host::SetDpi",      h_set_dpi     },
     { "NexOS.Forms.Host::FileCount",    h_file_count  },
     { "NexOS.Forms.Host::FileName",     h_file_name   },
     { "NexOS.Forms.Host::FileIsDir",    h_file_is_dir },
@@ -909,6 +1023,10 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::Log",          h_log         },
     { "NexOS.Forms.Host::CharStr",      h_charstr     },
     { "NexOS.Forms.Host::HttpGet",      h_http_get    },
+    { "NexOS.Forms.Host::DownloadFile",   h_download_file  },
+    { "NexOS.Forms.Host::DownloadAsync",  h_download_async },
+    { "NexOS.Forms.Host::DownloadStatus", h_download_status},
+    { "NexOS.Forms.Host::DownloadCancel", h_download_cancel},
     { "NexOS.Forms.Host::GetClipboard", h_clip_get    },
     { "NexOS.Forms.Host::SetClipboard", h_clip_set    },
     { "NexOS.Forms.Host::OpenApp",      h_open_app    },
@@ -991,9 +1109,35 @@ extern "C" int mforms_start(void) {
     if (!g_have_host) { scpy(g_report, "mforms: no host table", sizeof(g_report)); return -1; }
     if (!clr_ready())  { scpy(g_report, "mforms: CLR not initialised", sizeof(g_report)); return -1; }
 
-    if (clr_load("shell.mex") != 0) {
-        scpy(g_report, "mforms: ", sizeof(g_report));
-        scat(g_report, clr_last_report(), sizeof(g_report));
+    // BUG-9: shell.mex failing to load used to surface only as a bare
+    // "mforms: CLR: ..." one-liner, so the three real causes (unbound icall,
+    // out-of-memory, corrupt/truncated image) were indistinguishable from the
+    // serial log.  clr_load() already prints one "[CLR] unbound icall: <name>"
+    // line per missing binding and a "bad mex section" fault for a damaged
+    // image; carry that text through verbatim and tag which stage failed so
+    // the report names the cause.
+    int lrc = clr_load("shell.mex");
+    if (lrc != 0) {
+        const char* why = clr_last_report();
+        if (why && contains_(why, "unbound internal call"))
+            scpy(g_report, "mforms: shell.mex load failed - UNBOUND ICALL (see "
+                           "serial log for the name): ", sizeof(g_report));
+        else if (why && contains_(why, "managed heap exhausted"))
+            scpy(g_report, "mforms: shell.mex load failed - OUT OF MEMORY: ",
+                 sizeof(g_report));
+        else if (why && contains_(why, "bad mex section"))
+            scpy(g_report, "mforms: shell.mex load failed - CORRUPT IMAGE: ",
+                 sizeof(g_report));
+        else if (why && contains_(why, "file not found"))
+            scpy(g_report, "mforms: shell.mex load failed - IMAGE MISSING: ",
+                 sizeof(g_report));
+        else
+            scpy(g_report, "mforms: shell.mex load failed: ", sizeof(g_report));
+        scat(g_report, why, sizeof(g_report));
+        serial_puts("[MFORMS] shell.mex load FAILED (rc=");
+        serial_putdec(lrc);
+        serial_puts(") -- the managed desktop will not start; "
+                    "every window falls back to the native drawer.\n");
         return -2;
     }
 
@@ -1020,6 +1164,27 @@ extern "C" int mforms_open(int kind) {
     if (clr_call("NexOS.Forms.Shell::Open", &a, 1, &r) != 0) {
         scpy(g_report, clr_last_report(), sizeof(g_report));
         heap_recover();
+        return -1;
+    }
+    // ---- BUG-9: a managed app that cannot paint must NOT become a window ----
+    // Shell::Open returning < 0 means the C# side could not instantiate the
+    // app (unknown kind, OOM in the managed heap, ctor fault).  The caller used
+    // to still create the window: the client area was then handed to an app
+    // that paints nothing, and because the window body is alpha-blended glass
+    // the result is the reported ".mex window is transparent and empty".
+    // Fail loudly instead, with the reason in g_report, and let the caller
+    // fall back to the native drawer (or show an error) rather than opening a
+    // see-through window.
+    if (r < 0) {
+        scpy(g_report, "mforms: managed app unavailable (Shell::Open returned ",
+             sizeof(g_report));
+        scat(g_report, clr_last_report(), sizeof(g_report));
+        scat(g_report, ")", sizeof(g_report));
+        serial_puts("[MFORMS] mforms_open refused: managed app ");
+        serial_putdec(kind);
+        serial_puts(" unavailable -> ");
+        serial_puts(g_report);
+        serial_puts("\n");
         return -1;
     }
     rebaseline();                    // the new app's state must persist
@@ -1052,8 +1217,25 @@ extern "C" void mforms_paint(int id, int ox, int oy, int w, int h) {
     g_flist_fs = -1;                 // listings are per-frame snapshots
     uint32_t mark = clr_heap_mark();
     int32_t a[3] = { id, w, h }, r = 0;
-    clr_call("NexOS.Forms.Shell::Paint", a, 3, &r);
+    // BUG-9: a paint that draws nothing (managed ctor faulted, the heap blew,
+    // an unbound icall was hit) used to leave the client area completely empty.
+    // The window body is alpha-blended glass, so the user saw a transparent,
+    // contentless window.  Track that here so the compositor can fall back to
+    // the native drawer (see gui.cpp mforms_paint_failed) and so the fault is
+    // visible on the serial log instead of silently eating frames.
+    int rc = clr_call("NexOS.Forms.Shell::Paint", a, 3, &r);
     clr_heap_reset(mark);
+    if (rc != 0) {
+        g_paint_fail[id < MFORMS_MAX_WIN ? id : 0] = 1;
+        serial_puts("[MFORMS] paint fault on window ");
+        serial_putdec(id);
+        serial_puts(": ");
+        serial_puts(clr_last_report());
+        serial_puts("\n");
+        heap_recover();
+    } else {
+        g_paint_fail[id < MFORMS_MAX_WIN ? id : 0] = 0;
+    }
 }
 
 // Pan variant: the managed app is told its client size as usual, but every

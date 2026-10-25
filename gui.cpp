@@ -107,6 +107,8 @@ static inline int         mforms_desktop_menu_open(void) { return 0; }
 static inline int         mforms_desktop_key(int) { return 0; }
 static inline int         mforms_desktop_menu(int) { return -1; }
 static inline void        mforms_set_running(uint32_t) {}
+static inline void        mforms_set_ime(int) {}
+static inline int         mforms_paint_failed(int) { return 0; }
 #endif
 
 // ---------------------------------------------------------------------
@@ -1700,6 +1702,21 @@ static int g_gc_tab[GC_HTAB];     // bucket head slot index, -1 = empty
 static int g_gc_lru_head = -1;    // most-recently-used slot
 static int g_gc_lru_tail = -1;    // least-recently-used slot
 static bool g_gc_inited = false;
+
+// BUG-3: drop every cached glyph.  The cache is keyed on (codepoint, px) only,
+// so changing the supersampling factor (vec_set_dpr) would otherwise keep
+// handing out bitmaps rasterised at the old factor until each entry aged out
+// of the LRU.  Called from Host.SetDpi.
+extern "C" void gui_font_cache_clear(void) {
+    for (int i = 0; i < GC_N; i++) {
+        if (g_gc[i].bmp) { kfree(g_gc[i].bmp); g_gc[i].bmp = nullptr; }
+        g_gc[i].cp = 0; g_gc[i].px = 0;
+        g_gc[i].hnext = -1; g_gc[i].lru_prev = -1; g_gc[i].lru_next = -1;
+    }
+    for (int i = 0; i < GC_HTAB; i++) g_gc_tab[i] = -1;
+    g_gc_lru_head = g_gc_lru_tail = -1;
+    g_gc_inited = false;   // force a clean re-init on the next draw
+}
 
 struct Graphics {
     volatile uint32_t* lfb;      // frontbuffer (VBE LFB)
@@ -4442,6 +4459,29 @@ extern "C" int g_pixel_mode;
 extern "C" int g_pixel_scale;
 extern "C" int g_pixel_scan;
 
+// ---- BUG-3: high-DPI font scaling + AA-preserving retro mode -----------
+// The GUI is a fixed 16 px vector font, so on a high-resolution framebuffer
+// every glyph is drawn at its native 16 px cell no matter how many device
+// pixels that covers: the result is the reported "pre-rendered font looks
+// blurry / not scaled for the display".  g_dpr is the device-pixel ratio the
+// shell asks for (1 = 1 GUI px per device px, 2 = supersample 2x).  It is
+// pushed from the managed side through Host.SetDpi() exactly like the pixel
+// knobs above, and 0 means "not set" -> fall back to 1.
+extern "C" int g_dpr;          // device pixel ratio (1..4), 0 = unset
+
+// 1 = keep full 8-bit anti-aliasing on text while the retro post-process is
+// active.  The RGB565 + Bayer-dither pass quantises every coverage ramp on
+// the screen, and a gamma-correct AA glyph edge is exactly such a ramp --
+// quantising it is what made the "pre-rendered" font look muddy.  With this
+// flag on, the post-process leaves text pixels alone and only retro-ifies
+// the surrounding chrome (see pixelate_rect).
+extern "C" int g_text_aa;
+
+// BUG-3: setter for the AA-preserving flag above (Host.SetTextAa).  Lives next
+// to the knobs so the retro post-process and the text-quality switch are in
+// one place.
+extern "C" void gui_set_text_aa(int on) { g_text_aa = on ? 1 : 0; }
+
 // Ordered (Bayer 4x4) dither matrix used by pixelate_framebuffer().  Kept at
 // file scope so it is a real definition (an in-class static array initialiser
 // is only a declaration and would not link).
@@ -4468,6 +4508,11 @@ struct Win11Desktop {
     // Managed-window scrollbar drag (axis: 1 = vertical, 2 = horizontal).
     int scroll_drag_win;
     int scroll_drag_axis;
+    // BUG-#1: grab offset inside the scrollbar thumb (thumb_edge - pointer).
+    // The drag mapping is world = (pointer - track_origin - grab_offset) *
+    // range / travel, so the thumb tracks the pointer 1:1 from the moment it
+    // is grabbed instead of snapping its centre under the cursor.
+    int scroll_drag_off;
 
     // Desktop snapshot: the composited background WITHOUT any window, so a
     // window that moves / animates / closes can be erased by restoring its
@@ -4488,10 +4533,8 @@ struct Win11Desktop {
     // slider.  Lower = more transparent.  Defaults to C_GLASS_ALPHA (white
     // frost, more transparent than the old 140 look).
     int       glass_alpha;
-    int       slider_drag;          // 1 while the transparency slider thumb is grabbed
     // Transparency-slider geometry on the top bar (filled in by draw_topbar so
     // hit-testing and drag can reuse exactly the same rects).
-    int       tr_label_x, tr_x, tr_w, tr_y, tr_total;
 
     DesktopIcon icons[MAX_ICONS];
     int icon_count;
@@ -4559,11 +4602,10 @@ struct Win11Desktop {
         drag_window = -1;
         scroll_drag_win = -1;
         scroll_drag_axis = 0;
+        scroll_drag_off = 0;
         g_snap = nullptr; g_snap_cap = 0; g_snap_failed = 0; g_no_glass = false;
         glass_alpha = C_GLASS_ALPHA;   // white frost, more transparent by default
         g_window_transparent = 0;      // whole-window transparency off by default
-        slider_drag = 0;
-        tr_label_x = tr_x = tr_w = tr_y = tr_total = 0;
         gui_mode = false;
         mouse_left = false;
         drag_counter = 0;
@@ -4938,10 +4980,7 @@ struct Win11Desktop {
 
         // Right side: clock removed by request; language indicator is drawn
         // in render_all() so it overlays the managed C# desktop as well.
-        // The transparency slider overlay reserves tr_total px on the right,
-        // so start the memory/64b indicators to its left.
-        transp_layout();
-        int rx = gfx.width - 8 - tr_total - 8;
+        int rx = gfx.width - 8;
 
         // Memory indicator (compact)
         if (g_cb.get_total_mem_kb) {
@@ -4965,51 +5004,18 @@ struct Win11Desktop {
         }
     }
 
-    // ---- Transparency slider (top-right overlay) ----
-    // Fixed geometry of the slider in the top-right corner.  Filled into the
-    // tr_* members so handle_mouse_down / handle_mouse_move hit-test and drag
-    // exactly the rect that was drawn.
-    void transp_layout() {
-        int tlabel_w = 2 * g_font_w;           // "透明" label
-        int ttrack_w = 100;                    // slider track width (px)
-        int tgap     = 6;
-        tr_total   = tlabel_w + tgap + ttrack_w;
-        tr_label_x = gfx.width - 8 - tr_total;
-        tr_x       = tr_label_x + tlabel_w + tgap;
-        tr_y       = TOPBAR_H / 2 - 3;
-        tr_w       = ttrack_w;
-    }
-
-    // Draw the slider as a self-contained floating pill.  Called from
-    // render_all() AFTER the windows in BOTH desktop modes, so the control
-    // stays visible and grabbable even on the managed C# desktop (which has
-    // no native top bar at all).
-    void draw_transp_slider() {
-        transp_layout();
-        int ttrack_h = 6;
-        // Frosted pill backdrop so the control reads on any wallpaper
-        gfx.blend_rounded_rect(tr_label_x - 8, 2, tr_total + 16, TOPBAR_H - 4, 6,
-                               0x000000, 70);
-        // Label
-        gfx.draw_text_transparent(tr_label_x, 8, "透明", C_TOPBAR_TEXT);
-        // Track background
-        gfx.blend_rounded_rect(tr_x, tr_y, tr_w, ttrack_h, 3, 0xFFFFFF, 60);
-        // Filled portion up to the current alpha
-        int rel = glass_alpha - TRANSPARENT_MIN;
-        if (rel < 0) rel = 0;
-        int fill_w = (rel * tr_w) / (TRANSPARENT_MAX - TRANSPARENT_MIN);
-        if (fill_w > tr_w) fill_w = tr_w;
-        if (fill_w > 0)
-            gfx.blend_rounded_rect(tr_x, tr_y, fill_w, ttrack_h, 3, C_ACCENT, 190);
-        // Thumb (white pill)
-        int thumb_w = 8, thumb_h = 14;
-        int thumb_x = tr_x + fill_w - thumb_w / 2;
-        if (thumb_x < tr_x) thumb_x = tr_x;
-        if (thumb_x > tr_x + tr_w - thumb_w) thumb_x = tr_x + tr_w - thumb_w;
-        int thumb_y = TOPBAR_H / 2 - thumb_h / 2;
-        gfx.fill_rounded_rect(thumb_x, thumb_y, thumb_w, thumb_h, 3, COLOR_WHITE);
-        gfx.blend_rounded_rect(thumb_x, thumb_y, thumb_w, thumb_h, 3, 0x000000, 28);
-    }
+    // ---- BUG-#6: the top-right transparent drag strip is GONE ----------
+    // The old floating "transparent" transparency-slider pill lived in the
+    // top-right corner of the screen.  Two things were wrong with it:
+    //   1. it was redundant chrome nobody asked for (window transparency is
+    //      already owned by the whole-window toggle / Control Panel);
+    //   2. it was drawn AFTER every window and grabbed BEFORE any window
+    //      hit-test, so it sat exactly on top of a fullscreen window close
+    //      button (screen right edge, y < TITLE_BAR_H) and stole its click --
+    //      the button became unclickable.
+    // The control, its geometry (tr_*), its drag state (slider_drag) and both
+    // grab sites in handle_mouse_down() are removed.  Window glass keeps the
+    // fixed C_GLASS_ALPHA default; it is no longer editable from the desktop.
 
     void draw_desktop_icons() {
         for (int i = 0; i < icon_count; i++) {
@@ -5262,6 +5268,22 @@ struct Win11Desktop {
                     mforms_paint_pan(win.managed_app, ox, oy, mw, mh, win.scroll_x, win.scroll_y);
                     win.scroll_cw = mforms_content_w();
                     win.scroll_ch = mforms_content_h();
+                    // BUG-9: the managed app faulted while painting.  The body
+                    // is alpha-blended glass, so an empty client area reads as a
+                    // transparent window.  Paint an opaque panel with the reason
+                    // so the failure is visible and the window is never see-through.
+                    if (mforms_paint_failed(win.managed_app)) {
+                        gfx.fill_rect(ox, oy, mw, mh, 0xFF1B1B1B);
+                        gfx.draw_rect(ox + 1, oy + 1, mw - 2, mh - 2, 0xFFC42B1C);
+                        const char* msg = "This app failed to load.";
+                        gfx.draw_text_transparent(ox + 12, oy + 12, msg, 0xFFFFFFFF);
+                        gfx.draw_text_transparent(ox + 12, oy + 30,
+                                                 "Close and reopen it, or check the serial log.",
+                                                 0xFFBBBBBB);
+                        serial_puts("[GUI] managed window ");
+                        serial_putdec(id);
+                        serial_puts(": paint fault -> native fallback panel\n");
+                    }
                     // Refresh the cache with exactly what was just painted.
                     uint32_t* cb = content_buf(win, mw, mh);
                     if (cb) {
@@ -7277,7 +7299,15 @@ struct Win11Desktop {
                     int qr = sr + off; if (qr > 255) qr = 255;
                     int qg = sg + off; if (qg > 255) qg = 255;
                     int qb = sb + off; if (qb > 255) qb = 255;
-                    int r = r5[qr], g = g6[qg], b = b5[qb];
+                    // BUG-3: with g_text_aa on, do NOT posterise to RGB565.
+                    // A gamma-correct AA glyph edge is a smooth 0..255 coverage
+                    // ramp; quantising it to 5/6/5 steps (plus dither) is what
+                    // made the pre-rendered font look muddy.  Full 8-bit colour
+                    // keeps every edge sharp while the scanline dim and the
+                    // block/scale effects below still give the CRT look.
+                    int r, g, b;
+                    if (g_text_aa) { r = qr; g = qg; b = qb; }
+                    else           { r = r5[qr]; g = g6[qg]; b = b5[qb]; }
                     if (dim) {
                         r = (r * 21) >> 5; g = (g * 21) >> 5; b = (b * 21) >> 5;
                     }
@@ -7314,7 +7344,10 @@ struct Win11Desktop {
                         int qg = sg + off; if (qg < 0) qg = 0; else if (qg > 255) qg = 255;
                         int qb = sb + off; if (qb < 0) qb = 0; else if (qb > 255) qb = 255;
 
-                        int r = r5[qr], g = g6[qg], b = b5[qb];
+                        // BUG-3: same AA-preservation as the scale==1 path.
+                        int r, g, b;
+                        if (g_text_aa) { r = qr; g = qg; b = qb; }
+                        else           { r = r5[qr]; g = g6[qg]; b = b5[qb]; }
                         if (dim) {   // subtle CRT scanline (~66% on odd rows)
                             r = (r * 21) >> 5; g = (g * 21) >> 5; b = (b * 21) >> 5;
                         }
@@ -7508,6 +7541,9 @@ struct Win11Desktop {
             if (repaint_desk) {
                 mforms_set_mouse(mouse_x, mouse_y);
                 mforms_set_running(running_mask());
+                // BUG-7: publish the IME language mode so the managed
+                // taskbar (and the native topbar strip) can show CN/EN.
+                mforms_set_ime(g_ime_cn ? 1 : 0);
                 diag_step(101, "render_all before desktop layer");
                 int npix = gfx.width * gfx.height;
                 // Never trust the cache unless the managed shell is actually
@@ -7665,12 +7701,11 @@ struct Win11Desktop {
         perf_win_ms += tick_ms_now() - tS;    // stage 2: window compositing
         tS = tick_ms_now();
 
-        // Transparency slider overlay: drawn AFTER the windows in BOTH desktop
-        // modes so it stays visible and grabbable (the managed C# desktop has
-        // no native top bar).  Cheap (a few rects), and its strip is dirtied
-        // every frame so alpha changes show immediately.
-        draw_transp_slider();
-        dirty_add(tr_label_x - 10, 0, tr_total + 20, TOPBAR_H);
+        // BUG-#6: the top-right transparency slider used to be drawn HERE,
+        // after every window, so that it stayed visible and grabbable.  That
+        // is exactly what let it sit on top of a fullscreen window close
+        // button (right screen edge, y < TITLE_BAR_H) and swallow its click.
+        // The control is gone; see the note where transp_layout used to live.
 
         // Layer 2 of the managed shell: taskbar + Start menu, on top of
         // every window.  The native start menu only exists as a fallback.
@@ -7688,6 +7723,27 @@ struct Win11Desktop {
             static uint32_t g_over_sig  = 0xFFFFFFFFu;
             static int      g_over_idle = 0;
             bool menu_up = mforms_desktop_menu_open();
+            // BUG-#menu-residue fix: the managed (C#) Start menu runs a 220 ms
+            // close tween after menuOpen flips to false.  Anim.Tick() clears
+            // Host.SetAnim the moment that tween settles, so g_mforms_anim goes
+            // to 0 and this overlay block stops being dirty BEFORE the last
+            // (already-opaque) transition frame is ever flushed -- the menu
+            // panel is then left permanently on screen until something else
+            // repaints.  Keep forcing the overlay while the menu was visible in
+            // either this frame or the previous one, and remember the previous
+            // state so the transition is not missed.
+            static bool s_menu_was_up = false;
+            bool menu_transition = menu_up || s_menu_was_up;
+            s_menu_was_up = menu_up;
+            // BUG-#11: the same "remember the previous frame" trick is needed for
+            // the NATIVE (gui.cpp fallback) Start menu.  start_menu_open is
+            // already false by the time this block runs on the closing frame, so
+            // the dirty_add guarded by `if (start_menu_open ...)` below could never
+            // fire on the frame that actually has to erase the panel -- the
+            // translucent backdrop stayed in the backbuffer (the ghost menu).
+            static bool s_native_menu_was_up = false;
+            bool native_menu_transition = start_menu_open || s_native_menu_was_up;
+            s_native_menu_was_up = start_menu_open;
             uint32_t osig = running_mask();
             osig ^= start_menu_open ? 0x5A5A5A5Au : 0u;
             // FIX #menu-freeze (2026-10-23): managed (C#) Start menu / popup state
@@ -7697,6 +7753,11 @@ struct Win11Desktop {
             // repainted again (menu stuck half-drawn until a mouse event).
             // menu_up comes from mforms_desktop_menu_open() (IsMenuOpen|ContextOpen).
             osig ^= menu_up ? 0xA5A5A5A5u : 0u;
+            // BUG-#menu-residue: fold the transition state into the signature so
+            // the final close frame is never considered "unchanged".
+            if (menu_transition) osig ^= 0x5A5A5A5Au;
+            // BUG-#11: the native menu's close frame must also count as a change.
+            if (native_menu_transition) osig ^= 0x33CC33CCu;
             // Taskbar hover highlight.  Deliberately skipped while a window is
             // animating: the pointer position feeding this hash changes as the
             // mouse moves, which forced a full C# taskbar repaint (~20-30 ms)
@@ -7712,10 +7773,51 @@ struct Win11Desktop {
             // its panel background until the next click).
             bool over_dirty = repaint_desk            // desktop overwrote the strip
                             || (g_mforms_anim != 0)   // animation: repaint EVERY frame (no down-sampling -> buttery motion)
+                            || menu_transition       // BUG-#menu-residue: menu open/close tween must reach the LFB
+                            || native_menu_transition // BUG-#11: native menu close frame must reach the LFB
                             || g_over_force_n > 0     // managed state settling
-                            || g_over_idle >= 2       // FIX #menu-freeze: 2 idle keepalive calls ~= 1s fallback
+                            // BUG-#0: the old unconditional `g_over_idle >= 2`
+                            // keepalive repainted the overlay every third frame even
+                            // on a completely settled desktop, re-blending the
+                            // translucent chrome each time (moire).  Keep the safety
+                            // net ONLY while a menu is actually up, which is the case
+                            // it was introduced for (FIX #menu-freeze: a half-drawn
+                            // menu must not stay frozen).
+                            || (g_over_idle >= 2 && (menu_up || start_menu_open))
                             || osig != g_over_sig;
             if (over_dirty) {
+                // BUG-#0 (moire): the overlay is painted ON TOP of a retained
+                // backbuffer that still holds last frame's chrome.  Alpha-blended
+                // chrome (taskbar tint, rounded corners, AA label glyphs) blended
+                // over its own previous output accumulates coverage, and the
+                // accumulated coverage modulates with the pixel grid -> moire
+                // bands that get stronger the longer the shell runs.  Reset the
+                // chrome strip to the cached background FIRST so every overlay
+                // pass composites onto a known-clean surface.
+                //
+                // The snapshot already holds the composited desktop PLUS the
+                // taskbar strip (captured at the end of every overlay frame), so
+                // restoring that strip is idempotent: it puts back exactly what
+                // the next overlay pass is about to draw over.  Skipped when
+                // repaint_desk ran, because then the desktop layer already rewrote
+                // the whole surface from scratch this frame.
+                if (!repaint_desk && g_snap) {
+                    snapshot_blit(0, gfx.height - MANAGED_TASKBAR_H, gfx.width,
+                                  MANAGED_TASKBAR_H, false);
+                    // BUG-#0 (moire, still reproducible): the Start-menu panel
+                    // lives at y~=TOPBAR_H+2 and is ~248 px tall -- FAR outside
+                    // the 48 px taskbar strip restored above.  Its translucent
+                    // panel was therefore alpha-blended onto the RETAINED
+                    // backbuffer on every overlay frame; repeatedly blending a
+                    // translucent surface over its own previous output
+                    // accumulates coverage, which is exactly the moire/ghosting
+                    // reported on an idle desktop.  Restore the menu rect as
+                    // well -- it is a window in the DB, so its rect is known.
+                    if (start_menu_id >= 0 && windows[start_menu_id].visible) {
+                        Win11Window& smr = windows[start_menu_id];
+                        snapshot_blit(smr.x, smr.y, smr.w, smr.h, false);
+                    }
+                }
                 mforms_paint_overlay(gfx.width, gfx.height);
                 g_over_sig  = osig;
                 g_over_idle = 0;
@@ -7727,7 +7829,7 @@ struct Win11Desktop {
                 // can live anywhere, and we cannot see their rect), then dirty
                 // exactly the taskbar strip plus the Start-menu rect, which is
                 // known because the menu is a window in the DB.
-                if (g_mforms_anim != 0 || menu_up || g_over_force_n > 0)
+                if (g_mforms_anim != 0 || menu_up || menu_transition || g_over_force_n > 0)
                     dirty_add(0, 0, gfx.width, gfx.height);
                 else {
                     dirty_add(0, gfx.height - MANAGED_TASKBAR_H, gfx.width, MANAGED_TASKBAR_H);
@@ -7746,6 +7848,16 @@ struct Win11Desktop {
                         if (windows[i].visible && !windows[i].minimized)
                             dirty_add(windows[i].x, windows[i].y, windows[i].w, windows[i].h);
                     }
+                }
+                // BUG-#11: dirty the native Start-menu rect on the transitions
+                // too.  The `if (start_menu_open ...)` above is inside the
+                // low-animation else branch AND is false on the closing frame, so
+                // it can never erase the panel by itself.  native_menu_transition
+                // is true on both the open and the close frame, which is exactly
+                // when the backdrop pixels have to be flipped.
+                if (native_menu_transition && start_menu_id >= 0) {
+                    Win11Window& smn = windows[start_menu_id];
+                    dirty_add(smn.x, smn.y, smn.w, smn.h);
                 }
                 if (g_over_force_n > 0) g_over_force_n--;
             }
@@ -7783,18 +7895,23 @@ struct Win11Desktop {
             }
         }
 
-        // Top-right language indicator: 涓?= Chinese IME, EN = English.
-        // Drawn here so it overlays the managed C# desktop wallpaper/taskbar,
-        // but the managed Win11 shell doesn't have a top status bar, so we
-        // only paint the strip when the native Portal topbar is in use.
-        if (!managed_desk) {
-            const char* lang = g_ime_cn ? "中" : "EN";
+        // Top-right language indicator: CN = Chinese IME, EN = English.
+        // BUG-7 fix: this strip used to be gated on `!managed_desk`, so it was
+        // NEVER drawn in the normal case -- the managed Win11 shell owns the
+        // desktop surface (managed_desk == true), which is exactly when the user
+        // needs to see which input mode is active.  Draw it unconditionally now:
+        // it sits on the topbar strip, above the managed wallpaper/taskbar, so
+        // it is visible in both modes.
+        {
+            const char* lang = g_ime_cn ? "CN" : "EN";
             int lw = g_ime_cn ? 16 : (2 * g_font_w);
-            // Leave room for the transparency-slider overlay on the right.
-            int lx = gfx.width - 8 - lw - tr_total - 12;
+            int lx = gfx.width - 8 - lw - 12;
             Color fg = g_ime_cn ? 0xFFCC00 : C_TOPBAR_TEXT;
             gfx.fill_rect(lx - 4, 0, lw + 8, TOPBAR_H, C_TOPBAR_BG);
-            gfx.draw_text_utf8(lx, 8, lang, fg, C_TOPBAR_BG);
+            gfx.draw_text_transparent(lx, 8, lang, fg);
+            // Flush just this strip so the indicator reaches the LFB even on a
+            // frame that did not otherwise repaint the topbar.
+            dirty_add(lx - 4, 0, lw + 8, TOPBAR_H);
         }
 
         // Remote-control security guard overlay (drawn on top of everything)
@@ -7980,6 +8097,16 @@ struct Win11Desktop {
             // wall=1 when the cached wallpaper layer was usable (blit path),
             // 0 when the expensive C# bloom had to be repainted.  sn=1 when the
             // desktop snapshot buffer is present (window-erase path).
+            serial_puts(" anim=");
+            serial_putdec(g_mforms_anim);
+            serial_puts(" drp=");
+            serial_putdec(g_desk_refresh_pending);
+            serial_puts(" ofn=");
+            serial_putdec(g_over_force_n);
+            serial_puts(" dfn=");
+            serial_putdec(g_desk_needs_full ? 1 : 0);
+            serial_puts(" fr=");
+            serial_putdec((int)fps_frames);
             serial_puts(" wall=");
             serial_putdec(g_wall_ok ? 1 : 0);
             serial_puts(" sn=");
@@ -8062,37 +8189,64 @@ struct Win11Desktop {
 
         // The pointer position is always recorded so a later click routes right.
         cursor.x += dx; cursor.y += dy;
+        // BUG-#5 fix: the clamp used to subtract the whole 32x32 sprite, so the
+        // LOGICAL pointer could never reach the right/bottom screen edge -- the
+        // last 31 columns/rows were dead.  A fullscreen window's close button
+        // sits at x = width-28..width-4, i.e. inside that dead band, so it was
+        // literally unclickable.  Clamp the pointer to the SCREEN
+        // [0,width-1] x [0,height-1] (absolute edge reachable) and let the
+        // sprite painter clip itself: MouseCursor::save_bg / restore_bg / draw
+        // all go through Graphics::get_pixel / put_pixel, which bounds-check
+        // and no-op outside the framebuffer, so a sprite hanging off the edge
+        // is harmless.
         if (cursor.x < 0) cursor.x = 0;
         if (cursor.y < 0) cursor.y = 0;
-        if (cursor.x >= gfx.width  - MouseCursor::CURSOR_SIZE) cursor.x = gfx.width  - MouseCursor::CURSOR_SIZE;
-        if (cursor.y >= gfx.height - MouseCursor::CURSOR_SIZE) cursor.y = gfx.height - MouseCursor::CURSOR_SIZE;
+        if (cursor.x >= gfx.width)  cursor.x = gfx.width  - 1;
+        if (cursor.y >= gfx.height) cursor.y = gfx.height - 1;
         mouse_x = cursor.x;
         mouse_y = cursor.y;
         cursor_backend_sync(cursor.x, cursor.y);
 
         // Forward pointer motion to the Linux Guest (no window-drag in progress).
-        if (!was_drag && !scroll_drag_win && !slider_drag && linux_guest_capture_input()) {
+        if (!was_drag && !scroll_drag_win && linux_guest_capture_input()) {
             int rx = 0, ry = 0;
             if (linux_guest_map(mouse_x, mouse_y, rx, ry))
                 linux_guest_send(rx, ry, mouse_left ? 1 : 0, 0);
         }
 
         // A scrollbar drag pans the managed window's content (not the window).
+        //
+        // BUG-#1 (screen <-> world mapping): the old code mapped the pointer as
+        //     rel = pointer - track_origin - 12
+        // which forces the thumb top to sit 12 px above the cursor the instant
+        // the button goes down and keeps that bias for the whole gesture, so
+        // dragging the thumb DOWN yanks the content UP by the grab bias --
+        // exactly the reported "drag down, the background moves up" symptom.
+        // Preserve the grab offset (scroll_drag_off, captured at mouse-down)
+        // instead, so the world offset moves 1:1 with the pointer from the
+        // position it was grabbed at:
+        //     world = (pointer - track_origin - grab_offset) * range / travel
         if (scroll_drag_win >= 0 && scroll_drag_win < window_count) {
             Win11Window& w = windows[scroll_drag_win];
             int ox = w.x + 1, oy = w.y + TITLE_BAR_H;
             int mw = w.w - 2, mh = w.h - TITLE_BAR_H;
             if (scroll_drag_axis == 1 && mh > 0 && w.scroll_ch > mh) {
                 int denom = w.scroll_ch - mh; if (denom < 1) denom = 1;
-                int span = mh - 24; if (span < 1) span = 1;
-                int rel = mouse_y - oy - 12;
+                int thumb = (mh * mh) / w.scroll_ch;
+                if (thumb < 24) thumb = 24;
+                if (thumb > mh) thumb = mh;
+                int span = mh - thumb; if (span < 1) span = 1;
+                int rel = mouse_y - oy - scroll_drag_off;
                 if (rel < 0) rel = 0; if (rel > span) rel = span;
                 w.scroll_y = rel * denom / span;
                 render_all();
             } else if (scroll_drag_axis == 2 && mw > 0 && w.scroll_cw > mw) {
                 int denom = w.scroll_cw - mw; if (denom < 1) denom = 1;
-                int span = mw - 24; if (span < 1) span = 1;
-                int rel = mouse_x - ox - 12;
+                int thumbw = (mw * mw) / w.scroll_cw;
+                if (thumbw < 24) thumbw = 24;
+                if (thumbw > mw) thumbw = mw;
+                int span = mw - thumbw; if (span < 1) span = 1;
+                int rel = mouse_x - ox - scroll_drag_off;
                 if (rel < 0) rel = 0; if (rel > span) rel = span;
                 w.scroll_x = rel * denom / span;
                 render_all();
@@ -8100,25 +8254,26 @@ struct Win11Desktop {
             return;
         }
 
-        // Transparency slider drag: map the pointer's x onto the alpha range
-        // and repaint so the frosted windows update live behind the slider.
-        if (slider_drag && tr_w > 0) {
-            int rel = mouse_x - tr_x;
-            if (rel < 0) rel = 0; if (rel > tr_w) rel = tr_w;
-            glass_alpha = TRANSPARENT_MIN + rel * (TRANSPARENT_MAX - TRANSPARENT_MIN) / tr_w;
-            if (glass_alpha < TRANSPARENT_MIN) glass_alpha = TRANSPARENT_MIN;
-            if (glass_alpha > TRANSPARENT_MAX) glass_alpha = TRANSPARENT_MAX;
-            render_all();
-            return;
-        }
-
         // Dragging a window is a real UI state change (the window itself moves),
         // so it legitimately needs a full redraw 鈥?render_all repaints the cursor.
+        //
+        // BUG-#4 fix: this branch used to `return` immediately after moving the
+        // window, but the soft cursor had ALREADY been erased at the top of
+        // handle_mouse_move() (restore_bg + present_rect of the old position).
+        // render_all() only runs every 3rd move, so for the two frames in
+        // between the arrow was erased and never redrawn -> the cursor vanished
+        // for most of a drag.  Repaint the sprite here, exactly like the
+        // non-drag fast path below, before returning.
         if (was_drag) {
             windows[drag_window].x = mouse_x - drag_off_x;
             windows[drag_window].y = mouse_y - drag_off_y;
             if (windows[drag_window].y < TOPBAR_H)
                 windows[drag_window].y = TOPBAR_H;
+            if (g_cursor_backend == CURSOR_SOFT && cursor.visible) {
+                cursor.save_bg(gfx);
+                cursor.draw(gfx);
+                gfx.present_rect(cursor.x, cursor.y, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
+            }
             drag_counter++;
             if (drag_counter >= 3) {
                 drag_counter = 0;
@@ -8139,10 +8294,13 @@ struct Win11Desktop {
 
     void set_mouse_position(int x, int y) {
         if (!gui_mode) return;
+        // BUG-#5 fix: same absolute-edge clamp as handle_mouse_move() -- the
+        // pointer must be able to reach the last column/row of the screen so a
+        // fullscreen window's title buttons (right edge) stay clickable.
         if (x < 0) x = 0;
         if (y < 0) y = 0;
-        if (x >= gfx.width  - MouseCursor::CURSOR_SIZE) x = gfx.width  - MouseCursor::CURSOR_SIZE;
-        if (y >= gfx.height - MouseCursor::CURSOR_SIZE) y = gfx.height - MouseCursor::CURSOR_SIZE;
+        if (x >= gfx.width)  x = gfx.width  - 1;
+        if (y >= gfx.height) y = gfx.height - 1;
         // BUG-A1 fix: the absolute-pointer path (USB tablet / VMMDev) moves the
         // cursor in one jump instead of by a delta, so we must erase the PREVIOUS
         // soft-cursor pixels before adopting the new position -- otherwise the old
@@ -8287,6 +8445,48 @@ struct Win11Desktop {
         }
     }
 
+    // BUG-#6 helper: hit-test the caption buttons (close / fullscreen /
+    // minimize / float) of every visible window in z-order and run the same
+    // action window_click() would.  Returns true when a button consumed the
+    // click.  Order mirrors click_windows_z(): floating windows first, then
+    // the active window, then the rest topmost-first -- so the button that
+    // is visually on top is the one that responds.
+    bool title_button_click() {
+        for (int pass = 0; pass < 3; pass++) {
+            for (int i = window_count - 1; i >= 0; i--) {
+                Win11Window& win = windows[i];
+                if (!win.visible || win.minimized) continue;
+                if (pass == 0 && !win.floating) continue;
+                if (pass == 1 && (win.floating || i != active_window)) continue;
+                if (pass == 2 && (win.floating || i == active_window)) continue;
+                if (!win.title_contains(mouse_x, mouse_y)) continue;
+                for (int b = 0; b < 4; b++) {
+                    int bx, by; win.title_btn_rect(b, bx, by);
+                    if (mouse_x < bx || mouse_x >= bx + 24) continue;
+                    if (mouse_y < by || mouse_y >= by + 24) continue;
+                    if (b == 0) {
+                        close_window(i);
+                    } else if (b == 1) {
+                        toggle_fullscreen(i);
+                    } else if (b == 2) {
+                        // Start a minimize animation (finish_close-style collapse).
+                        if (win.anim_state == 0 && !win.minimized) {
+                            win.anim_state = 3; // minimizing
+                            win.anim_p = 0;
+                        }
+                    } else { // b == 3 float
+                        win.floating = !win.floating;
+                        for (int j = 0; j < window_count; j++) windows[j].active = false;
+                        win.active = true; active_window = i;
+                    }
+                    render_all();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     void handle_mouse_down() {
         if (!gui_mode) return;
         telem_click_begin();
@@ -8303,6 +8503,17 @@ struct Win11Desktop {
         }
         mouse_left = true;
         start_menu_open = false; // close by default, reopen if clicked
+
+        // ---- BUG-#6: window caption buttons have the HIGHEST priority ------
+        // They used to be reached only through window_click(), which runs
+        // after the taskbar strip, the (now removed) transparency slider and
+        // every desktop-surface hit-test.  A fullscreen window puts its close
+        // button on the absolute top-right corner of the screen -- the same
+        // corner the taskbar tray / slider / overlays also claim -- so the
+        // button was routinely swallowed.  Test the three caption buttons of
+        // every visible window FIRST, in z-order (floating = topmost), and
+        // consume the click before anything else can see it.
+        if (title_button_click()) return;
 
         // WSL2-style Linux Guest: a left-click inside its client area is
         // forwarded to the nested Linux desktop (and does NOT hit-test our
@@ -8380,19 +8591,9 @@ struct Win11Desktop {
                 render_all();
                 return;
             }
-            // Transparency slider (top-right overlay): grab before windows so
-            // a window under it cannot steal the drag.
-            if (mouse_y < TOPBAR_H && tr_total > 0 &&
-                mouse_x >= tr_label_x - 2 && mouse_x <= tr_x + tr_w + 2) {
-                slider_drag = 1;
-                int rel = mouse_x - tr_x;
-                if (rel < 0) rel = 0; if (rel > tr_w) rel = tr_w;
-                glass_alpha = TRANSPARENT_MIN + rel * (TRANSPARENT_MAX - TRANSPARENT_MIN) / tr_w;
-                if (glass_alpha < TRANSPARENT_MIN) glass_alpha = TRANSPARENT_MIN;
-                if (glass_alpha > TRANSPARENT_MAX) glass_alpha = TRANSPARENT_MAX;
-                render_all();
-                return;
-            }
+            // BUG-#6: the transparency slider grab that used to sit here is
+            // gone.  It ran BEFORE click_windows_z(), so a fullscreen window
+            // close button under it could never receive the click.
             if (click_windows_z()) return;
             // Desktop icons: a single click only selects (no launch);
             // launching requires a double-click, like Windows.  A second
@@ -8425,18 +8626,6 @@ struct Win11Desktop {
 
         // Check top bar (Start button)
         if (mouse_y < TOPBAR_H) {
-            // Transparency slider (right side): grab anywhere on the label or
-            // track to start dragging; the thumb follows the pointer live.
-            if (tr_total > 0 && mouse_x >= tr_label_x - 2 && mouse_x <= tr_x + tr_w + 2) {
-                slider_drag = 1;
-                int rel = mouse_x - tr_x;
-                if (rel < 0) rel = 0; if (rel > tr_w) rel = tr_w;
-                glass_alpha = TRANSPARENT_MIN + rel * (TRANSPARENT_MAX - TRANSPARENT_MIN) / tr_w;
-                if (glass_alpha < TRANSPARENT_MIN) glass_alpha = TRANSPARENT_MIN;
-                if (glass_alpha > TRANSPARENT_MAX) glass_alpha = TRANSPARENT_MAX;
-                render_all();
-                return;
-            }
             if (mouse_x >= 8 && mouse_x < 52) {
                 start_menu_open = true;
                 render_all();
@@ -8564,6 +8753,32 @@ struct Win11Desktop {
             int ax = scrollbar_hit(win, mouse_x, mouse_y);
             if (ax != 0) {
                 scroll_drag_win = i; scroll_drag_axis = ax;
+                // BUG-#1: remember where inside the thumb the pointer grabbed
+                // it, so the drag keeps that offset for its whole duration
+                // (the same convention drag_off_x/y uses for window dragging).
+                {
+                    int sox = win.x + 1, soy = win.y + TITLE_BAR_H;
+                    int smw = win.w - 2, smh = win.h - TITLE_BAR_H;
+                    if (ax == 1 && smh > 0 && win.scroll_ch > smh) {
+                        int sden = win.scroll_ch - smh; if (sden < 1) sden = 1;
+                        int sthumb = (smh * smh) / win.scroll_ch;
+                        if (sthumb < 24) sthumb = 24;
+                        if (sthumb > smh) sthumb = smh;
+                        int stop = soy + (smh - sthumb) * win.scroll_y / sden;
+                        if (stop < soy) stop = soy;
+                        scroll_drag_off = mouse_y - stop;
+                    } else if (ax == 2 && smw > 0 && win.scroll_cw > smw) {
+                        int sden = win.scroll_cw - smw; if (sden < 1) sden = 1;
+                        int sthumw = (smw * smw) / win.scroll_cw;
+                        if (sthumw < 24) sthumw = 24;
+                        if (sthumw > smw) sthumw = smw;
+                        int sleft = sox + (smw - sthumw) * win.scroll_x / sden;
+                        if (sleft < sox) sleft = sox;
+                        scroll_drag_off = mouse_x - sleft;
+                    } else {
+                        scroll_drag_off = 0;
+                    }
+                }
                 for (int j = 0; j < window_count; j++) windows[j].active = false;
                 win.active = true; active_window = i;
                 render_all();
@@ -8708,7 +8923,7 @@ struct Win11Desktop {
         mouse_left = false;
         scroll_drag_win = -1;
         scroll_drag_axis = 0;
-        slider_drag = 0;
+        scroll_drag_off = 0;
         int dw = drag_window;
         drag_window = -1;
 
@@ -9410,8 +9625,36 @@ struct Win11Desktop {
         int mkind = (app == APP_AIAGENT || app == APP_LINUX_GUEST) ? -1 : managed_kind_for(app);
         if (mkind >= 0 && mforms_ready()) {
             int mid = mforms_open(mkind);
+            // BUG-9: mforms_open now refuses (returns -1, with the reason in
+            // mforms_report()) when the managed app cannot be instantiated --
+            // unbound icall, managed-heap exhaustion, or a ctor fault.  Before
+            // that, the code still created the window and handed the client area
+            // to an app that paints nothing: because the body is alpha-blended
+            // glass the user got a transparent, contentless ".mex window".
+            // Log the reason once so the failure is diagnosable, then fall
+            // through to the native drawer below.
+            if (mid < 0) {
+                serial_puts("[gui] managed open refused for app ");
+                serial_putdec((int)app);
+                serial_puts(" (mkind ");
+                serial_putdec(mkind);
+                serial_puts("): ");
+                serial_puts(mforms_report());
+                serial_puts("\n");
+            }
             if (mid >= 0) {
                 int wid = create_window(wx, wy, ww, wh, title, APP_MANAGED);
+                // BUG-9: the window could not be created (slot table full).
+                // Release the managed app instead of leaking its id: an orphan
+                // id is never painted but keeps its state in the managed heap
+                // forever, which is one of the ways the shell ran out of room.
+                if (wid < 0) {
+                    serial_puts("[gui] create_window failed for managed app ");
+                    serial_putdec(mid);
+                    serial_puts(" -- releasing it\n");
+                    mforms_close(mid);
+                    return;
+                }
                 if (wid >= 0) {
                     windows[wid].managed_app = mid;
                     windows[wid].launch_kind = app;   // for taskbar / focus
@@ -9994,6 +10237,19 @@ struct Win11Desktop {
         // virtual keys straight to the managed desktop so it works even when
         // no window is focused.
         if (code == 5 || code == 6 || code == 7) {
+            // BUG-#11 (ghost Start menu): this branch used to switch the
+            // virtual desktop WITHOUT touching the native Start-menu state, so
+            // when the fallback menu was what the user had opened (i.e. the
+            // managed shell never reported it via mforms_desktop_menu_open()),
+            // start_menu_open stayed true forever.  The menu window in the DB
+            // then kept being composited -- and because the switch repaints the
+            // desktop underneath it, the content was gone while its translucent
+            // backdrop stayed painted on screen (the "ghost Start menu").
+            // Close the native menu first, then force a full desktop repaint so
+            // the backdrop pixels are actually overwritten by the wallpaper in
+            // the same frame (repaint_desk -> full-screen dirty_add).
+            start_menu_open = false;
+            g_desk_needs_full = true;
             int k = (code == 5) ? -7 : (code == 6) ? -8 : -9;
             mforms_desktop_key(k);
             render_all();
@@ -10618,6 +10874,12 @@ int gui_init(void) {
             diag_step(0x32500000u | ((uint32_t)vg & 0xFFFFFFu), "vec-got");
         }
     }
+    // BUG-3: apply the requested device-pixel ratio to the rasteriser so
+    // glyphs are supersampled (2x by default: a 16 px glyph then comes from a
+    // 32 px raster box-filtered down, which is what removes the "pre-rendered
+    // font is blurry" look).  Default 2 when the shell never pushed a value.
+    vec_set_dpr(g_dpr > 1 ? g_dpr : 2);
+    gui_set_text_aa(1);   // keep 8-bit AA even while the retro mode is on
     g_font_round = 1;   // enable rounded vector font (vector path + baked AA Latin)
     return 0;
 }
@@ -11250,6 +11512,32 @@ void gui_tick(void) {
     //    is redrawn locally via present_rect().  An idle desktop therefore
     //    costs ZERO repaints -- we never paint "just in case".
     if (g_mforms_anim) {
+        // BUG-#0 (moire) DEADLOCK FIX: g_mforms_anim can be left at 1 with no
+        // way back to 0.  The managed shell arms it (SetAnim(1)) during Init /
+        // tween starts, and the ONLY thing that ever clears it is Anim.Tick(),
+        // which runs inside mforms_paint_desktop().  But render_all() skips
+        // that call whenever repaint_desk==0 (the desktop layer is cached), so
+        // once the last tween settles the driver stays armed forever:
+        //   anim=1 -> frames keep coming -> paint_desktop still skipped
+        //          -> Tick never runs -> anim stays 1 ... (self-sustaining)
+        // On an idle desktop that means the translucent overlay is
+        // alpha-blended onto the RETAINED backbuffer ~10x/sec, accumulating
+        // coverage -> the reported moire.
+        //
+        // Break the cycle: if the desktop layer is NOT being repainted there is
+        // nothing that can advance a managed tween this frame, so an armed
+        // driver that produced no desktop repaint for several consecutive
+        // ticks is stale -- release it and let the shell fall back to
+        // event-driven repaints.  A genuine animation always sets
+        // g_desk_refresh_pending (which forces repaint_desk), so this cannot
+        // cut a real animation short.
+        static int s_anim_stale = 0;
+        if (g_desk_refresh_pending != 0 || g_desk_needs_full)
+            s_anim_stale = 0;
+        else if (++s_anim_stale >= 8) {
+            s_anim_stale = 0;
+            g_mforms_anim = 0;   // release the stale frame driver
+        }
         uint32_t now = g_wm.tick_ms_now();
         // ~60 fps cadence.  This used to be 33 ms, which hard-capped the whole
         // shell at 30 fps even after the compositor was optimised down to a
@@ -11259,15 +11547,24 @@ void gui_tick(void) {
             g_wm.render_all();
         }
     } else {
-        // FIX #menu-freeze: with anim==0 gui_tick never drove render_all, so
-        // g_over_idle could never reach its fallback count while the pointer
-        // was still -- a half-drawn menu stayed frozen forever.  A 2 Hz
-        // keepalive lets the overlay safety net fire within ~1 s; idle frames
-        // cost almost nothing (empty damage list -> no flip work).
-        uint32_t now = g_wm.tick_ms_now();
-        if ((uint32_t)(now - g_wm.last_ai_repaint_ms) >= 500) {
-            g_wm.last_ai_repaint_ms = now;
-            g_wm.render_all();
+        // BUG-#0 (idle repaint accumulation): this branch used to call
+        // render_all() unconditionally every 500 ms, for as long as the desktop
+        // sat idle.  That was NOT free, contrary to the old comment: each pass
+        // re-runs the whole compositor and alpha-blends the overlay (taskbar /
+        // Start menu / HUD) over the RETAINED backbuffer.  Repeatedly blending a
+        // translucent element over itself accumulates coverage, which is exactly
+        // the moire / ghosting the bug reports.  Drive a frame ONLY while
+        // something is genuinely settling:
+        //   - g_desk_refresh_pending : a managed layer asked for a repaint
+        //   - g_desk_needs_full      : the desktop layer is known stale
+        //   - g_over_force_n > 0     : a forced overlay countdown is running
+        // When all are clear the desktop is settled and idle costs ZERO frames.
+        if (g_desk_refresh_pending != 0 || g_desk_needs_full || g_over_force_n > 0) {
+            uint32_t now = g_wm.tick_ms_now();
+            if ((uint32_t)(now - g_wm.last_ai_repaint_ms) >= 500) {
+                g_wm.last_ai_repaint_ms = now;
+                g_wm.render_all();
+            }
         }
     }
 }

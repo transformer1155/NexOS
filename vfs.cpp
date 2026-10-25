@@ -191,8 +191,13 @@ int vfs_check_access(const char* abspath, int mode){
 
     // SFS is read-only; a write attempt inside the sandbox is still refused,
     // but it is refused as "read-only medium", not as a sandbox violation.
+    // BUG #8: the read-only medium is SFS itself, so the refusal is
+    // unconditional -- a ring-0/Kernel caller does NOT get a bypass here
+    // (the sandbox bypass above only escapes path containment, never the
+    // medium's own write protection).  The denial is logged as EROFS so the
+    // two causes (containment vs read-only medium) stay distinguishable.
     if (mode & VFS_ACC_WRITE){
-        serial_puts("[VFS] DENIED pid=");   serial_putdec((int)g_current->pid);
+        serial_puts("[VFS] EROFS pid=");   serial_putdec((int)g_current->pid);
         serial_puts(" path=");              serial_puts(abspath);
         serial_puts(" (read-only backend)\n");
         return VFS_DENY;
@@ -216,9 +221,16 @@ int vfs_open(const char* path, int flags){
         return -1;
     }
 
-    int mode = (flags & 0x3) ? VFS_ACC_WRITE : VFS_ACC_READ;
+    // BUG #8: resolve the write intent from the O_RDWR/O_WRONLY bits AND
+    // from O_CREAT/O_TRUNC, so "open for create" cannot slip through as a
+    // read.  SFS has no create path, so a write-intent open is refused here
+    // by the same read-only medium rule that blocks vfs_write().
+    int mode = VFS_ACC_READ;
+    if (flags & 0x3)  mode |= VFS_ACC_WRITE;   // O_RDWR / O_WRONLY
+    if (flags & 0x40) mode |= VFS_ACC_WRITE;   // O_CREAT
+    if (flags & 0x200) mode |= VFS_ACC_WRITE;  // O_TRUNC
     if (vfs_check_access(abs, mode) != VFS_ALLOW)
-        return -1;                       // -EACCES
+        return -1;                       // -EACCES / -EROFS
 
     int slot = -1;
     for (int i = 3; i < VFS_MAX_FD; i++)  // 0/1/2 stay reserved for std streams
@@ -255,8 +267,14 @@ int vfs_read(int fd, void* buf, int count){
 int vfs_write(int fd, const void* buf, int count){
     (void)buf; (void)count;
     if (fd < 3 || fd >= VFS_MAX_FD || !g_fds[fd].used) return -1;
-    // Routed through the choke point so the refusal is auditable.
+    // BUG #8: routed through the choke point so the refusal is auditable.
+    // vfs_check_access() already denies WRITE for every caller on the SFS
+    // backend, so the log + EROFS return below is the belt-and-braces path
+    // that survives any future relaxation of the medium rules.
     if (vfs_check_access(g_fds[fd].path, VFS_ACC_WRITE) != VFS_ALLOW) return -1;
+    serial_puts("[VFS] EROFS write fd="); serial_putdec(fd);
+    serial_puts(" path=");                serial_puts(g_fds[fd].path);
+    serial_puts("\n");
     return -1;                                   // -EROFS
 }
 

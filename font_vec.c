@@ -69,6 +69,18 @@ void vec_last_err(int* code, int* got, int* stb) {
  * this ring; the buffer is valid until the next 2 vec_glyph calls. */
 #define VEC_NBUF 2
 #define VEC_BUFMAX (256 * 256)            /* up to 256x256 AA glyph */
+
+/* BUG-3 (devicePixelRatio): how many times to supersample each glyph before
+ * box-filtering it back to the requested pixel height.  0 or 1 = plain 1x
+ * rasterisation; 2/3/4 give a progressively smoother, correctly area-filtered
+ * small glyph.  Pushed from the managed shell through Host.SetDpi(). */
+int g_vec_dpr = 0;
+
+void vec_set_dpr(int factor) {
+    if (factor < 1) factor = 1;
+    if (factor > 4) factor = 4;
+    g_vec_dpr = factor;
+}
 static uint8_t g_buf[VEC_NBUF][VEC_BUFMAX];
 static int     g_buf_idx = 0;
 
@@ -146,36 +158,80 @@ const uint8_t* vec_glyph(uint32_t cp, int px, int* w, int* h, int* xoff, int* yo
     int glyph = stbtt_FindGlyphIndex(&g_font, (int)cp);
     if (glyph == 0) return NULL;          /* .notdef */
 
-    float scale = stbtt_ScaleForPixelHeight(&g_font, (float)px);
+    /* BUG-3 (devicePixelRatio): rasterise at Nx the requested pixel height and
+     * box-filter back down.  A 16 px glyph rasterised directly has ~1/16 px
+     * of coverage resolution, so its edges are already the blurry "pre-rendered"
+     * look the bug report describes.  Rendering at px*N and averaging N*N
+     * samples per destination pixel is a proper area filter: it is what makes
+     * a small glyph look like a scaled-down large one instead of a
+     * re-rasterised small one.  N comes from g_vec_dpr (0/1 = off). */
+    int N = g_vec_dpr;
+    if (N < 1) N = 1;
+    if (N > 4) N = 4;
+
     int lsb, advance;
     /* We only need the bitmap; stb computes xoff/yoff internally. */
     (void)lsb; (void)advance;
 
     int rw = 0, rh = 0, rxo = 0, ryo = 0;
-    /* Plain 1x grayscale AA: render at the requested pixel size (scaleX ==
-     * scaleY).  This yields a w=rw by h=rh single-channel (coverage 0..255)
-     * bitmap -- one byte per destination pixel, row-major with stride w.
-     * Averaging a 3x horizontal supersample back to grayscale (the old path)
-     * over-smoothed glyph edges and made CJK look blurry next to the crisp
-     * pre-baked ASCII bitmap; 1x grayscale keeps every edge sharp. */
-    unsigned char* bmp = stbtt_GetGlyphBitmap(&g_font, scale, scale, glyph,
-                                              &rw, &rh, &rxo, &ryo);
-    if (!bmp || rw <= 0 || rh <= 0) return NULL;
+    if (N == 1) {
+        float scale = stbtt_ScaleForPixelHeight(&g_font, (float)px);
+        /* Plain 1x grayscale AA: render at the requested pixel size (scaleX ==
+         * scaleY).  This yields a w=rw by h=rh single-channel (coverage 0..255)
+         * bitmap -- one byte per destination pixel, row-major with stride w. */
+        unsigned char* bmp = stbtt_GetGlyphBitmap(&g_font, scale, scale, glyph,
+                                                  &rw, &rh, &rxo, &ryo);
+        if (!bmp || rw <= 0 || rh <= 0) return NULL;
+        if (rw * rh > VEC_BUFMAX) { STBTT_free(bmp, NULL); return NULL; }
+        uint8_t* dst = g_buf[g_buf_idx];
+        g_buf_idx = (g_buf_idx + 1) % VEC_NBUF;
+        for (int r = 0; r < rh; r++) {
+            const uint8_t* s = bmp + (size_t)r * rw;
+            uint8_t* d = dst + (size_t)r * rw;
+            for (int c = 0; c < rw; c++) d[c] = s[c];
+        }
+        STBTT_free(bmp, NULL);
+        *w = rw; *h = rh; *xoff = rxo; *yoff = ryo;
+        return dst;
+    }
 
-    int pixel_w = rw;                     /* 1x: stride == width */
-    int cov_w   = rw;
-    if (cov_w * rh > VEC_BUFMAX) { STBTT_free(bmp, NULL); return NULL; }
+    /* Supersampled path: render at px*N, then average NxN blocks. */
+    float scale = stbtt_ScaleForPixelHeight(&g_font, (float)(px * N));
+    unsigned char* big = stbtt_GetGlyphBitmap(&g_font, scale, scale, glyph,
+                                              &rw, &rh, &rxo, &ryo);
+    if (!big || rw <= 0 || rh <= 0) return NULL;
+
+    /* The supersampled bitmap is N times bigger, so its bearings must be
+     * divided back down (round to nearest keeps the glyph centred). */
+    int out_w = (rw + N - 1) / N;
+    int out_h = (rh + N - 1) / N;
+    if (out_w <= 0) out_w = 1;
+    if (out_h <= 0) out_h = 1;
+    if (out_w * out_h > VEC_BUFMAX) { STBTT_free(big, NULL); return NULL; }
 
     uint8_t* dst = g_buf[g_buf_idx];
     g_buf_idx = (g_buf_idx + 1) % VEC_NBUF;
-    for (int r = 0; r < rh; r++) {
-        const uint8_t* s = bmp + (size_t)r * rw;
-        uint8_t* d = dst + (size_t)r * cov_w;
-        for (int c = 0; c < rw; c++) d[c] = s[c];
+    for (int r = 0; r < out_h; r++) {
+        for (int c = 0; c < out_w; c++) {
+            int sum = 0, cnt = 0;
+            for (int dy = 0; dy < N; dy++) {
+                int sy = r * N + dy;
+                if (sy >= rh) break;
+                const uint8_t* srow = big + (size_t)sy * rw;
+                for (int dx = 0; dx < N; dx++) {
+                    int sx = c * N + dx;
+                    if (sx >= rw) break;
+                    sum += srow[sx]; cnt++;
+                }
+            }
+            dst[(size_t)r * out_w + c] = cnt ? (uint8_t)(sum / cnt) : 0;
+        }
     }
-    STBTT_free(bmp, NULL);
+    STBTT_free(big, NULL);
 
-    *w = pixel_w; *h = rh; *xoff = rxo; *yoff = ryo;
+    *w = out_w; *h = out_h;
+    *xoff = (rxo >= 0) ? (rxo / N) : -((-rxo + N - 1) / N);
+    *yoff = (ryo >= 0) ? (ryo / N) : -((-ryo + N - 1) / N);
     return dst;
 }
 
@@ -184,8 +240,13 @@ int vec_advance(uint32_t cp, int px) {
     if (!g_inited) return px;             /* sensible fallback */
     int glyph = stbtt_FindGlyphIndex(&g_font, (int)cp);
     if (glyph == 0) return px;
-    float scale = stbtt_ScaleForPixelHeight(&g_font, (float)px);
+    int N = g_vec_dpr;
+    if (N < 1) N = 1;
+    if (N > 4) N = 4;
+    float scale = stbtt_ScaleForPixelHeight(&g_font, (float)(px * N));
     int adv = 0, lsb = 0;
     stbtt_GetGlyphHMetrics(&g_font, glyph, &adv, &lsb);
-    return (int)(adv * scale + 0.5f);
+    /* Advance stays in DESTINATION pixels: the glyph is box-filtered back to
+     * px, so dividing by N keeps caller layout identical at any DPR. */
+    return (int)((adv * scale) / N + 0.5f);
 }

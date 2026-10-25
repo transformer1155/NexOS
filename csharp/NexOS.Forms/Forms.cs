@@ -117,6 +117,17 @@ namespace NexOS.Forms
         // Bit i is set when a window of Kind i is open; drives the
         // running-app indicators under the taskbar buttons.
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int RunningMask();
+        // BUG-7: pinyin IME language mode -- 1 = Chinese, 0 = English.
+        // The kernel owns the IME, so the taskbar reads it here to draw the
+        // CN / EN indicator (previously the indicator was native-only and
+        // gated off the managed desktop, so it never showed).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ImeMode();
+        // BUG-3: device pixel ratio for the font rasteriser.  1 = 1:1, 2 = each
+        // glyph is rendered at 2x and box-filtered down (the fix for the blurry
+        // pre-rendered font).  The kernel mirrors this into g_dpr and calls
+        // vec_set_dpr() + clears the glyph cache, so it is safe to call at any
+        // time; changing it re-rasterises every glyph on the next frame.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void SetDpi(int dpr);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int FileCount(int fs);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern string FileName(int fs, int idx);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int FileIsDir(int fs, int idx);
@@ -428,6 +439,12 @@ namespace NexOS.Forms
         public static int    PixelMode  = 1;
         public static int    PixelScale = 1;
         public static int    PixelScan  = 0;
+        // BUG-3: device pixel ratio used by the kernel font rasteriser.
+        // 1 = rasterise 1:1 (fastest), 2 = supersample 2x and box-filter down
+        // (sharpest small glyphs -- the default), 3/4 = even smoother at more
+        // CPU cost.  Only the vector (msyh.ttf) path honours it; the bitmap
+        // fallbacks ignore it.
+        public static int    FontDpr    = 2;
         public static int    WidgetsOn  = 1;   // 1 = show desktop telemetry widget
 
         // Terminal (GNOME-Terminal-style) presentation, persisted so it
@@ -495,6 +512,9 @@ namespace NexOS.Forms
             cfg = NexOS.Sys.StrConcat(cfg, "pixelscan=");
             cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(PixelScan));
             cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "fontdpr=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(FontDpr));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
             cfg = NexOS.Sys.StrConcat(cfg, "widgetson=");
             cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(WidgetsOn));
             cfg = NexOS.Sys.StrConcat(cfg, "\n");
@@ -539,6 +559,7 @@ namespace NexOS.Forms
                 else if (NexOS.Sys.StrEq(key, "pixelmode"))   PixelMode  = v;
                 else if (NexOS.Sys.StrEq(key, "pixelscale"))  PixelScale = (v > 1) ? v : 1;
                 else if (NexOS.Sys.StrEq(key, "pixelscan"))   PixelScan  = v;
+                else if (NexOS.Sys.StrEq(key, "fontdpr"))     FontDpr = (v >= 1 && v <= 4) ? v : 2;
                 else if (NexOS.Sys.StrEq(key, "widgetson"))   WidgetsOn = v;
                 else if (NexOS.Sys.StrEq(key, "termcellh"))   { TermCellH = v; if (TermCellH < 12) TermCellH = 12; if (TermCellH > 28) TermCellH = 28; }
                 else if (NexOS.Sys.StrEq(key, "termbgmode"))  TermBgMode = v;
@@ -550,6 +571,11 @@ namespace NexOS.Forms
         public static void ApplyPixel()
         {
             Host.SetPixel(PixelMode, PixelScale, PixelScan);
+            // BUG-3: keep the font rasteriser and the AA flag in sync with the
+            // retro mode.  Turning pixel mode ON without this is what made the
+            // pre-rendered font look blurred: the post-process quantised every
+            // glyph coverage ramp to 5/6/5 bits.
+            Host.SetDpi(FontDpr);
         }
 
         // Decimal (optionally signed) integer parse.  No BCL int.Parse in

@@ -1159,6 +1159,8 @@ namespace NexOS.Forms
         void BeginNewFolder()
         {
             if (fs < 0) return;
+            // BUG #8: read-only volumes cannot gain a directory.
+            if (fs != 0) { Host.Log("[FILES] new folder refused: read-only volume"); return; }
             string baseName = "New Folder";
             string name = baseName;
             int n = Host.FileCount(fs);
@@ -1173,12 +1175,16 @@ namespace NexOS.Forms
                 k++;
                 n = Host.FileCount(fs);
             }
-            Host.FileMkDir(fs, name);
-            Host.FileRefresh();
-            int nn = Host.FileCount(fs);
+            if (Host.FileMkDir(fs, name) < 0)
+            { Host.Log("[FILES] new folder FAILED: create refused"); return; }
+            // BUG #2: FileMkDir already refreshes the host listing, but this
+            // window's order[] array is an independent cache -- rebuild it or
+            // the new folder stays invisible until the user navigates away.
+            RebuildOrder();
+            int nn = ListCount();
             sel = -1;
             for (int i = 0; i < nn; i++)
-                if (Host.FileName(fs, i) == name) { sel = i; break; }
+                if (ListName(i) == name) { sel = i; break; }
             if (sel >= 0)
             {
                 int rows = (Gfx.Height() - 60) / W.RowH;
@@ -1191,6 +1197,10 @@ namespace NexOS.Forms
         void BeginNewFile()
         {
             if (fs < 0) return;
+            // BUG #8: SFS is read-only.  The context menu already hides the
+            // verb, but the toolbar and the keyboard can reach here, so the
+            // volume itself is checked before anything is created.
+            if (fs != 0) { Host.Log("[FILES] new file refused: read-only volume"); return; }
             string baseName = "New File.txt";
             string name = baseName;
             int n = Host.FileCount(fs);
@@ -1205,13 +1215,19 @@ namespace NexOS.Forms
                 k++;
                 n = Host.FileCount(fs);
             }
-            Host.WriteText(fs, name, "");
+            int wr = Host.WriteText(fs, name, "");
+            if (wr < 0) { Host.Log("[FILES] new file FAILED: write refused"); return; }
             Host.Log(U.Cat("[FILES] new file created: ", name));
-            Host.FileRefresh();
-            int nn = Host.FileCount(fs);
+            // BUG #2 (ghost new file): WriteText already called FileRefresh,
+            // but the paint order[] array is a SEPARATE cache -- it was only
+            // rebuilt on navigation, so the freshly created file was missing
+            // from the very next frame even though Host.FileCount() grew.
+            // Rebuild the order and re-derive the selection every time.
+            RebuildOrder();
+            int nn = ListCount();
             sel = -1;
             for (int i = 0; i < nn; i++)
-                if (Host.FileName(fs, i) == name) { sel = i; break; }
+                if (ListName(i) == name) { sel = i; break; }
             if (sel >= 0)
             {
                 int rows = (Gfx.Height() - 60) / W.RowH;

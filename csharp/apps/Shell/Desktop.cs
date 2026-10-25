@@ -123,12 +123,23 @@ namespace NexOS.Forms
         static int      hudCount;    // valid samples (<= HUD_MAX)
         static int      hudIdx;      // ring write position
         static int      hudLast;     // TickMs() of last sample
+        static int      hudArmLast;  // TickMs() of last HUD frame-arm (independent of hudLast)
         const  int      HUD_MAX = 40;
 
         // ---- Start menu state -----------------------------------------
         static int startView = 0;         // 0 = Pinned, 1 = All apps
         static int menuSel   = 0;         // keyboard-highlighted item (Win key / arrows)
         static int startMenuX, startMenuY, startMenuW, startMenuH;
+        // BUG-#11 (gap 2): the Start menu used to return immediately once it
+        // was closed and never erase the translucent panel it had drawn, so the
+        // pixels only disappeared if some later event happened to repaint the
+        // whole desktop.  Track whether the panel is actually on screen and at
+        // which rect, so the closing frame can repaint the wallpaper over it.
+        static int startMenuDrawn = 0;                 // 1 = panel pixels on screen
+        static int smDrawnX, smDrawnY, smDrawnW, smDrawnH;
+        // BUG-#11 (gap 3): frames of forced animation repaint still owed after a
+        // virtual-desktop switch, so the last OPAQUE close frame reaches the LFB.
+        static int menuCloseFrames = 0;
         static int startRClickIdx = -1;   // tile / all-apps row under right-click
 
         // P0-1: desktop icon selection state (-1 = none, 0..dN-1 = selected)
@@ -1187,14 +1198,26 @@ namespace NexOS.Forms
         public static void SwitchDesktop(int d) {
             if (d == CurrentDesktop) return;
             CurrentDesktop = d;
+            // BUG-#11 (gap 3): keep the close tween ANIMATING rather than
+            // snapping it to 0.  Anim.Set() sets a target, not a value, so the
+            // panel now slides/fades out over DUR_SLIDE ms and the StartMenu
+            // erase branch (startMenuDrawn) fires on the final frame.  Snapping
+            // to 0 here made gui.cpp see menu_transition == false and
+            // g_mforms_anim == false, so the closing frame was never flushed.
             menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1);
             Host.Log(U.Cat("[DESK] switched to ", U.I(d), "\n"));
             // Keep (or stop) requesting animation repaints: the typewriter
             // pauses while the user is on the other desktop and resumes on
             // return.  Without this the loop would repaint the wrong desktop
             // forever while aiTypeActive is latched.
-            if (CurrentDesktop == 1) Host.SetAnim((aiThinking != 0 || aiTypeActive != 0) ? 1 : 0);
-            else Host.SetAnim(0);
+            // BUG-#11 (gap 3): never drop to SetAnim(0) on the switch frame.
+            // The panel is still fading out and the last opaque frame has not
+            // been presented yet; killing the frame driver here is exactly what
+            // left the backdrop pixels on screen forever.  Ask for frames now
+            // and let PaintOverlay() release the request (menuCloseFrames) once
+            // the close has actually settled.
+            Host.SetAnim(1);
+            menuCloseFrames = 3;
             // caller (gui.cpp handle_ctrl -> render_all) repaints the frame
         }
         static int AiDesktopClick(int mx, int my, int w, int h) {
@@ -1397,18 +1420,88 @@ namespace NexOS.Forms
             // open/close transition.  This avoids the "empty menu until cursor
             // moves" bug while still letting the host spin down to idle when
             // nothing is animating (FIX #overlay-setanim, 2026-10-23).
-            if (Theme.WidgetsOn != 0 || Popup.IsOpen() || menuOpen)
+            // BUG-#0 (moire) ROOT CAUSE: WidgetsOn defaults to 1, so this
+            // unconditional SetAnim(1) fired on EVERY frame for as long as the
+            // telemetry HUD was enabled -- i.e. permanently, on a completely
+            // idle desktop.  That kept the host frame driver alive forever, so
+            // the translucent overlay (taskbar / HUD / Start menu) was
+            // alpha-blended onto the RETAINED backbuffer ~10x/sec.  Repeatedly
+            // blending a translucent surface over its own previous output
+            // accumulates coverage that modulates with the pixel grid -- the
+            // reported moire.  The HUD only samples CPU every 500 ms (see
+            // TelemetryHud), so request frames at that cadence instead of every
+            // frame.  Popups and the Start menu still need continuous frames
+            // while they animate.
+            if (Popup.IsOpen() || menuOpen)
                 Host.SetAnim(1);
+            else if (Theme.WidgetsOn != 0)
+            {
+                // BUG-#0 (moire): arm frames only once per HUD sample period.
+                // NOTE: must use an INDEPENDENT timestamp -- hudLast is written
+                // by TelemetryHud() AFTER this point in the frame, so testing
+                // against it here always yielded age~0 and re-armed every frame
+                // (which is exactly the bug this is meant to remove).
+                int nowMs = Host.TickMs();
+                if (hudArmLast == 0 || (nowMs - hudArmLast) >= 500)
+                {
+                    hudArmLast = nowMs;
+                    Host.SetAnim(1);
+                }
+            }
         }
 
         public static void PaintOverlay(int w, int h)
         {
             ShellTheme();
             Taskbar(w, h);
-            if (menuOpen || Anim.Get(START_KEY) != 0) StartMenu(w, h);
+            // BUG-#11 (gap 2): also call StartMenu when a panel is still on
+            // screen but the menu is already closed -- that call is the one that
+            // erases the panel.  Without the startMenuDrawn term the erase branch
+            // could never be reached (menuOpen == false and enter == 0).
+            // BUG-#11b (regression): while the Start menu is OPEN, or its
+            // open/close tween is still running, the frame driver MUST keep
+            // running.  StartMenu() draws the panel background at enter==0 but
+            // gates its CONTENT on `enter < 120`; if frames stop before the
+            // tween reaches 12% the user sees an empty panel -- exactly the
+            // "menu shows only its background" regression.  Anim.Tick() calls
+            // Host.SetAnim(active) every frame and overwrites any SetAnim(1)
+            // issued earlier in the same frame, so re-arm here, AFTER Tick.
+            if (menuOpen || Anim.Get(START_KEY) != 0 || startMenuDrawn != 0)
+            {
+                // Re-arm ONLY while the menu still needs frames: opening, its
+                // tween is mid-flight, or a panel is on screen awaiting erase.
+                // Releasing is handled below (menuCloseFrames), so this cannot
+                // spin forever: once the panel is erased AND the tween is 0 AND
+                // menuOpen is false, neither branch above is taken and the
+                // driver is released.  Guarding on the SAME condition the call
+                // itself uses keeps open/close symmetric.
+                Host.SetAnim(1);          // keep the driver alive for this menu
+                StartMenu(w, h);
+            }
             if (Popup.IsOpen()) Popup.Paint(w, h);
             Toast.Paint(w, h);
             if (Theme.WidgetsOn != 0) TelemetryHud(w, h);
+            // BUG-#11 (gap 3): after a virtual-desktop switch the close sequence
+            // owes a few extra whole-frame repaints.  Release the animation
+            // request only once the panel is gone, so the last opaque close frame
+            // is guaranteed to be flushed instead of being lost when SetAnim(0)
+            // stopped the frame driver.
+            if (menuCloseFrames > 0)
+            {
+                // Release only once the close has REALLY settled: the tween has
+                // reached 0 and the panel has been erased.  Releasing after a
+                // fixed number of frames would stop the frame driver while the
+                // slide-out is still mid-flight, freezing the panel half-faded
+                // on screen -- the very failure this fix exists to prevent.
+                if (!menuOpen && Anim.Get(START_KEY) == 0 && startMenuDrawn == 0)
+                {
+                    menuCloseFrames = 0;
+                    if (CurrentDesktop == 1 && (aiThinking != 0 || aiTypeActive != 0))
+                        Host.SetAnim(1);   // AI desktop still animating
+                    else
+                        Host.SetAnim(0);   // settled: idle desktop costs zero frames
+                }
+            }
         }
 
         static void Taskbar(int w, int h)
@@ -1469,6 +1562,25 @@ namespace NexOS.Forms
             string t = Clock();
             int tw = Gfx.Measure(t);
             Gfx.Text(w - 16 - tw, y + (TaskH - 16) / 2, t, TaskBarInk);
+            ImeIndicator(w, h);
+        }
+
+        // BUG-7: IME language indicator on the taskbar (CN = Chinese pinyin,
+        // EN = English).  The IME lives in the kernel, so this reads the mode
+        // through Host.ImeMode() every frame.  It sits left of the tray
+        // cluster and shows an accent dot in Chinese mode, so the state is
+        // visible without hovering or clicking anything.
+        static void ImeIndicator(int w, int h)
+        {
+            int cn = Host.ImeMode();
+            int ty = trayRect[1];
+            int tb = trayRect[2];
+            int cx = trayRect[0] - 12 - 26;
+            if (cx < 8) cx = 8;
+            Gfx.FillRound(cx, ty, 26, tb, 6, cn != 0 ? BarHot : Bar);
+            uint ink = cn != 0 ? 0xFFCC00 : TaskBarInk;
+            Gfx.Text(cx + 5, ty + (tb - 16) / 2, cn != 0 ? "CN" : "EN", ink);
+            if (cn != 0) Gfx.FillRound(cx + 2, ty + 2, 4, 4, 2, 0xFFCC00);
         }
 
         // Lay out the three tray buttons and stash the rect in trayRect.
@@ -1566,12 +1678,74 @@ namespace NexOS.Forms
         public static int AppLetter(int kind) { if (kind >= 0 && kind < KINDS) return kName[kind][0]; return '?'; }
         static bool IsStartPinned(int kind) { for (int i = 0; i < dN; i++) if (dKind[i] == kind) return true; return false; }
 
+        // Colour of the wallpaper gradient at vertical position y.  Mirrors the
+        // three stops in Wallpaper() exactly (that routine always uses these
+        // literals, independent of the light/dark theme).
+        static uint WallC(int h, int y)
+        {
+            if (y < 0) y = 0;
+            if (y > h) y = h;
+            int midY = (h * 55) / 100;
+            if (midY < 1) return 0x218FD9;
+            if (y <= midY) return Mix(0x218FD9, 0x0D57B3, (y * 255) / midY);
+            int span = h - midY;
+            if (span < 1) return 0x05216B;
+            return Mix(0x0D57B3, 0x05216B, ((y - midY) * 255) / span);
+        }
+
+        // BUG-#0 / BUG-#11: repaint just the wallpaper band that one rectangle
+        // covers.  This is what erases the Start menu panel on its final close
+        // frame instead of leaving a ghost, and it never re-blends an existing
+        // translucent element in place (which is what accumulated into moire).
+        // The menu sits near the bottom of the screen, below the centred bloom,
+        // so the band is pure gradient there and this is visually identical to
+        // the real wallpaper.
+        static void RepaintWallpaperBand(int w, int h, int rx, int ry, int rw, int rh)
+        {
+            if (rw <= 0 || rh <= 0) return;
+            // Clamp to the screen so a stale rect can never paint out of bounds.
+            if (rx < 0) { rw += rx; rx = 0; }
+            if (ry < 0) { rh += ry; ry = 0; }
+            if (rx + rw > w) rw = w - rx;
+            if (ry + rh > h) rh = h - ry;
+            if (rw <= 0 || rh <= 0) return;
+            if (Gfx.HasImage(Tex.Wall) != 0)
+            {
+                // A texture wallpaper has no cheap per-band source, so lay down
+                // the gradient base colour.  The desktop layer repaint restores
+                // the real texture within a frame; this only guarantees the
+                // panel cannot persist on screen.
+                uint basec = WallC(h, ry + rh / 2);
+                Gfx.Gradient(rx, ry, rw, rh, basec, basec);
+                return;
+            }
+            Gfx.Gradient(rx, ry, rw, rh, WallC(h, ry), WallC(h, ry + rh));
+        }
+
         static void StartMenu(int w, int h)
         {
             // open/close transition is now event-driven (Menu()/open/close sites),
             // so we only READ the tween here instead of (re)arming it during Paint.
             int enter = (int)Anim.Get(START_KEY);
-            if (!menuOpen && enter == 0) return;
+            if (!menuOpen && enter == 0)
+            {
+                // BUG-#11 (gap 2): the panel was drawn on an earlier frame but the
+                // menu is now fully closed.  Erase it before returning -- otherwise
+                // the translucent backdrop stays in the backbuffer forever (the
+                // ghost menu) because nothing guarantees another desktop repaint.
+                if (startMenuDrawn != 0)
+                {
+                    RepaintWallpaperBand(w, h, smDrawnX, smDrawnY, smDrawnW, smDrawnH);
+                    startMenuDrawn = 0;
+                    // Keep frames coming for a moment: the band repaint is exact
+                    // for the wallpaper, but it cannot restore windows that were
+                    // behind the panel, so make sure the desktop layer recomposites
+                    // and the erased band reaches the screen.
+                    Host.SetAnim(1);
+                    menuCloseFrames = 3;
+                }
+                return;
+            }
 
             int mw = MenuW(w), mh = MenuH(h);
             int x  = MenuX(w),  y = MenuY(h);
@@ -1698,6 +1872,16 @@ namespace NexOS.Forms
                             CurrentDesktop == 0 ? "AI 桌面" : "旧版桌面", Ink);
             // Voice: flip between the AI desktop and the classic desktop.
             W.Voice("切换桌面 switch desktop", swx, swy, swbw, swbh);
+            // BUG-#11: remember that the panel is on screen, and where, so the
+            // closing frame can erase exactly this rectangle.
+            startMenuDrawn = 1;
+            smDrawnX = startMenuX; smDrawnY = startMenuY;
+            smDrawnW = startMenuW;
+            // +8 for the slide-up offset (y -= 8*.../1000 above): the panel is
+            // drawn up to 8 px lower than its resting rect while the close tween
+            // runs, so the erase band must cover that strip too or a thin ghost
+            // line survives at the bottom edge.
+            smDrawnH = startMenuH + 8;
         }
 
         static void Btn(int x, int y, int w, int h, string s)
@@ -2023,7 +2207,19 @@ namespace NexOS.Forms
             int mw = MenuW(w), mh = MenuH(h);
             int x  = MenuX(w),  y = MenuY(h);
 
-            if (!U.In(mx, my, x, y, mw, mh)) { menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1); return -1; }
+            if (!U.In(mx, my, x, y, mw, mh))
+            {
+                // BUG-#menu-residue: this is the "clicked away" close path.
+                // Anim.Set only records a TARGET; without SetAnim(1) the host
+                // frame driver never runs, so PaintOverlay is never called again,
+                // the erase branch below is never reached, and the opaque panel
+                // stays on screen forever.  Arm the driver exactly like the
+                // keyboard paths do.
+                menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1);
+                Host.SetAnim(1);
+                menuCloseFrames = 3;
+                return -1;
+            }
 
             int fy = FootY(y, mh);
             int px = PowerX(x, mw), rx = px - 48, py = fy + 4;
@@ -2063,7 +2259,14 @@ namespace NexOS.Forms
                         // P2-15: record click position for drag-threshold detection.
                         pendingClickIdx = i;
                         pendingClickX = mx; pendingClickY = my;
-                        menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1); return dKind[i];
+                        // BUG-#menu-residue: launching an app from a tile closes
+                        // the menu, and this is the path that left the panel
+                        // pixels behind.  Arm the host frame driver so the close
+                        // tween + the wallpaper-band erase actually reach the LFB.
+                        menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1);
+                        Host.SetAnim(1);
+                        menuCloseFrames = 3;
+                        return dKind[i];
                     }
                 }
             }
@@ -2080,7 +2283,14 @@ namespace NexOS.Forms
                     if (sel < sc) { sel++; continue; }
                     int ry = ly + (sel - sc) * rowH;
                     if (ry + rowH > fy2 - 4) break;
-                    if (U.In(mx, my, lx, ry, listW, rowH - 1)) { menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1); return i; }
+                    if (U.In(mx, my, lx, ry, listW, rowH - 1))
+                    {
+                        // BUG-#menu-residue: same as the Pinned-tile path above.
+                        menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1);
+                        Host.SetAnim(1);
+                        menuCloseFrames = 3;
+                        return i;
+                    }
                     sel++;
                 }
             }

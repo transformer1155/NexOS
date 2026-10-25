@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # gnu-efi-free BOOTX64.EFI build, adapted to run under WSL with the system
-# gcc/ld (the original tools/build_uefi_gnuefi_free.sh needs MSYS cygpath and
+# gcc/ld (the original tools/boot/build_uefi_gnuefi_free.sh needs MSYS cygpath and
 # the native Windows x86_64-elf toolchain).  Reuses the Makefile's blob objects
 # (build/kernel_blob.o etc.), whose _binary_build_*_blob_{start,end} symbols are
 # exactly what uefi/get_embedded.S and bootuefi.c expect.

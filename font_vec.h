@@ -31,6 +31,13 @@ const uint8_t* vec_glyph(uint32_t cp, int px, int* w, int* h,
 /* Horizontal advance (pixels) for a codepoint at height px. */
 int  vec_advance(uint32_t cp, int px);
 
+/* BUG-3: glyph supersampling factor (devicePixelRatio equivalent).
+ * 0/1 = rasterise 1:1, 2..4 = render at px*factor and box-filter down, which
+ * is what makes a 16 px glyph look like a scaled-down large glyph instead of
+ * a re-rasterised (blurry) small one.  Must be called before drawing text;
+ * the caller also clears any glyph cache keyed on px only. */
+void vec_set_dpr(int factor);
+
 /* Last-error details for diagnosis (code/got/stb). May be NULL. */
 void vec_last_err(int* code, int* got, int* stb);
 

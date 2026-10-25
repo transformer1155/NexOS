@@ -2,7 +2,7 @@
 
 > 版本：1（`schema_version: 1`）
 > 状态：正式
-> 相关实现：[`tools/nexpack.py`](../tools/nexpack.py)（打包/解包/校验）、
+> 相关实现：[`tools/image/nexpack.py`](../tools/image/nexpack.py)（打包/解包/校验）、
 > [`csharp/winhost/PackageInstaller.cs`](../csharp/winhost/PackageInstaller.cs)（安装器）、
 > [`csharp/NexOS.Core/McpSdk.cs`](../csharp/NexOS.Core/McpSdk.cs)（MCP SDK）
 
@@ -20,7 +20,7 @@ NexOS 的第三方应用需要一套**可分发、可校验、可安装**的包�
 | 内核**没有 zlib/inflate** | `plugins/vnc_client.cpp:393` 明确注释 | 包内成员**必须 STORE（不压缩）**，否则内核侧无法读取 |
 | 内核**没有二进制写原语** | 只有 `kern_fs_read`，无 `kern_fs_write` | 安装由**托管侧 / 宿主侧**完成，内核只读结果 |
 | **SFS 只读** | `apps.json` 在 SFS，VM 内不可写 | 安装产物落在 **MKFS**，注册表走 MKFS overlay |
-| MiniCLR **无反射** | `clr.cpp` / `mex_pack.py` 扁平化设计 | MCP 工具列表**构建期**由 `tools/mcp_scan.py` 生成 |
+| MiniCLR **无反射** | `clr.cpp` / `mex_pack.py` 扁平化设计 | MCP 工具列表**构建期**由 `tools/misc/mcp_scan.py` 生成 |
 | 内存受限 | 32 位内核堆 | 单包建议 ≤ 4 MiB，图标 ≤ 64 KiB |
 
 ---
@@ -135,7 +135,7 @@ example.nexpack
 ### 4.1 打包
 
 ```bash
-python tools/nexpack.py pack \
+python tools/image/nexpack.py pack \
     --mex   sfs_files/Weather.mex \
     --manifest manifest.json \
     --icon  icon.png \
@@ -144,14 +144,14 @@ python tools/nexpack.py pack \
 
 工具会：
 1. 校验 `manifest.json` 全部字段（含 `app_id` 与 `.mex` basename 一致性）；
-2. 校验 `app.mex` 是合法 `.mex`（魔数 `MEX1`，见 `tools/mex_dump.py`）；
+2. 校验 `app.mex` 是合法 `.mex`（魔数 `MEX1`，见 `tools/diag/mex_dump.py`）；
 3. 以 **STORE** 方式写入 ZIP；
 4. 计算并打印每个成员的 CRC32 与 SHA-256。
 
 ### 4.2 校验
 
 ```bash
-python tools/nexpack.py verify dist/weather-1.0.0.nexpack
+python tools/image/nexpack.py verify dist/weather-1.0.0.nexpack
 ```
 
 退出码 `0` 表示通过，非 `0` 表示失败（并打印具体原因）。
@@ -159,7 +159,7 @@ python tools/nexpack.py verify dist/weather-1.0.0.nexpack
 ### 4.3 检视
 
 ```bash
-python tools/nexpack.py inspect dist/weather-1.0.0.nexpack
+python tools/image/nexpack.py inspect dist/weather-1.0.0.nexpack
 ```
 
 打印 manifest 摘要、成员列表、大小、以及将被注册的 MCP 工具。
@@ -235,7 +235,7 @@ McpServer 子类源码
    │  [McpTool("get_weather", Description="...")]
    │  public static string GetWeather(string json_args)
    ▼
-tools/mcp_scan.py            ← Roslyn 不可用，改用语法扫描（正则 + 括号配平）
+tools/misc/mcp_scan.py            ← Roslyn 不可用，改用语法扫描（正则 + 括号配平）
    │  产出 mcp_tools.json
    ▼
 manifest.json 的 mcp_server[]  ← 由 nexpack.py pack 合并进包
@@ -250,7 +250,7 @@ mcp_dispatch_request → clr_call("App.Tools::Dispatch", ...)  ← 原生→托�
 ### 7.1 SDK 类型（`NexOS.Core/McpSdk.cs`）
 
 ```csharp
-// 标记一个静态方法为 MCP 工具。构建期被 tools/mcp_scan.py 发现。
+// 标记一个静态方法为 MCP 工具。构建期被 tools/misc/mcp_scan.py 发现。
 public sealed class McpToolAttribute : Attribute
 {
     public string Name;        // 工具名；null 则用方法名转 snake_case
@@ -269,7 +269,7 @@ public abstract class McpServerBase
 }
 ```
 
-`Invoke` 由 `tools/mcp_scan.py --emit-dispatch` 生成一个 `partial` 实现，
+`Invoke` 由 `tools/misc/mcp_scan.py --emit-dispatch` 生成一个 `partial` 实现，
 这样既不需要反射，也不需要开发者手写 if-else 链。
 
 ### 7.2 派发链路
@@ -319,8 +319,8 @@ const char* managed_dispatch(const char* src, const char* tgt,
 
 | 组件 | 路径 |
 | --- | --- |
-| 打包 / 解包 / 校验 CLI | `tools/nexpack.py` |
-| 构建期 MCP 工具扫描 | `tools/mcp_scan.py` |
+| 打包 / 解包 / 校验 CLI | `tools/image/nexpack.py` |
+| 构建期 MCP 工具扫描 | `tools/misc/mcp_scan.py` |
 | MCP SDK（`McpServerBase` / `[McpTool]`） | `csharp/NexOS.Core/McpSdk.cs` |
 | 安装器 | `csharp/winhost/PackageInstaller.cs` |
 | 内核注册表加载 | `nexos_ai.cpp` → `ai_gateway_init` |

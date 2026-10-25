@@ -67,7 +67,7 @@ $SUDO apt-get install -y -qq "${pkgs[@]}"
 
 # ---- Python build-time deps ----------------------------------------
 # Pillow: used by most tools/*.py (gen_*, ai_*, *_check, test_* ...)
-# pypinyin: used by tools/gen_ime_dict.py
+# pypinyin: used by tools/font/gen_ime_dict.py
 echo "==> installing Python packages (Pillow, pypinyin)"
 $SUDO python3 -m pip install --break-system-packages -q --upgrade pip || true
 $SUDO python3 -m pip install --break-system-packages -q Pillow pypinyin

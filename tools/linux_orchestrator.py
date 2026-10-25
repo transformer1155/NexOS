@@ -41,7 +41,7 @@ DEF_LINUX_ISO     = os.environ.get("NEXOS_LINUX_ISO", "")
 DEF_LINUX_KVM     = ""                   # set to "-enable-kvm" if your host supports it
 DEF_LINUX_LOG     = os.environ.get("NEXOS_LINUX_LOG", "qemu2_guest.log")
 DEF_LINUX_NAME    = "NexOS-Linux"
-DEF_LINUX_INIT    = "tools/linux_guest_init.sh"
+DEF_LINUX_INIT    = "tools/boot/linux_guest_init.sh"
 DEF_LINUX_KERNEL  = os.environ.get('NEXOS_LINUX_KERNEL', '')   # vmlinuz-virt (auto-exported from ISO if empty)
 DEF_LINUX_INITRD  = os.environ.get('NEXOS_LINUX_INITRD', '')   # initramfs-virt (auto-exported from ISO if empty)
 DEF_LINUX_APPEND  = 'console=ttyS0 modules=loop,squashfs,sd-mod,usb-storage,ata_piix,virtio_pci,virtio_blk,virtio_net,ext4 alpine_dev=cdrom:iso9660 quiet'

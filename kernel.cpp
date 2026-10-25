@@ -8851,9 +8851,35 @@ static int gui_cb_read_file(int fs_type, const char* name, uint8_t* buf, int buf
 
 // ---- File write callback (MKFS data disk) ----
 // fs_type: 0=MKFS only for now.  Returns bytes written, or -1 on error.
+//
+// BUG #8 (SFS read-only penetration): every volume except the in-RAM MKFS
+// data disk (fs==0) and the Desktop folder inside it (fs==3) is a read-only
+// medium -- SFS is a pre-built boot image and FAT32 is a foreign partition.
+// The guard below is the single choke point that returns EROFS for them, so
+// an AI/agent/MCP-driven write cannot sneak past the UI-side menu hiding.
+// -EROFS is distinct from -ENOENT/-EACCES so callers can report it as
+// "read-only medium" instead of "not found".
+#define KERN_EROFS (-30)
 static int gui_cb_write_file(int fs_type, const char* name, const uint8_t* buf, int size) {
     while (*name == ' ') name++;
-    if (fs_type != 0) return -1;          // MKFS only
+    if (!name || !name[0]) return -1;
+    if (fs_type == 3) {                       // Desktop folder lives inside MKFS
+        if (!mkfs.mounted) return -1;
+        int di = desktop_dir_index();
+        if (di < 0) return -1;
+        uint16_t saved = g_cwd; g_cwd = (uint16_t)di;
+        int r = mkfs.create(name, buf, size);
+        g_cwd = saved;
+        return r;
+    }
+    if (fs_type != 0) {                       // SFS(1) / FAT32(2) = read-only
+        serial_puts("[FS] EROFS write refused fs=");
+        serial_puts_dec(fs_type);
+        serial_puts(" path=");
+        serial_puts(name);
+        serial_puts("\n");
+        return KERN_EROFS;
+    }
     if (!mkfs.mounted) return -1;
     return mkfs.create(name, buf, size);
 }
@@ -8985,6 +9011,9 @@ static int gui_cb_cpu_64bit_capable(void) {
 // ---- File-mutation callbacks (context-menu: new folder / delete / rename) ----
 // Only the in-RAM MKFS volume (fs==0) is writable from the GUI; the SFS
 // boot image and FAT32 are read-only, so they return -1 here.
+// BUG #8: SFS/FAT32 are read-only media.  Refuse with a dedicated
+// EROFS code (and an audit line) rather than a generic -1, so the caller can
+// tell "read-only medium" apart from "not mounted" / "name taken".
 static int gui_cb_mkdir(int fs, const char* name) {
     while (name && *name == ' ') name++;
     if (!name || !name[0]) return -1;
@@ -8997,26 +9026,39 @@ static int gui_cb_mkdir(int fs, const char* name) {
         g_cwd = saved;
         return r;
     }
-    if (fs != 0 || !mkfs.mounted) return -1;
+    if (fs != 0) {
+        serial_puts("[FS] EROFS mkdir refused fs=");
+        serial_puts_dec(fs);
+        serial_puts(" path=");
+        serial_puts(name);
+        serial_puts("\n");
+        return KERN_EROFS;
+    }
+    if (!mkfs.mounted) return -1;
     return mkfs.mkdir(name);
 }
 static int gui_cb_remove(int fs, const char* name) {
     while (name && *name == ' ') name++;
     if (!name || !name[0]) return -1;
-    int r = -1;
     if (fs == 3) {
         if (!mkfs.mounted) return -1;
         int di = desktop_dir_index();
         if (di < 0) return -1;
         uint16_t saved = g_cwd; g_cwd = (uint16_t)di;
-        r = mkfs.remove(name);
+        int r = mkfs.remove(name);
         g_cwd = saved;
-    } else if (fs == 0 && mkfs.mounted) {
-        r = mkfs.remove(name);
-    } else {
-        return -1;
+        return r;
     }
-    return r;
+    if (fs != 0) {
+        serial_puts("[FS] EROFS remove refused fs=");
+        serial_puts_dec(fs);
+        serial_puts(" path=");
+        serial_puts(name);
+        serial_puts("\n");
+        return KERN_EROFS;
+    }
+    if (!mkfs.mounted) return -1;
+    return mkfs.remove(name);
 }
 static int gui_cb_rename(int fs, const char* old_name, const char* new_name) {
     while (old_name && *old_name == ' ') old_name++;
@@ -9032,7 +9074,15 @@ static int gui_cb_rename(int fs, const char* old_name, const char* new_name) {
         g_cwd = saved;
         return r;
     }
-    if (fs != 0 || !mkfs.mounted) return -1;
+    if (fs != 0) {
+        serial_puts("[FS] EROFS rename refused fs=");
+        serial_puts_dec(fs);
+        serial_puts(" path=");
+        serial_puts(old_name);
+        serial_puts("\n");
+        return KERN_EROFS;
+    }
+    if (!mkfs.mounted) return -1;
     if (mkfs.copy(old_name, new_name) < 0) return -1;
     return mkfs.remove(old_name);
 }

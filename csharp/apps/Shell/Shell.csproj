@@ -52,6 +52,7 @@
     <Compile Include="AiLauncher.cs" />
     <Compile Include="Popup.cs" />
     <Compile Include="Toast.cs" />
+    <Compile Include="WebView.cs" />
     <Compile Include="Lang.cs" />
   </ItemGroup>
 

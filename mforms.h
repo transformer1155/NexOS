@@ -244,8 +244,20 @@ int  mforms_desktop_menu(int code);
 // running-app indicators; call once per frame before painting.
 void mforms_set_running(uint32_t mask);
 
+// BUG-7 fix: publish the pinyin IME language mode so the managed taskbar
+// can show the CN / EN indicator (and the native topbar strip can draw it
+// at all).  mode = 1 Chinese, 0 English.  Call once per frame before
+// painting the overlay, exactly like mforms_set_running().
+void mforms_set_ime(int mode);
+
 // Managed heap pressure, 0..100, for the task manager and diagnostics.
 int  mforms_heap_pct(void);
+
+// BUG-9: 1 when the last managed paint of window `id` faulted (unbound
+// icall / managed-heap exhaustion / bad method).  The compositor uses this to
+// fall back to the native drawer instead of leaving a transparent, empty
+// client area on screen.  0 = healthy (or no managed shell at all).
+int  mforms_paint_failed(int id);
 
 } // extern "C"
 

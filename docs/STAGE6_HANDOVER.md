@@ -54,7 +54,7 @@ NexOS 的远期目标是跑真·《我的世界》Java 版。为此需要一条�
 | `usr/dynlink_crt.c` | 新建 | 动态链接 guest 的 `_start`（naked，读 argc/argv/envp 调 main） |
 | `usr/linux_dynlink.c` | 新建 | 测试 guest：`main` 调 `printf` + `nex_add(2,3)`/`nex_add(10,20)`，打 `LXDL:` 标记 |
 | `Makefile` | 改 | `libc.so` 规则、`linux_dynlink` 规则、`$(LINUX_SFS_IMG)` 依赖恢复 `linux_dynlink` |
-| `tools/verify_linux_dynlink.py` | 新建 | 无头 QEMU 验证 harness（9 项 CHECKS） |
+| `tools/verify/verify_linux_dynlink.py` | 新建 | 无头 QEMU 验证 harness（9 项 CHECKS） |
 
 ### 2.1 关键代码位置（linux_compat.cpp）
 - 类型/宏定义：`~1758–1790`（`Elf32_Phdr/Sym/Rel`、重定位宏、`DYN_LIB_BASE=0x0A400000`、`DYN_MAX_LIBS=8`、`dyn_mod_t`）
@@ -70,9 +70,9 @@ NexOS 的远期目标是跑真·《我的世界》Java 版。为此需要一条�
 
 ## 3. 构建环境（纯 Windows，不用 WSL）
 
-- 统一构建入口：`tools/build_win.sh <target>`，在**真实 MSYS2 bash** 下调用：
+- 统一构建入口：`tools/misc/build_win.sh <target>`，在**真实 MSYS2 bash** 下调用：
   ```
-  "C:\msys64\usr\bin\bash.exe" -lc 'cd /d/MyOS/bootloader && tools/build_win.sh textboot'
+  "C:\msys64\usr\bin\bash.exe" -lc 'cd /d/MyOS/bootloader && tools/misc/build_win.sh textboot'
   ```
   ⚠️ WorkBuddy 自带 Git Bash 会把 `/msys64` 解析成 `E:\Program Files\Git\msys64`（不存在），导致 `make: not found`。**必须用上面这个真实 MSYS2 路径**。
 - 交叉工具链：`i686-elf-g++` / `i686-elf-ld`（`C:/Users/trans/elf_tools/bin/`），由 `build_win.sh` 的 PATH 补上。
@@ -80,8 +80,8 @@ NexOS 的远期目标是跑真·《我的世界》Java 版。为此需要一条�
 - 本机无原生 C 编译器（只有交叉编译器产出 ELF 不能直接执行）；要对 C 逻辑做确定性实测时，把逻辑 1:1 移植成 Python 用托管 python 跑。
 
 ### 3.1 构建目标
-- `tools/build_win.sh textboot` → `build/os_textboot.img`（BIOS raw，含 32 位内核 + kernel64 + SFS + linux_sfs）。本 Stage 验证用这个。
-- 全量 `tools/build_win.sh`（产出 `os.img`）当前可能因后台代理 WIP（见 §5 遗留）无法干净重建，先以 `textboot` 为准。
+- `tools/misc/build_win.sh textboot` → `build/os_textboot.img`（BIOS raw，含 32 位内核 + kernel64 + SFS + linux_sfs）。本 Stage 验证用这个。
+- 全量 `tools/misc/build_win.sh`（产出 `os.img`）当前可能因后台代理 WIP（见 §5 遗留）无法干净重建，先以 `textboot` 为准。
 
 ### 3.2 Makefile 关键规则（Stage 6）
 `libc.so`（Makefile ~453）：
@@ -136,7 +136,7 @@ $(NEX_LD) -m elf_i386 -shared -nostdlib --soname=libc.so --hash-style=sysv -z no
 ## 5. 验证方式与结果
 
 ### 5.1 验证 harness
-`tools/verify_linux_dynlink.py`（无头 QEMU `pc/256M/tcg`，**无 NIC**）：
+`tools/verify/verify_linux_dynlink.py`（无头 QEMU `pc/256M/tcg`，**无 NIC**）：
 1. 启动 QEMU → 等登录提示 → 登录 `root`/`admin`
 2. 等 Shell ready → 发 `linux linux_dynlink`
 3. 抓 serial 落 `build/serial_linux_dynlink.txt`，断言 9 项 CHECKS
@@ -168,8 +168,8 @@ linux: process exited
 
 ### 5.4 如何复跑
 ```bash
-"C:\msys64\usr\bin\bash.exe" -lc 'cd /d/MyOS/bootloader && tools/build_win.sh textboot'
-python3 tools/verify_linux_dynlink.py
+"C:\msys64\usr\bin\bash.exe" -lc 'cd /d/MyOS/bootloader && tools/misc/build_win.sh textboot'
+python3 tools/verify/verify_linux_dynlink.py
 ```
 期望输出 `VERDICT: GOOD: Stage 6 PASS`。
 

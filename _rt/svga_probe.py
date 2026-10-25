@@ -1,6 +1,6 @@
 """Boot the image with -vga vmware and capture what the SVGA-II driver reports.
 
-Uses the same QEMU options as tools/verify_gui.py except for the VGA device, so
+Uses the same QEMU options as tools/verify/verify_gui.py except for the VGA device, so
 the only variable is the accelerator.  Writes:
     build/svga_serial.log  - serial output (the [SVGA]/[CURSOR] lines live here)
     build/svga_shot.ppm    - one screendump at the desktop

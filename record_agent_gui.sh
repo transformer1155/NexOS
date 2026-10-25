@@ -30,7 +30,7 @@ XVFB_PID=$!
 sleep 1
 
 # ---- 2. Host-side TLS proxy: guest plain-HTTP -> DeepSeek HTTPS ----
-DEEPSEEK_API_KEY="$DEEPSEEK_KEY" python3 -u tools/deepseek_proxy.py \
+DEEPSEEK_API_KEY="$DEEPSEEK_KEY" python3 -u tools/net/deepseek_proxy.py \
   --listen "$PROXY_PORT" >/tmp/proxy.log 2>&1 &
 PROXY_PID=$!
 sleep 1

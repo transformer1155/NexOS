@@ -37,7 +37,7 @@ auto-GUI boot 后 Login.IsActive()==1 但无人登录 → Shell.cs 所有入口�
 h_set_anim 是直接赋值（最后一次调用赢）。同一 clr_call 事务里 PaintOverlay 尾部的
 SetAnim(1) 可能被后续 SetAnim(0) 覆盖 → gui_tick 停摆。
 
-## QEMU 验证标准流程（tools/verify_fixes.sh 已固化）
+## QEMU 验证标准流程（tools/verify/verify_fixes.sh 已固化）
 1. 构建: WSL Ubuntu-24.04。C# 改动必须 `rm -f sfs_files/shell.mex` 再 make（Makefile wildcard 陷阱）。
    C++ 改动 rm 掉对应 .o。clock skew 警告可忽略。
 2. 启动: `-drive format=raw,file=build/os_v2.img -m 4096 -vga std -display none
@@ -47,7 +47,7 @@ SetAnim(1) 可能被后续 SetAnim(0) 覆盖 → gui_tick 停摆。
    - `mouse_move dx dy` 是**相对**移动！每次≤80px，自维护 CURSOR 累计坐标。
    - `mouse_button N`: 1=左 2=右 0=全部释放。
    - `screendump file.ppm` 后 sleep ≥2.5s。
-4. Python 判定（tools/verify_diff.py / ghost_check.py）:
+4. Python 判定（tools/verify/verify_diff.py / ghost_check.py）:
    - 菜单出现: diff > 15000 px（菜单背景 RGB sum ~645，壁纸 ~282）
    - 重影: 在长按点/光标路径点查 40-52px 盒，<50 px 差异 = PASS
    - 帧对比必须 base/menu/after 三帧取齐，先 dismiss 再采 base。

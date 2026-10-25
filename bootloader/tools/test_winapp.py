@@ -7,8 +7,8 @@
 #  自动完成: 复制到 SFS -> 重新编译 -> QEMU 启动 ->
 #  自动输入 "run <file>" -> 打开 GUI -> 截图验证。
 #
-#  用法:  python tools/test_winapp.py
-#         python tools/test_winapp.py "C:\path\to\app.exe"
+#  用法:  python tools/verify/test_winapp.py
+#         python tools/verify/test_winapp.py "C:\path\to\app.exe"
 # =====================================================================
 import os
 import sys

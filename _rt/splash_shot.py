@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Boot build/os_v2.img headless and screendump at fixed times, to catch the
-early boot animation.  Mirrors tools/verify_gui.py's QEMU invocation."""
+early boot animation.  Mirrors tools/verify/verify_gui.py's QEMU invocation."""
 import os, shutil, socket, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

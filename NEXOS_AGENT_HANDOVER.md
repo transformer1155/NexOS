@@ -81,7 +81,7 @@ bootuefi.c (gnu-efi)
 ## 5. 测试 / 验证工作流（用户铁律：必须实测）
 
 - **用户要求**：所有改动完成后**必须实际运行验证**（引导/截图/串口输出）才能交付，编译通过 ≠ 完成。
-- 无头测试脚本：`tools/test_ie_pe.py` / `test_ie_click.py` / `test_desktop_ui.py` / `test_kb_input.py` / `test_linux_compat.py`（4451）。跑完 `pkill -f "[q]emu-system"`。
+- 无头测试脚本：`tools/verify/test_ie_pe.py` / `test_ie_click.py` / `test_desktop_ui.py` / `test_kb_input.py` / `test_linux_compat.py`（4451）。跑完 `pkill -f "[q]emu-system"`。
 - **验证通道分工**：`term.write` 不写串口 → 屏幕内容靠 **screendump（截图）**；内核逻辑靠 **`serial_puts` 串口日志**。
 - **VirtualBox 真机式引导**（Windows 侧，`VBoxManage`）：
   - BIOS：`MyOSTest`（32-bit, 128MB, PIIX3, VBoxVGA, COM1→文件）；`VBoxManage convertfromraw build/os.img build/os_vbox.vdi`。

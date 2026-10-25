@@ -20,7 +20,7 @@ NexOS 是一个从零自研的 **x86 操作系统**：起点是一个支持 BIOS
 
 - **内核与引导**：Stage1→Stage2 二阶引导，32 位保护模式内核 `kernel.cpp` + 64 位长模式内核 `kernel64.cpp`，UEFI/BIOS 双路径汇合到同一 C++ 入口。
 - **图形桌面（GUI）**：`gui.cpp` 在帧缓冲上自绘 Win11 风格桌面；其上叠加 **C# 托管壳**（`csharp/NexOS.Forms` / `NexOS.Core`，`csharp/apps/Shell` 以 `Desktop.cs`/`Browser.cs`/`Login.cs`/`Shell.cs`/`AiAgent.cs` 实现窗口管理器、菜单、托盘、登录与 AI Agent）。
-- **Web 控制台**：`win11-ui/` 提供浏览器端 Win11 桌面 + 分布式网络面板 + Visual Agent Forge，经 WebSocket 桥（`tools/nexos_bridge.py`）通过串口直连**真 QEMU 虚拟机内核**，登录/命令/算力任务全部真实执行（无本地模拟）。
+- **Web 控制台**：`win11-ui/` 提供浏览器端 Win11 桌面 + 分布式网络面板 + Visual Agent Forge，经 WebSocket 桥（`tools/net/nexos_bridge.py`）通过串口直连**真 QEMU 虚拟机内核**，登录/命令/算力任务全部真实执行（无本地模拟）。
 - **AI 能力**：Markov + GPT 风格文本引擎（`ai_engine.cpp`）+ 内置 **Qwen2-0.5B (Q4_K_M) GGUF Transformer 推理引擎**（`gguf_infer.cpp`，`ask64` 切换 64 位流式推理）；`agent/` 智能体与 Agent Forge 可视化编排。
 - **分布式算力网络**：内核内 `distnet.cpp`（UDP 广播发现 + 任务调度 + 结果回收）+ 独立运行时 `dcn/`（crypto/discovery/sched/transport/wifi），可将推理/计算任务**分片下发到多 VM / 宿主节点合并推理**。
 - **兼容层**：自研 **PE/Win32 子系统**（`winloader.cpp` + `win32.cpp`，已能跑自研 IE 浏览器）；**Linux 二进制兼容**（`linux_compat.cpp` + `linux_root/`，运行 ELF/动态链接程序）；**Mono 运行时移植**（`mono_port/`，在 NexOS 上跑 .NET 托管代码）。
@@ -121,7 +121,7 @@ UEFI 路径下,`BOOTX64.EFI` 从 ESP 读取 `kernel.bin` 复制到 `0x10000`,
 Makefile 的 `$(IMG)` 规则有守卫会直接报错,但**改内核前先自检更快**:
 
 ```bash
-bash tools/check_k64_fit.sh
+bash tools/verify/check_k64_fit.sh
 ```
 
 当前状态:`KERNEL64_SECTORS=1500`、`SFS_LBA=3568`,kernel64 约 765KB,
@@ -317,9 +317,9 @@ OVMF 退出后 monitor 读 VGA 返回 `0xFFFFFFFF`,改用 `screendump` 截图
 
 | 组件 | 路径 | 作用 |
 |------|------|------|
-| **包格式** | `docs/NEXPACK.md` + `tools/nexpack.py` | `.nexpack` = ZIP（**STORE 不压缩**），含 `app.mex` + `manifest.json` + `icon.png` |
+| **包格式** | `docs/NEXPACK.md` + `tools/image/nexpack.py` | `.nexpack` = ZIP（**STORE 不压缩**），含 `app.mex` + `manifest.json` + `icon.png` |
 | **安装器** | `csharp/winhost/PackageInstaller.cs` | 解包 → 校验 → 写 MKFS → 合并注册表 → 建桌面快捷方式 → 刷新桌面 |
-| **MCP SDK** | `csharp/NexOS.Core/McpSdk.cs` + `tools/mcp_scan.py` | 继承 `McpServerBase`、打 `[McpTool("name")]`，构建期自动注册到 MCP 总线 |
+| **MCP SDK** | `csharp/NexOS.Core/McpSdk.cs` + `tools/misc/mcp_scan.py` | 继承 `McpServerBase`、打 `[McpTool("name")]`，构建期自动注册到 MCP 总线 |
 
 ### 为什么成员必须是 STORE
 
@@ -331,7 +331,7 @@ OVMF 退出后 monitor 读 VGA 返回 `0xFFFFFFFF`,改用 `screendump` 截图
 
 ```bash
 # 1. 构建期扫描 [McpTool]，产出工具描述符
-python tools/mcp_scan.py --src csharp/apps/examples/Weather \
+python tools/misc/mcp_scan.py --src csharp/apps/examples/Weather \
     --out mcp_tools.json \
     --emit-dispatch csharp/apps/examples/Weather/WeatherTools.Dispatch.g.cs \
     --class WeatherTools
@@ -339,16 +339,16 @@ python tools/mcp_scan.py --src csharp/apps/examples/Weather \
 # 2. 把扫描结果并进 manifest.json（mcp_server 字段）
 
 # 3. 打包
-python tools/nexpack.py pack \
+python tools/image/nexpack.py pack \
     --mex sfs_files/Weather.mex \
     --manifest manifest.json \
     --icon icon.png \
     --out dist/weather-1.0.0.nexpack
 
 # 4. 校验 / 检视 / 解包
-python tools/nexpack.py verify  dist/weather-1.0.0.nexpack
-python tools/nexpack.py inspect dist/weather-1.0.0.nexpack
-python tools/nexpack.py unpack  dist/weather-1.0.0.nexpack --out /tmp/x
+python tools/image/nexpack.py verify  dist/weather-1.0.0.nexpack
+python tools/image/nexpack.py inspect dist/weather-1.0.0.nexpack
+python tools/image/nexpack.py unpack  dist/weather-1.0.0.nexpack --out /tmp/x
 ```
 
 ### 写一个 MCP 服务端
@@ -373,7 +373,7 @@ namespace Weather
 }
 ```
 
-`tools/mcp_scan.py` 在**构建期**（不是运行期）扫描 `[McpTool]` 方法，
+`tools/misc/mcp_scan.py` 在**构建期**（不是运行期）扫描 `[McpTool]` 方法，
 生成 `manifest.json` 的 `mcp_server[]` 和一个 `partial` 的 `Invoke` 派发表。
 这样做是因为 MiniCLR **没有反射**——程序集被 `mex_pack.py` 扁平化成数组，
 没有 ECMA-335 元数据可枚举。
@@ -412,10 +412,10 @@ namespace Weather
 
 ```bash
 # 全部自动检查（包格式 / 扫描 / 安装器 / SDK / 内核合并逻辑 / WinHost 编译）
-python tools/verify_all.py
+python tools/verify/verify_all.py
 
 # 内核 TU 编译（需要 WSL/Linux）
-wsl -d Ubuntu-24.04 -e bash /mnt/e/NexOS/NexOS/tools/check_kernel_ai.sh
+wsl -d Ubuntu-24.04 -e bash /mnt/e/NexOS/NexOS/tools/verify/check_kernel_ai.sh
 ```
 
 `verify_all.py` 覆盖：
@@ -518,7 +518,7 @@ distnet scheduler 10.0.2.2 fib 30   -> RESULT: RESULT 1 ok 832040
 
 ### 分布式推理(模型分片)
 
-`tools/distnet_shard_orchestrator.py` + `tools/distnet_shard_node.py` 实现
+`tools/net/distnet_shard_orchestrator.py` + `tools/net/distnet_shard_node.py` 实现
 **多节点协同推理同一个模型**,对应五项能力:
 
 | 能力 | 实现 |
@@ -533,11 +533,11 @@ distnet scheduler 10.0.2.2 fib 30   -> RESULT: RESULT 1 ok 832040
 
 ```bash
 # 起 3 个分片节点(算力权重 1 / 2 / 4)
-python tools/distnet_shard_node.py --port 5501 --weight 1 --dim 16 &
-python tools/distnet_shard_node.py --port 5502 --weight 2 --dim 16 &
-python tools/distnet_shard_node.py --port 5503 --weight 4 --dim 16 &
+python tools/net/distnet_shard_node.py --port 5501 --weight 1 --dim 16 &
+python tools/net/distnet_shard_node.py --port 5502 --weight 2 --dim 16 &
+python tools/net/distnet_shard_node.py --port 5503 --weight 4 --dim 16 &
 # 编排器:12 层模型切给这 3 个节点
-python tools/distnet_shard_orchestrator.py --port 5500 --layers 12 --dim 16 \
+python tools/net/distnet_shard_orchestrator.py --port 5500 --layers 12 --dim 16 \
        --nodes 127.0.0.1:5501,127.0.0.1:5502,127.0.0.1:5503
 ```
 
@@ -552,7 +552,7 @@ python tools/distnet_shard_orchestrator.py --port 5500 --layers 12 --dim 16 \
 [orch] job job1 done (2 shards)
 ```
 
-验证:`python tools/_shard_demo.py`(自动起 3 节点 + 编排器,中途 kill 掉正在
+验证:`python tools/misc/_shard_demo.py`(自动起 3 节点 + 编排器,中途 kill 掉正在
 计算的节点,验证重新分片与检查点续跑;恢复后的结果与无故障基线**逐位一致**)。
 
 #### 在 Agent Forge 里使用(桥做协议路由)
@@ -593,11 +593,11 @@ python tools\nexos_bridge.py
 
 ### 计算节点从哪来
 
-- **宿主 peer(推荐,单 VM 即可)**:`python tools/distnet_host_peer.py`
+- **宿主 peer(推荐,单 VM 即可)**:`python tools/net/distnet_host_peer.py`
   在宿主起一个真实计算节点(UDP 5455/5456)。SLIRP 下宿主地址是 `10.0.2.2`。
 - **第二台 VM(`-Fabric`)**:`.\run_nexos.ps1 -Ops -Fabric` 会启动
-  `tools/nexos_l2hub.py`(L2 交换 hub)+ 两台 VM(调度器 + 计算节点),
-  计算节点由 `tools/distnet_compute_driver.py` 自动登录并保持 `distnet compute` 在线。
+  `tools/net/nexos_l2hub.py`(L2 交换 hub)+ 两台 VM(调度器 + 计算节点),
+  计算节点由 `tools/net/distnet_compute_driver.py` 自动登录并保持 `distnet compute` 在线。
 
 ### 关键约束:广播与网卡
 
@@ -616,7 +616,7 @@ python tools\nexos_bridge.py
 浏览器(nexos-desktop.html)
    │  WebSocket  ws://127.0.0.1:8765
    ▼
-tools/nexos_bridge.py       ← 桥:WebSocket 帧 ↔ 串口字节流
+tools/net/nexos_bridge.py       ← 桥:WebSocket 帧 ↔ 串口字节流
    │  TCP  127.0.0.1:4321
    ▼
 QEMU 虚拟机串口 → NexOS 内核(kmain / kmain64)
@@ -755,7 +755,7 @@ LFB 0xFD000000),因此任何 QEMU/VirtualBox 显卡都能进 GUI;UEFI 路径
 
 ## 中文支持
 
-- GB2312 16×16 点阵字库(387 个 UI 常用字),由 `tools/gen_zfont.py`
+- GB2312 16×16 点阵字库(387 个 UI 常用字),由 `tools/font/gen_zfont.py`
   从 SimSun 渲染(22px → LANCZOS 缩放到 16×16 → 阈值二值化)嵌入内核。
 - `draw_text_utf8` / `draw_text_utf8_transparent`:UTF-8 3 字节 → Unicode
   → 二分查找字库 → 16×16 blit;ASCII 走原 8×16 字体,中英文混排。
@@ -763,7 +763,7 @@ LFB 0xFD000000),因此任何 QEMU/VirtualBox 显卡都能进 GUI;UEFI 路径
 
 ## 拼音输入法(IME)
 
-- `tools/gen_ime_dict.py`:pypinyin 把 387 字转拼音,输出 `ime_dict.h`
+- `tools/font/gen_ime_dict.py`:pypinyin 把 387 字转拼音,输出 `ime_dict.h`
   (按拼音排序,前缀匹配)。
 - GUI Terminal 内直接可用:
 
@@ -879,7 +879,7 @@ NexOS is a from-scratch **x86 operating system**. It started as a C++ kernel + t
 
 - **Kernel & boot**: Stage1→Stage2 two-stage loader; 32-bit protected-mode kernel `kernel.cpp` + 64-bit long-mode kernel `kernel64.cpp`; UEFI/BIOS paths converge on the same C++ entry.
 - **GUI desktop**: `gui.cpp` draws a Win11-style desktop on the framebuffer; on top sits a **C# managed shell** (`csharp/NexOS.Forms` / `NexOS.Core`, `csharp/apps/Shell` implements the window manager, menus, tray, login and AI Agent via `Desktop.cs`/`Browser.cs`/`Login.cs`/`Shell.cs`/`AiAgent.cs`).
-- **Web console**: `win11-ui/` provides a browser-based Win11 desktop + distributed-network panel + Visual Agent Forge, talking to the **real QEMU kernel** over a WebSocket bridge (`tools/nexos_bridge.py`) through the serial port — login/commands/compute tasks execute for real (no local simulation).
+- **Web console**: `win11-ui/` provides a browser-based Win11 desktop + distributed-network panel + Visual Agent Forge, talking to the **real QEMU kernel** over a WebSocket bridge (`tools/net/nexos_bridge.py`) through the serial port — login/commands/compute tasks execute for real (no local simulation).
 - **AI**: Markov + GPT-style text engine (`ai_engine.cpp`) + built-in **Qwen2-0.5B (Q4_K_M) GGUF Transformer inference engine** (`gguf_infer.cpp`, `ask64` switches to 64-bit streaming inference); `agent/` agents + Agent Forge visual orchestration.
 - **Distributed compute**: in-kernel `distnet.cpp` (UDP discovery + scheduling + result collection) + standalone runtime `dcn/` (crypto/discovery/sched/transport/wifi) can shard inference/compute tasks to multiple VMs / host nodes for merged inference.
 - **Compat layers**: self-built **PE/Win32 subsystem** (`winloader.cpp` + `win32.cpp`, already runs a self-built IE browser); **Linux binary compatibility** (`linux_compat.cpp` + `linux_root/`, runs ELF/dynamically-linked programs); **Mono runtime port** (`mono_port/`, runs .NET managed code on NexOS).
@@ -1148,13 +1148,13 @@ Enter `gui` to launch the Win11 Portal style desktop (1024×768 32-bit):
 
 ## Chinese Support
 
-- GB2312 16×16 bitmap font (387 commonly-used UI characters), generated by `tools/gen_zfont.py` from SimSun (22px → LANCZOS scaled to 16×16 → threshold binarization) and embedded in the kernel.
+- GB2312 16×16 bitmap font (387 commonly-used UI characters), generated by `tools/font/gen_zfont.py` from SimSun (22px → LANCZOS scaled to 16×16 → threshold binarization) and embedded in the kernel.
 - `draw_text_utf8` / `draw_text_utf8_transparent`: UTF-8 3-byte → Unicode → binary search font → 16×16 blit; ASCII uses original 8×16 font, enabling mixed Chinese/English rendering.
 - Top bar `欢迎使用`, Terminal output/input all support Chinese.
 
 ## Pinyin IME
 
-- `tools/gen_ime_dict.py`: uses pypinyin to convert 387 characters to pinyin, outputs `ime_dict.h` (sorted by pinyin, prefix matching).
+- `tools/font/gen_ime_dict.py`: uses pypinyin to convert 387 characters to pinyin, outputs `ime_dict.h` (sorted by pinyin, prefix matching).
 - Directly usable within GUI Terminal:
 
 | Key | Behavior |
@@ -1208,8 +1208,8 @@ NexOS 正在探索"让 Linux 作为访客跑在 NexOS 之上"的两条路线。
 | `plugins/plugins_boot.cpp` | 注册 `g_vnc_client` |
 | `net.cpp` | `net_guest_connect/send/recv/close` 内核 TCP API |
 | `linux_root/vmlinuz` | 访客内核（Alpine virt 或 Ubuntu generic） |
-| `tools/mk_initramfs.py` | 打包 gzip newc CPIO initramfs |
-| `tools/build_guest_initrd.sh` | 一键构建访客 rootfs + initrd |
+| `tools/image/mk_initramfs.py` | 打包 gzip newc CPIO initramfs |
+| `tools/boot/build_guest_initrd.sh` | 一键构建访客 rootfs + initrd |
 | `tools/guest_init/init` | 访客原始 `/init` 脚本（busybox init 场景下已替换为 `rc.start`） |
 
 ### 访客 rootfs 构成（简化版）
@@ -1234,7 +1234,7 @@ NexOS 正在探索"让 Linux 作为访客跑在 NexOS 之上"的两条路线。
 ```bash
 # 1) 构建访客 initrd (依赖 busybox-static/x11vnc/xvfb/xterm/iproute2)
 apt-get install -y busybox-static x11vnc xvfb xterm iproute2
-bash tools/build_guest_initrd.sh
+bash tools/boot/build_guest_initrd.sh
 
 # 2) 启动（注意用内置所有网卡驱动的通用内核；Alpine virt 内核缺网卡驱动）
 qemu-system-x86_64 -m 512 -smp 1 \
@@ -1287,7 +1287,7 @@ plugin_call("vnc", "request_frame", NULL, NULL, 0);
 5. **soname symlink 三层**：host `libGL.so.1.7.0 → libGL.so.1 → libGL.so`；拷到 rootfs 后每一层都要重建，否则 ldd 会找到 dangling link。
 6. **dl 路径**：ELF `.interp` 通常是 `/lib64/ld-linux-x86-64.so.2`，rootfs 必须在该位置有真实 link 到 `/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2`。
 7. **RFB 3.8 SetEncodings 格式**：4B 头（type+pad+count16 大端）+ count×4B 编码，count 不是大端 32 位。
-8. **initrd cpio 魔数**：newc 格式开头 `070701`，每个 entry header 110B 后紧跟 name+NUL，data 前要对齐 4 字节。工具见 `tools/mk_initramfs.py`。
+8. **initrd cpio 魔数**：newc 格式开头 `070701`，每个 entry header 110B 后紧跟 name+NUL，data 前要对齐 4 字节。工具见 `tools/image/mk_initramfs.py`。
 
 ### 方案2（VT-x hypervisor）待办
 

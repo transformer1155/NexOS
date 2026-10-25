@@ -482,6 +482,49 @@ namespace NexOS.Forms
         // fs==2 is reserved (FAT32); anything above 3 is out of range.
         static bool FsOk(int fs) { return fs >= 0 && fs <= 3 && fs != 2; }
 
+        // BUG #8 (SFS read-only penetration).  The SFS volume is a pre-built
+        // boot image; nothing may be written to it.  The UI already hides the
+        // mutating verbs, but the backend is the last line of defence, so it
+        // refuses with the same EROFS code the kernel returns (-30) instead of
+        // a generic -1.  Callers can tell "read-only medium" from "bad name".
+        const int EROFS = -30;
+        static bool FsWritable(int fs) { return fs == 0 || fs == 3; }
+
+        // ---- directory-change watch (BUG #2: ghost new file) ------------
+        // The managed shell caches a volume listing for one frame, so a file
+        // created OUTSIDE the shell (installer, terminal, package install,
+        // another process) would not show up until the user navigated away
+        // and back.  A FileSystemWatcher on the writable volumes drops that
+        // cache the moment the medium changes, so the next paint re-reads it.
+        static readonly System.Collections.Generic.List<FileSystemWatcher> s_watchers
+            = new System.Collections.Generic.List<FileSystemWatcher>();
+        static bool s_watchers_on;
+
+        static void EnsureWatchers()
+        {
+            if (s_watchers_on) return;
+            s_watchers_on = true;
+            try
+            {
+                string root = string.IsNullOrEmpty(FsRoot) ? AppContext.BaseDirectory : FsRoot;
+                foreach (int v in new int[] { 0, 3 })
+                {
+                    string d = Path.Combine(root, v == 3 ? Path.Combine("mkfs", "Desktop") : "mkfs");
+                    if (!System.IO.Directory.Exists(d)) continue;
+                    var w = new FileSystemWatcher(d);
+                    w.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName
+                                     | NotifyFilters.LastWrite | NotifyFilters.Size;
+                    w.IncludeSubdirectories = (v == 3);
+                    w.Changed += (s, e) => FileRefresh();
+                    w.Created += (s, e) => FileRefresh();
+                    w.Deleted += (s, e) => FileRefresh();
+                    w.Renamed += (s, e) => FileRefresh();
+                    w.EnableRaisingEvents = true;
+                    s_watchers.Add(w);
+                }
+            }
+            catch { }   // a watcher is an optimisation; never fatal
+        }
         static void Load(int fs)
         {
             if (!FsOk(fs)) return;
@@ -525,7 +568,14 @@ namespace NexOS.Forms
             return isdir[fs][idx] ? 1 : 0;
         }
 
-        public static int FileRefresh() { listing[0] = null; listing[1] = null; listing[3] = null; return 1; }
+        public static int FileRefresh()
+        {
+            // BUG #2: start the directory watch on first use, then drop the
+            // cached listings so the next query re-reads the medium.
+            EnsureWatchers();
+            listing[0] = null; listing[1] = null; listing[3] = null;
+            return 1;
+        }
 
         // File-system mutations (context-menu: new folder / delete / rename).
         // Backed by the real Windows directories under FsRoot, so the same
@@ -533,6 +583,7 @@ namespace NexOS.Forms
         public static int FileMkDir(int fs, string name)
         {
             if (!FsOk(fs) || string.IsNullOrEmpty(name)) return -1;
+            if (!FsWritable(fs)) return EROFS;   // BUG #8: SFS is read-only
             try { Directory.CreateDirectory(Path.Combine(Dir(fs), name)); FileRefresh(); return 1; }
             catch { return -1; }
         }
@@ -540,6 +591,7 @@ namespace NexOS.Forms
         public static int FileDelete(int fs, string name)
         {
             if (!FsOk(fs) || string.IsNullOrEmpty(name)) return -1;
+            if (!FsWritable(fs)) return EROFS;   // BUG #8: SFS is read-only
             try
             {
                 string p = Path.Combine(Dir(fs), name);
@@ -555,6 +607,7 @@ namespace NexOS.Forms
         public static int FileRename(int fs, string oldName, string newName)
         {
             if (!FsOk(fs) || string.IsNullOrEmpty(oldName) || string.IsNullOrEmpty(newName)) return -1;
+            if (!FsWritable(fs)) return EROFS;   // BUG #8: SFS is read-only
             try
             {
                 string o = Path.Combine(Dir(fs), oldName);
@@ -738,11 +791,32 @@ namespace NexOS.Forms
 
         public static void Log(string s) { Console.WriteLine("[shell] " + s); }
 
-        // Persist a text body (dev harness: write to the working directory).
+        // Persist a text body to the volume selected by fs.
+        //
+        // BUG #2 (ghost new file): this used to ignore fs and name and call
+        // File.WriteAllText(name, ...), which resolved against the PROCESS
+        // WORKING DIRECTORY.  The file landed next to the .exe, so the volume
+        // listing (which reads FsRoot/mkfs) never saw it: New file appeared to
+        // do nothing, and refreshing did not help because the entry existed
+        // outside the volume entirely.
+        //
+        // BUG #8: SFS (fs==1) is read-only, so a write there is refused with
+        // EROFS instead of silently writing to the wrong place.
         public static int WriteText(int fs, string name, string text)
         {
-            try { System.IO.File.WriteAllText(name, text);
-                  return System.Text.Encoding.UTF8.GetByteCount(text); }
+            if (!FsOk(fs) || string.IsNullOrEmpty(name)) return -1;
+            if (!FsWritable(fs)) return EROFS;   // BUG #8: SFS is read-only
+            try
+            {
+                // Strip any directory part: the volume namespace is flat.
+                string leaf = Path.GetFileName(name);
+                if (string.IsNullOrEmpty(leaf)) return -1;
+                string p = Path.Combine(Dir(fs), leaf);
+                Directory.CreateDirectory(Dir(fs));
+                File.WriteAllText(p, text);
+                FileRefresh();                   // BUG #2: listing must see it
+                return System.Text.Encoding.UTF8.GetByteCount(text);
+            }
             catch { return -1; }
         }
 
