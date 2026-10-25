@@ -27,6 +27,10 @@ extern void* kmalloc(unsigned int size);
 extern void  kfree(void* ptr);
 extern void  serial_puts(const char* s);
 extern void  serial_putc(char c);
+extern void  serial_puts_dec(int v);
+extern void  serial_hex(uint32_t v);
+extern int   kern_fs_read(const char* name, unsigned char* buf, int bufsize);
+extern int   kern_fs_size(const char* name);
 
 /* ---- real ELF/SFS driver image backend (driver_elf.c) ------------------- */
 typedef struct ElfDriverImage ElfDriverImage;
@@ -37,6 +41,13 @@ void* elf_image_header(const ElfDriverImage* img);
 void driver_elf_free(ElfDriverImage* img);
 /* Non-zero once the SFS filesystem is mounted and kern_fs_read() is usable. */
 extern int  kern_fs_ready(void);
+/* ---- boot-time driver discovery ----------------------------------------
+ * The kernel owns the filesystem layout, so it also owns directory
+ * enumeration: nexos_fs_drv_count()/nexos_fs_drv_name() list the .drv images
+ * present on the mounted SFS.  They are declared weak so the host-side test
+ * harness (which has no SFS) still links. */
+extern int  nexos_fs_drv_count(void) __attribute__((weak));
+extern const char* nexos_fs_drv_name(int idx) __attribute__((weak));
 /* Physical page allocator + CPUID, used by hardware-virtualization drivers. */
 extern uint32_t pmm_alloc_page(void);
 extern void     pmm_free_page(uint32_t pa);
@@ -170,10 +181,28 @@ static void puts_dec(uint32_t v)
  * hard load failure, never a NULL call.                                     */
 typedef struct KernelExport { const char* name; void* addr; } KernelExport;
 
+/* Driver-visible kernel symbols.  Keep this list minimal and explicit:
+ * every entry is a permanent ABI promise to out-of-tree .drv images.
+ *
+ * memcpy/memset are required by almost every freestanding C module -- the
+ * compiler emits calls to them for struct copies and initialisers, so a
+ * driver that omits them fails to relocate rather than merely misbehaving.
+ * font_vec.c additionally needs kmalloc/kfree for its stb_truetype scratch
+ * buffers. */
+extern void* memcpy(void* d, const void* s, unsigned int n);
+extern void* memset(void* d, int v, unsigned int n);
+
 static const KernelExport g_exports[] = {
     { "kmalloc",           (void*)&kmalloc          },
     { "kfree",             (void*)&kfree            },
     { "printk",            (void*)&serial_puts      },
+    { "memcpy",            (void*)&memcpy           },
+    { "memset",            (void*)&memset           },
+    { "kern_fs_read",      (void*)&kern_fs_read     },
+    { "kern_fs_ready",     (void*)&kern_fs_ready    },
+    { "kern_fs_size",      (void*)&kern_fs_size     },
+    { "serial_puts_dec",  (void*)&serial_puts_dec },
+    { "serial_hex",        (void*)&serial_hex       },
 };
 static const int g_export_count = (int)(sizeof(g_exports) / sizeof(g_exports[0]));
 
@@ -320,6 +349,14 @@ static DriverRec* current_driver_for_calls(void) { return g_current; }
 
 int driver_subsystem_init(void)
 {
+    /* The boot path reaches this twice: once from the kernel's driver block
+     * (after the heap is up, so images can actually be allocated) and again
+     * from plugin_manager_boot().  Re-zeroing a populated registry on the
+     * second call would orphan every image, device and IRQ record the first
+     * call installed, so treat it as an idempotent "make sure the API vtable
+     * is published" call instead. */
+    if (g_count > 0) return DRIVER_OK;
+
     g_count = 0;
     g_current = 0;
     g_lock.locked = 0;
@@ -895,6 +932,104 @@ int driver_hot_reload(const char* name, const char* new_path)
     serial_puts("[DRIVER] hot reload complete\n");
     lock_release(&g_lock);
     return DRIVER_OK;
+}
+
+/* ---- ELF-class filter ----------------------------------------------------
+ * An image is only usable by the kernel whose pointer width it was built for:
+ * DriverHeader and every pointer inside it are pointer-sized, so a 32-bit
+ * kernel decoding an ELF64 header reads the fields at the wrong offsets and
+ * fails validation with a confusing "load failed rc=3".  Filtering here,
+ * before any parse or relocation pass, keeps the boot log honest.  Cost is
+ * one 8-byte read per image.
+ */
+static int image_is_other_class(const char* path)
+{
+    unsigned char id[8];
+    int n = kern_fs_read(path, id, (int)sizeof(id));
+    if (n < 8) return 0;                      /* unreadable: let the loader report */
+    if (id[0] != 0x7F || id[1] != 'E' || id[2] != 'L' || id[3] != 'F') return 0;
+#if __SIZEOF_POINTER__ == 8
+    return id[4] == 1;                        /* ELFCLASS32 image on a 64-bit kernel */
+#else
+    return id[4] == 2;                        /* ELFCLASS64 image on a 32-bit kernel */
+#endif
+}
+
+/* ---- boot-time scan -----------------------------------------------------
+ * Called once after the root filesystem is mounted.  Loads every .drv the
+ * kernel reports, in directory order.
+ *
+ * Contract: this MUST NOT panic or block boot.  Each image is independent:
+ * a bad, missing, or self-rejecting driver is logged and skipped so the
+ * rest of the system still comes up.  A driver whose init() fails is left
+ * in DRV_STATE_FAULTED by the loader and is simply not usable -- that is a
+ * normal, recoverable outcome, not a fatal error.
+ *
+ * Returns the number of drivers successfully loaded. */
+int driver_boot_scan(void)
+{
+    /* No enumeration hook (host harness) or no filesystem yet: nothing to do. */
+    if (!nexos_fs_drv_count || !nexos_fs_drv_name) {
+        serial_puts("[DRIVER] scan: no fs enumeration hook\n");
+        return 0;
+    }
+    if (!kern_fs_ready()) {
+        serial_puts("[DRIVER] scan: no filesystem mounted, skipping\n");
+        return 0;
+    }
+
+    int total = nexos_fs_drv_count();
+    if (total < 0) total = 0;
+    serial_puts("[DRIVER] scan: ");
+    serial_puts_dec(total);
+    serial_puts(" .drv image(s) on SFS\n");
+
+    int loaded = 0;
+    for (int i = 0; i < total; ++i) {
+        const char* name = nexos_fs_drv_name(i);
+        if (!name || !name[0]) continue;
+
+        /* nexos_fs_drv_name() returns a pointer INTO the filesystem's shared
+         * directory buffer.  Everything below -- the log line, kern_fs_size()
+         * and kern_fs_read() -- performs another directory read that overwrites
+         * that buffer, so the name has to be copied out first.  Without this
+         * the loader got a corrupt path (and read the wrong file); it only
+         * showed up once the scan ran late enough for kmalloc to succeed,
+         * because the earlier failure happened before any directory read. */
+        char namebuf[DRV_MAX_PATH];
+        if (str_copy(namebuf, name, DRV_MAX_PATH) <= 0) continue;
+
+        serial_puts("[DRIVER] scanning ");
+        serial_puts(namebuf);
+        serial_puts("\n");
+        /* Wrong ELF class for this kernel: skip before parsing anything. */
+        if (image_is_other_class(namebuf)) {
+            serial_puts("[DRIVER] skip ");
+            serial_puts(namebuf);
+            serial_puts(" (other ELF class)\n");
+            continue;
+        }
+
+        /* Skip anything already loaded: a re-scan (or a driver pulled in as
+         * a dependency) must not be initialised twice. */
+        int rc = driver_load(namebuf);
+        if (rc == DRIVER_OK) {
+            ++loaded;
+        } else if (rc == DRIVER_ERR_DUPLICATE) {
+            serial_puts("[DRIVER] already loaded, skipping\n");
+        } else {
+            /* Log and degrade.  Never abort the scan: one broken image must
+             * not cost the user every other driver. */
+            serial_puts("[DRIVER] load failed rc=");
+            serial_puts_dec(rc < 0 ? -rc : rc);
+            serial_puts(" -- skipped\n");
+        }
+    }
+
+    serial_puts("[DRIVER] scan complete: ");
+    serial_puts_dec(loaded);
+    serial_puts(" loaded\n");
+    return loaded;
 }
 
 /* ---- introspection ------------------------------------------------------ */

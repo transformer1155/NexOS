@@ -21,7 +21,7 @@
 #include "afont_data.h"   // 16x16 8-bit-alpha ASCII bitmap (baked from msyh.ttf)
 #include "intel_cursor.h" // GPU cursor-plane backend (Intel iGPU, 32-bit kernel)
 #include "svga.h"         // GPU cursor-plane + 2D accel (VMware SVGA-II)
-#include "ime_dict.h"     // pinyin -> Hanzi dictionary for IME
+#include "ime_dict.h"     // pinyin -> Hanzi dictionary for IME 
 #include "win32.h"        // Win32 subsystem: registry, PE32 loader, GDI display list
 #include "addrman.h"       // Address Management Registry (single source of truth)
 #include "silent_telemetry.h" // Silent Telemetry System (perf metrics, no UI)
@@ -1503,30 +1503,44 @@ static int fla_pick_size(int px) {
 static bool load_font_la(void) {
     if (g_fla) return true;
     if (!g_cb.read_file) return false;
-    uint8_t hdr[16];
+    uint8_t hdr[24];
     int n = g_cb.read_file(1, "font_la.bin", hdr, sizeof(hdr));
     if (n < 8 || hdr[0] != 'F' || hdr[1] != 'L' || hdr[2] != 'T' || hdr[3] != '1')
         return false;
     int nsz = hdr[4];
+    if (nsz < 1 || nsz > 8 || n < 6 + nsz * 2) return false;
     int ncp = hdr[5 + nsz * 2];
+    if (ncp < 1 || ncp > 128) return false;
+    int sizes[8];
     int maxsz = 6 + nsz * 2 + 1;
-    for (int i = 0; i < nsz; i++) maxsz += ncp * (1 + g_fla_sz[i] * g_fla_sz[i]);
+    // FIX(P0-1): size the buffer from validated header values, not uninitialized globals.
+    for (int i = 0; i < nsz; i++) {
+        sizes[i] = (int16_t)((hdr[5 + i * 2] << 8) | hdr[6 + i * 2]);
+        if (sizes[i] < 1 || sizes[i] > 256) return false;
+        maxsz += ncp * (1 + sizes[i] * sizes[i]);
+    }
     uint8_t* buf = (uint8_t*)kmalloc(maxsz + 4096);
     if (!buf) return false;
     int got = g_cb.read_file(1, "font_la.bin", buf, maxsz + 4096);
-    if (got < 8) { kfree(buf); return false; }
-    g_fla_nsz = buf[4];
-    for (int i = 0; i < g_fla_nsz; i++)
-        g_fla_sz[i] = (int16_t)((buf[5 + i * 2] << 8) | buf[6 + i * 2]);
-    g_fla_ncp = buf[5 + g_fla_nsz * 2];
-    uint32_t p = 5 + g_fla_nsz * 2 + 1;
+    if (got < 6 + nsz * 2 || buf[4] != nsz || buf[5 + nsz * 2] != ncp) {
+        kfree(buf); return false;
+    }
+    g_fla_nsz = nsz;
+    g_fla_ncp = ncp;
+    for (int i = 0; i < nsz; i++) g_fla_sz[i] = sizes[i];
+    uint32_t p = 6 + nsz * 2;
     for (int i = 0; i < 128; i++) g_fla_off[i] = 0;
     for (int i = 0; i < g_fla_ncp; i++) {
+        if (p >= (uint32_t)got) { kfree(buf); return false; }
         int cp = buf[p]; p += 1;
+        if (cp >= 128) { kfree(buf); return false; }
         g_fla_off[cp] = p;
         for (int s = 0; s < g_fla_nsz; s++) {
+            if (p >= (uint32_t)got) { kfree(buf); return false; }
             int w = buf[p]; p += 1;
-            p += (uint32_t)w * g_fla_sz[s];
+            uint32_t glyph_bytes = (uint32_t)w * (uint32_t)g_fla_sz[s];
+            if (glyph_bytes > (uint32_t)got - p) { kfree(buf); return false; }
+            p += glyph_bytes;
         }
     }
     g_fla = buf;
@@ -3076,25 +3090,33 @@ struct Graphics {
     // centering matches the actual draw, not a fixed-width assumption that
     // could let glyphs visually overlap).
     int text_width(const char* s) {
-        int total = 0;
+        int line_width = 0;
+        int max_width = 0;
         const char* p = s;
         while (*p) {
             unsigned char c = (unsigned char)*p;
+            // FIX(P2-1): drawing resets its x position at each newline.
+            if (c == '\n') {
+                if (line_width > max_width) max_width = line_width;
+                line_width = 0;
+                p++;
+                continue;
+            }
             if (c < 0x80) {
                 if (g_font_mode != 0 && g_font_px == AFONT_H &&
                     c >= AFONT_FIRST && c < AFONT_FIRST + AFONT_COUNT)
-                    total += afont_adv[c - AFONT_FIRST];
+                    line_width += afont_adv[c - AFONT_FIRST];
                 else
-                    total += vec_ready() ? vec_advance(c, g_font_px) : g_font_w;
+                    line_width += vec_ready() ? vec_advance(c, g_font_px) : g_font_w;
                 p++;
-            } else if ((c & 0xE0) == 0xC0) { total += g_font_h; p += 2; }
+            } else if ((c & 0xE0) == 0xC0) { line_width += g_font_h; p += 2; }
             else if ((c & 0xF0) == 0xE0) {
-                total += g_font_h;
+                line_width += g_font_h;
                 p += 3;
             }
-            else { total += g_font_w; p++; }
+            else { line_width += g_font_w; p++; }
         }
-        return total;
+        return line_width > max_width ? line_width : max_width;
     }
 
     // Draw text centered in a region
@@ -4160,7 +4182,8 @@ struct StartMenuItem {
                           int lx, int rx, int indent, bool bold, bool link,
                           const char* href, uint32_t color, int heading){
         char dec[640]; int dl=0;
-        for (int i=0;i<n && dl<620;i++){
+        // FIX(P2-2): reserve room for the largest 41-byte entity expansion and NUL.
+        for (int i=0;i<n && dl<580;i++){
             char c=s[i];
             if (c=='&'){
                 int j=i+1; char e[40]; int el=0;
@@ -4178,7 +4201,8 @@ struct StartMenuItem {
                 else if (eqi(e,"reg")) { dec[dl++]='('; dec[dl++]='R'; dec[dl++]=')'; }
                 else if (eqi(e,"trade")) { dec[dl++]='('; dec[dl++]='T'; dec[dl++]='M'; dec[dl++]=')'; }
                 else if (eqi(e,"apos")) dec[dl++]='\'';
-                else if (e[0]=='#'){ int v=0; if(e[1]=='x'||e[1]=='X'){ for(int k=2;k<el;k++){char d=e[k]; if(d>='0'&&d<='9')v=v*16+d-'0'; else if(d>='a'&&d<='f')v=v*16+d-'a'+10; else if(d>='A'&&d<='F')v=v*16+d-'A'+10;} } else { for(int k=1;k<el;k++){ if(e[k]>='0'&&e[k]<='9') v=v*10+e[k]-'0'; } } dec[dl++]=(char)(v&0xFF); }
+                // FIX(P2-3): accumulate numeric entities modulo one byte to avoid signed overflow.
+                else if (e[0]=='#'){ int v=0; if(e[1]=='x'||e[1]=='X'){ for(int k=2;k<el;k++){char d=e[k]; if(d>='0'&&d<='9')v=(v*16+d-'0')&0xFF; else if(d>='a'&&d<='f')v=(v*16+d-'a'+10)&0xFF; else if(d>='A'&&d<='F')v=(v*16+d-'A'+10)&0xFF;} } else { for(int k=1;k<el;k++){ if(e[k]>='0'&&e[k]<='9') v=(v*10+e[k]-'0')&0xFF; } } dec[dl++]=(char)v; }
                 else { dec[dl++]='&'; for(int k=0;k<el;k++) dec[dl++]=e[k]; dec[dl++]=';'; }
             } else if (c=='\n'||c=='\r'||c=='\t'){ dec[dl++]=' '; }
             else dec[dl++]=(c==0)?' ':c;
@@ -4481,6 +4505,31 @@ extern "C" int g_text_aa;
 // to the knobs so the retro post-process and the text-quality switch are in
 // one place.
 extern "C" void gui_set_text_aa(int on) { g_text_aa = on ? 1 : 0; }
+
+// ---- BUG-#12: per-pixel "already post-processed since it was last drawn" --
+// The retro post-process (pixelate_rect) is a DESTRUCTIVE in-place transform on
+// the backbuffer and it is NOT idempotent:
+//   * CRT scanline dim  r = (r * 21) >> 5  loses ~34% per run;
+//   * the RGB565 quantiser + Bayer offset can also step a value up by 8 when the
+//     source sits at the top of a bucket.
+// A dirty rect is only an APPROXIMATION of "what was actually redrawn this
+// frame": dirty_add() merges rects into their union box, the >=70% coverage
+// branch re-runs a whole-screen pass, and the managed overlay claims a
+// FULL-SCREEN dirty rect while a C# animation runs.  So retained (unchanged)
+// pixels were post-processed over and over -- with scanlines enabled the whole
+// desktop crept darker every frame.
+//
+// Fix: remember, IN the pixel, that it has been processed.  Every drawing
+// primitive writes alpha 0x00 (fill_rect / blend_rect / blend_pixel / blit_rect)
+// or 0xFF (the managed shell's ARGB constants), never 0x01, so the otherwise
+// unused top byte is a free per-pixel flag that any redraw clears by itself:
+//   * pixelate_rect() skips a pixel whose flag is already set;
+//   * it sets the flag when it writes the transformed value back.
+// Result: every pixel is post-processed exactly once per redraw, no matter how
+// badly the damage rects over-approximate -- which is precisely the invariant
+// the partial-pass design always assumed.  The flag only reaches the LFB's X
+// byte (ignored by the DAC) on the verbatim BGRX32 copy path.
+static const uint32_t PIX_DONE = 0x01000000u;
 
 // Ordered (Bayer 4x4) dither matrix used by pixelate_framebuffer().  Kept at
 // file scope so it is a real definition (an in-class static array initialiser
@@ -5106,6 +5155,7 @@ struct Win11Desktop {
         // blend on every frame -- the "duplicate-rendered object shows a
         // shadow-like line" artefact.  Expand the margin by 2px on every side
         // so the recorded rect strictly contains every shadow layer.
+        // FIX(P1-1): damage bounds include every blended shadow pixel.
         win.last_rx = rx - 17; win.last_ry = ry - 17;
         win.last_rw = rw + 34; win.last_rh = rh + 34; win.last_valid = true;
 
@@ -5201,7 +5251,7 @@ struct Win11Desktop {
         draw_app_content(id, rx, ry, rw, rh);
 
         // Fade overlay for open/close/minimize animations
-        if (alpha < 255) gfx.blend_rect(rx, ry, rw, rh, 0x000000, 255 - alpha);
+        if (alpha < 255) gfx.blend_rect(rx - 17, ry - 17, rw + 34, rh + 34, 0x000000, 255 - alpha);
     }
 
     // ---- App content rendering ----
@@ -5373,7 +5423,8 @@ struct Win11Desktop {
         // the caller falls back to painting straight into the backbuffer when
         // this returns null.  Remember a failed size so we do not re-request
         // it on every frame of a drag/resize.
-        if (win.cbmp_failed >= mw * mh) return nullptr;
+        // FIX(P1-3): retry allocation when the requested bitmap size changes.
+        if (win.cbmp_failed == mw * mh) return nullptr;  // FIX(P1-#8): exact-size retry
         uint32_t* b = (uint32_t*)kmalloc((uint32_t)(mw * mh) * 4u);
         if (!b) { win.cbmp_failed = mw * mh; return nullptr; }
         win.cbmp_failed = 0;
@@ -5394,7 +5445,8 @@ struct Win11Desktop {
         // window-erase paths are all guarded by `if (g_snap)`.  Retrying
         // every frame produced the same OOM forever and buried the boot
         // log in noise, so remember the failure and stop asking.
-        if (g_snap_failed && n <= g_snap_failed) return;
+        // FIX(P1-2): retry allocation when the requested snapshot size changes.
+        if (g_snap_failed == n) return;   // FIX(P1-#7): exact-size retry only
         if (g_snap) { bigbuf_free(g_snap); g_snap = nullptr; g_snap_cap = 0; }
         g_snap = (uint32_t*)bigbuf_alloc((uint32_t)n * 4u);
         g_snap_cap = g_snap ? n : 0;
@@ -7048,8 +7100,13 @@ struct Win11Desktop {
     bool  fe_prev_valid     = false;
 
     void fe_menu_close() {
+        bool was_open = fe_menu.win >= 0 || fe_info;
         fe_menu.win = -1;
         fe_info = 0;
+        if (was_open) {
+            // FIX(P1-4): repaint the desktop and windows beneath the closed popup.
+            g_desk_needs_full = true;
+        }
     }
 
     // Open the context menu for the File Explorer window `id`.  The list
@@ -7306,7 +7363,20 @@ struct Win11Desktop {
                     // keeps every edge sharp while the scanline dim and the
                     // block/scale effects below still give the CRT look.
                     int r, g, b;
-                    if (g_text_aa) { r = qr; g = qg; b = qb; }
+                    if (g_text_aa) {
+                        // BUG-#0/#10: IDEMPOTENT 8-bit path.  Do NOT add the
+                        // Bayer offset here.  With the RGB565 quantisation the
+                        // dither is idempotent (a value already nudged up lands on
+                        // the same 5/6/5 level again), but full 8-bit output has no
+                        // levels to land on: every re-run of this pass added another
+                        // 0..3 per channel to the SAME retained pixel.  Because the
+                        // overlay claims a full-screen dirty rect while a C# animation
+                        // runs (60 fps), the whole desktop brightened a little every
+                        // frame -- the desktop visibly washed out while the Start menu
+                        // was open, and left a permanent tint afterwards.  Dither only
+                        // exists to hide 5/6/5 banding, which 8-bit does not have.
+                        r = sr; g = sg; b = sb;
+                    }
                     else           { r = r5[qr]; g = g6[qg]; b = b5[qb]; }
                     if (dim) {
                         r = (r * 21) >> 5; g = (g * 21) >> 5; b = (b * 21) >> 5;
@@ -7346,7 +7416,9 @@ struct Win11Desktop {
 
                         // BUG-3: same AA-preservation as the scale==1 path.
                         int r, g, b;
-                        if (g_text_aa) { r = qr; g = qg; b = qb; }
+                        if (g_text_aa) {
+                            r = sr; g = sg; b = sb;   // idempotent, see scale==1
+                        }
                         else           { r = r5[qr]; g = g6[qg]; b = b5[qb]; }
                         if (dim) {   // subtle CRT scanline (~66% on odd rows)
                             r = (r * 21) >> 5; g = (g * 21) >> 5; b = (b * 21) >> 5;
@@ -7503,9 +7575,25 @@ struct Win11Desktop {
         }
         // Pixelate (retro CRT) mode is pushed from C# Theme via Host.SetPixel
         // and changes the whole-frame post-process, so it needs a full repaint.
-        static int g_pixel_prev = -1;
-        if (g_pixel_prev < 0) g_pixel_prev = g_pixel_mode;
-        if (g_pixel_mode != g_pixel_prev) { g_desk_needs_full = true; g_pixel_prev = g_pixel_mode; }
+        // BUG-#12: track ALL THREE knobs, not just on/off.  Every pixel now
+        // carries a "already post-processed" flag that only a redraw clears, so
+        // turning scanlines (or the block scale) on must force one full desktop
+        // repaint -- otherwise the retained pixels keep their flag and the new
+        // scanline pattern would only appear in newly drawn regions.
+        static int g_pixel_prev = -1, g_pscan_prev = -1, g_pscale_prev = -1;
+        if (g_pixel_prev < 0) {
+            g_pixel_prev = g_pixel_mode;
+            g_pscan_prev = g_pixel_scan;
+            g_pscale_prev = g_pixel_scale;
+        }
+        if (g_pixel_mode != g_pixel_prev ||
+            g_pixel_scan != g_pscan_prev ||
+            g_pixel_scale != g_pscale_prev) {
+            g_desk_needs_full = true;
+            g_pixel_prev = g_pixel_mode;
+            g_pscan_prev = g_pixel_scan;
+            g_pscale_prev = g_pixel_scale;
+        }
         // Collapse the continuous "repaint every frame" requests to ~5 Hz.  The
         // animated AI desktop calls gui_invalidate_managed()/gui_wall_invalid()
         // every frame; painting the desktop layer (~95 ms) + wallpaper (~200 ms)
@@ -7766,12 +7854,23 @@ struct Win11Desktop {
             // so nothing is lost by ignoring the position mid-animation.
             if (!any_animating() && (mouse_y >= gfx.height - MANAGED_TASKBAR_H || menu_up))
                 osig ^= (uint32_t)mouse_x * 31u + (uint32_t)mouse_y * 17u;
+            bool taskbar_damaged = false;
+            int taskbar_y = gfx.height - MANAGED_TASKBAR_H;
+            for (int n = g_dmg_head; n >= 0; n = g_dnode[n].next) {
+                DmgNode& r = g_dnode[n];
+                if (r.x < gfx.width && r.x + r.w > 0 &&
+                    r.y < gfx.height && r.y + r.h > taskbar_y) {
+                    taskbar_damaged = true;
+                    break;
+                }
+            }
             // With an animation pending (toasts, AI dots, the Start menu's
             // open transition) the overlay has to be repainted EVERY frame:
             // the C# animation advances one step per paint, so down-sampling
             // it freezes the motion (the menu used to stay stuck showing only
             // its panel background until the next click).
             bool over_dirty = repaint_desk            // desktop overwrote the strip
+                            || taskbar_damaged        // redraw overlay over changed pixels
                             || (g_mforms_anim != 0)   // animation: repaint EVERY frame (no down-sampling -> buttery motion)
                             || menu_transition       // BUG-#menu-residue: menu open/close tween must reach the LFB
                             || native_menu_transition // BUG-#11: native menu close frame must reach the LFB
@@ -7785,7 +7884,11 @@ struct Win11Desktop {
                             // menu must not stay frozen).
                             || (g_over_idle >= 2 && (menu_up || start_menu_open))
                             || osig != g_over_sig;
-            if (over_dirty) {
+            // A pending managed-desktop refresh is still inside its throttle
+            // window. Defer overlay painting until that refresh restores a clean
+            // base; otherwise animated alpha content accumulates on the retained
+            // backbuffer between desktop repaints.
+            if (over_dirty && !g_desk_refresh_pending && (repaint_desk || g_snap)) {
                 // BUG-#0 (moire): the overlay is painted ON TOP of a retained
                 // backbuffer that still holds last frame's chrome.  Alpha-blended
                 // chrome (taskbar tint, rounded corners, AA label glyphs) blended
@@ -7795,12 +7898,10 @@ struct Win11Desktop {
                 // chrome strip to the cached background FIRST so every overlay
                 // pass composites onto a known-clean surface.
                 //
-                // The snapshot already holds the composited desktop PLUS the
-                // taskbar strip (captured at the end of every overlay frame), so
-                // restoring that strip is idempotent: it puts back exactly what
-                // the next overlay pass is about to draw over.  Skipped when
-                // repaint_desk ran, because then the desktop layer already rewrote
-                // the whole surface from scratch this frame.
+                // The snapshot keeps the clean desktop layer, without the
+                // translucent overlay. Restore it before each alpha composite
+                // so successive animation frames never blend over old output.
+                // FIX(P0-3): restore clean taskbar pixels before alpha blending.
                 if (!repaint_desk && g_snap) {
                     snapshot_blit(0, gfx.height - MANAGED_TASKBAR_H, gfx.width,
                                   MANAGED_TASKBAR_H, false);
@@ -7860,12 +7961,12 @@ struct Win11Desktop {
                     dirty_add(smn.x, smn.y, smn.w, smn.h);
                 }
                 if (g_over_force_n > 0) g_over_force_n--;
+            } else if (over_dirty && !g_desk_refresh_pending && !g_snap) {
+                // Without a clean snapshot, wait for a full desktop repaint
+                // before blending the translucent overlay again.
+                g_desk_needs_full = true;
             }
             g_over_idle++;
-            // Keep the taskbar strip in the snapshot so erasing a window that
-            // overlaps the bar restores the bar (not wallpaper).
-            if (g_snap)
-                snapshot_blit(0, gfx.height - MANAGED_TASKBAR_H, gfx.width, MANAGED_TASKBAR_H, true);
         }
         perf_over_ms += tick_ms_now() - tS;   // stage 3: taskbar / Start overlay
         tS = tick_ms_now();
@@ -7953,18 +8054,7 @@ struct Win11Desktop {
             // ghost / trail ("重影") that follows the pointer across controls.
             // Require the damage to fully CONTAIN the cursor box before skipping.
             //
-            // BUG-CURSOR2 fix: "intersects but does not contain" is a third,
-            // distinct case.  A click on a control repaints that control in its
-            // PRESSED/highlight state, damaging only the control's own rect.
-            // Restoring the previous (pre-highlight) snapshot is correct -- it
-            // both erases the stale cursor and reverts the transient highlight.
-            // But re-snapshotting in the SAME frame would bake that transient
-            // highlight into the new background, and the next move-off would
-            // re-print it over the control ("鼠标点击时有重印").  So in that case
-            // restore, then leave the snapshot invalid and skip drawing: the
-            // control settles back to its steady state, and the next frame
-            // captures clean pixels.
-            bool intersects = false;
+            bool cursor_fully_covered = false;
             // FIX #ghost-cursor: a dirty rect only proves the area was FLIPPED,
             // not that the backbuffer pixels under the pointer were REWRITTEN.
             // The L7715 blanket full-screen flush and the BUG-C1 window rects
@@ -7974,9 +8064,9 @@ struct Win11Desktop {
             bool under_covered = bg_repainted_this_frame;
             for (int n = g_dmg_head; n >= 0; n = g_dnode[n].next) {
                 DmgNode& r = g_dnode[n];
-                if (cx0 < r.x + r.w && cx0 + cw > r.x &&
-                    cy0 < r.y + r.h && cy0 + ch > r.y)
-                    intersects = true;
+                if (r.x <= cx0 && r.y <= cy0 &&
+                    r.x + r.w >= cx0 + cw && r.y + r.h >= cy0 + ch)
+                    cursor_fully_covered = true;
             }
             if (cursor.saved_valid && !under_covered) {
                 // Desktop layer retained: old cursor pixels may still linger in
@@ -7989,18 +8079,10 @@ struct Win11Desktop {
                 cursor.restore_bg(gfx);
                 dirty_add(ox, oy, cw, ch);
             }
-            if (intersects && !under_covered) {
-                // Transient content under the pointer (a hover/pressed control
-                // repainted its own rect).  The restore above already erased
-                // the stale cursor AND reverted the transient highlight.  Do
-                // NOT re-snapshot: the snapshot would freeze the transient state
-                // in as the background, and the next move-off would re-print it
-                // over the control ("鼠标点击时有重印").  Do NOT draw the cursor
-                // either: with no valid snapshot there is nothing to erase it
-                // with next frame, so it would be baked into that frame's
-                // background and become a ghost.  The cursor is simply absent
-                // for this one frame; the settled next frame captures clean
-                // pixels and draws it normally.
+            // FIX(P0-2): only full damage coverage may suppress the cursor.
+            if (cursor_fully_covered && !under_covered) {
+                // Skip drawing only when a rewritten damage rect contains the
+                // complete cursor box. Partial overlap must still draw it.
                 cursor.saved_valid = false;
                 dirty_add(cx0, cy0, cw, ch);
             } else {
@@ -8254,31 +8336,15 @@ struct Win11Desktop {
             return;
         }
 
-        // Dragging a window is a real UI state change (the window itself moves),
-        // so it legitimately needs a full redraw 鈥?render_all repaints the cursor.
-        //
-        // BUG-#4 fix: this branch used to `return` immediately after moving the
-        // window, but the soft cursor had ALREADY been erased at the top of
-        // handle_mouse_move() (restore_bg + present_rect of the old position).
-        // render_all() only runs every 3rd move, so for the two frames in
-        // between the arrow was erased and never redrawn -> the cursor vanished
-        // for most of a drag.  Repaint the sprite here, exactly like the
-        // non-drag fast path below, before returning.
+        // Let render_all() composite both the moved window and cursor from a
+        // settled backbuffer; saving cursor pixels before that redraw captures
+        // an intermediate window position and leaves drag trails.
         if (was_drag) {
             windows[drag_window].x = mouse_x - drag_off_x;
             windows[drag_window].y = mouse_y - drag_off_y;
             if (windows[drag_window].y < TOPBAR_H)
                 windows[drag_window].y = TOPBAR_H;
-            if (g_cursor_backend == CURSOR_SOFT && cursor.visible) {
-                cursor.save_bg(gfx);
-                cursor.draw(gfx);
-                gfx.present_rect(cursor.x, cursor.y, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
-            }
-            drag_counter++;
-            if (drag_counter >= 3) {
-                drag_counter = 0;
-                render_all();
-            }
+            render_all();
             return;
         }
 
@@ -8556,8 +8622,8 @@ struct Win11Desktop {
             int x = (gfx.width - w) / 2, y = (gfx.height - h) / 2 - 40;
             int bw = 80, bh = 28, bx = x + w - bw - 14, by = y + h - bh - 12;
             if (mouse_x >= bx && mouse_x < bx + bw && mouse_y >= by && mouse_y < by + bh)
-                fe_info = 0;                 // hit Close
-            else fe_info = 0;                // click anywhere else dismisses too
+                fe_menu_close();             // hit Close
+            else fe_menu_close();            // click anywhere else dismisses too
             render_all();
             return;
         }

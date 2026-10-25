@@ -800,7 +800,7 @@ int32_t h_win_action(int32_t* a) {
 //   mode  : 0 off, 1 on
 //   scale : block size in pixels (1 = full detail, >1 = chunkier pixels)
 //   scan  : 0 off, 1 on (CRT scanline darkening)
-extern "C" { int g_pixel_mode = 0; int g_pixel_scale = 1; int g_pixel_scan = 0; }
+extern "C" { int g_pixel_mode = 1; int g_pixel_scale = 1; int g_pixel_scan = 1; }
 int32_t h_set_pixel(int32_t* a) {
     g_pixel_mode  = (a && a[0]) ? 1 : 0;
     g_pixel_scale = (a && a[1] > 1) ? a[1] : 1;

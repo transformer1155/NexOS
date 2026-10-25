@@ -6463,11 +6463,108 @@ extern "C" int kern_fs_read(const char* name, unsigned char* buf, int bufsize){
     return n;
 }
 
+/* kern_fs_size - true size of a filesystem object, or -1 if unknown.
+ * The driver loader uses this to allocate exactly the right buffer instead
+ * of a worst-case one; see driver_elf.c.  Mirrors kern_fs_read's precedence:
+ * the writable MKFS volume wins over the read-only SFS. */
+extern "C" int kern_fs_size(const char* name){
+    if (!name || !name[0]) return -1;
+    /* Only the SFS exposes a size query.  The writable MKFS volume does not,
+     * so a file that lives there reports -1 and the caller falls back to a
+     * bounded probe read.  Drivers are packaged into the SFS, so this is the
+     * path that matters in practice. */
+    if (sfs.mounted) return sfs.size_of(name);
+    return -1;
+}
+
 /* kern_fs_ready - is any filesystem mounted that kern_fs_read can serve?
  * The hot-loadable driver loader asks this before trying to read a .drv
  * image, so it can distinguish "no filesystem yet" from "file not found". */
 extern "C" int kern_fs_ready(void){
     return (sfs.mounted || mkfs.mounted) ? 1 : 0;
+}
+
+/* ---- driver discovery for the hot-loadable driver framework -------------
+ * The driver loader (drivers/driver_loader.c) is filesystem-agnostic: it
+ * asks the kernel which .drv images exist and then reads them by name.  We
+ * own the on-disk layout, so we own the enumeration.
+ *
+ * The SFS directory is flat (one FileEntry table, no real hierarchy), so
+ * "scanning /sfs/drivers/" means selecting entries whose name ends in
+ * ".drv".  Matching on the suffix rather than a path keeps the image layout
+ * free to change without touching the loader.
+ *
+ * Both functions keep no state of their own: they walk the directory table on
+ * every call.  driver_boot_scan() calls count() once and then name(i) per
+ * index, so this costs a handful of sector reads at boot and nothing after.
+ *
+ * Caveat: name() still returns a pointer into the one shared directory buffer
+ * (g_fsbuf).  "No state of their own" describes the functions, NOT the string
+ * they hand back -- see the LIFETIME note on nexos_fs_drv_name() below.
+ */
+static int drv_name_is_image(const char* n){
+    if (!n) return 0;
+    int len = 0;
+    while (n[len] && len < FS_NAME_LEN) len++;
+    if (len < 5) return 0;                       // shortest useful: "x.drv"
+    // case-insensitive ".drv"
+    const char* e = n + len - 4;
+    return (e[0]=='.' )
+        && (e[1]=='d' || e[1]=='D')
+        && (e[2]=='r' || e[2]=='R')
+        && (e[3]=='v' || e[3]=='V');
+}
+
+/* Number of .drv images currently present on the mounted SFS. */
+extern "C" int nexos_fs_drv_count(void){
+    if (!sfs.mounted) return 0;
+    int n = 0;
+    for (int sec = 0; sec < SFS_DIR_SECT; sec++) {
+        sfs.rd(sfs.dir_lba(sec), (uint16_t*)g_fsbuf);
+        for (int e = 0; e < FS_ENTRY_PER_SEC; e++) {
+            FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
+            if (fe->name[0] && drv_name_is_image(fe->name)) n++;
+        }
+    }
+    return n;
+}
+
+/* Name of the idx-th .drv image, or 0 if idx is out of range.
+ *
+ * LIFETIME -- READ THIS BEFORE CALLING:
+ *   The returned pointer points INTO the SFS shared directory buffer
+ *   (g_fsbuf).  It is valid ONLY until the next directory-sector read, and
+ *   every operation a caller normally wants to perform invalidates it in
+ *   place: kern_fs_size() and kern_fs_read()/sfs.read() both re-read the
+ *   directory into g_fsbuf, so "name" becomes a dangling alias of unrelated
+ *   bytes.  The caller MUST copy the name into its own buffer first.
+ *
+ *   driver_boot_scan() does exactly that:
+ *       char namebuf[DRV_MAX_PATH];
+ *       str_copy(namebuf, name, DRV_MAX_PATH);
+ *   and passes namebuf to driver_load().  Keep it that way.
+ *
+ *   This comment used to claim "driver_load() reads the image immediately, so
+ *   the loader's usage is safe".  That was WRONG and it hid a real bug: once
+ *   driver_boot_scan() started running after heap_init() (so kmalloc finally
+ *   succeeded), driver_load() -> driver_elf_read() -> kern_fs_read() clobbered
+ *   g_fsbuf while "path" still aliased it, and the loader read a garbage
+ *   filename and the wrong file (115192 bytes of junk instead of svm.drv).
+ *   It had only ever worked because the other call site passed a .rodata
+ *   string literal ("svm.drv"), which cannot be overwritten. */
+extern "C" const char* nexos_fs_drv_name(int idx){
+    if (!sfs.mounted || idx < 0) return 0;
+    int seen = 0;
+    for (int sec = 0; sec < SFS_DIR_SECT; sec++) {
+        sfs.rd(sfs.dir_lba(sec), (uint16_t*)g_fsbuf);
+        for (int e = 0; e < FS_ENTRY_PER_SEC; e++) {
+            FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
+            if (!fe->name[0] || !drv_name_is_image(fe->name)) continue;
+            if (seen == idx) return fe->name;
+            seen++;
+        }
+    }
+    return 0;
 }
 
 static void cmd_agent(const char* args){
@@ -7357,7 +7454,21 @@ static void do_switch64(void){
             kfree(stage);
             return;
         }
-        if (stage_phys < 0x00200000u || stage_phys + KERNEL64_SECTORS * 512 > 0x02000000u) {
+        // The staging buffer must (a) sit outside the destination window
+        // (1-2 MiB, where the 64-bit image will be blitted) and (b) be inside
+        // the identity-mapped region, because switch_to_64bit() blits from it
+        // with paging still on and VA == PA only within that map.
+        //
+        // The upper bound used to be 0x02000000 (32 MiB).  That was correct
+        // only while kmalloc() drew from a low heap; the heap now lives at
+        // HEAP_START = 0x10000000 (256 MiB) and vmm_init() identity-maps
+        // 0-256 MiB plus the 256-384 MiB supervisor window.  A 256 MiB staging
+        // buffer therefore failed the old check on EVERY invocation, so
+        // `switch` / `ask64` could never enter long mode -- the 64-bit kernel
+        // was unreachable.  Track the real identity-mapped ceiling instead of
+        // a hard-coded number so this cannot drift again.
+        const uint32_t IDENT_TOP = 0x18000000u;   // HEAP_END: end of the identity map
+        if (stage_phys < 0x00200000u || stage_phys + KERNEL64_SECTORS * 512 > IDENT_TOP) {
             // Must be outside the destination window and inside the identity map.
             term.set_color(make_color(RED, BLACK));
             term.write("ERROR: staging buffer at a bad address.\n");
@@ -9785,6 +9896,14 @@ extern "C" void kmain(){
     }
     serial_puts("[K6] filesystem init done\n");
 
+    // ---- hot-loadable drivers ------------------------------------------
+    // Deliberately NOT scanned here.  driver_elf_read() allocates its probe
+    // and file buffers with kmalloc(), and the kernel heap does not exist
+    // until heap_init() runs further down; scanning at this point made the
+    // very first 4 KiB probe allocation fail, so every .drv reported
+    // DRIVER_ERR_NO_MEMORY (-4) and was skipped.  The scan now runs right
+    // after heap_init(), still before the managed shell starts.
+
     // ---- MCP app registry (table-driven) ----
     // The registry is built entirely from /apps.json on the SFS volume: there
     // is no compiled-in app list.  This must run after sfs.init() so the
@@ -9832,6 +9951,35 @@ extern "C" void kmain(){
     // framebuffer console / beacon write.
     heap_init();
     serial_puts("[K7] memory management init done\n");
+
+    // ---- hot-loadable drivers ------------------------------------------
+    // Bring the driver framework up and load every .drv image found on the
+    // mounted SFS.  This MUST run after heap_init(): driver_elf_read()
+    // allocates its probe and file buffers with kmalloc(), so scanning
+    // before the heap exists fails every image with DRIVER_ERR_NO_MEMORY
+    // (-4).  It still runs before plugin_manager_boot() and the managed
+    // shell, so a driver that provides a device is already registered by
+    // the time anything can ask for it.
+    //
+    // Both calls are failure-tolerant by contract: a missing framework, an
+    // empty directory, or an individual image that will not load is logged
+    // and skipped.  Driver bring-up must never stop the kernel from booting.
+    {
+        extern int driver_subsystem_init(void);
+        extern int driver_boot_scan(void);
+        int dri = driver_subsystem_init();
+        if (dri != 0) {
+            serial_puts("[DRIVER] subsystem init failed rc=");
+            serial_puts_dec(dri < 0 ? -dri : dri);
+            serial_puts(" -- continuing without hot-loadable drivers\n");
+        } else {
+            serial_puts("[DRIVER] subsystem ready\n");
+            int n = driver_boot_scan();
+            serial_puts("[DRIVER] hot-loaded ");
+            serial_puts_dec(n);
+            serial_puts(" driver(s)\n");
+        }
+    }
 
     /* Phase 1: plugin manager (loads hello_world in this phase) */
     plugin_manager_boot();

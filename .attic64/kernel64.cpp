@@ -38,6 +38,8 @@
 #include "knowledge_base.h"  // verified-fact KB (truth-from-practice + authoritative fallback)
 #include "ai_plugin.h"        // plugin catalogue / manager (Settings > Plugins + `plugin` cmd)
 #include "smp64.h"            // Stage 8.1: SMP / multiprocessor bring-up
+#include "font_vec.h"         // vec_* signatures: the rasteriser now lives in fontvec.drv
+#include "driver_contract.h"   // hot-loadable driver framework (32/64 shared ABI)
 
 // Phase 0 ggml adapter self-test (declared here, defined just before kmain64).
 void gguf_adapter_selftest(void);
@@ -55,7 +57,22 @@ static inline void outl(uint16_t p,uint32_t v){ __asm__ __volatile__("outl %0,%1
 // =====================================================================
 //  Serial debug output (port 0x3F8)  -  for UEFI boot tracing
 // =====================================================================
-void serial_puts(const char* s){ while(*s) outb(0x3F8, (uint8_t)*s++); }
+void serial_puts(const char* s){
+    while (*s) {
+        // Wait for THR-empty before each byte: the UART FIFO is only 16 deep
+        // and this port is written from long mode too, so an unthrottled loop
+        // silently drops characters and makes 64-bit logs unreadable.
+        //
+        // BOUNDED on purpose: if the UART ever stops reporting THRE (host
+        // misconfiguration, or a port we should not be touching), an unbounded
+        // spin would hang the kernel inside a debug print -- the worst possible
+        // place to lose the machine.  After the budget we just emit the byte.
+        for (uint32_t spin = 0; spin < 100000u; ++spin) {
+            if (inb(0x3FD) & 0x20) break;
+        }
+        outb(0x3F8, (uint8_t)*s++);
+    }
+}
 void serial_hex(uint32_t v){
     const char* h = "0123456789ABCDEF";
     for (int i = 28; i >= 0; i -= 4) outb(0x3F8, (uint8_t)h[(v >> i) & 0xF]);
@@ -2279,7 +2296,7 @@ static void pmm_init(){
     }
 }
 
-static uint32_t pmm_alloc_page(){
+extern "C" uint32_t pmm_alloc_page(){
     for (uint32_t i = 0; i < pmm_total_pages; i++){
         uint32_t w = i / 32, b = i % 32;
         if (!(pmm_bitmap[w] & (1u << b))){
@@ -2292,7 +2309,7 @@ static uint32_t pmm_alloc_page(){
     return 0;  // OOM
 }
 
-static void pmm_free_page(uint32_t phys){
+extern "C" void pmm_free_page(uint32_t phys){
     if (phys < PMM_BASE_ADDR) return;
     uint32_t i = (phys - PMM_BASE_ADDR) / PAGE_SIZE;
     if (i >= pmm_total_pages) return;
@@ -2304,7 +2321,7 @@ static void pmm_free_page(uint32_t phys){
     }
 }
 
-static uint32_t pmm_alloc_range(uint32_t count){
+extern "C" uint32_t pmm_alloc_range(uint32_t count){
     // Contiguous allocation via bitmap run scan (O(N)).
     if (count == 0 || count > pmm_total_pages) return 0;
     uint32_t i = 0;
@@ -2345,6 +2362,13 @@ extern "C" void big_free(void* p, uint32_t bytes){
     uint32_t phys = (uint32_t)(uintptr_t)p;
     uint32_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
     for (uint32_t j = 0; j < pages; j++) pmm_free_page(phys + j * PAGE_SIZE);
+}
+
+// Released contiguous range.  The driver framework's contract declares this
+// so a hot-loaded driver can hand memory back the same way it obtained it;
+// it did not exist here because only big_free() ever freed a run.
+extern "C" void pmm_free_range(uint32_t pa, uint32_t pages){
+    for (uint32_t j = 0; j < pages; j++) pmm_free_page(pa + j * PAGE_SIZE);
 }
 
 // =====================================================================
@@ -6167,6 +6191,174 @@ static void diag_mark(uint8_t r, uint8_t g, uint8_t b, bool freeze){
     if (freeze) __asm__ __volatile__("cli;hlt");
 }
 
+// =====================================================================
+//  Hot-loadable driver framework host services  (task-8)
+// ---------------------------------------------------------------------
+//  driver_loader.c / driver_elf.c are shared, freestanding C and are now
+//  linked into this kernel too, so ELF32 or ELF64 .drv images can be
+//  relocated at boot.  They bind kernel services by NAME (contract ABI),
+//  and the 32-bit kernel provided these under the same names via kernel.cpp.
+//  Everything here is failure-tolerant: the scan logs and skips a broken
+//  image, it never panics and never blocks the boot.
+// =====================================================================
+
+// driver_contract.h declares driver_subsystem_init() but NOT the boot scan,
+// which lives in driver_loader.c (same definition the 32-bit kernel uses).
+extern "C" int driver_boot_scan(void);
+
+extern "C" int kern_fs_ready(void){
+    return sfs.mounted ? 1 : 0;
+}
+
+extern "C" int kern_fs_read(const char* name, unsigned char* buf, int bufsize){
+    if (!sfs.mounted || !name || !buf || bufsize <= 0) return -1;
+    return sfs.read(name, buf, bufsize);
+}
+
+// True size of an SFS object, read from its directory entry.  driver_elf.c
+// sizes its image buffer from this instead of grabbing ELF_MAX_IMAGE.
+extern "C" int kern_fs_size(const char* name){
+    if (!sfs.mounted || !name) return -1;
+    int idx = sfs.find(name);
+    if (idx < 0) return -1;
+    int sec = idx / FS_ENTRY_PER_SEC;
+    int ent = idx % FS_ENTRY_PER_SEC;
+    sfs.rd(sfs.dir_lba(sec), (uint16_t*)g_fsbuf);
+    FileEntry* fe = (FileEntry*)(g_fsbuf + ent * FS_ENTRY_SIZE);
+    return (int)fe->size;
+}
+
+extern "C" void serial_putc(char c){ outb(0x3F8, (uint8_t)c); }
+
+extern "C" void serial_puts_dec(int v){
+    char b[12]; int n = 0;
+    if (v == 0) { outb(0x3F8, '0'); return; }
+    if (v < 0) { outb(0x3F8, '-'); v = -v; }
+    while (v > 0 && n < 11) { b[n++] = (char)('0' + (v % 10)); v /= 10; }
+    while (n > 0) outb(0x3F8, (uint8_t)b[--n]);
+}
+
+extern "C" void nexos_cpuid(uint32_t leaf, uint32_t sub,
+                             uint32_t* a, uint32_t* b, uint32_t* c, uint32_t* d){
+    uint32_t ra, rb, rc, rd;
+    __asm__ __volatile__("cpuid" : "=a"(ra), "=b"(rb), "=c"(rc), "=d"(rd)
+                         : "a"(leaf), "c"(sub));
+    if (a) *a = ra;
+    if (b) *b = rb;
+    if (c) *c = rc;
+    if (d) *d = rd;
+}
+
+// ---- .drv enumeration for driver_boot_scan() -------------------------
+//  The SFS directory is flat, so "scan the drivers directory" means
+//  "select entries whose name ends in .drv", exactly as in kernel.cpp.
+static bool drv_name_is_image(const char* n){
+    if (!n) return false;
+    int len = 0;
+    while (n[len] && len < FS_NAME_LEN) len++;
+    if (len < 5) return false;
+    const char* e = n + len - 4;
+    return e[0] == '.' &&
+           (e[1] == 'd' || e[1] == 'D') &&
+           (e[2] == 'r' || e[2] == 'R') &&
+           (e[3] == 'v' || e[3] == 'V');
+}
+
+extern "C" int nexos_fs_drv_count(void){
+    if (!sfs.mounted) return 0;
+    int n = 0;
+    for (int sec = 0; sec < SFS_DIR_SECT; sec++){
+        sfs.rd(sfs.dir_lba(sec), (uint16_t*)g_fsbuf);
+        for (int e = 0; e < FS_ENTRY_PER_SEC; e++){
+            FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
+            if (fe->name[0] && drv_name_is_image(fe->name)) n++;
+        }
+    }
+    return n;
+}
+
+// Returns a pointer into g_fsbuf; the caller (driver_load) consumes it
+// immediately, before the next directory read reuses the buffer.
+extern "C" const char* nexos_fs_drv_name(int idx){
+    if (!sfs.mounted || idx < 0) return 0;
+    int seen = 0;
+    for (int sec = 0; sec < SFS_DIR_SECT; sec++){
+        sfs.rd(sfs.dir_lba(sec), (uint16_t*)g_fsbuf);
+        for (int e = 0; e < FS_ENTRY_PER_SEC; e++){
+            FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
+            if (!fe->name[0] || !drv_name_is_image(fe->name)) continue;
+            if (seen == idx) return fe->name;
+            seen++;
+        }
+    }
+    return 0;
+}
+
+// ---- font_vec forwarding shims ---------------------------------------
+//  The vector rasteriser is no longer linked in: it arrives as
+//  fontvec.drv.  gui.cpp's call sites are unchanged, and when the driver is
+//  absent (or its TTF failed to load) every entry reports "not ready", so
+//  gui.cpp takes the baked bitmap-font path.  That is the required
+//  graceful degradation -- never a fault, never a blank screen.
+typedef struct FontVecApi {
+    int  (*init)(int (*read_file)(int, const char*, uint8_t*, int));
+    int  (*ready)(void);
+    const uint8_t* (*glyph)(uint32_t, int, int*, int*, int*, int*);
+    int  (*advance)(uint32_t, int);
+    void (*set_dpr)(int);
+    void (*last_err)(int*, int*, int*);
+} FontVecApi;
+
+static const FontVecApi* g_vec_api = 0;
+
+// Recover the table the driver published in DriverHeader.reserved[0..1].
+static void vec_api_bind(void){
+    if (g_vec_api) return;
+    const DriverHeader* h = driver_find("fontvec");
+    if (!h) { return; }                       // driver not loaded: bitmap font
+    uintptr_t p = (uintptr_t)h->reserved[0] | ((uintptr_t)h->reserved[1] << 32);
+    if (!p) { return; }
+    g_vec_api = (const FontVecApi*)p;
+    serial_puts("[GUI] fontvec driver bound\n");
+}
+
+extern "C" int vec_ready(void){
+    vec_api_bind();
+    if (!g_vec_api || !g_vec_api->ready) return 0;
+    return g_vec_api->ready() ? 1 : 0;
+}
+
+extern "C" int vec_init(int (*read_file)(int, const char*, uint8_t*, int)){
+    vec_api_bind();
+    if (!g_vec_api || !g_vec_api->init) return -1;
+    return g_vec_api->init(read_file);
+}
+
+extern "C" const uint8_t* vec_glyph(uint32_t cp, int px, int* w, int* h,
+                                     int* xoff, int* yoff){
+    vec_api_bind();
+    if (!g_vec_api || !g_vec_api->glyph) return 0;
+    return g_vec_api->glyph(cp, px, w, h, xoff, yoff);
+}
+
+extern "C" int vec_advance(uint32_t cp, int px){
+    vec_api_bind();
+    if (!g_vec_api || !g_vec_api->advance) return px;   // same fallback as font_vec.c
+    return g_vec_api->advance(cp, px);
+}
+
+extern "C" void vec_set_dpr(int factor){
+    vec_api_bind();
+    if (g_vec_api && g_vec_api->set_dpr) g_vec_api->set_dpr(factor);
+}
+
+extern "C" void vec_last_err(int* code, int* got, int* stb){
+    vec_api_bind();
+    if (g_vec_api && g_vec_api->last_err) { g_vec_api->last_err(code, got, stb); return; }
+    if (code) *code = -1;                 // -1: no rasteriser at all
+    if (got)  *got  = 0;
+    if (stb)  *stb  = 0;
+}
 extern "C" void kmain64(){
     serial_puts("[K64-1] kmain64 entered\n");
     // Install the real 64-bit IDT so any synchronous fault (#PF/#GP/#UD/...)
@@ -6322,6 +6514,30 @@ extern "C" void kmain64(){
     vmm_init();
     heap_init();
     serial_puts("[K64-7] memory management init done\n");
+
+    // ---- Hot-loadable drivers -------------------------------------------
+    // Runs AFTER heap_init() (the ELF loader allocates its image buffer) and
+    // BEFORE gui_init(), so fontvec.drv is bound by the time the GUI asks for
+    // its first glyph.  Contract: a missing/broken image is logged and
+    // skipped -- driver bring-up must never panic or block the boot.
+    {
+        int dri = driver_subsystem_init();
+        if (dri != 0) {
+            serial_puts("[DRIVER] subsystem init failed rc=");
+            serial_puts_dec(dri < 0 ? -dri : dri);
+            serial_puts(" -- continuing without hot-loadable drivers\n");
+        } else {
+            serial_puts("[DRIVER] subsystem ready\n");
+            int nd = driver_boot_scan();
+            serial_puts("[DRIVER] hot-loaded ");
+            serial_puts_dec(nd);
+            serial_puts(" driver(s)\n");
+
+            // Bind the rasteriser now: vec_ready() then reports the truth for
+            // gui_init() below, which is what selects vector vs bitmap font.
+            (void)vec_ready();
+        }
+    }
     diag_mark(255, 0, 255, false);     // M4 MAGENTA : post memory management (vmm_init)
 
     // ---- GUI initialization (if VBE info is available) ----

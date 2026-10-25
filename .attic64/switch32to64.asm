@@ -47,13 +47,37 @@ extern __lm_stack_top
 %define PD2_ADDR        __lm_pd2       ; unused (1 GiB pages), kept for clarity
 %define PDPT2_ADDR      __lm_pdpt2     ; Extra PDPT for a >512GiB GOP framebuffer
 %define KERNEL64_ENTRY  0x100000
-; MUST cover the WHOLE kernel64.bin.  The 32-bit side stages KERNEL64_SECTORS
-; (1440) sectors into stage_phys; anything we fail to blit here stays as
-; whatever physical RAM held that page -- and rodata literals (e.g. the
-; "msyh.ttf" string used by Sfs::find and font_vec's vec_init) live past the
-; old 640 KiB window, so they read back as a zero page and strcmp() never
-; matches -> vec_init fails (step 319).  Keep this == KERNEL64_SECTORS*512/4.
-%define KERNEL64_DWORDS (1452 * 512 / 4)   ; MUST cover the whole kernel64.bin (now 742672 B = ~1452 sectors incl. embedded trampoline). Keep in sync with KERNEL64_SECTORS in kernel.cpp.
+; The blit length must cover the WHOLE image.  It is expressed in terms of the
+; window the 32-bit side actually stages -- KERNEL64_SECTORS in kernel.cpp --
+; NOT as a hand-counted sector figure for a particular build.  That is exactly
+; how this broke before: the constant said 1452 while the image had grown to
+; ~1620 sectors, so the tail of .rodata (and .data) was never copied, RAM kept
+; its previous contents, and every rodata literal past the cut read back as a
+; zero page -- g_elf_exports resolved every import to NULL, giving exactly one
+; failed relocation per import.  Silence like that is worse than a crash.
+;
+; Keep == KERNEL64_SECTORS*512/4 (4096*512/4 = 524288 dwords = 2 MiB).
+; Two invariants hold:
+;   * the staging buffer is KERNEL64_SECTORS*512 bytes, so the source is always
+;     at least this long (reading the window never runs off the allocation);
+;   * the build asserts kernel64.bin <= KERNEL64_SECTORS*512 (Makefile GUARD),
+;     so the image is always fully inside the window below.
+; Destination 0x100000..0x300000 touches kernel64's .bss tail, which entry64.asm
+; zeroes before use, and stays far below .lmboot (>= 0x1800000).
+; The exact byte count comes from the build (Makefile passes
+; -DKERNEL64_BYTES=$(stat -c%s build/kernel64.bin), rounded up to a multiple
+; of 4), so the blit is always exactly the image -- never a hand-counted
+; sector figure that can drift as the image grows.  That drift is what broke
+; this before: the constant said 1452 sectors while the image was ~1620, so the
+; .rodata/.data tail was never copied and every rodata literal past the cut read
+; back as a zero page (driver imports all resolved to NULL, font paths failed).
+;
+; The %ifndef fallback keeps a standalone nasm run (no -D) conservative: the
+; full 2 MiB staging window, which entry64.asm's .bss clear makes safe.
+%ifndef KERNEL64_BYTES
+%define KERNEL64_BYTES (4096 * 512)
+%endif
+%define KERNEL64_DWORDS ((KERNEL64_BYTES + 3) / 4)
 
 global switch_to_64bit
 

@@ -40,8 +40,26 @@ _start64:
     mov al, 0x45           ; 'E'
     out dx, al
 
-    ; ---- Set up 64-bit stack ----
-    mov rsp, 0x1F0000
+    ; ---- Set up 64-bit stack --------------------------------------------
+    ; The stack must sit ABOVE the 64-bit image AND its .bss, because it
+    ; grows downward into whatever lies below it.
+    ;
+    ; This used to be a literal 0x1F0000, which was safe while kernel64.bin
+    ; ended near 0x1B5510.  The image has since grown past 0x1CA8B8 and its
+    ; .bss now ends at 0x48ACA8, so 0x1F0000 landed INSIDE the running kernel:
+    ; the first push overwrote 64-bit code/data, which is why the serial
+    ; markers came out scrambled and kmain64 was never reached.
+    ;
+    ; 0x1828000 is __lm_stack_top from linker.ld: the 32-bit side reserves a
+    ; 64 KiB boot stack at 0x1800000..0x1828000 in the .lmboot region, which
+    ; vmm_init() identity-maps and PMM marks used.  It sits above kernel64's
+    ; .bss and below the 32 MiB identity-map ceiling, so it is valid from the
+    ; instant long mode is entered.
+    ;
+    ; NOTE: entry64.o links against linker64.ld, which does not define
+    ; __lm_stack_top, so this cannot be an extern -- keep it in sync with
+    ; linker.ld's __lm_stack_top by hand.
+    mov rsp, 0x1828000
 
     ; ---- Enable FPU (x87) + SSE ----
     mov rax, cr0

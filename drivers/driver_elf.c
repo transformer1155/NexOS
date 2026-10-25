@@ -22,6 +22,9 @@
 
 /* ---- kernel / SFS services ---------------------------------------------- */
 extern int  kern_fs_read(const char* name, unsigned char* buf, int bufsize);
+/* True size of a filesystem object, or <0 if unknown.  Weak so the host-side
+ * test harness (no filesystem) still links. */
+extern int  kern_fs_size(const char* name) __attribute__((weak));
 extern void* kmalloc(unsigned int size);
 extern void  kfree(void* ptr);
 extern void  serial_puts(const char* s);
@@ -86,6 +89,7 @@ static void e_putdec(unsigned int v)
 #define EI_CLASS       4
 #define EI_DATA        5
 #define ELFCLASS32     1
+#define ELFCLASS64     2   /* recognised (and refused) on 32-bit builds too */
 #define ELFDATA2LSB    1
 #define ET_REL         1      /* relocatable object                        */
 #define ET_DYN         3      /* shared object / PIE                       */
@@ -148,6 +152,79 @@ typedef struct ElfDriverImage {
 #define ELF_MIN_VADDR   0x00100000u   /* above the first megabyte          */
 #define ELF_MAX_VADDR   0x02000000u   /* 32 MiB ceiling                    */
 #define ELF_MAX_IMAGE   (4u * 1024u * 1024u)
+
+/* --------------------------------------------------------------------------
+ * The ELF64 half is compiled ONLY into 64-bit builds.
+ * --------------------------------------------------------------------------
+ * A 32-bit kernel can never relocate an ELF64 image: DriverHeader and every
+ * pointer inside it are pointer-sized, so parsing ELF64 there would read the
+ * fields at the wrong offsets.  The 32-bit loader refuses EM_X86_64 anyway,
+ * and kernel.bin has a hard 576 KiB budget -- so the parser is compiled out
+ * entirely instead of being carried as dead code.  driver_elf_read() filters
+ * an ELF64 image by e_ident[EI_CLASS] long before this code would be used.
+ * ========================================================================*/
+/* --------------------------------------------------------------------------
+ * ELF64 half: compiled ONLY into 64-bit builds.
+ * --------------------------------------------------------------------------
+ * A 32-bit kernel can never relocate an ELF64 image -- DriverHeader and every
+ * pointer in it are pointer-sized, so the fields would be read at the wrong
+ * offsets -- and kernel.bin has a hard 576 KiB budget.  The 32-bit loader
+ * therefore refuses ELF64 by e_ident[EI_CLASS] alone and never carries the
+ * parser.  Nothing below this point is referenced on a 32-bit build.
+ * ========================================================================*/
+#if __SIZEOF_POINTER__ == 8
+/* ==========================================================================
+ * ELF64 structures (long mode).  Duplicated on purpose: the ELF32 path below
+ * stays byte-for-byte untouched, and a shared/parameterised parser would make
+ * both classes harder to audit.  Firmware for the 64-bit kernel is selected by
+ * e_ident[EI_CLASS] in driver_elf_read().
+ * ========================================================================*/
+#define ELFCLASS64      2
+#define EM_X86_64       62
+
+/* x86-64 relocation types we can apply. */
+#define R_X86_64_NONE   0
+#define R_X86_64_64     1    /* S + A            (64-bit)   */
+#define R_X86_64_PC32   2    /* S + A - P        (32-bit)   */
+#define R_X86_64_PLT32  4    /* S + A - P        (32-bit)   */
+#define R_X86_64_32    10    /* S + A            (zero-ext) */
+#define R_X86_64_32S   11    /* S + A            (sign-ext) */
+
+#define ELF64_R_SYM(i)  ((uint32_t)((i) >> 32))
+#define ELF64_R_TYPE(i) ((uint32_t)((i) & 0xFFFFFFFFu))
+
+typedef struct { unsigned char e_ident[EI_NIDENT];
+                 uint16_t e_type, e_machine; uint32_t e_version;
+                 uint64_t e_entry, e_phoff, e_shoff;
+                 uint32_t e_flags;
+                 uint16_t e_ehsize, e_phentsize, e_phnum;
+                 uint16_t e_shentsize, e_shnum, e_shstrndx; } Elf64_Ehdr;
+
+typedef struct { uint32_t sh_name, sh_type;
+                 uint64_t sh_flags, sh_addr, sh_offset, sh_size;
+                 uint32_t sh_link, sh_info;
+                 uint64_t sh_addralign, sh_entsize; } Elf64_Shdr;
+
+/* ELF64 r_info is a 64-bit word: symbol index in the high half, type in the
+ * low half.  Both relocation records are 8-byte aligned and 24/16 bytes. */
+typedef struct { uint64_t r_offset, r_info; int64_t r_addend; } Elf64_Rela;
+typedef struct { uint64_t r_offset, r_info; } Elf64_Rel;
+
+typedef struct { uint32_t st_name;
+                 unsigned char st_info, st_other; uint16_t st_shndx;
+                 uint64_t st_value, st_size; } Elf64_Sym;
+
+static void e_puthex64(uint64_t v)
+{
+    static const char* h = "0123456789ABCDEF";
+    char b[19]; b[0]='0'; b[1]='x';
+    for (int i = 0; i < 16; ++i) b[2+i] = h[(unsigned)((v >> (60 - i*4)) & 0xF)];
+    b[18] = 0;
+    serial_puts(b);
+}
+#endif  /* __SIZEOF_POINTER__ == 8: ELF64 structures */
+
+
 
 /* ==========================================================================
  * Validation
@@ -230,11 +307,20 @@ static DriverStatus elf_validate(const unsigned char* raw, uint32_t size,
  * ========================================================================*/
 typedef struct { const char* name; void* addr; } ElfExport;
 
+/* memcpy/memset are emitted by the compiler for struct copies and
+ * initialisers in almost every freestanding C module, so a driver that does
+ * not declare them (or a loader table that omits them) fails relocation.
+ * Kept deliberately minimal otherwise. */
+extern void* memcpy(void* d, const void* s, unsigned int n);
+extern void* memset(void* d, int v, unsigned int n);
+
 static const ElfExport g_elf_exports[] = {
     { "kmalloc",   (void*)&kmalloc       },
     { "kfree",     (void*)&kfree         },
     { "printk",    (void*)&serial_puts   },
     { "kern_fs_read", (void*)&kern_fs_read },
+    { "memcpy",    (void*)&memcpy        },
+    { "memset",    (void*)&memset        },
 };
 static const int g_elf_export_count =
     (int)(sizeof(g_elf_exports) / sizeof(g_elf_exports[0]));
@@ -408,7 +494,8 @@ static DriverStatus elf_load(const unsigned char* raw, uint32_t size,
         }
     }
 
-    /* ---- apply relocations ------------------------------------------- */
+    
+/* ---- apply relocations ------------------------------------------- */
     uint32_t applied = 0, failed = 0;
     for (uint32_t i = 0; i < eh->e_shnum; ++i) {
         const Elf32_Shdr* sh = (const Elf32_Shdr*)
@@ -611,6 +698,325 @@ static DriverHeader* elf_find_header(const unsigned char* raw, uint32_t size,
     return 0;
 }
 
+#if __SIZEOF_POINTER__ == 8
+/* ==========================================================================
+ * ELF64 loader (long mode)
+ * --------------------------------------------------------------------------
+ * Same pipeline as the ELF32 case -- validate, pack SHF_ALLOC sections into
+ * one contiguous buffer, apply relocations, locate nexos_driver_header --
+ * but with 64-bit section/symbol/relocation records and uintptr_t addresses.
+ *
+ * Takes ownership of 'raw' (frees it on every path).
+ * ========================================================================*/
+static int elf64_load_image(unsigned char* raw, uint32_t size, const char* path,
+                            void** out_base, uint32_t* out_size,
+                            ElfDriverImage** out_image)
+{
+    const Elf64_Ehdr* eh = (const Elf64_Ehdr*)raw;
+
+    /* ---- validate ---------------------------------------------------- */
+    if (size < sizeof(Elf64_Ehdr)) {
+        serial_puts("[ELF64] image too small for Ehdr\n");
+        kfree(raw); return DRIVER_ERR_IO;
+    }
+    if (eh->e_ident[EI_MAG0]     != 0x7F || eh->e_ident[EI_MAG0 + 1] != 'E' ||
+        eh->e_ident[EI_MAG0 + 2] != 'L'  || eh->e_ident[EI_MAG0 + 3] != 'F') {
+        serial_puts("[ELF64] bad magic\n");
+        kfree(raw); return DRIVER_ERR_INVALID_MAGIC;
+    }
+    if (eh->e_ident[EI_DATA] != ELFDATA2LSB) {
+        serial_puts("[ELF64] not little-endian\n");
+        kfree(raw); return DRIVER_ERR_IO;
+    }
+    if (eh->e_machine != EM_X86_64) {
+        serial_puts("[ELF64] not x86-64, machine=\n");
+        e_putdec(eh->e_machine);
+        kfree(raw); return DRIVER_ERR_IO;
+    }
+    if (eh->e_type != ET_REL && eh->e_type != ET_DYN) {
+        serial_puts("[ELF64] not REL/DYN\n");
+        kfree(raw); return DRIVER_ERR_IO;
+    }
+    if (eh->e_shnum == 0 || eh->e_shentsize != sizeof(Elf64_Shdr)) {
+        serial_puts("[ELF64] bad shdr table\n");
+        kfree(raw); return DRIVER_ERR_IO;
+    }
+    {
+        uint64_t need = eh->e_shoff + (uint64_t)eh->e_shnum * eh->e_shentsize;
+        if (need > (uint64_t)size) {
+            serial_puts("[ELF64] shdr table out of file\n");
+            kfree(raw); return DRIVER_ERR_IO;
+        }
+    }
+    serial_puts("[ELF64] magic/class/endian/machine OK, shnum=");
+    e_putdec(eh->e_shnum);
+    serial_puts("\n");
+
+    /* ---- pass 1: pack SHF_ALLOC sections ----------------------------- */
+    /* ET_REL carries sh_addr == 0, so assign 16-byte-aligned offsets first
+     * and rewrite them to real addresses once the buffer exists. */
+    uint64_t cursor = 0;
+    int alloc_sections = 0;
+    for (uint32_t i = 0; i < eh->e_shnum; ++i) {
+        Elf64_Shdr* sh = (Elf64_Shdr*)(raw + eh->e_shoff + (uint64_t)i * eh->e_shentsize);
+        if (!(sh->sh_flags & SHF_ALLOC) || sh->sh_size == 0) continue;
+        if (sh->sh_type != SHT_NOBITS &&
+            sh->sh_offset + sh->sh_size > (uint64_t)size) {
+            serial_puts("[ELF64] section out of file bounds\n");
+            kfree(raw); return DRIVER_ERR_IO;
+        }
+        alloc_sections++;
+        if (sh->sh_addr) continue;                 /* honour explicit address */
+        sh->sh_addr = cursor;
+        cursor += (sh->sh_size + 15u) & ~(uint64_t)15u;
+    }
+    if (!alloc_sections) {
+        serial_puts("[ELF64] no SHF_ALLOC sections\n");
+        kfree(raw); return DRIVER_ERR_IO;
+    }
+    if (cursor == 0 || cursor > (uint64_t)ELF_MAX_IMAGE) {
+        serial_puts("[ELF64] bad span\n");
+        kfree(raw); return DRIVER_ERR_IO;
+    }
+    uint64_t span = cursor;
+
+    /* ---- allocate + rewrite section addresses ------------------------ */
+    void* base = kmalloc((unsigned int)span);
+    if (!base) {
+        serial_puts("[ELF64] OOM for image span\n");
+        kfree(raw); return DRIVER_ERR_NO_MEMORY;
+    }
+    e_memset(base, 0, (unsigned int)span);
+    uintptr_t base_addr = (uintptr_t)base;
+
+    for (uint32_t i = 0; i < eh->e_shnum; ++i) {
+        Elf64_Shdr* sh = (Elf64_Shdr*)(raw + eh->e_shoff + (uint64_t)i * eh->e_shentsize);
+        if (!(sh->sh_flags & SHF_ALLOC) || sh->sh_size == 0) continue;
+        sh->sh_addr = (uint64_t)(base_addr + (uintptr_t)sh->sh_addr);
+    }
+    serial_puts("[ELF64] load base=");
+    e_puthex64((uint64_t)base_addr);
+    serial_puts(" span=");
+    e_puthex64(span);
+    serial_puts("\n");
+
+    /* ---- copy section payloads --------------------------------------- */
+    int copied = 0;
+    for (uint32_t i = 0; i < eh->e_shnum; ++i) {
+        const Elf64_Shdr* sh = (const Elf64_Shdr*)
+            (raw + eh->e_shoff + (uint64_t)i * eh->e_shentsize);
+        if (!(sh->sh_flags & SHF_ALLOC) || sh->sh_size == 0) continue;
+        uintptr_t dst = (uintptr_t)sh->sh_addr;
+        if (dst < base_addr || dst + sh->sh_size > base_addr + span) {
+            serial_puts("[ELF64] section overflows image\n");
+            kfree(base); kfree(raw); return DRIVER_ERR_IO;
+        }
+        if (sh->sh_type != SHT_NOBITS)
+            e_memcpy((void*)dst, raw + sh->sh_offset, (unsigned int)sh->sh_size);
+        copied++;
+    }
+    serial_puts("[ELF64] sections copied=");
+    e_putdec((uint32_t)copied);
+    serial_puts("\n");
+
+    /* ---- symtab / strtab --------------------------------------------- */
+    const Elf64_Shdr* symtab = 0;
+    const Elf64_Shdr* strtab = 0;
+    for (uint32_t i = 0; i < eh->e_shnum; ++i) {
+        const Elf64_Shdr* sh = (const Elf64_Shdr*)
+            (raw + eh->e_shoff + (uint64_t)i * eh->e_shentsize);
+        if (sh->sh_type == SHT_SYMTAB || sh->sh_type == SHT_DYNSYM) {
+            symtab = sh;
+            if (sh->sh_link < eh->e_shnum)
+                strtab = (const Elf64_Shdr*)
+                    (raw + eh->e_shoff + (uint64_t)sh->sh_link * eh->e_shentsize);
+            break;
+        }
+    }
+
+/* ---- apply relocations ------------------------------------------- */
+    uint32_t applied = 0, failed = 0;
+    for (uint32_t i = 0; i < eh->e_shnum; ++i) {
+        const Elf64_Shdr* sh = (const Elf64_Shdr*)
+            (raw + eh->e_shoff + (uint64_t)i * eh->e_shentsize);
+        if (sh->sh_type != SHT_REL && sh->sh_type != SHT_RELA) continue;
+        if (!symtab || !strtab) {
+            serial_puts("[ELF64] relocs but no symtab/strtab\n");
+            kfree(base); kfree(raw); return DRIVER_ERR_IO;
+        }
+        if (sh->sh_offset + sh->sh_size > (uint64_t)size) {
+            kfree(base); kfree(raw); return DRIVER_ERR_IO;
+        }
+        uint64_t entsz = (sh->sh_type == SHT_RELA) ? sizeof(Elf64_Rela)
+                                                   : sizeof(Elf64_Rel);
+        if (sh->sh_entsize && sh->sh_entsize != entsz) {
+            kfree(base); kfree(raw); return DRIVER_ERR_IO;
+        }
+        uint64_t count = sh->sh_size / entsz;
+
+        /* ET_REL: r_offset is relative to the section named by sh_info. */
+        uint64_t tgt_addr = 0;
+        int have_tgt = 0;
+        if (sh->sh_info < eh->e_shnum) {
+            const Elf64_Shdr* tgt = (const Elf64_Shdr*)
+                (raw + eh->e_shoff + (uint64_t)sh->sh_info * eh->e_shentsize);
+            tgt_addr = tgt->sh_addr;
+            have_tgt = (tgt->sh_size > 0);
+        }
+
+        for (uint64_t r = 0; r < count; ++r) {
+            const unsigned char* ent = raw + sh->sh_offset + r * entsz;
+            uint64_t off;
+            uint64_t info;
+            int64_t addend = 0;
+            if (sh->sh_type == SHT_RELA) {
+                const Elf64_Rela* ra = (const Elf64_Rela*)ent;
+                off = ra->r_offset; info = ra->r_info; addend = ra->r_addend;
+            } else {
+                const Elf64_Rel* rr = (const Elf64_Rel*)ent;
+                off = rr->r_offset; info = rr->r_info;
+            }
+            uint32_t type = ELF64_R_TYPE(info);
+            uint32_t symi = ELF64_R_SYM(info);
+            if (type == R_X86_64_NONE) continue;
+            if (!have_tgt) { failed++; continue; }
+            off += tgt_addr;
+            if (off < (uint64_t)base_addr || off + 8 > (uint64_t)base_addr + span) {
+                failed++; continue;
+            }
+
+            uint64_t symval = 0;
+            if (symi) {
+                if ((uint64_t)symi * sizeof(Elf64_Sym) + sizeof(Elf64_Sym) > symtab->sh_size) {
+                    failed++; continue;
+                }
+                const Elf64_Sym* sym = (const Elf64_Sym*)
+                    (raw + symtab->sh_offset + (uint64_t)symi * sizeof(Elf64_Sym));
+                if (sym->st_shndx == 0) {                 /* undefined -> kernel */
+                    if (sym->st_name >= strtab->sh_size) { failed++; continue; }
+                    const char* nm = (const char*)(raw + strtab->sh_offset + sym->st_name);
+                    void* ext = elf_resolve(nm);
+                    if (!ext) {
+serial_puts("[ELF64] unresolved import: ");
+                        serial_puts(nm);
+                        serial_puts("\n");
+                        failed++;
+                        continue;
+                    }
+                    symval = (uint64_t)(uintptr_t)ext;
+                } else if (sym->st_shndx < eh->e_shnum) {
+                    const Elf64_Shdr* defsec = (const Elf64_Shdr*)
+                        (raw + eh->e_shoff + (uint64_t)sym->st_shndx * eh->e_shentsize);
+                    symval = defsec->sh_addr + sym->st_value;
+                } else {
+                    symval = sym->st_value;               /* SHN_ABS */
+                }
+            }
+
+            uintptr_t P = base_addr + (uintptr_t)(off - (uint64_t)base_addr);
+            switch (type) {
+            case R_X86_64_64:
+                *(uint64_t*)P = symval + (uint64_t)addend;
+                break;
+            case R_X86_64_PC32:
+            case R_X86_64_PLT32: {
+                int64_t v = (int64_t)symval + addend - (int64_t)P;
+                *(int32_t*)P = (int32_t)v;
+                break;
+            }
+            case R_X86_64_32:
+            case R_X86_64_32S: {
+                int64_t v = (int64_t)symval + addend;
+                *(uint32_t*)P = (uint32_t)v;
+                break;
+            }
+            default:
+                serial_puts("[ELF64] unsupported reloc type\n");
+                e_putdec(type);
+                serial_puts("\n");
+                failed++;
+                continue;
+            }
+            applied++;
+        }
+    }
+    serial_puts("[ELF64] relocs applied=");
+    e_putdec(applied);
+    serial_puts(" failed=");
+    e_putdec(failed);
+    serial_puts("\n");
+    if (failed) {
+        serial_puts("[ELF64] relocation failure - refusing image\n");
+        kfree(base); kfree(raw);
+        return DRIVER_ERR_SYMBOL_NOT_FOUND;
+    }
+
+    /* ---- locate the nexos_driver_header export ----------------------- */
+    DriverHeader* hdr = 0;
+    if (!symtab || !strtab) {
+        serial_puts("[ELF64] no symbol table (strip?)\n");
+    } else {
+        uint64_t scount = symtab->sh_size / sizeof(Elf64_Sym);
+        for (uint64_t i = 0; i < scount; ++i) {
+            const Elf64_Sym* sym = (const Elf64_Sym*)
+                (raw + symtab->sh_offset + i * sizeof(Elf64_Sym));
+            if (!sym->st_name || sym->st_name >= strtab->sh_size) continue;
+            if (sym->st_shndx == 0) continue;
+            const char* nm = (const char*)(raw + strtab->sh_offset + sym->st_name);
+            if (e_strlen(nm) < 18) continue;
+            if (!(nm[0]=='n'&&nm[1]=='e'&&nm[2]=='x'&&nm[3]=='o'&&nm[4]=='s'&&
+                  nm[5]=='_'&&nm[6]=='d'&&nm[7]=='r'&&nm[8]=='i'&&nm[9]=='v'&&
+                  nm[10]=='e'&&nm[11]=='r'&&nm[12]=='_'&&nm[13]=='h'&&
+                  nm[14]=='e'&&nm[15]=='a'&&nm[16]=='d'&&nm[17]=='e')) continue;
+            uint64_t addr = sym->st_value;
+            if (sym->st_shndx < eh->e_shnum) {
+                const Elf64_Shdr* defsec = (const Elf64_Shdr*)
+                    (raw + eh->e_shoff + (uint64_t)sym->st_shndx * eh->e_shentsize);
+                addr = defsec->sh_addr + sym->st_value;
+            }
+            if (addr < (uint64_t)base_addr || addr + sizeof(DriverHeader) > (uint64_t)base_addr + span) {
+                serial_puts("[ELF64] header symbol outside image\n");
+                continue;
+            }
+            serial_puts("[ELF64] found export ");
+            serial_puts(nm);
+            serial_puts("\n");
+            hdr = (DriverHeader*)(uintptr_t)addr;
+            break;
+        }
+    }
+
+    if (!hdr) {
+        kfree(base); kfree(raw);
+        return DRIVER_ERR_IO;
+    }
+
+    ElfDriverImage* img = (ElfDriverImage*)kmalloc(sizeof(ElfDriverImage));
+    if (!img) {
+        serial_puts("[ELF64] OOM for image record\n");
+        kfree(base); kfree(raw);
+        return DRIVER_ERR_NO_MEMORY;
+    }
+    e_memset(img, 0, sizeof(*img));
+    img->name       = path;
+    img->header     = hdr;
+    img->image_base = base;
+    img->image_size = (uint32_t)span;
+    img->load_span  = (uint32_t)span;
+    img->entry      = 0;                      /* ET_REL has no entry point */
+
+    kfree(raw);                               /* file bytes no longer needed */
+
+    *out_base  = img->image_base;
+    *out_size  = img->image_size;
+    *out_image = img;
+    return DRIVER_OK;
+}
+
+
+
+#endif  /* __SIZEOF_POINTER__ == 8: ELF64 loader */
+
 /* ==========================================================================
  * Public entry point, called by driver_loader.c in place of mock_read_file().
  * ========================================================================*/
@@ -625,7 +1031,14 @@ int driver_elf_read(const char* path, void** out_base, uint32_t* out_size,
      * size when the caller asks for more than one page. */
     const int PROBE = 4096;
     unsigned char* raw = (unsigned char*)kmalloc(PROBE);
-    if (!raw) return DRIVER_ERR_NO_MEMORY;
+    if (!raw) {
+        /* Silent before: a heap that is not up yet made the very first
+         * allocation fail and the caller only saw DRIVER_ERR_NO_MEMORY. */
+        serial_puts("[ELF] OOM for probe buffer ");
+        e_putdec((uint32_t)PROBE);
+        serial_puts("\n");
+        return DRIVER_ERR_NO_MEMORY;
+    }
 
     int n = kern_fs_read(path, raw, PROBE);
     if (n <= 0) {
@@ -636,14 +1049,33 @@ int driver_elf_read(const char* path, void** out_base, uint32_t* out_size,
         return DRIVER_ERR_IO;
     }
 
-    /* ELF images are normally larger than the probe.  The SFS reader clamps
-     * to bufsize, so a full probe means "may be truncated" -> re-read with a
-     * generous buffer.  A driver image is capped at ELF_MAX_IMAGE. */
+    /* The SFS reader clamps to bufsize, so a full probe means "possibly
+     * truncated".  Ask the filesystem for the TRUE size and allocate exactly
+     * that, rather than blindly grabbing ELF_MAX_IMAGE (4 MiB).
+     *
+     * This used to kmalloc(ELF_MAX_IMAGE) on every driver whose size was a
+     * multiple of the probe size.  At the point driver_boot_scan() runs --
+     * right after the root filesystem is mounted, before the GUI heap has
+     * grown -- a 4 MiB allocation fails, so every such driver reported
+     * DRIVER_ERR_NO_MEMORY (-4) and was silently skipped.  Sizing the buffer
+     * from the file's own metadata costs one extra stat and makes the load
+     * independent of how early it happens. */
     uint32_t size = (uint32_t)n;
     if (n == PROBE) {
-        unsigned char* big = (unsigned char*)kmalloc(ELF_MAX_IMAGE);
-        if (!big) { kfree(raw); return DRIVER_ERR_NO_MEMORY; }
-        int n2 = kern_fs_read(path, big, (int)ELF_MAX_IMAGE);
+        int real = kern_fs_size ? kern_fs_size(path) : -1;
+        uint32_t want = (real > 0) ? (uint32_t)real : (uint32_t)ELF_MAX_IMAGE;
+        if (want < (uint32_t)PROBE) want = (uint32_t)PROBE;
+        if (want > (uint32_t)ELF_MAX_IMAGE) want = (uint32_t)ELF_MAX_IMAGE;
+        /* A driver image must at least be able to hold an ELF header. */
+        unsigned char* big = (unsigned char*)kmalloc(want);
+        if (!big) {
+            serial_puts("[ELF] OOM for file buffer ");
+            e_putdec(want);
+            serial_puts("\n");
+            kfree(raw);
+            return DRIVER_ERR_NO_MEMORY;
+        }
+        int n2 = kern_fs_read(path, big, (int)want);
         if (n2 <= 0) { kfree(raw); kfree(big); return DRIVER_ERR_IO; }
         kfree(raw);
         raw  = big;
@@ -655,6 +1087,29 @@ int driver_elf_read(const char* path, void** out_base, uint32_t* out_size,
     serial_puts(path);
     serial_puts("\n");
 
+    /* ---- 2a) ELF64 dispatch (purely additive) -----------------------
+     * A long-mode kernel cannot execute ELF32 and a 32-bit kernel cannot
+     * execute ELF64, so e_ident[EI_CLASS] selects the pipeline.  An
+     * ELFCLASS32 image never enters this branch, which keeps the 32-bit
+     * loading path below unchanged.
+     *
+     * The ELF64 branch is compiled only for 64-bit builds: DriverHeader and
+     * every pointer inside it are pointer-sized, so parsing an ELF64 image in
+     * a 32-bit kernel would silently read fields at the wrong offsets.  There
+     * we refuse it as a wrong-architecture image instead. */
+#if __SIZEOF_POINTER__ == 8
+    if (size >= EI_NIDENT && raw[EI_CLASS] == ELFCLASS64)
+        return elf64_load_image(raw, size, path, out_base, out_size, out_image);
+#else
+    if (size >= EI_NIDENT && raw[EI_CLASS] == ELFCLASS64) {
+        serial_puts("[ELF] ELF64 image on a 32-bit kernel - skipped: ");
+        serial_puts(path);
+        serial_puts("\n");
+        kfree(raw);
+        return DRIVER_ERR_IO;
+    }
+#endif
+
     /* ---- 2) validate ------------------------------------------------ */
     Elf32_Ehdr eh;
     DriverStatus st = elf_validate(raw, size, &eh);
@@ -662,7 +1117,13 @@ int driver_elf_read(const char* path, void** out_base, uint32_t* out_size,
 
     /* ---- 3) load + relocate ----------------------------------------- */
     ElfDriverImage* img = (ElfDriverImage*)kmalloc(sizeof(ElfDriverImage));
-    if (!img) { kfree(raw); return DRIVER_ERR_NO_MEMORY; }
+    if (!img) {
+        serial_puts("[ELF] OOM for image record ");
+        e_putdec((uint32_t)sizeof(ElfDriverImage));
+        serial_puts("\n");
+        kfree(raw);
+        return DRIVER_ERR_NO_MEMORY;
+    }
     e_memset(img, 0, sizeof(*img));
     img->name = path;
 

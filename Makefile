@@ -148,7 +148,7 @@ ISO        := $(BUILD)/os.iso
 ISO_ROOT   := $(BUILD)/iso_root
 HYBRID_IMG := $(BUILD)/os_hybrid.img
 
-.PHONY: all clean run test test-ai test-net test-gguf disasm uefi uefi-run uefi-test sfs \
+.PHONY: all clean run test test-ai test-net test-gguf disasm uefi uefi-run uefi-test sfs fontvec-drv fontvec-stage \
         bios-run bios-test \
         iso iso-run iso-run-uefi iso-test iso-test-uefi \
         hybrid hybrid-run hybrid-run-uefi hybrid-test hybrid-test-uefi \
@@ -247,6 +247,112 @@ $(BUILD)/driver_elf.o: drivers/driver_elf.c drivers/driver_contract.h | $(BUILD)
 	$(DRIVER_C) -m32 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
 		-fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra \
 		-Idrivers -c $< -o $@
+
+# ---------------------------------------------------------------------
+#  font_vec as a hot-loadable driver  (task-8: architecture decoupling)
+# ---------------------------------------------------------------------
+#  The TrueType rasteriser (font_vec.c + stb_truetype) is product code,
+#  not kernel core.  Build it as a standalone ELF REL driver image that
+#  the loader relocates at boot, instead of linking it into the kernel.
+#
+#  Bitness matters: a driver loaded by the 64-bit kernel is executed in
+#  long mode, so it MUST be ELF64.  The image is therefore built with the
+#  $(CC64) driver (-m64) and linked with -m elf_x86_64.  The 32-bit
+#  font_vec.o used by kernel.elf is untouched (32-bit side is frozen).
+#
+#  DRV64_CFLAGS is the driver-module variant of CXX64FLAGS: no
+#  -mcmodel=kernel (a module is placed wherever the loader maps it, so it
+#  must stay PC-relative) and -mno-red-zone (kernel interrupt handlers
+#  share the stack, so the 128-byte red zone is unsafe).
+# ---------------------------------------------------------------------
+DRV64_CFLAGS := -m64 -mno-red-zone -ffreestanding -fno-stack-protector \
+                -fno-pic -fno-pie -fcf-protection=none \
+                -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra
+
+# NOTE: the image is produced in $(BUILD), NOT staged into $(SFS_DIR)
+# automatically.  A 64-bit ELF driver cannot be loaded by the current
+# ELF32-only loader, and the 32-bit boot scan enumerates every *.drv on SFS --
+# shipping it early would make a healthy boot log a spurious
+# "[DRIVER] load failed rc=5 -- skipped" line.  Run `make fontvec-stage` once
+# the 64-bit loader exists.
+FONTVEC_DRV      := $(BUILD)/fontvec.drv
+FONTVEC_STAGED   := $(SFS_DIR)/fontvec.drv
+FONTVEC_DRV_OBJS := $(BUILD)/fontvec_text.o $(BUILD)/fontvec_driver.o
+
+# The rasteriser itself, exactly as the kernel builds it, but -m64.
+$(BUILD)/fontvec_text.o: font_vec.c font_vec.h tools/stb/stb_truetype.h | $(BUILD)
+	$(CC64) -x c $(DRV64_CFLAGS) -I tools/stb -I tools/vecmath \
+		-c font_vec.c -o $@
+
+# The driver wrapper: publishes nexos_driver_header + the API table.
+$(BUILD)/fontvec_driver.o: drivers/font_vec_driver.c drivers/driver_contract.h font_vec.h | $(BUILD)
+	$(CC64) -x c $(DRV64_CFLAGS) -Idrivers -I. \
+		-c drivers/font_vec_driver.c -o $@
+
+# Link the two into one ET_REL image.  Kernel imports (kmalloc/kfree/
+# memcpy/memset) stay UNDEFINED on purpose: the loader binds them at load
+# time from its export table, so the image is not statically linkable to a
+# particular kernel build.
+$(FONTVEC_DRV): $(FONTVEC_DRV_OBJS) | $(BUILD)
+	$(LD64) -m elf_x86_64 -r -o $@ $(FONTVEC_DRV_OBJS)
+	@echo "    fontvec.drv -> $@ (ELF64 ET_REL)"
+
+fontvec-drv: $(FONTVEC_DRV)
+
+# Explicit opt-in: copy the driver image into the SFS staging directory so the
+# next SFS rebuild packs it.  Do NOT make this part of `all` until the 64-bit
+# kernel can actually relocate an ELF64 driver.
+# The staging copy is now a first-class build product: the 64-bit kernel
+# loads it at boot, so it must be on the SFS volume (see SFS_IMG below).
+$(FONTVEC_STAGED): $(FONTVEC_DRV)
+	cp $(FONTVEC_DRV) $(FONTVEC_STAGED)
+	@echo "    staged $(FONTVEC_STAGED)"
+
+fontvec-stage: $(FONTVEC_STAGED)
+
+# ---------------------------------------------------------------------
+#  stub.drv -- hardware-independent load-path driver
+# ---------------------------------------------------------------------
+#  A minimal ELF32 driver whose init() does nothing but return 0: no MSR,
+#  no CPUID, no allocation, no privileged instruction.  It exists so the
+#  boot-time scan can be exercised end to end on ANY cpu -- svm.drv needs
+#  real AMD-V, so on ordinary hardware the scan can never log a successful
+#  load without this image.  It is loaded by exactly the same code path as
+#  any production driver (SFS scan -> ELF relocate -> init()).
+STUB_DRV    := $(BUILD)/stub.drv
+STUB_STAGED := $(SFS_DIR)/stub.drv
+
+$(BUILD)/stub_driver.o: drivers/stub_driver.c drivers/driver_contract.h | $(BUILD)
+	$(DRIVER_C) -m32 -ffreestanding -nostdlib -fno-pic -fno-pie \
+		-fno-stack-protector -fno-asynchronous-unwind-tables -Os -Wall -Wextra \
+		-Idrivers -c $< -o $@
+
+# ET_REL on purpose: the loader relocates the image at load time.
+$(STUB_DRV): $(BUILD)/stub_driver.o | $(BUILD)
+	ld -m elf_i386 -r -o $@ $(BUILD)/stub_driver.o
+	@echo "    stub.drv -> $@ (ELF32 ET_REL)"
+
+$(STUB_STAGED): $(STUB_DRV)
+	cp $(STUB_DRV) $@
+	@echo "    staged $(STUB_STAGED)"
+
+stub-drv: $(STUB_STAGED)
+
+# ---------------------------------------------------------------------
+#  Hot-loadable driver framework, 64-bit build  (task-8)
+# ---------------------------------------------------------------------
+#  driver_loader.c + driver_elf.c used to be linked ONLY into the 32-bit
+#  kernel, so the long-mode kernel had no way to accommodate a .drv at all.
+#  They are plain freestanding C, so they compile unchanged for -m64; the
+#  ELF reader picks ELF32 vs ELF64 from the image's e_ident[EI_CLASS], which
+#  means ONE build of this file serves both kernels.
+DRIVER_FW_OBJS64 := $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o
+
+$(BUILD)/driver_loader64.o: drivers/driver_loader.c drivers/driver_contract.h | $(BUILD)
+	$(DRIVER_C) $(DRV64_CFLAGS) -Idrivers -c $< -o $@
+
+$(BUILD)/driver_elf64.o: drivers/driver_elf.c drivers/driver_contract.h | $(BUILD)
+	$(DRIVER_C) $(DRV64_CFLAGS) -Idrivers -c $< -o $@
 
 # compile each plugin .cpp in place (header "plugin_manager.h" sits next to it)
 $(BUILD)/plugin_manager.o: plugins/plugin_manager.cpp plugins/plugin_manager.h | $(BUILD)
@@ -450,7 +556,7 @@ $(SFS_DIR)/%.bc: $(SFS_DIR)/%.skill tools/skillc.py | $(BUILD)
 
 skillbc: $(SKILL_BCS)
 
-$(SFS_IMG): $(wildcard $(SFS_DIR)/*) $(wildcard $(SFS_DIR)/*/*) tools/sfs_gen.py tools/tex_pack.py $(SKILL_BCS) $(SFS_DIR)/userdemo $(SFS_DIR)/hello.mex $(SFS_DIR)/shell.mex $(SFS_DIR)/hello.nex | $(BUILD)
+$(SFS_IMG): $(wildcard $(SFS_DIR)/*) $(wildcard $(SFS_DIR)/*/*) $(STUB_STAGED) $(FONTVEC_STAGED) tools/sfs_gen.py tools/tex_pack.py $(SKILL_BCS) $(SFS_DIR)/userdemo $(SFS_DIR)/hello.mex $(SFS_DIR)/shell.mex $(SFS_DIR)/hello.nex | $(BUILD)
 	$(PYTHON) tools/tex_pack.py
 	$(PYTHON) tools/sfs_gen.py $(SFS_DIR) $@
 
@@ -753,6 +859,12 @@ $(IMG): $(BUILD)/boot.bin $(BUILD)/stage2.bin $(BUILD)/kernel.bin $(BUILD)/kerne
 	 secs=$$(sed -n 's/^#define[[:space:]]*KERNEL64_SECTORS[[:space:]]*\([0-9]*\).*/\1/p' kernel.cpp | head -1); \
 	 gap=$$(( ($(SFS_LBA) - 2048) * 512 )); \
 	 lim=$$(( $$secs * 512 )); \
+	 if [ $$k64sz -gt $$(( $$secs * 512 )) ]; then \
+	   echo "*** ERROR: kernel64.bin ($$k64sz bytes) exceeds the KERNEL64_SECTORS window ($$(( $$secs * 512 )) bytes)."; \
+	   echo "***        The 32-bit side can only stage that many sectors, so the image would be"; \
+	   echo "***        truncated before switch_to_64bit() ever sees it."; \
+	   exit 1; \
+	 fi; \
 	 if [ $$lim -gt $$gap ]; then lim=$$gap; fi; \
 	 if [ $$k64sz -gt $$lim ]; then \
 	   echo "*** ERROR: kernel64.bin is $$k64sz bytes but only $$lim bytes are reachable."; \
@@ -987,8 +1099,8 @@ TEXTBOOT_IMG := $(BUILD)/os_textboot.img
 $(BUILD)/kernel_textboot.o: kernel.cpp | $(BUILD)
 	$(CC) $(CXXFLAGS) -DTEXT_BOOT -c kernel.cpp -o $@
 
-$(BUILD)/kernel_textboot.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_textboot.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o | $(BUILD)
-	$(LD) $(LDFLAGS) -o $@ $^
+$(BUILD)/kernel_textboot.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_textboot.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS) linker.ld | $(BUILD)
+	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_textboot.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS)
 
 $(BUILD)/kernel_textboot.bin: $(BUILD)/kernel_textboot.elf | $(BUILD)
 	$(OBJCOPY) -O binary $< $@
@@ -1414,11 +1526,18 @@ $(BUILD)/entry64.o: .attic64/entry64.asm | $(BUILD)
 $(BUILD)/switch64to32.o: .attic64/switch64to32.asm | $(BUILD)
 	$(AS) $(AS64FLAGS) -o $@ .attic64/switch64to32.asm
 
-$(BUILD)/switch32to64.o: .attic64/switch32to64.asm | $(BUILD)
-	$(AS) $(ASFLAGS_ELF) -o $@ .attic64/switch32to64.asm
+# Depends on kernel64.bin: the blit length is derived from the REAL image size,
+# so growing kernel64 can never again leave part of it un-copied (the failure
+# mode is silent zero pages at run time, which is exactly what we hit).
+$(BUILD)/switch32to64.o: .attic64/switch32to64.asm $(BUILD)/kernel64.bin | $(BUILD)
+	@k64bytes=$$(stat -c%s $(BUILD)/kernel64.bin); \
+	 echo "    switch32to64: blitting $$k64bytes bytes of kernel64.bin"; \
+	 $(AS) $(ASFLAGS_ELF) -DKERNEL64_BYTES=$$k64bytes -o $@ .attic64/switch32to64.asm
 
-$(BUILD)/kernel64.o: .attic64/kernel64.cpp | $(BUILD)
-	$(CC64) $(CXX64FLAGS) -c .attic64/kernel64.cpp -o $@
+# -Idrivers: kernel64.cpp includes driver_contract.h for the driver-scan
+# hookup (task-8) and font_vec.h for the vec_* forwarding shims.
+$(BUILD)/kernel64.o: .attic64/kernel64.cpp drivers/driver_contract.h font_vec.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -Idrivers -c .attic64/kernel64.cpp -o $@
 
 $(BUILD)/smp64.o: .attic64/smp64.cpp .attic64/smp64.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c .attic64/smp64.cpp -o $@
@@ -1495,8 +1614,8 @@ $(BUILD)/clr64.o: clr.cpp | $(BUILD)
 $(BUILD)/mforms64.o: mforms.cpp | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -fno-optimize-sibling-calls -c mforms.cpp -o $@
 
-$(BUILD)/kernel64.elf: $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/silent_telemetry64.o $(BUILD)/gui64.o $(BUILD)/font_vec64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o .attic64/linker64.ld | $(BUILD)
-	$(LD64) $(LDFLAGS64) -o $@ $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/font_vec64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o
+$(BUILD)/kernel64.elf: $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/silent_telemetry64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o .attic64/linker64.ld | $(BUILD)
+	$(LD64) $(LDFLAGS64) -o $@ $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o
 $(BUILD)/ap_trampoline.o: .attic64/ap_trampoline.asm | $(BUILD)
 	$(AS) -f bin -o $(BUILD)/ap_trampoline.bin .attic64/ap_trampoline.asm
 	$(OBJCOPY64) -I binary -O elf64-x86-64 -B i386 --rename-section .data=.rodata $(BUILD)/ap_trampoline.bin $@

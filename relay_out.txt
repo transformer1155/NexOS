@@ -1,3 +1,0 @@
-[relay] pipe connected after 0.0s
-[relay] listening tcp 127.0.0.1:4399
-[relay] bridge connected

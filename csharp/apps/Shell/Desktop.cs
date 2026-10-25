@@ -140,6 +140,15 @@ namespace NexOS.Forms
         // BUG-#11 (gap 3): frames of forced animation repaint still owed after a
         // virtual-desktop switch, so the last OPAQUE close frame reaches the LFB.
         static int menuCloseFrames = 0;
+        // BUG-#10: set by Paint() on any frame that actually redraws the desktop
+        // layer (the real wallpaper), cleared at the end of PaintOverlay().  The
+        // Start-menu erase path uses it to tell "the real background was just
+        // painted" from "we are looking at a retained backbuffer that still has
+        // the panel in it".
+        static int bgPaintedThisFrame = 0;
+        // Frames spent waiting for that real repaint; bounded so a pathological
+        // host can never spin here forever.
+        static int smEraseWait = 0;
         static int startRClickIdx = -1;   // tile / all-apps row under right-click
 
         // P0-1: desktop icon selection state (-1 = none, 0..dN-1 = selected)
@@ -854,6 +863,10 @@ namespace NexOS.Forms
         // =============================================================
         public static void Paint(int w, int h)
         {
+            // BUG-#10: this is the ONLY place the real wallpaper is drawn.  Tell
+            // the Start-menu erase path that the true background is on screen for
+            // this frame, so it must not paint a synthetic band over it.
+            bgPaintedThisFrame = 1;
             ShellTheme();
             if (CurrentDesktop == 1) { AiDesktopPaint(w, h); return; }
             Wallpaper(w, h);
@@ -1502,6 +1515,10 @@ namespace NexOS.Forms
                         Host.SetAnim(0);   // settled: idle desktop costs zero frames
                 }
             }
+            // BUG-#10: the frame is over.  Paint() re-arms this on any frame that
+            // actually redraws the desktop layer, so the Start-menu erase path can
+            // trust it to mean "this frame", not "some earlier frame".
+            bgPaintedThisFrame = 0;
         }
 
         static void Taskbar(int w, int h)
@@ -1709,16 +1726,13 @@ namespace NexOS.Forms
             if (rx + rw > w) rw = w - rx;
             if (ry + rh > h) rh = h - ry;
             if (rw <= 0 || rh <= 0) return;
-            if (Gfx.HasImage(Tex.Wall) != 0)
-            {
-                // A texture wallpaper has no cheap per-band source, so lay down
-                // the gradient base colour.  The desktop layer repaint restores
-                // the real texture within a frame; this only guarantees the
-                // panel cannot persist on screen.
-                uint basec = WallC(h, ry + rh / 2);
-                Gfx.Gradient(rx, ry, rw, rh, basec, basec);
-                return;
-            }
+            // BUG-#10: this band painter is now only a LAST-RESORT fallback (see
+            // the StartMenu close path, which prefers waiting for the real desktop
+            // repaint).  It must never fill a flat colour: doing that over a small
+            // part of a gradient/bitmap wallpaper is exactly the hard-edged colour
+            // block the user reported.  Always paint the true vertical gradient so
+            // the worst case blends with the analytic wallpaper (Wallpaper()'s
+            // non-texture path) instead of standing out as a solid rectangle.
             Gfx.Gradient(rx, ry, rw, rh, WallC(h, ry), WallC(h, ry + rh));
         }
 
@@ -1729,19 +1743,62 @@ namespace NexOS.Forms
             int enter = (int)Anim.Get(START_KEY);
             if (!menuOpen && enter == 0)
             {
-                // BUG-#11 (gap 2): the panel was drawn on an earlier frame but the
-                // menu is now fully closed.  Erase it before returning -- otherwise
-                // the translucent backdrop stays in the backbuffer forever (the
-                // ghost menu) because nothing guarantees another desktop repaint.
+                // BUG-#11 (gap 2) / BUG-#10: the panel was drawn on an earlier frame
+                // but the menu is now fully closed, so those pixels must be replaced.
+                //
+                // The old code painted a synthetic band here and was WRONG twice over:
+                //   1. When the wallpaper is a texture it painted ONE flat colour,
+                //      leaving a hard-edged block where a gradient had been.
+                //   2. Worse, Paint() (which draws the real wallpaper) and
+                //      PaintOverlay() (this function) run in the SAME frame, desktop
+                //      layer first.  So on the frame the desktop layer restored the
+                //      true wallpaper, this code immediately stamped the flat band
+                //      back on top of it -- and because it cleared startMenuDrawn it
+                //      was never corrected afterwards.  That is the permanent residue
+                //      the pixel diff measured (25.87%).
+                //
+                // Correct behaviour: if Paint() already drew the real background this
+                // frame there is nothing left to erase -- just drop the bookkeeping.
+                // Otherwise ask for frames and WAIT for that real repaint rather than
+                // approximating it.  C# cannot read back pixels (no Gfx pixel API, and
+                // Image() has no source-rect crop), so the native desktop layer is the
+                // only thing that can put the true pixels back.
                 if (startMenuDrawn != 0)
                 {
-                    RepaintWallpaperBand(w, h, smDrawnX, smDrawnY, smDrawnW, smDrawnH);
-                    startMenuDrawn = 0;
-                    // Keep frames coming for a moment: the band repaint is exact
-                    // for the wallpaper, but it cannot restore windows that were
-                    // behind the panel, so make sure the desktop layer recomposites
-                    // and the erased band reaches the screen.
-                    Host.SetAnim(1);
+                    if (bgPaintedThisFrame != 0)
+                    {
+                        // The desktop layer redrew the REAL wallpaper this frame, so
+                        // the panel pixels are already gone -- nothing to erase.
+                        startMenuDrawn = 0;
+                    }
+                    else if (Host.RunningMask() == 0)
+                    {
+                        // No desktop repaint arrived, but no application window is on
+                        // screen either, so we can repaint the REAL desktop ourselves:
+                        // Paint() is exactly the code the desktop layer runs, so the
+                        // result matches the real wallpaper pixel for pixel (texture OR
+                        // gradient) instead of approximating one band.  The taskbar
+                        // belongs to this overlay layer and sits under the panel, so
+                        // redraw it too; Popup/Toast/HUD are painted after this call.
+                        //
+                        // The RunningMask() guard is load-bearing: the native
+                        // compositor draws windows BETWEEN the desktop layer and this
+                        // overlay, so repainting the desktop while a window is up would
+                        // erase that window.
+                        Paint(w, h);
+                        Taskbar(w, h);
+                        startMenuDrawn = 0;
+                    }
+                    else
+                    {
+                        // A window is open, so a full desktop repaint is not allowed
+                        // here.  Fall back to the true gradient band -- never a flat
+                        // colour, which is what produced the hard-edged block.
+                        RepaintWallpaperBand(w, h, smDrawnX, smDrawnY, smDrawnW, smDrawnH);
+                        startMenuDrawn = 0;
+                    }
+                    smEraseWait = 0;
+                    Host.SetAnim(1);       // let this frame reach the LFB
                     menuCloseFrames = 3;
                 }
                 return;
@@ -2018,6 +2075,7 @@ namespace NexOS.Forms
         internal static void OpenStartMenu(int showAll, int w, int h)
         {
             menuOpen = true;
+            smEraseWait = 0;   // BUG-#10: fresh close sequence
             Host.SetAnim(1);   // kick open/close transition repaints
             Anim.Set(START_KEY, 1000, Anim.DUR_SLIDE, 1);   // real open tween (event-driven)
             startView = (showAll != 0) ? 1 : 0;

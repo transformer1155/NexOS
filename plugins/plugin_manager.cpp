@@ -288,17 +288,16 @@ void plugin_manager_boot(void) {
      * block the boot: log it and continue.
      */
     {
+        /* The generic boot scan (driver_boot_scan(), called from kmain right
+         * after heap_init()) already enumerates the SFS volume and loads every
+         * .drv image found there.  This block used to ALSO load one hardcoded
+         * image ("svm.drv") a second time, duplicating the scan's work and
+         * making it ambiguous who owns driver bring-up.  Only the framework
+         * bring-up and the log dump remain.
+         *
+         * driver_subsystem_init() is idempotent: if the scan already registered
+         * drivers, it leaves that registry intact rather than wiping it. */
         driver_subsystem_init();
-        {
-            int drc = driver_load("svm.drv");
-            if (drc == 0) {
-                pm_serial("[PM] driver loaded: svm.drv\n");
-            } else {
-                pm_serial("[PM] driver svm.drv not loaded rc=");
-                pm_serial_byte((uint8_t)('0' + ((drc < 0 ? -drc : drc) % 10)));
-                pm_serial(" - continuing\n");
-            }
-        }
         driver_dump();
     }
 }
