@@ -15,7 +15,7 @@ VIDEO="build/agent_demo.avi"
 
 # DeepSeek API key (provided by user).  The guest sends this as the
 # Authorization header; the host proxy forwards it to api.deepseek.com.
-DEEPSEEK_KEY="sk-1a841c4d516b46ac95ac7171b0b2db86"
+DEEPSEEK_KEY=""
 AGENT_GOAL="Format the data disk with mkfs. Next: fwrite demo.txt hello nexos. Last: cat demo.txt."
 
 pkill -f "qemu-system" 2>/dev/null
