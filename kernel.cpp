@@ -1065,7 +1065,27 @@ static bool ata_wait_drq_base(uint16_t base){
 static bool ata_wait_bsy(){ return ata_wait_bsy_base(0x1F0); }
 static bool ata_wait_drq(){ return ata_wait_drq_base(0x1F0); }
 
-static void ata_read_sector_dev(int dev, uint32_t lba, uint16_t* buf){
+// Diagnostics for the silent-failure path below: a sector read that times out
+// returns without touching the caller's buffer, so the caller sees whatever
+// was already in that memory (e.g. a freed SFS superblock buffer) and cannot
+// tell it apart from a successful read.
+static volatile uint32_t g_ata_rd_fail      = 0;
+static volatile uint32_t g_ata_rd_fail_lba  = 0xFFFFFFFFu;
+static volatile uint32_t g_ata_rd_fail_stage = 0;   // 1=bsy, 2=bsy2, 3=drq
+static volatile uint32_t g_ata_last_status  = 0;
+
+// ATA soft reset (SRST) on the channel control port.
+static void ata_soft_reset(uint16_t base){
+    uint16_t ctl = (uint16_t)(base + 0x206u);   // 0x3F6 primary / 0x376 secondary
+    outb(ctl, 0x04);                            // SRST asserted
+    for (volatile int i = 0; i < 20000; i++) {}
+    outb(ctl, 0x00);                            // release
+    for (volatile int i = 0; i < 500000; i++) {}
+}
+
+// Returns true when the sector really was transferred.  A false return means
+// the buffer was NOT touched -- callers must check.
+static bool ata_read_sector_dev(int dev, uint32_t lba, uint16_t* buf){
     // Pump the boot animation from the one place every slow boot step shares.
     //
     // Measuring the cadence rather than guessing at it showed the animation was
@@ -1084,17 +1104,36 @@ static void ata_read_sector_dev(int dev, uint32_t lba, uint16_t* buf){
     boot_splash_tick();
 
     uint16_t base = dev ? 0x170 : 0x1F0;
-    if(!ata_wait_bsy_base(base)) return;
-    outb(base+6, 0xE0 | ((lba>>24)&0x0F));
-    outb(base+1, 0x00);
-    outb(base+2, 1);
-    outb(base+3, lba & 0xFF);
-    outb(base+4, (lba>>8) & 0xFF);
-    outb(base+5, (lba>>16) & 0xFF);
-    outb(base+7, 0x20);                 // READ SECTORS
-    if(!ata_wait_bsy_base(base)) return;
-    if(!ata_wait_drq_base(base)) return;
-    for(int i=0;i<256;i++) buf[i]=inw(base);
+
+    // Retry with an ATA soft reset.  A PIO read that loses BSY/DRQ leaves the
+    // channel wedged: every later read then times out too, and because this
+    // function used to return silently the caller's buffer kept whatever was
+    // already in that memory.  That is how a 64-bit switch once "staged" a
+    // freed SFS superblock (stage[0..3]=0x00534653 = "SFS\0") and jumped into
+    // long mode with garbage.
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt) ata_soft_reset(base);
+        if (!ata_wait_bsy_base(base)) { g_ata_rd_fail_stage=1; continue; }
+        outb(base+6, 0xE0 | ((lba>>24)&0x0F));
+        outb(base+1, 0x00);
+        outb(base+2, 1);
+        outb(base+3, lba & 0xFF);
+        outb(base+4, (lba>>8) & 0xFF);
+        outb(base+5, (lba>>16) & 0xFF);
+        outb(base+7, 0x20);                 // READ SECTORS
+        if (!ata_wait_bsy_base(base)) { g_ata_rd_fail_stage=2; continue; }
+        if (!ata_wait_drq_base(base)) { g_ata_rd_fail_stage=3; continue; }
+        uint8_t st = inb(base+7);
+        g_ata_last_status = st;
+        if (st & 0x01) { g_ata_rd_fail_stage=4; continue; }   // ERR: no data
+        for (int i = 0; i < 256; i++) buf[i] = inw(base);
+        return true;                        // sector transferred
+    }
+
+    g_ata_rd_fail++;
+    if (g_ata_rd_fail_lba == 0xFFFFFFFFu) g_ata_rd_fail_lba = lba;
+    g_ata_last_status = inb(base+7);
+    return false;                           // caller MUST treat buf as garbage
 }
 static void ata_write_sector_dev(int dev, uint32_t lba, const uint16_t* buf){
     uint16_t base = dev ? 0x170 : 0x1F0;
@@ -1112,7 +1151,7 @@ static void ata_write_sector_dev(int dev, uint32_t lba, const uint16_t* buf){
     ata_wait_bsy_base(base);
 }
 
-static void ata_read_sector(uint32_t lba, uint16_t* buf){ ata_read_sector_dev(0, lba, buf); }
+static bool ata_read_sector(uint32_t lba, uint16_t* buf){ return ata_read_sector_dev(0, lba, buf); }
 static void ata_write_sector(uint32_t lba, const uint16_t* buf){ ata_write_sector_dev(0, lba, buf); }
 
 // ---- Read/write with explicit ATA base port + drive select ----
@@ -7441,6 +7480,7 @@ static void do_switch64(void){
 
     void* stage = nullptr;
     uint32_t stage_phys = 0;
+    int bad_sectors = 0;
 
     if (use_handoff) {
         stage_phys = h->phys;
@@ -7515,10 +7555,59 @@ static void do_switch64(void){
         serial_hex(KERNEL64_SECTORS);
         serial_puts("\n");
 
-        uint16_t* dst = (uint16_t*)stage;
-        for(int i=0; i<KERNEL64_SECTORS; i++){
-            ata_read_sector(KERNEL64_LBA_DISK + i, dst);
-            dst += 256;  // 512 bytes = 256 words
+        // Read the image, then PROVE it landed.  A read can report success
+        // (channel accepted every command, no ERR bit) and still leave the
+        // buffer untouched: that is the intermittently observed failure where
+        // stage[0] came back as leftover heap data ("SFS\0" or "// =") while
+        // ata total_fails was 0.  The staging address itself is provably
+        // writable, so the only safe response is to verify the result and
+        // re-read on mismatch, with a channel reset in between.
+        for (int attempt = 0; attempt < 4; attempt++) {
+            if (attempt) ata_soft_reset(0x1F0);
+            bad_sectors = 0;
+            uint16_t* w = (uint16_t*)stage;
+            for (int i = 0; i < KERNEL64_SECTORS; i++) {
+                if (!ata_read_sector(KERNEL64_LBA_DISK + i, w)) bad_sectors++;
+                w += 256;  // 512 bytes = 256 words
+            }
+            if (!bad_sectors && *(volatile uint32_t*)stage == 0x03F8BA66u) break;
+            serial_puts("[K32] K64 staging attempt ");
+            serial_puts_dec(attempt + 1);
+            serial_puts(" failed: bad_sectors=");
+            serial_puts_dec(bad_sectors);
+            serial_puts(", magic=");
+            serial_hex(*(volatile uint32_t*)stage);
+            serial_puts(" -- resetting channel and re-reading\n");
+        }
+        serial_puts("[K32] ata rd: total_fails=");
+        serial_puts_dec((int)g_ata_rd_fail);
+        serial_puts(" first_lba=");
+        serial_hex(g_ata_rd_fail_lba);
+        serial_puts(" stage=");
+        serial_puts_dec((int)g_ata_rd_fail_stage);
+        serial_puts(" status=");
+        serial_hex(g_ata_last_status);
+        serial_puts("\n");
+    }
+
+    // Safety net: never jump into long mode unless the staged image really is
+    // kernel64.bin.  A failed ATA read leaves the buffer holding whatever was
+    // in that heap block before, which can look plausible (SFS magic) and used
+    // to send the CPU into garbage with no explanation at all.
+    {
+        uint32_t magic = *(volatile uint32_t*)stage;
+        if (bad_sectors || magic != 0x03F8BA66u) {
+            serial_puts("[K32] ERROR: K64 staging invalid (bad_sectors=");
+            serial_puts_dec(bad_sectors);
+            serial_puts(", magic=");
+            serial_hex(magic);
+            serial_puts(") -- refusing to enter long mode\n");
+            term.set_color(make_color(RED, BLACK));
+            term.write("ERROR: could not read kernel64.bin from disk.\n");
+            term.write("64-bit boot aborted; staying in the 32-bit shell.\n");
+            term.set_color(make_color(WHITE, BLACK));
+            if (!use_handoff && stage) kfree(stage);
+            return;
         }
     }
 
