@@ -1,0 +1,65 @@
+# ============================================================================
+#  k64_undefined_allowlist.txt - symbols the 64-bit kernel links as ZERO
+# ----------------------------------------------------------------------------
+#  kernel64 links with --unresolved-symbols=ignore-all, so a symbol this build
+#  does not define is silently bound to address 0.  Any *call* through one of
+#  them jumps to 0, executes the real-mode IVT bytes and ends in #UD -> #GP ->
+#  #DF -> triple fault, which the user experiences as a random reboot.
+#
+#  That is not hypothetical: task-8 lost a whole day to it.  serial_enter /
+#  serial_leave were missing, fb_console_init() called one, and the 64-bit
+#  kernel rebooted before it ever reached the driver scan.  bigbuf_alloc was
+#  the next one -- it killed gui_init() on its first backbuffer allocation.
+#
+#  tools/check_k64_undefined.sh now fails the build for any symbol that is NOT
+#  listed here, so a new missing symbol can never ship silently again.
+#
+#  THIS FILE IS A BURN-DOWN LIST, not a blessing.  Each entry is a live
+#  landmine: delete a line only after the symbol is actually defined (then the
+#  check stays green), and prefer deleting lines over adding them.
+# ============================================================================
+
+ai_request
+app_registry_note_resident
+g_host_cursor_active
+get_mode
+kern_fs_create
+lg_active
+lg_init
+lg_launch
+lg_poll
+lg_read_fb
+lg_send_input
+lg_shutdown
+lg_status
+lgb_use_vmm_if_available
+linux_manager_active
+linux_manager_fb
+linux_manager_start
+linux_manager_stop
+mcp_dispatch_request
+net_agent_execute
+quota_remaining
+sa_astar
+sa_bloom_add
+sa_bloom_contains
+sa_bloom_create
+sa_bloom_destroy
+sa_cosine
+sa_dot
+sa_levenshtein
+sa_lru_contains
+sa_lru_create
+sa_lru_destroy
+sa_lru_get
+sa_lru_put
+sa_sort
+sa_spatial_create
+sa_spatial_destroy
+sa_spatial_insert
+sa_spatial_query
+sa_topk
+set_mode
+svc_lookup
+svga_mode_hint
+term_swap_ssh_sink

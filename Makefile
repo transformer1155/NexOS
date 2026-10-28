@@ -1644,8 +1644,29 @@ $(BUILD)/clr64.o: clr.cpp | $(BUILD)
 $(BUILD)/mforms64.o: mforms.cpp | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -fno-optimize-sibling-calls -c mforms.cpp -o $@
 
-$(BUILD)/kernel64.elf: $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/silent_telemetry64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o .attic64/linker64.ld | $(BUILD)
-	$(LD64) $(LDFLAGS64) -o $@ $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o
+# The 64-bit object list lives in ONE variable: the real link and the
+# strict re-link used by tools/check_k64_undefined.sh must never diverge,
+# otherwise the gate would validate a different binary than we ship.
+KERNEL64_OBJS := $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o
+
+$(BUILD)/kernel64.elf: $(KERNEL64_OBJS) .attic64/linker64.ld | $(BUILD)
+	$(LD64) $(LDFLAGS64) -o $@ $(KERNEL64_OBJS)
+
+# ---- build-time gate: no silent bind-to-zero symbols --------------------
+# kernel64 links with --unresolved-symbols=ignore-all, so an undefined symbol
+# becomes address 0 and any call through it triple-faults the machine (see
+# tools/k64_undefined_allowlist.txt).  Re-link strictly and fail on anything
+# that is not on the burn-down list.  SKIP_K64_CHECK=1 to bypass.
+check-k64: $(KERNEL64_OBJS) .attic64/linker64.ld tools/check_k64_undefined.sh tools/k64_undefined_allowlist.txt
+	@if [ "$(SKIP_K64_CHECK)" = "1" ]; then \
+	   echo "    k64 undefined: check skipped (SKIP_K64_CHECK=1)"; \
+	 else \
+	   K64_OBJS='$(KERNEL64_OBJS)' \
+	   K64_LDFLAGS='$(filter-out --unresolved-symbols=ignore-all,$(LDFLAGS64))' \
+	   bash tools/check_k64_undefined.sh || exit 1; \
+	 fi
+
+.PHONY: check-k64
 $(BUILD)/ap_trampoline.o: .attic64/ap_trampoline.asm | $(BUILD)
 	$(AS) -f bin -o $(BUILD)/ap_trampoline.bin .attic64/ap_trampoline.asm
 	$(OBJCOPY64) -I binary -O elf64-x86-64 -B i386 --rename-section .data=.rodata $(BUILD)/ap_trampoline.bin $@
@@ -1660,5 +1681,5 @@ $(BUILD)/smp_impl64.o: smp_impl64.cpp .attic64/smp64.h | $(BUILD)
 # binutils objcopy must be used here (OBJCOPY64).  On multilib Linux builds
 # OBJCOPY64 defaults to $(OBJCOPY) and everything is one toolchain.
 OBJCOPY64 ?= $(OBJCOPY)
-$(BUILD)/kernel64.bin: $(BUILD)/kernel64.elf | $(BUILD)
+$(BUILD)/kernel64.bin: $(BUILD)/kernel64.elf check-k64 | $(BUILD)
 	$(OBJCOPY64) -O binary $< $@
