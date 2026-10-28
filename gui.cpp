@@ -7346,6 +7346,15 @@ struct Win11Desktop {
                 uint32_t* row = fb + (uint32_t)y * (uint32_t)W;
                 for (int x = x0; x < x1; x++) {
                     uint32_t p = row[x];
+                    // BUG-#12: this pixel was already post-processed since it was
+                    // last DRAWN -> leave it alone.  A damage rect is only an
+                    // over-approximation of "what was repainted" (dirty_add merges
+                    // rects into their union box, the >=70% branch re-runs a
+                    // whole-screen pass, and the managed overlay claims a FULL
+                    // SCREEN dirty rect while a C# animation runs), so without this
+                    // test retained pixels were dimmed again on every frame and the
+                    // desktop crept darker as soon as scanlines were enabled.
+                    if ((p & 0xFF000000u) == PIX_DONE) continue;
                     int sb = (int)(p & 0xFF);
                     int sg = (int)((p >> 8) & 0xFF);
                     int sr = (int)((p >> 16) & 0xFF);
@@ -7381,7 +7390,14 @@ struct Win11Desktop {
                     if (dim) {
                         r = (r * 21) >> 5; g = (g * 21) >> 5; b = (b * 21) >> 5;
                     }
-                    row[x] = (uint32_t)b | ((uint32_t)g << 8) | ((uint32_t)r << 16);
+                    // BUG-#12: stamp the pixel as processed.  Every drawing
+                    // primitive writes alpha 0x00 (fill_rect / blend_rect /
+                    // blend_pixel / blit_rect) or 0xFF (the managed shell's ARGB
+                    // constants), never 0x01, so the next redraw clears this flag
+                    // by itself and the pixel is transformed exactly once per
+                    // paint -- the invariant the partial-pass design assumed.
+                    row[x] = (uint32_t)b | ((uint32_t)g << 8) | ((uint32_t)r << 16)
+                             | PIX_DONE;
                 }
             }
             return;
@@ -7393,6 +7409,10 @@ struct Win11Desktop {
                 int xlim = bx + scale; if (xlim > W) xlim = W;
 
                 uint32_t p = fb[by * W + bx];   // block origin colour
+                // BUG-#12: the whole block is rebuilt from this origin colour and
+                // every pixel in it carries the same flag, so one test covers the
+                // block (same reasoning as the scale==1 path above).
+                if ((p & 0xFF000000u) == PIX_DONE) continue;
                 int sb = (int)(p & 0xFF);       // BGRx layout in memory
                 int sg = (int)((p >> 8) & 0xFF);
                 int sr = (int)((p >> 16) & 0xFF);
@@ -7424,7 +7444,9 @@ struct Win11Desktop {
                             r = (r * 21) >> 5; g = (g * 21) >> 5; b = (b * 21) >> 5;
                         }
 
-                        fb[rowbase + x] = (uint32_t)b | ((uint32_t)g << 8) | ((uint32_t)r << 16);
+                        fb[rowbase + x] = (uint32_t)b | ((uint32_t)g << 8) | ((uint32_t)r << 16)
+                                        | PIX_DONE;   // BUG-#12: processed
+
                     }
                 }
             }

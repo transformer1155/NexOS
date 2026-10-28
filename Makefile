@@ -1561,8 +1561,13 @@ $(BUILD)/switch32to64.o: .attic64/switch32to64.asm $(BUILD)/kernel64.bin | $(BUI
 
 # -Idrivers: kernel64.cpp includes driver_contract.h for the driver-scan
 # hookup (task-8) and font_vec.h for the vec_* forwarding shims.
-$(BUILD)/kernel64.o: .attic64/kernel64.cpp drivers/driver_contract.h font_vec.h | $(BUILD)
-	$(CC64) $(CXX64FLAGS) -Idrivers -c .attic64/kernel64.cpp -o $@
+# -DSFS_LBA_FROM_MAKEFILE: the 64-bit kernel has to FIND the SFS volume it
+# was shipped with, and it used to hard-code the offset (SFS_ALT_LBA 3488)
+# -- which silently drifted when the image layout moved the SFS to 6144, so
+# the 64-bit kernel reported 'SFS not mounted' and could never load a driver.
+# Passing the Makefile's own SFS_LBA removes the second source of truth.
+$(BUILD)/kernel64.o: .attic64/kernel64.cpp drivers/driver_contract.h font_vec.h Makefile | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -Idrivers -DSFS_LBA_FROM_MAKEFILE=$(SFS_LBA) -c .attic64/kernel64.cpp -o $@
 
 $(BUILD)/smp64.o: .attic64/smp64.cpp .attic64/smp64.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c .attic64/smp64.cpp -o $@

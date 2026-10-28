@@ -57,6 +57,36 @@ static inline void outl(uint16_t p,uint32_t v){ __asm__ __volatile__("outl %0,%1
 // =====================================================================
 //  Serial debug output (port 0x3F8)  -  for UEFI boot tracing
 // =====================================================================
+// ---------------------------------------------------------------------
+//  COM1 re-entrancy lock  (serial_enter / serial_leave)
+// ---------------------------------------------------------------------
+//  gui.cpp and svga.cpp line-buffer their COM1 output and bracket every
+//  flush with these two calls, so each '\n'-terminated line is emitted
+//  atomically.  The definitions live in kernel.cpp, which is 32-bit only --
+//  so in the 64-bit link they were simply ABSENT, and because kernel64 links
+//  with --unresolved-symbols=ignore-all the calls were bound to address 0
+//  instead of failing the build.  The first call inside fb_console_init()
+//  therefore jumped to 0, executed the real-mode IVT and raised #UD at
+//  RIP=0x2d -> #GP -> #DF -> triple fault -> the machine rebooted into the
+//  32-bit kernel.  Providing the same lock here (same contract, same
+//  semantics as kernel.cpp) fixes that class of failure at its source.
+static volatile int g_sio_lock = 0;
+
+// Plain test-and-set lock.  The 32-bit kernel also saves/restores EFLAGS here,
+// but in long mode IF is already clear (we cli at kmain64 entry and nothing
+// re-enables interrupts -- the kernel is fully polled), and the 32-bit
+// pushf/popf mnemonics do not encode in 64-bit code.  The only contract the
+// callers need is that one '\n'-terminated line is emitted atomically.
+extern "C" void serial_lock_acquire(void){
+    while (__sync_lock_test_and_set(&g_sio_lock, 1)) {
+        __asm__ __volatile__("pause" ::: "memory");
+    }
+}
+extern "C" void serial_lock_release(void){
+    __sync_lock_release(&g_sio_lock);
+}
+extern "C" void serial_enter(void){ serial_lock_acquire(); }
+extern "C" void serial_leave(void){ serial_lock_release(); }
 void serial_puts(const char* s){
     while (*s) {
         // Wait for THR-empty before each byte: the UART FIFO is only 16 deep
@@ -558,7 +588,7 @@ static struct { uint16_t limit; uint64_t base; } __attribute__((packed)) g_idt_d
 static uint32_t g_last_step = 0;
 static char g_last_step_name[32] = {0};
 
-static void serial_hex64(uint64_t v){
+void serial_hex64(uint64_t v){
     serial_hex((uint32_t)(v >> 32));
     serial_hex((uint32_t)(v & 0xFFFFFFFFULL));
 }
@@ -1379,7 +1409,15 @@ static int g_auto_gui;
 // it does not collide with the 64-bit kernel payload.  Probe both locations
 // (kept in sync with kernel.cpp).  kernel64.bin grew with the vector font, so
 // the BIOS build places SFS at LBA 3488 (KERNEL64_SECTORS=1440).
-#define SFS_ALT_LBA       3488
+// The build's own SFS placement (Makefile SFS_LBA, injected as
+// -DSFS_LBA_FROM_MAKEFILE) -- never a hand-copied constant again.  When this
+// drifted (3488 vs the real 6144) the 64-bit kernel could not mount the very
+// volume it was shipped on, so driver_boot_scan() found no .drv images.
+#ifdef SFS_LBA_FROM_MAKEFILE
+#define SFS_ALT_LBA       SFS_LBA_FROM_MAKEFILE
+#else
+#define SFS_ALT_LBA       6144
+#endif
 
 // RAM-backed SFS handoff, written by the bootloader at 0x0900:
 //   [0] magic == SFS_RAM_MAGIC, [1] physical base, [2] size in bytes.
@@ -2369,6 +2407,49 @@ extern "C" void big_free(void* p, uint32_t bytes){
 // it did not exist here because only big_free() ever freed a run.
 extern "C" void pmm_free_range(uint32_t pa, uint32_t pages){
     for (uint32_t j = 0; j < pages; j++) pmm_free_page(pa + j * PAGE_SIZE);
+}
+// ---------------------------------------------------------------------
+//  bigbuf_alloc / bigbuf_free  (PMM-backed large buffers)
+// ---------------------------------------------------------------------
+//  gui.cpp, net.cpp, vnc_client.cpp and linux_manager.cpp all allocate their
+//  multi-megabyte buffers through these two (a 1280x720x4 backbuffer cannot
+//  live in the small kernel heap).  Only kernel.cpp defined them, so the
+//  64-bit link left them undefined and --unresolved-symbols=ignore-all bound
+//  the calls to address 0: gui_init() therefore triple-faulted on its very
+//  first backbuffer allocation, right after the "BGA:" line.  Same failure
+//  mode as serial_enter/serial_leave.
+//
+//  The 64-bit big_alloc/big_free pair needs an explicit size on free, which
+//  this API does not carry, so a tiny span table records ptr -> pages.
+#define BIGBUF_MAX 32
+struct BigBufRec { void* ptr; uint32_t pages; };
+static BigBufRec g_bigbuf[BIGBUF_MAX];
+
+extern "C" void* bigbuf_alloc(uint32_t size){
+    if (size == 0) return 0;
+    uint32_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint32_t pa = pmm_alloc_range(pages);
+    if (!pa) return 0;
+    for (int i = 0; i < BIGBUF_MAX; i++){
+        if (!g_bigbuf[i].ptr){
+            g_bigbuf[i].ptr   = (void*)(uintptr_t)pa;
+            g_bigbuf[i].pages = pages;
+            return g_bigbuf[i].ptr;
+        }
+    }
+    pmm_free_range(pa, pages);          // span table full: do not leak
+    return 0;
+}
+extern "C" void bigbuf_free(void* ptr){
+    if (!ptr) return;
+    for (int i = 0; i < BIGBUF_MAX; i++){
+        if (g_bigbuf[i].ptr == ptr){
+            pmm_free_range((uint32_t)(uintptr_t)ptr, g_bigbuf[i].pages);
+            g_bigbuf[i].ptr   = 0;
+            g_bigbuf[i].pages = 0;
+            return;
+        }
+    }
 }
 
 // =====================================================================
@@ -6359,8 +6440,30 @@ extern "C" void vec_last_err(int* code, int* got, int* stb){
     if (got)  *got  = 0;
     if (stb)  *stb  = 0;
 }
+// read_file adapter handed to the fontvec driver: the same SFS bridge that
+// gui.cpp's private g_cb.read_file wraps (kern_fs_read -> sfs.read), reachable
+// from this translation unit.
+static int k64_read_file_cb(int fs_type, const char* name, uint8_t* buf, int bufsize){
+    (void)fs_type;
+    return kern_fs_read(name, buf, bufsize);
+}
 extern "C" void kmain64(){
     serial_puts("[K64-1] kmain64 entered\n");
+
+    // ---- Quiesce the 8259 before anything can take an interrupt ----------
+    // Long mode here is entirely POLLED: the keyboard, ATA and PIT are all
+    // read by polling, nothing installs an IRQ handler, and no `sti` is ever
+    // issued.  The PIC therefore still sits in its post-reset state, where
+    // IRQ0 is delivered as vector 0x08 -- and vector 0x08 in our IDT is the
+    // #DF slot.  A single timer tick was consequently decoded as a double
+    // fault, whose handler chained into #GP and triple-faulted the machine
+    // (QEMU: `Servicing hardware INT=0x08` xN, v=06 at RIP=0x2d, then
+    // v=0d/v=0d/v=08 -> Triple fault -> reboot into the 32-bit kernel).
+    // Masking both PICs and clearing IF makes that class of fault impossible
+    // while the kernel is still bring-up code.
+    outb(0x21, 0xFF);            // master PIC: mask all
+    outb(0xA1, 0xFF);            // slave PIC: mask all
+    __asm__ __volatile__("cli" ::: "memory");
     // Install the real 64-bit IDT so any synchronous fault (#PF/#GP/#UD/...)
     // is captured by fault_common() instead of triple-faulting silently.
     build_idt();
@@ -6545,6 +6648,33 @@ extern "C" void kmain64(){
     // Users can type 'gui' to enter the desktop.
     if(g_vbe_active){
         register_gui_callbacks();
+
+        // ---- Bring the vector rasteriser up as soon as SFS reads are ---------
+        // ---- available, and log the outcome.                            -----
+        //  The rasteriser now lives in fontvec.drv: vec_init() goes through
+        //  the vec_* shims -> driver_find("fontvec") -> the driver's own
+        //  font_vec.c, which reads msyh.ttf out of SFS with the callback we
+        //  hand it.  Doing it here (instead of waiting for gui_init's font
+        //  section, which first loads the multi-megabyte BAKED bitmaps) means
+        //  the vector path is exercised and reported even if the legacy bitmap
+        //  loads are slow or skipped, and gui_init's own vec_init() then just
+        //  returns 0 immediately (font_vec.c is idempotent).
+        {
+            int vr = vec_init(k64_read_file_cb);
+            serial_puts("[K64-FONT] driver vec_init rc=");
+            serial_puts_dec(vr);
+            serial_puts(" ready=");
+            serial_puts_dec(vec_ready());
+            if (vr != 0) {
+                int ec = 0, eg = 0, es = 0;
+                vec_last_err(&ec, &eg, &es);
+                serial_puts(" err=");
+                serial_puts_dec(ec);
+                serial_puts(" got=");
+                serial_puts_dec(eg);
+            }
+            serial_puts("\n");
+        }
         gui_init();
         if(gui_available()){
             serial_puts("[K64-VBE] GUI initialized successfully (available via 'gui' command)\n");
