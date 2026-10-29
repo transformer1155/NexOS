@@ -24,15 +24,6 @@ app_registry_note_resident
 g_host_cursor_active
 get_mode
 kern_fs_create
-lg_active
-lg_init
-lg_launch
-lg_poll
-lg_read_fb
-lg_send_input
-lg_shutdown
-lg_status
-lgb_use_vmm_if_available
 mcp_dispatch_request
 net_agent_execute
 quota_remaining

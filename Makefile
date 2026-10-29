@@ -1668,11 +1668,17 @@ $(BUILD)/vnc_client64.o: plugins/vnc_client.cpp | $(BUILD)
 $(BUILD)/linux_manager64.o: plugins/linux_manager.cpp | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -I plugins -c plugins/linux_manager.cpp -o $@
 
+# linux_guest_backend implements the lg_* guest API consumed by the 64-bit GUI
+# and CLR (8 call sites in gui64.o alone).  It sits on linux_manager64.o +
+# vmm64.o + vnc_client64.o and the pm_*/svc_* shims, so it links last.
+$(BUILD)/linux_guest_backend64.o: plugins/linux_guest_backend.cpp | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -I plugins -c plugins/linux_guest_backend.cpp -o $@
+
 # The 64-bit object list lives in ONE variable: the real link and the
 # strict re-link used by tools/check_k64_undefined.sh must never diverge,
 # otherwise the gate would validate a different binary than we ship.
 KERNEL64_OBJS := $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o $(BUILD)/systemalgo64.o \
-	$(BUILD)/vmm64.o $(BUILD)/vnc_client64.o $(BUILD)/linux_manager64.o
+	$(BUILD)/vmm64.o $(BUILD)/vnc_client64.o $(BUILD)/linux_manager64.o $(BUILD)/linux_guest_backend64.o
 
 $(BUILD)/kernel64.elf: $(KERNEL64_OBJS) .attic64/linker64.ld | $(BUILD)
 	$(LD64) $(LDFLAGS64) -o $@ $(KERNEL64_OBJS)
