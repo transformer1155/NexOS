@@ -41,7 +41,6 @@ mcp_dispatch_request
 net_agent_execute
 quota_remaining
 set_mode
-svc_lookup
 svga_mode_hint
 term_swap_ssh_sink
 

@@ -146,6 +146,55 @@ extern "C" void* memmove(void* d, const void* s, unsigned long n){
 }
 
 // =====================================================================
+//  Plugin-service shims (64-bit kernel)
+// ---------------------------------------------------------------------
+//  linux_guest_backend.cpp / linux_manager.cpp / vmm.cpp / vnc_client.cpp
+//  are compiled for the 64-bit kernel and between them reference the
+//  plugin service registry that lives in plugins/plugin_manager.cpp.
+//
+//  plugin_manager.cpp is deliberately NOT linked here: it pulls in
+//  plugins_boot(), which needs the 20 per-plugin globals (g_app_browser
+//  ... g_wm_core) that exist only in the 32-bit plugin build.  That
+//  cascade is much larger than the debt being paid off, so expose a
+//  minimal and HONEST surface instead:
+//
+//    pm_serial    real   - forwards to the COM1 writer above
+//    pm_strcmp    real   - plain strcmp semantics
+//    svc_register FAILS  - returns -1: there is no registry in 64-bit,
+//                          and returning 0 would falsely tell callers a
+//                          service got published that svc_lookup can
+//                          never hand back.
+//    svc_lookup   MISS   - returns 0, which is the registry's own
+//                          not-found result; callers already handle it.
+//
+//  If the 64-bit kernel ever grows a real plugin layer, delete these and
+//  link plugin_manager.cpp plus its plugin objects instead.
+// =====================================================================
+typedef int (*svc_fn)(void* args, void* out, int outcap);
+
+extern "C" void pm_serial(const char* s){ serial_puts(s); }
+
+extern "C" int pm_strcmp(const char* a, const char* b){
+    while (*a && *a == *b) { a++; b++; }
+    return (int)((unsigned char)*a - (unsigned char)*b);
+}
+
+extern "C" int svc_register(const char* name, svc_fn fn){
+    (void)name; (void)fn;
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        serial_puts("[K64] svc_register: no plugin service registry in the 64-bit kernel\n");
+    }
+    return -1;              /* explicit failure: nothing was registered */
+}
+
+extern "C" svc_fn svc_lookup(const char* name){
+    (void)name;
+    return 0;               /* not found -- the registry's own miss result */
+}
+
+// =====================================================================
 //  AI Engine interface (implemented in ai_engine.cpp)
 // =====================================================================
 extern "C" {

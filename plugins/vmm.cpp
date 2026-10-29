@@ -589,12 +589,24 @@ static void vm_dump_vmcb(VmmGuest* gg) {
  * and may carry stale ZF/CF -- so CLC is executed before VMRUN (making any
  * later ZF/CF meaningful) and the VMCB EXITCODE is cross-checked. */
 static long vm_svm_vmrun(VmmGuest* gg) {
-    uint32_t flags, vmcb = gg->vmcb_phys;
+    /* RFLAGS capture.  pushf/pop are 32-bit mnemonics; the assembler
+     * rejects them in 64-bit mode ("invalid instruction suffix"), so pick
+     * the mnemonic by target.  The 32-bit branch MUST stay byte-identical:
+     * this one file is linked into both kernels (build/vmm.o and
+     * build/vmm64.o), and the 32-bit baseline is verified separately.
+     * flags is unsigned long so the operand width matches the mnemonic. */
+    unsigned long flags;
+    uint32_t vmcb = gg->vmcb_phys;
     __asm__ __volatile__(
         "clc\n\t"
         ".byte 0x0F, 0x01, 0xD8\n\t"    /* VMRUN (rAX = vmcb phys) */
+#if defined(__x86_64__)
+        "pushfq\n\t"
+        "popq %1\n\t"
+#else
         "pushfl\n\t"
         "popl %1\n\t"
+#endif
         : "+a"(vmcb), "=r"(flags)
         :
         : "memory", "cc");
@@ -609,7 +621,7 @@ static long vm_svm_vmrun(VmmGuest* gg) {
         vm_log(":"); vm_log_hex(e0);
         vm_log(" info1="); vm_log_hex(i1);
         vm_log(":"); vm_log_hex(i0);
-        vm_log(" rflags="); vm_log_hex(flags);
+        vm_log(" rflags="); vm_log_hex((uint32_t)flags);
         vm_log("\n");
     }
     uint32_t exitcode = vm_get32((const uint8_t*)gg->vmcb_phys, VMCB_EXITCODE);

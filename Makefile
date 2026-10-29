@@ -1652,10 +1652,21 @@ $(BUILD)/clr64.o: clr.cpp | $(BUILD)
 $(BUILD)/mforms64.o: mforms.cpp | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -fno-optimize-sibling-calls -c mforms.cpp -o $@
 
+# Plugins that are also linked into the 64-bit kernel.  Same CXX64FLAGS as the
+# rest of kernel64; -I plugins because they include plugin_manager.h /
+# guest_blob.h.  vmm.cpp needs the 64-bit RFLAGS mnemonics (pushfq/popq) and
+# vnc_client.cpp is already 64-bit clean.
+$(BUILD)/vmm64.o: plugins/vmm.cpp | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -I plugins -c plugins/vmm.cpp -o $@
+
+$(BUILD)/vnc_client64.o: plugins/vnc_client.cpp | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -I plugins -c plugins/vnc_client.cpp -o $@
+
 # The 64-bit object list lives in ONE variable: the real link and the
 # strict re-link used by tools/check_k64_undefined.sh must never diverge,
 # otherwise the gate would validate a different binary than we ship.
-KERNEL64_OBJS := $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o $(BUILD)/systemalgo64.o
+KERNEL64_OBJS := $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o $(BUILD)/systemalgo64.o \
+	$(BUILD)/vmm64.o $(BUILD)/vnc_client64.o
 
 $(BUILD)/kernel64.elf: $(KERNEL64_OBJS) .attic64/linker64.ld | $(BUILD)
 	$(LD64) $(LDFLAGS64) -o $@ $(KERNEL64_OBJS)
