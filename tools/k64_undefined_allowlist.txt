@@ -33,10 +33,6 @@ lg_send_input
 lg_shutdown
 lg_status
 lgb_use_vmm_if_available
-linux_manager_active
-linux_manager_fb
-linux_manager_start
-linux_manager_stop
 mcp_dispatch_request
 net_agent_execute
 quota_remaining
