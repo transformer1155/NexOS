@@ -1575,6 +1575,14 @@ $(BUILD)/smp64.o: .attic64/smp64.cpp .attic64/smp64.h | $(BUILD)
 $(BUILD)/silent_telemetry64.o: silent_telemetry.cpp silent_telemetry.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c silent_telemetry.cpp -o $@
 
+# SystemAlgo (sorting / hashing / spatial / cosine ...).  clr64.o calls these
+# through C linkage (systemalgo.h wraps them in extern "C"), and the source is
+# plain freestanding C++ that compiles unchanged for -m64 (verified: 0 warnings,
+# only kmalloc/kfree external).  Until this rule existed the whole sa_* family
+# was bound to address 0 -- 19 call sites in clr64.o, any one a triple fault.
+$(BUILD)/systemalgo64.o: systemalgo.cpp systemalgo.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c systemalgo.cpp -o $@
+
 $(BUILD)/gui64.o: gui.cpp logo.h font_vec.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -I plugins -c gui.cpp -o $@
 
@@ -1647,7 +1655,7 @@ $(BUILD)/mforms64.o: mforms.cpp | $(BUILD)
 # The 64-bit object list lives in ONE variable: the real link and the
 # strict re-link used by tools/check_k64_undefined.sh must never diverge,
 # otherwise the gate would validate a different binary than we ship.
-KERNEL64_OBJS := $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o
+KERNEL64_OBJS := $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o $(BUILD)/systemalgo64.o
 
 $(BUILD)/kernel64.elf: $(KERNEL64_OBJS) .attic64/linker64.ld | $(BUILD)
 	$(LD64) $(LDFLAGS64) -o $@ $(KERNEL64_OBJS)

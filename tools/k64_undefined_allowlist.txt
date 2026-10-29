@@ -40,26 +40,13 @@ linux_manager_stop
 mcp_dispatch_request
 net_agent_execute
 quota_remaining
-sa_astar
-sa_bloom_add
-sa_bloom_contains
-sa_bloom_create
-sa_bloom_destroy
-sa_cosine
-sa_dot
-sa_levenshtein
-sa_lru_contains
-sa_lru_create
-sa_lru_destroy
-sa_lru_get
-sa_lru_put
-sa_sort
-sa_spatial_create
-sa_spatial_destroy
-sa_spatial_insert
-sa_spatial_query
-sa_topk
 set_mode
 svc_lookup
 svga_mode_hint
 term_swap_ssh_sink
+
+# --- retired ---------------------------------------------------------------
+# The sa_* family (19 symbols) is now DEFINED in the 64-bit kernel by
+# systemalgo.cpp -> build/systemalgo64.o.  They were the first batch of this
+# burn-down list: clr64.o had 19 call sites through them, every one of which
+# would have triple-faulted the machine.
