@@ -16,7 +16,9 @@ import re
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GUI = os.path.join(REPO, "gui.cpp")
+GUI = os.path.join(REPO, "src", "gui", "gui_legacy.cpp")
+if not os.path.exists(GUI):
+    GUI = os.path.join(REPO, "gui.cpp")  # pre-refactor layout
 OUT = os.path.join(REPO, "font16x16.h")
 W, H = 16, 16
 

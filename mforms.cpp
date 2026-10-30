@@ -1311,35 +1311,39 @@ extern "C" int mforms_has_desktop(void) {
     return 1;
 }
 
-extern "C" void mforms_paint_desktop(int w, int h) {
+// Shared prologue/epilogue for a managed desktop-layer paint.
+//
+// `entry` is the NexOS.Forms.Shell:: static that draws the layer.  The old
+// implementation re-ran ONE entry point (Shell::PaintDesktop, which paints
+// wallpaper + icons together) for all three host functions, so a desktop
+// repaint cost a full managed desktop paint (~50-55 ms measured) even when the
+// host already had the wallpaper cached -- and the first frame paid for the
+// same paint twice.  Shell::PaintWall / Shell::PaintIcons are the C# side of
+// that split.
+//
+// `run_deferred` runs Desktop::DeferredRun (AI-desktop deferred work) and is
+// true only for the wallpaper pass, so it executes at most once per desktop
+// frame even when wall + icons are both drawn.
+static void mforms_paint_layer(const char* entry, int w, int h, int run_deferred) {
     if (!mforms_ready()) return;
-    diag_step(200, "mforms_paint_desktop enter");
-    // PERF-BUG fix: g_clr_trace used to be forced to 1 here "for diagnosis",
-    // which made the CLR print an [icall]/[clr] trace line for EVERY managed
-    // method call on EVERY desktop frame.  That is a ~2 MB/80 s serial flood
-    // (the COM port drains at ~11 KB/s at 115200 baud), so the guest spent
-    // most of each frame blocked writing to COM1 -- the whole UI (and the
-    // mouse) crawled.  Tracing is off by default (g_clr_trace == 0 in clr.cpp);
-    // leave it alone so the shell runs at full speed.  Re-enable temporarily
-    // only when actively diagnosing the CLR.
+    diag_step(200, "mforms_paint_layer enter");
+    // PERF-BUG fix: do NOT force g_clr_trace here.  Per-call tracing floods COM1
+    // (~11 KB/s at 115200) and stalls the whole frame; leave it off.
     set_context(0, 0, w, h);
     g_flist_fs = -1;
     uint32_t mark = clr_heap_mark();
     int32_t a[2] = { w, h }, r = 0;
-    clr_call("NexOS.Forms.Shell::PaintDesktop", a, 2, &r);
+    if (clr_call(entry, a, 2, &r) != 0) { heap_recover(); return; }
     clr_heap_reset(mark);
-    diag_step(201, "mforms_paint_desktop returned -> DeferredRun");
+    if (!run_deferred) return;
+    diag_step(201, "mforms_paint_layer returned -> DeferredRun");
     // AI desktop deferred work (e.g. agent run) must happen AFTER the paint
     // heap is reset so its allocations survive as persistent state.
     //
-    // PER-FRAME DISCIPLINE: this runs on EVERY desktop frame, and whatever
-    // it leaves allocated is promoted to the persistent watermark by
-    // rebaseline().  A stray `U.Cat(...)`/`U.I(...)` in that path therefore
-    // grows the baseline forever until Shell::Paint has no headroom left and
-    // faults with "managed heap exhausted" (the shell then loses all managed
-    // text).  DeferredRun must stay allocation-free unless it is actually
-    // doing one-shot work; the guard below turns any future regression into
-    // a loud warning instead of a silent, slow-motion death.
+    // PER-FRAME DISCIPLINE: whatever this leaves allocated is promoted to the
+    // persistent watermark by rebaseline(), so a stray U.Cat()/U.I() here grows
+    // the baseline until the managed heap is exhausted.  The guard below turns
+    // a future regression into a loud warning instead of a slow-motion death.
     uint32_t before = clr_heap_mark();
     if (clr_call("NexOS.Forms.Desktop::DeferredRun", nullptr, 0, &r) == 0) {
         uint32_t after = clr_heap_mark();
@@ -1354,18 +1358,24 @@ extern "C" void mforms_paint_desktop(int w, int h) {
     } else {
         heap_recover();
     }
-    // PERF-BUG fix: do NOT re-enable g_clr_trace here.  Leaving the per-call
-    // trace on floods COM1 every frame and stalls the whole system.
 }
 
-// Finer-grained wallpaper / desktop-icon layers.  The managed Shell::PaintDesktop
-// paints the whole layer at once, so both simply re-run the full desktop paint.
+// Full desktop layer (wallpaper + icons) in one call.  Kept for any caller that
+// wants the whole layer; the desktop stage in gui.cpp uses the split pair below.
+extern "C" void mforms_paint_desktop(int w, int h) {
+    mforms_paint_layer("NexOS.Forms.Shell::PaintDesktop", w, h, 1);
+}
+
+// Wallpaper-only layer: restores the real wallpaper (and handles the
+// AI-desktop / lock-screen cases).
 extern "C" void mforms_paint_wall(int w, int h) {
-    mforms_paint_desktop(w, h);
+    mforms_paint_layer("NexOS.Forms.Shell::PaintWall", w, h, 1);
 }
 
+// Icons-only layer, painted over an already-present wallpaper.  This is the
+// cheap pass the host re-runs on every desktop repaint.
 extern "C" void mforms_paint_desk_icons(int w, int h) {
-    mforms_paint_desktop(w, h);
+    mforms_paint_layer("NexOS.Forms.Shell::PaintIcons", w, h, 0);
 }
 
 // Taskbar and Start menu, painted after the windows so the shell chrome

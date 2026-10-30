@@ -300,6 +300,34 @@ namespace NexOS.Forms
             Desktop.Paint(w, h);
         }
 
+        // Split desktop-layer entry points (see Desktop.PaintWall/PaintIcons).
+        //
+        // Anim.Tick() runs ONLY in PaintWall so that a PaintWall + PaintIcons
+        // pair advances every tween exactly once per frame: the host calls both
+        // on a full repaint (first frame / cache miss) and only PaintIcons when
+        // it re-blits the cached wallpaper.  Putting Tick() in both would double
+        // the animation rate on full-repaint frames.
+        public static void PaintWall(int w, int h)
+        {
+            Anim.Tick();
+            if (Login.IsActive() != 0) { Login.Paint(w, h); return; }
+            App.Current = null;
+            Voice.BeginFrame();
+            Desktop.PaintWall(w, h);
+        }
+
+        // Icons-only pass over an already-present wallpaper.  No Anim.Tick():
+        // the tween must advance exactly once per frame (see above).  A voice
+        // frame is still opened because this pass is what registers the desktop
+        // icon controls on repaint frames that reuse the host's wallpaper cache.
+        public static void PaintIcons(int w, int h)
+        {
+            if (Login.IsActive() != 0) return;   // lock screen owns the surface
+            App.Current = null;
+            Voice.BeginFrame();
+            Desktop.PaintIcons(w, h);
+        }
+
         public static void PaintOverlay(int w, int h)
         {
             if (Login.IsActive() != 0) return;   // no taskbar while locked

@@ -11,7 +11,9 @@ import struct, os, re, sys
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GUI = os.path.join(ROOT, 'gui.cpp')
+GUI = os.path.join(ROOT, "src", "gui", "gui_legacy.cpp")
+if not os.path.exists(GUI):
+    GUI = os.path.join(ROOT, "gui.cpp")  # pre-refactor layout
 
 # ---- Microsoft YaHei (微软雅黑) candidates (pure Windows first) ----
 CANDIDATES = [

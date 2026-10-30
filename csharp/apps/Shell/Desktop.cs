@@ -861,17 +861,44 @@ namespace NexOS.Forms
         // =============================================================
         //  Layer 1 - wallpaper + icons (painted behind every window)
         // =============================================================
-        public static void Paint(int w, int h)
+        // Layer 1a -- the WALLPAPER only.
+        //
+        // Split out of Paint() so the host can keep the expensive wallpaper in
+        // its own g_wall cache and re-blit it, repainting only the icon layer on
+        // every desktop repaint.  Before the split both host entry points
+        // (Host::paint_wall / paint_desk_icons) re-ran the ENTIRE desktop paint,
+        // which measured 50-55 ms per repaint and made the wallpaper cache
+        // completely pointless.
+        public static void PaintWall(int w, int h)
         {
             // BUG-#10: this is the ONLY place the real wallpaper is drawn.  Tell
             // the Start-menu erase path that the true background is on screen for
             // this frame, so it must not paint a synthetic band over it.
             bgPaintedThisFrame = 1;
             ShellTheme();
+            // The AI desktop is one monolithic, self-animating surface (chat log,
+            // HUD, cards, input box).  It cannot be split, so it is drawn whole
+            // here and PaintIcons() is a no-op for it.
             if (CurrentDesktop == 1) { AiDesktopPaint(w, h); return; }
             Wallpaper(w, h);
+        }
+
+        // Layer 1b -- the desktop icons / portal surface, painted OVER the
+        // wallpaper.  This is the cheap layer the host re-runs on every repaint.
+        public static void PaintIcons(int w, int h)
+        {
+            ShellTheme();
+            if (CurrentDesktop == 1) return;   // drawn whole by PaintWall()
             if (Theme.DesktopMode == 0) ClassicIcons(w, h);
-            else                         PortalSurface(w, h);
+            else                        PortalSurface(w, h);
+        }
+
+        // Full desktop layer = wallpaper + icons.  Kept as the single-call entry
+        // point so existing Host::PaintDesktop callers keep working unchanged.
+        public static void Paint(int w, int h)
+        {
+            PaintWall(w, h);
+            PaintIcons(w, h);
         }
 
         // Win11 "Bloom": a deep blue gradient with a radial glow.
