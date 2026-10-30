@@ -418,7 +418,7 @@ $(BUILD)/distnet.o: distnet.cpp distnet.h | $(BUILD)
 $(BUILD)/silent_telemetry.o: silent_telemetry.cpp silent_telemetry.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c silent_telemetry.cpp -o $@
 
-$(BUILD)/gui.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h | $(BUILD)
+$(BUILD)/gui.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h afont_data.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -Iplugins -I. -c gui.cpp -o $@
 
 # Runtime vector font rasterizer (stb_truetype.h) - 32-bit and 64-bit.
@@ -1597,7 +1597,7 @@ $(BUILD)/svga64.o: svga.cpp svga.h | $(BUILD)
 $(BUILD)/nexos_ai64.o: nexos_ai.cpp nexos_ai.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c nexos_ai.cpp -o $@
 
-$(BUILD)/gui64.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h | $(BUILD)
+$(BUILD)/gui64.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h afont_data.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -I plugins -c gui.cpp -o $@
 
 $(BUILD)/ai_engine64.o: ai_engine.cpp | $(BUILD)
