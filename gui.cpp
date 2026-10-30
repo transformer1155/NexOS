@@ -1504,6 +1504,14 @@ static uint32_t fps_frames = 0;
 static uint32_t perf_desk_ms = 0, perf_win_ms = 0, perf_over_ms = 0, perf_pres_ms = 0;
 static uint32_t perf_deskfull = 0, perf_cpaint = 0, perf_cblit = 0, perf_dmgpx = 0;
 
+// BUG-M2 observability: number of idle hover refreshes serviced by gui_tick().
+// Hover feedback is the only repaint path that runs while the desktop is
+// otherwise settled, and it left no trace anywhere -- so "did the highlight
+// actually refresh?" could not be answered from the serial log.  This counter
+// is monotonic (never reset with the per-burst perf counters) and is reported
+// as hov= in the [PERF] line plus a rate-limited [HOVER] line.
+static uint32_t perf_hover_n = 0;
+
 
 
 // desk_sig() is defined just before render_all() so it can see `windows`/`Win`.
@@ -8029,6 +8037,19 @@ struct Win11Desktop {
                         snapshot_blit(smr.x, smr.y, smr.w, smr.h, false);
                     }
                 }
+                // BUG-M7 fix: the overlay (taskbar + Start menu) hit-tests and
+                // draws its hover state through NexOS.Forms.Controls::Hot() ->
+                // Gfx::MouseX/MouseY, which read the pointer g_msx/g_msy that the
+                // host publishes via mforms_set_mouse().  That publish only
+                // happened inside `if (repaint_desk)` (desktop-layer repaint) and
+                // in the per-window managed paint, so on an ordinary pointer move
+                // -- desktop layer retained, only the overlay repainted -- the
+                // taskbar composited with a STALE pointer: the Start button and
+                // the pinned-app plates could never light up, no matter how many
+                // frames were drawn for them (this is why the hover-refresh frames
+                // added for BUG-M2 still produced a pixel diff of exactly
+                // 0).  Publish the position before every overlay pass.
+                mforms_set_mouse(mouse_x, mouse_y);
                 mforms_paint_overlay(gfx.width, gfx.height);
                 g_over_sig  = osig;
                 g_over_idle = 0;
@@ -8294,6 +8315,8 @@ struct Win11Desktop {
             serial_putdec((int)fps_frames);
             serial_puts(" wall=");
             serial_putdec(g_wall_ok ? 1 : 0);
+            serial_puts(" hov=");
+            serial_putdec((int)perf_hover_n);
             serial_puts(" sn=");
             serial_putdec(g_snap ? 1 : 0);
             serial_puts("\n");
@@ -11815,6 +11838,21 @@ void gui_tick(void) {
                 g_wm.mouse_hover_pending = false;
                 g_wm.last_ai_repaint_ms  = hnow;
                 g_wm.render_all();
+                // Trace the refresh: one line per second at most (a moving
+                // pointer "rests" every time it pauses, so an unthrottled log
+                // could flood COM1 at 115200 baud).
+                perf_hover_n++;
+                static uint32_t hov_log_t = 0;
+                if ((uint32_t)(hnow - hov_log_t) >= 1000u) {
+                    hov_log_t = hnow;
+                    serial_puts("[HOVER] refresh n=");
+                    serial_putdec((int)perf_hover_n);
+                    serial_puts(" at ");
+                    serial_putdec(g_wm.mouse_x);
+                    serial_puts(",");
+                    serial_putdec(g_wm.mouse_y);
+                    serial_puts("\n");
+                }
             }
         }
         if (g_desk_refresh_pending != 0 || g_desk_needs_full || g_over_force_n > 0) {
