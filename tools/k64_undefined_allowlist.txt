@@ -19,17 +19,6 @@
 #  check stays green), and prefer deleting lines over adding them.
 # ============================================================================
 
-ai_request
-app_registry_note_resident
-g_host_cursor_active
-get_mode
-kern_fs_create
-mcp_dispatch_request
-net_agent_execute
-quota_remaining
-set_mode
-svga_mode_hint
-term_swap_ssh_sink
 
 # --- retired ---------------------------------------------------------------
 # The sa_* family (19 symbols) is now DEFINED in the 64-bit kernel by

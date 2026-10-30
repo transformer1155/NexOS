@@ -1583,6 +1583,20 @@ $(BUILD)/silent_telemetry64.o: silent_telemetry.cpp silent_telemetry.h | $(BUILD
 $(BUILD)/systemalgo64.o: systemalgo.cpp systemalgo.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c systemalgo.cpp -o $@
 
+# SVGA (VMware/VirtualBox vmsvga) detection.  svga.cpp is freestanding C++ that
+# compiles unchanged for -m64; its only external deps are kmalloc plus the COM1
+# lock and vmm_map_page, all of which kernel64 now provides.
+$(BUILD)/svga64.o: svga.cpp svga.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c svga.cpp -o $@
+
+# nexos_ai: the AI gateway + MCP dispatcher.  Compiles unchanged for -m64; of its
+# 17 external dependencies 10 already exist in the 64-bit link (ai_reason,
+# ai_set_mode, browser_*, net_http_get, kern_fs_read) and the 7 nexos_mcp_*
+# tool back-ends are provided in kernel64.cpp, so this is a REAL implementation
+# rather than a stub.
+$(BUILD)/nexos_ai64.o: nexos_ai.cpp nexos_ai.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c nexos_ai.cpp -o $@
+
 $(BUILD)/gui64.o: gui.cpp logo.h font_vec.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -I plugins -c gui.cpp -o $@
 
@@ -1678,7 +1692,7 @@ $(BUILD)/linux_guest_backend64.o: plugins/linux_guest_backend.cpp | $(BUILD)
 # strict re-link used by tools/check_k64_undefined.sh must never diverge,
 # otherwise the gate would validate a different binary than we ship.
 KERNEL64_OBJS := $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o $(BUILD)/systemalgo64.o \
-	$(BUILD)/vmm64.o $(BUILD)/vnc_client64.o $(BUILD)/linux_manager64.o $(BUILD)/linux_guest_backend64.o
+	$(BUILD)/vmm64.o $(BUILD)/vnc_client64.o $(BUILD)/linux_manager64.o $(BUILD)/linux_guest_backend64.o $(BUILD)/svga64.o $(BUILD)/nexos_ai64.o
 
 $(BUILD)/kernel64.elf: $(KERNEL64_OBJS) .attic64/linker64.ld | $(BUILD)
 	$(LD64) $(LDFLAGS64) -o $@ $(KERNEL64_OBJS)

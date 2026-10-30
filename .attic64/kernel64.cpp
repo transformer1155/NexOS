@@ -2583,7 +2583,7 @@ static bool vmm_split_4mb(uint32_t pd_idx){
 }
 
 // Map a 4 KiB virtual page to a physical page
-static bool vmm_map_page(uint32_t virt, uint32_t phys, uint32_t flags){
+static bool vmm_map32_page(uint32_t virt, uint32_t phys, uint32_t flags){
     if (!vmm_our_paging) return false;  // can't modify firmware page tables
 
     uint32_t pd_idx = virt >> 22;
@@ -2609,6 +2609,25 @@ static bool vmm_map_page(uint32_t virt, uint32_t phys, uint32_t flags){
     return true;
 }
 
+// ---------------------------------------------------------------------
+//  vmm_map_page  (C linkage -- svga.cpp calls this)
+// ---------------------------------------------------------------------
+//  svga.cpp was written for the 32-bit kernel, which programs its own page
+//  tables, so it asks for a 4 KiB device BAR to be ALIASED at a different
+//  virtual address.  In long mode switch32to64.asm installs a flat identity
+//  map over the low 8 GiB and the kernel never builds per-page tables, so such
+//  an alias simply cannot be expressed.
+//
+//  Returning 0 is the honest answer, not a fake success: svga.cpp treats a
+//  failed map as "this BAR is unusable as a register window" (it does
+//  `if (!vmm_map_page(...)) continue;` / `return 0;`) and falls back to the
+//  port-I/O path, which needs no mapping at all.  Claiming success here would
+//  instead make it dereference an address that does not point at the device.
+//  virt == phys is already covered by the identity map, so that needs no work.
+extern "C" int vmm_map_page(unsigned int virt, unsigned int phys, unsigned int flags){
+    (void)flags;
+    return (virt == phys) ? 1 : 0;
+}
 // Translate virtual → physical (returns 0 if not mapped)
 static uint32_t vmm_get_phys(uint32_t virt){
     if (!vmm_paging_on) return virt;  // identity (no paging)
@@ -2919,7 +2938,7 @@ static void cmd_pagetest(){
     for (int i = 0; i < 256; i++) phys_ptr[i] = (uint8_t)(i & 0xFF);
 
     // Map virtual to physical
-    bool mapped = vmm_map_page(vaddr, paddr, PG_PRESENT | PG_RW);
+    bool mapped = vmm_map32_page(vaddr, paddr, PG_PRESENT | PG_RW);
     term.write("  vmm_map_page:  ");
     term.set_color(mapped ? make_color(GREEN,BLACK) : make_color(RED,BLACK));
     term.write(mapped ? "OK\n" : "FAILED\n");
@@ -5326,7 +5345,7 @@ static void auto_ask_backdoor(void){
 
 // Forward declarations: these are defined later in this file (after run_command),
 // but cmd_plugin needs them, so declare them here.
-int  kern_fs_create(const char* name, const unsigned char* data, int len);
+extern "C" int kern_fs_create(const char* name, const unsigned char* data, int len);
 static void int_to_str_k64(int val, char* buf);
 
 static void cmd_plugin(const char* args){
@@ -5508,7 +5527,27 @@ extern "C" void kernel_exec_line(const char* line){
 
 extern "C" void term_set_ssh_sink(ssh_out_fn_t fn){ g_ssh_out_fn = fn; }
 extern "C" void term_clear_ssh_sink(void){ g_ssh_out_fn = 0; }
+// Swap the sink and return the previous one, so nested captures (an MCP command
+// running while a remote console streams) do not silently disarm the outer
+// sink.  Same contract as the 32-bit kernel.cpp implementation; net.cpp calls
+// it while an MCP request is in flight.
+extern "C" ssh_out_fn_t term_swap_ssh_sink(ssh_out_fn_t fn){
+    ssh_out_fn_t old = g_ssh_out_fn;
+    g_ssh_out_fn = fn;
+    return old;
+}
 
+// ---- net_agent_execute (called by ai_engine.cpp with C linkage) ---------
+// The 32-bit kernel routes this to net_agent_plan_exec(), which asks the
+// configured LLM for `shell:` / `plugin:` action lines and runs them.  The
+// plan executor lives in net.cpp, which IS part of the 64-bit link, so the
+// real implementation is already present -- route to it rather than inventing
+// a failure stub.  (If the network target turns out to be unreachable the plan
+// executor itself returns the error, so callers still see a truthful result.)
+extern "C" int net_agent_plan_exec(const char* goal, char* out, int outsize);
+extern "C" int net_agent_execute(const char* goal, char* out, int outsize){
+    return net_agent_plan_exec(goal, out, outsize);
+}
 void Terminal::render(){
     if(m_at_bottom) m_view=bottom_view();
     int cur_row = m_at_bottom ? (m_count - m_view) : -1;
@@ -5767,11 +5806,23 @@ static int gui_cb_session_load(const char* name, void* buf, int bufsize) {
 
 // Kernel file-system write back (MKFS data FS) -- used by the Win32 subsystem
 // (CreateFileA/WriteFile/CloseHandle) and the skill system to persist files.
-// Mirrors the 32-bit kernel.cpp definition so win32_64.o can link it.
-int kern_fs_create(const char* name, const unsigned char* data, int len){
+// Mirrors the 32-bit kernel.cpp definition so win32_64.o can link it -- and,
+// like that one, it MUST carry extern "C": every caller (net.cpp, win32.cpp,
+// skill.h) declares it with C linkage, so a plain C++ definition here would be
+// emitted as _Z15kern_fs_createPKcPKhi while the C references stayed bound to 0.
+extern "C" int kern_fs_create(const char* name, const unsigned char* data, int len){
     if (!mkfs.mounted) return -2;
     return mkfs.create(name, (const uint8_t*)data, len);
 }
+
+// ---- Host absolute-mouse flag (read by gui.cpp) -------------------------
+// The 32-bit kernel raises this when the VMMDev absolute pointer is live.
+// The 64-bit kernel has no VMMDev driver, so the honest value is false and the
+// GUI falls back to the PS/2 relative mouse -- which is what actually exists
+// here.  Claiming true would make gui.cpp wait for absolute coordinates that
+// never arrive.
+bool g_host_cursor_active = false;
+
 
 // ---- Time callback (from CMOS RTC) ----
 static void gui_cb_get_time(int* h, int* m, int* s) {
@@ -5907,6 +5958,84 @@ static void gui_cb_exec_command(const char* cmd, char* output, int outsize) {
     output[len] = 0;
 }
 
+// ---------------------------------------------------------------------
+//  MCP command / filesystem back-ends for nexos_ai.cpp
+// ---------------------------------------------------------------------
+//  nexos_ai.cpp (the AI gateway + MCP dispatcher) is part of the 64-bit link
+//  and exposes its tools through these seven callbacks.  The 32-bit kernel
+//  implements them as thin wrappers over the very same gui_cb_* helpers the GUI
+//  itself uses, so an AI-driven call behaves exactly like a user click and
+//  never invents a second filesystem path.  Six of the seven helpers already
+//  exist here, so these are real implementations, not stubs.
+extern "C" int nexos_mcp_exec(const char* cmd, char* out, int outsize){
+    if (!cmd || !cmd[0] || !out || outsize <= 0) return -1;
+    // Refuse destructive/interactive commands: an AI-driven session must not
+    // clear the buffer it is reading from, drop into a nested shell, or reboot
+    // the machine out from under itself mid-dispatch (parity with 32-bit).
+    static const char* const denied[] = { "shutdown", "reboot", "exit", "logout" };
+    for (unsigned di = 0; di < sizeof(denied)/sizeof(denied[0]); di++){
+        int n = 0; while (denied[di][n]) n++;
+        int m = 0; while (cmd[m] == ' ') m++;
+        int kk = 0; bool same = true;
+        for (; kk < n; kk++){
+            char c = cmd[m + kk];
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            if (c != denied[di][kk]) { same = false; break; }
+        }
+        if (same){
+            char tail = cmd[m + kk];
+            if (tail == 0 || tail == ' ' || tail == '\t'){ out[0] = 0; return -2; }
+        }
+    }
+    gui_cb_exec_command(cmd, out, outsize);
+    return 0;
+}
+
+extern "C" int nexos_mcp_fs_list(int fs, char* buf, int bufsize){
+    if (!buf || bufsize <= 0) return -1;
+    buf[0] = 0;
+    return gui_cb_list_files(fs, buf, bufsize);
+}
+
+extern "C" int nexos_mcp_fs_read(int fs, const char* name, unsigned char* buf, int bufsize){
+    if (!name || !name[0] || !buf || bufsize <= 0) return -1;
+    return gui_cb_read_file(fs, name, (uint8_t*)buf, bufsize);
+}
+
+extern "C" int nexos_mcp_fs_write(int fs, const char* name, const unsigned char* buf, int size){
+    while (*name == ' ') name++;
+    if (!name || !name[0] || size < 0) return -1;
+    // Only the writable MKFS data disk accepts writes; SFS/FAT32 are read-only.
+    // fs_type 3 is the desktop folder, which lives inside MKFS and needs the
+    // GUI's current-directory state -- not ported to 64-bit, so it is refused
+    // explicitly rather than silently writing into the wrong directory.
+    if (fs == 3) return -1;
+    if (fs != 0) {
+        serial_puts("[FS] EROFS write refused fs=");
+        serial_putdec(fs);
+        serial_puts(" path=");
+        serial_puts(name);
+        serial_puts("\n");
+        return -1;
+    }
+    if (!mkfs.mounted) return -1;
+    return mkfs.create(name, (const uint8_t*)buf, size);
+}
+
+extern "C" int nexos_mcp_fs_mkdir(int fs, const char* name){
+    if (!name || !name[0]) return -1;
+    return gui_cb_mkdir(fs, name);
+}
+
+extern "C" int nexos_mcp_fs_remove(int fs, const char* name){
+    if (!name || !name[0]) return -1;
+    return gui_cb_remove(fs, name);
+}
+
+extern "C" int nexos_mcp_fs_rename(int fs, const char* old_name, const char* new_name){
+    if (!old_name || !old_name[0] || !new_name || !new_name[0]) return -1;
+    return gui_cb_rename(fs, old_name, new_name);
+}
 // ---- Hardware info callbacks for GUI (Settings -> About) ----
 static const char* gui_cb_cpu_vendor(void) {
     static char v[13];

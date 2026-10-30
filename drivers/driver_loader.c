@@ -84,6 +84,43 @@ extern const DriverHeader sample_driver_v2;   /* version-bump variant      */
  * the built-in sample descriptors so the lifecycle logic stays testable.
  * That fallback is compiled out on a kernel build via DRV_NO_MOCK_FALLBACK.
  * -------------------------------------------------------------------------*/
+/* ---------------------------------------------------------------------------
+ * ELF-ident check with retry.
+ *
+ * WHY: the ATA/SFS path occasionally hands back a stale or torn buffer.  That is
+ * not theoretical -- a boot was observed where the 32-bit driver scan reported
+ * "ELF load failed" (bad magic) for ALL THREE .drv images, while the 64-bit
+ * scan of the same SFS on the same disk, in the same boot, succeeded.  The
+ * 64-bit kernel's staging read already guards against this with re-reads plus a
+ * magic check (task-14); the driver scan had no such guard, so a single bad read
+ * silently produced a boot with ZERO drivers loaded.
+ *
+ * The retry covers only the 4-byte ident read.  That is deliberate: it is the
+ * cheap, leak-free place to detect the torn buffer, and it catches exactly the
+ * failure that was observed.  Parsing (driver_elf_read) is not retried, because
+ * a failed parse may already have taken the image buffer apart; retrying it
+ * could compound a leak.  A parse that still fails after a good ident is a real
+ * image problem and gets reported as such.
+ * -------------------------------------------------------------------------*/
+#define DRV_READ_ATTEMPTS 4
+
+static int drv_ident_readable(const char* path)
+{
+    unsigned char id[4];
+    int attempt;
+    for (attempt = 0; attempt < DRV_READ_ATTEMPTS; attempt++) {
+        int n = kern_fs_read(path, id, (int)sizeof(id));
+        if (n >= 4 && id[0] == 0x7F && id[1] == 'E' && id[2] == 'L' && id[3] == 'F')
+            return 1;
+        /* Short pause before re-reading: let an outstanding controller
+         * transfer retire instead of racing it again immediately. */
+        {
+            volatile int spin;
+            for (spin = 0; spin < 50000; spin++) { }
+        }
+    }
+    return 0;
+}
 static int image_read(const char* path, void** out_base, uint32_t* out_size,
                       ElfDriverImage** out_img)
 {
@@ -97,6 +134,17 @@ static int image_read(const char* path, void** out_base, uint32_t* out_size,
     int have_fs = 1;
 #endif
     if (have_fs) {
+        /* Verify the ident (with retries) BEFORE parsing: a stale buffer here
+         * is what turns into a driver-less boot. */
+        if (!drv_ident_readable(path)) {
+            serial_puts("[DRIVER] image unreadable (bad ELF ident after ");
+            serial_putc((char)('0' + DRV_READ_ATTEMPTS));
+            serial_puts(" attempts): ");
+            serial_puts(path);
+            serial_puts("\n");
+            return DRIVER_ERR_IO;
+        }
+
         uint32_t size = 0;
         void*    base = 0;
         ElfDriverImage* img = 0;
