@@ -550,8 +550,29 @@ namespace NexOS.Forms
             // 5036/7056 px of 0x0078D4 inside the icon cell, even with the
             // pointer parked far away) and completely hid the IconHot hover
             // feedback (0 px of 0x1D5A96 ever measured).
-            selIdx        = -1;
+            selIdx         = -1;
             startRClickIdx = -1;
+            // Same reason for the drag / file-menu sentinels: their field
+            // initialisers are DROPPED by the mini-CLR, so without these they
+            // start at 0 instead of -1.  Concretely:
+            //   * dragKind/dragSrc at 0 mean "dragging item 0" -- the reorder
+            //     loop at Desktop.cs:2057 can move the wrong entry;
+            //   * fileSel at 0 defeats `if (fileSel < 0) return;` in FileAction,
+            //     so a path that reaches a destructive file action WITHOUT
+            //     going through OpenFileMenu (which assigns it) would act on
+            //     file 0 instead of the intended file.  Note the trigger is
+            //     narrow -- the menu path itself always assigns these first.
+            dragKind       = -1;
+            dragSrc        = -1;
+            fileOwner      = -1;
+            fileFs         =  0;
+            fileSel        = -1;
+            // Desktop view flags.  These are currently never READ (only toggled
+            // by the View menu), so a wrong value is inert -- set them anyway so
+            // they are correct if/when the feature is implemented.  Noted as a
+            // separate TODO: "show desktop icons" / "align to grid" are no-ops.
+            deskShowIcons  = 1;
+            deskGrid       = 1;
 
             kName = new string[KINDS];
             kName[0] = "Settings";     kName[1] = "This PC";    kName[2] = "Terminal";
@@ -579,6 +600,11 @@ namespace NexOS.Forms
             aiCodeN  = 0;
             aiFocus  = 0;
             aiReady  = 0;
+            // One-line startup self-check (task-24).  Reports whether this CLR
+            // executes static initialisers at all, plus the ACTUAL values of the
+            // sentinel fields that must be explicit because it does not.
+            InitProbe.Report(selIdx, startRClickIdx, dragKind, dragSrc,
+                             fileOwner, fileFs, fileSel, deskShowIcons, deskGrid);
         }
 
         // Rebuild the desktop icon table from the "Desktop" folder (fs==3).
@@ -3215,6 +3241,68 @@ namespace NexOS.Forms
             int g = ag + (bg - ag) * t / 255;
             int l = ab + (bb - ab) * t / 255;
             return ((uint)r << 16) | ((uint)g << 8) | (uint)l;
+        }
+    }
+
+    // =====================================================================
+    // Startup self-check for a mini-CLR limitation (task-24).
+    //
+    // The CLR does NOT execute static field initialisers: `static int x = -1;`
+    // holds 0, `static bool b = true;` holds 0, `static string s = "p";` holds
+    // null.  Method-body literals and explicit assignments are unaffected.  So
+    // every static that relies ONLY on its initialiser is silently zero, which
+    // is why the sentinel fields in Desktop.Init() are assigned explicitly.
+    //
+    // This prints ONE line at boot.  If a future field forgets the rule, or the
+    // CLR ever starts honouring initialisers, the line says so immediately
+    // instead of surfacing later as an unexplained behaviour bug.
+    // =====================================================================
+    public static class InitProbe
+    {
+        // Each initial value differs from the zero default, so these reveal the
+        // runtime's actual behaviour.
+        static int  pNeg1 = -1;
+        static int  pHex  = 0x0078D4;
+        static bool pTrue = true;
+
+        static void Pair(string tag, int v)
+        {
+            NexOS.Sys.Print(" ");
+            NexOS.Sys.Print(tag);
+            NexOS.Sys.Print("=");
+            NexOS.Sys.PrintInt(v);
+        }
+
+        public static void Report(int selIdx, int startRClickIdx, int dragKind,
+                                  int dragSrc, int fileOwner, int fileFs, int fileSel,
+                                  int deskShowIcons, int deskGrid)
+        {
+            int applied = 0;
+            if (pNeg1 == -1)       applied++;
+            if (pHex == 0x0078D4)  applied++;
+            if (pTrue)             applied++;
+            NexOS.Sys.Print("[CLR] static initialisers ");
+            if (applied == 3)
+                NexOS.Sys.Print("APPLIED (3/3)");
+            else if (applied == 0)
+                NexOS.Sys.Print("NOT APPLIED (0/3) -- statics MUST be assigned explicitly in Init()");
+            else
+            {
+                NexOS.Sys.Print("PARTIAL (");
+                NexOS.Sys.PrintInt(applied);
+                NexOS.Sys.Print("/3)");
+            }
+            NexOS.Sys.Print(" | sentinels:");
+            Pair("selIdx", selIdx);
+            Pair("startRClickIdx", startRClickIdx);
+            Pair("dragKind", dragKind);
+            Pair("dragSrc", dragSrc);
+            Pair("fileOwner", fileOwner);
+            Pair("fileFs", fileFs);
+            Pair("fileSel", fileSel);
+            Pair("deskShowIcons", deskShowIcons);
+            Pair("deskGrid", deskGrid);
+            NexOS.Sys.Print("\n");
         }
     }
 }

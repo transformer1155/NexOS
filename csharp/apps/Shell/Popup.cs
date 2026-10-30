@@ -38,8 +38,14 @@ namespace NexOS.Forms
         {
             if (Theme.Dark != 0) {
                 BG = 0xF227272B; Edge = 0x3A3A3A; Ink = 0xEAEAEA; Hover = 0xFF3A3A40;
+                // task-24: Danger MUST be set here.  Its field initialiser is
+                // dropped by the mini-CLR (static initialisers are not executed),
+                // and this sync forgot it -- so destructive (red) rows were
+                // painted in colour 0 (black) and were unreadable.
+                Danger = 0xC42B1C;
             } else {
                 BG = 0xF7F9FC; Edge = 0xD5DDE8; Ink = 0x1B1B1B; Hover = 0xE7EEF8;
+                Danger = 0xC42B1C;   // same red in both themes (see note above)
             }
         }
 
