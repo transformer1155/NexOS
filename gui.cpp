@@ -1371,6 +1371,14 @@ static inline void dirty_add(int x, int y, int w, int h) {
     // Else append a new node (collapse to full-screen if pool is exhausted).
     int nn = dmg_alloc();
     if (nn < 0) {
+        // Out of nodes: collapse this frame to a single full-screen rect.  The
+        // live chain MUST be recycled first -- the old code simply set the head
+        // to -1, which orphaned every live node for ever (dirty_reset() can only
+        // free what is reachable from g_dmg_head).  Repeated overflow therefore
+        // drained the 256-node pool permanently, after which every frame
+        // degenerated to a full-screen flip.
+        int cur = g_dmg_head;
+        while (cur >= 0) { int nx = g_dnode[cur].next; dmg_free(cur); cur = nx; }
         g_dmg_head = -1;
         int f = dmg_alloc();
         if (f >= 0) {
@@ -4665,6 +4673,15 @@ struct Win11Desktop {
 
     bool gui_mode;
     int mouse_x, mouse_y;
+    // Hover refresh owed after the pointer moved.  handle_mouse_move() must not
+    // run a full render_all() per raw MouseEvent packet (each managed window
+    // repaint is ~14 ms, and blocking the poll loop drops i8042 bytes -> the
+    // pointer would stutter), so a plain move only repaints the cursor sprite
+    // and sets this.  gui_tick() services it once the pointer has come to REST,
+    // which is when the user actually expects the highlight to light up.
+    bool     mouse_hover_pending;
+    uint32_t mouse_hover_ms;
+
     bool mouse_left;
     int drag_counter;
     bool prev_mouse_left;
@@ -4728,6 +4745,8 @@ struct Win11Desktop {
         mouse_left = false;
         drag_counter = 0;
         prev_mouse_left = false;
+        mouse_hover_pending = false;
+        mouse_hover_ms      = 0;
         start_menu_open = false;
         // The fe_menu / fe_info structs are only closed by fe_menu_close();
         // since g_wm is zero-initialised they otherwise start with win==0 (a
@@ -8146,7 +8165,11 @@ struct Win11Desktop {
             // disappear for a frame whenever a menu animated, and for the whole
             // 12 settling frames after every managed click.
             bool rewritten = bg_repainted_this_frame;
-            if (!rewritten) {
+            // An ANIMATING window is composited at its interpolated rect, not at
+            // w.x/w.y, so the containment test below would be wrong;  be
+            // conservative and keep the restore while anything animates (that is
+            // also the case where a stale snapshot would ghost permanently).
+            if (!rewritten && !any_animating()) {
                 for (int i = 0; i < window_count && !rewritten; i++) {
                     Win11Window& w = windows[i];
                     if (!w.visible || w.minimized) continue;
@@ -8360,7 +8383,6 @@ struct Win11Desktop {
             gfx.present_rect(sx, sy, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
             cursor.saved_valid = false;
         }
-        }
 
         // The pointer position is always recorded so a later click routes right.
         cursor.x += dx; cursor.y += dy;
@@ -8443,7 +8465,13 @@ struct Win11Desktop {
 
         // No hardware cursor: repaint the soft cursor at its new position and
         // flip just its rect (the cursor-move fast path).  With a hardware
-        // cursor this branch is skipped 鈥?the GPU owns the sprite.
+        // cursor this branch is skipped -- the GPU owns the sprite.
+        //
+        // Hover feedback (caption buttons, app buttons, desktop icons) can only
+        // change through render_all(); flag it here and let gui_tick() repaint
+        // once the pointer rests, so moving the mouse stays cheap.
+        mouse_hover_pending = true;
+        mouse_hover_ms      = tick_ms_now();
         if (g_cursor_backend == CURSOR_SOFT && cursor.visible) {
             cursor.save_bg(gfx);
             cursor.draw(gfx);
@@ -8482,6 +8510,10 @@ struct Win11Desktop {
             if (drag_counter >= 3) { drag_counter = 0; render_all(); }
         }
         // Repaint the soft cursor at the new (absolute) position and flip its rect.
+        // Absolute (tablet / VMMDev) pointer: same hover-refresh contract as
+        // handle_mouse_move().
+        mouse_hover_pending = true;
+        mouse_hover_ms      = tick_ms_now();
         if (g_cursor_backend == CURSOR_SOFT && cursor.visible) {
             cursor.save_bg(gfx);
             cursor.draw(gfx);
@@ -8661,6 +8693,7 @@ struct Win11Desktop {
             return;
         }
         mouse_left = true;
+        mouse_hover_pending = false;   // the click path repaints everything
         start_menu_open = false; // close by default, reopen if clicked
 
         // ---- BUG-#6: window caption buttons have the HIGHEST priority ------
@@ -11766,6 +11799,24 @@ void gui_tick(void) {
         //   - g_desk_needs_full      : the desktop layer is known stale
         //   - g_over_force_n > 0     : a forced overlay countdown is running
         // When all are clear the desktop is settled and idle costs ZERO frames.
+        // Mouse hover refresh (BUG-MOUSE-1): removing the unconditional 500 ms
+        // idle repaint (see the BUG-#0 note below) also removed the ONLY thing
+        // that ever refreshed hover feedback -- handle_mouse_move() repaints
+        // just the cursor sprite, so caption buttons, app buttons and desktop
+        // icons never lit up until the next click.  Service the pending hover
+        // refresh once the pointer has come to REST (>=120 ms since the last
+        // move).  Repainting only after the pointer stops keeps the poll loop
+        // free while the mouse is actually travelling (a full render_all()
+        // blocks it long enough to drop i8042 bytes and make the pointer jump),
+        // and it is exactly the moment the user expects a highlight to appear.
+        if (g_wm.mouse_hover_pending) {
+            uint32_t hnow = g_wm.tick_ms_now();
+            if ((uint32_t)(hnow - g_wm.mouse_hover_ms) >= 120u) {
+                g_wm.mouse_hover_pending = false;
+                g_wm.last_ai_repaint_ms  = hnow;
+                g_wm.render_all();
+            }
+        }
         if (g_desk_refresh_pending != 0 || g_desk_needs_full || g_over_force_n > 0) {
             uint32_t now = g_wm.tick_ms_now();
             if ((uint32_t)(now - g_wm.last_ai_repaint_ms) >= 500) {
