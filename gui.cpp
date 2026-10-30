@@ -1512,6 +1512,17 @@ static uint32_t perf_deskfull = 0, perf_cpaint = 0, perf_cblit = 0, perf_dmgpx =
 // as hov= in the [PERF] line plus a rate-limited [HOVER] line.
 static uint32_t perf_hover_n = 0;
 
+// Split of the `pres` stage (post-process vs LFB flip) for the first frame,
+// so a 32/64 gap can be attributed to the pixel post-process or the blit.
+static uint32_t perf_post_ms = 0, perf_flip_ms = 0;
+
+// Desktop-layer wallpaper blit accounting (the 3.71 MB g_wall -> backbuffer
+// copy on every desktop repaint).  Bounded trace so the cost of a window
+// open/close frame can be compared before/after without relying on the [PERF]
+// 8-frame burst gate (a window-open animation is shorter than that).
+static uint32_t perf_wallblit_ms = 0;
+static int      perf_wallblit_n  = 0;
+
 
 
 // desk_sig() is defined just before render_all() so it can see `windows`/`Win`.
@@ -1979,6 +1990,39 @@ struct Graphics {
         serial_puts("[GUI] Framebuffer initialized with double-buffering\n");
     }
 
+    // Fast backbuffer -> LFB row copy (n pixels).
+    //
+    // Deliberately does NOT call memcpy().  In the 32-bit kernel memcpy is a
+    // non-`rep` MOVSB loop (kernel.elf:17268 `a4; jmp`), and a bare MOVSB is
+    // microcoded at ~20-30 cycles PER BYTE.  Measured on a 1280x720x32bpp
+    // full-screen flip: 32-bit 95 ms (39 MB/s) vs 64-bit 7 ms -- a 13.6x gap
+    // on identical source, purely from that instruction choice.  Word stores
+    // cost ~1-2 cycles per 4/8 bytes on both kernels.
+    //
+    // The LFB pitch is frequently write-combining; word/quadword stores also
+    // let the WC buffer coalesce instead of emitting one byte store per cycle.
+    static inline void lfb_row_copy(uint32_t* dst, const uint32_t* src, int npix) {
+        int i = 0;
+        // Defensive: if either side is not 4-byte aligned (a pathological LFB
+        // pitch), fall back to a byte copy rather than issue misaligned dword
+        // stores into write-combining memory.
+        if ((((uintptr_t)dst | (uintptr_t)src) & 3u) != 0) {
+            uint8_t*       d = (uint8_t*)dst;
+            const uint8_t* s = (const uint8_t*)src;
+            int nb = npix * 4;
+            for (int k = 0; k < nb; k++) d[k] = s[k];
+            return;
+        }
+        if ((((uintptr_t)dst | (uintptr_t)src) & 7u) == 0) {
+            uint64_t*       d8 = (uint64_t*)dst;
+            const uint64_t* s8 = (const uint64_t*)src;
+            int n8 = npix >> 1;
+            for (int k = 0; k < n8; k++) d8[k] = s8[k];
+            i = n8 << 1;
+        }
+        for (; i < npix; i++) dst[i] = src[i];
+    }
+
     void present() {
         // Copy backbuffer to LFB (frontbuffer), converting pixel format if needed.
         // The backbuffer stores colors as 0x00RRGGBB (R in bits 16-23) and is
@@ -2037,7 +2081,7 @@ struct Graphics {
             for (int ry = 0; ry < height; ry++) {
                 uint8_t* dst = (uint8_t*)lfb + (uint32_t)ry * pitch;
                 uint8_t* src = (uint8_t*)backbuffer + (uint32_t)ry * width * 4u;
-                __builtin_memcpy(dst, src, (uint32_t)width * 4u);
+                lfb_row_copy((uint32_t*)dst, (const uint32_t*)src, width);
             }
         }
     }
@@ -2102,7 +2146,7 @@ struct Graphics {
                 int by = y + ry;
                 uint8_t* dst = (uint8_t*)lfb + (uint32_t)by * pitch + (uint32_t)x * 4u;
                 uint8_t* src = (uint8_t*)(backbuffer + by * width + x);
-                __builtin_memcpy(dst, src, (uint32_t)w * 4u);
+                lfb_row_copy((uint32_t*)dst, (const uint32_t*)src, w);
             }
         }
         // Drain the store buffer so the scanout reads the freshest LFB pixels.
@@ -7762,10 +7806,21 @@ struct Win11Desktop {
                     // Wallpaper unchanged: re-blit the cached copy (a few ms)
                     // instead of re-running the ~200 ms C# bloom paint, then
                     // redraw the cheap icons/tiles layer on top.
+                    uint32_t wb0 = tick_ms_now();
                     for (int ry = 0; ry < gfx.height; ry++)
-                        __builtin_memcpy(gfx.backbuffer + (size_t)ry * gfx.width,
-                                         g_wall + (size_t)ry * gfx.width,
-                                         (size_t)gfx.width * 4u);
+                        Graphics::lfb_row_copy(gfx.backbuffer + (size_t)ry * gfx.width,
+                                               g_wall + (size_t)ry * gfx.width,
+                                               gfx.width);
+                    uint32_t wb1 = tick_ms_now();
+                    perf_wallblit_ms += wb1 - wb0;
+                    if (perf_wallblit_n < 6) {
+                        serial_puts("[WALLBLIT] n="); serial_putdec(perf_wallblit_n);
+                        serial_puts(" blit="); serial_putdec((int)(wb1 - wb0));
+                        serial_puts(" desk="); serial_putdec((int)(tick_ms_now() - tS));
+                        serial_puts(" px="); serial_putdec(gfx.width * gfx.height);
+                        serial_puts("\n");
+                    }
+                    perf_wallblit_n++;
                     mforms_paint_desk_icons(gfx.width, gfx.height);
                 } else {
                     // Optimistically mark the cache valid BEFORE the paint:
@@ -7828,9 +7883,9 @@ struct Win11Desktop {
                         }
                         if (g_wall) {
                             for (int ry = 0; ry < gfx.height; ry++)
-                                __builtin_memcpy(g_wall + (size_t)ry * gfx.width,
-                                                 gfx.backbuffer + (size_t)ry * gfx.width,
-                                                 (size_t)gfx.width * 4u);
+                                Graphics::lfb_row_copy(g_wall + (size_t)ry * gfx.width,
+                                                       gfx.backbuffer + (size_t)ry * gfx.width,
+                                                       gfx.width);
                             g_wall_w = (uint32_t)gfx.width;
                             g_wall_h = (uint32_t)gfx.height;
                         } else {
@@ -8227,26 +8282,69 @@ struct Win11Desktop {
         // Walk the damage linked list.  Flip only the damaged rectangles to the
         // LFB.  If their union exceeds 70% of the screen we degrade to a single
         // full-screen flip (cheaper than many small copies).
+        // Split `pres` into post-process vs flip so a 32/64 difference (or a
+        // before/after optimisation) is attributable to one of them.
         if (g_dirty_valid) {
             int total = 0;
             for (int n = g_dmg_head; n >= 0; n = g_dnode[n].next)
                 total += g_dnode[n].w * g_dnode[n].h;
             perf_dmgpx += (uint32_t)total;
             if (total > (g_sw * g_sh * 7) / 10) {
+                uint32_t a = tick_ms_now();
                 pixelate_framebuffer();
+                uint32_t b2 = tick_ms_now();
                 gfx.present();
+                uint32_t c = tick_ms_now();
+                perf_post_ms += b2 - a; perf_flip_ms += c - b2;
             } else {
+                uint32_t a = tick_ms_now();
                 for (int n = g_dmg_head; n >= 0; n = g_dnode[n].next) {
                     DmgNode& r = g_dnode[n];
                     pixelate_rect(r.x, r.y, r.w, r.h);
                     gfx.present_rect(r.x, r.y, r.w, r.h);
                 }
+                // Small rects: not worth splitting further.
+                perf_flip_ms += tick_ms_now() - a;
             }
         } else {
+            uint32_t a = tick_ms_now();
             pixelate_framebuffer();
+            uint32_t b2 = tick_ms_now();
             gfx.present();
+            uint32_t c = tick_ms_now();
+            perf_post_ms += b2 - a; perf_flip_ms += c - b2;
         }
         perf_pres_ms += tick_ms_now() - tS;   // stage 4: post-process + flip
+
+        // ---- One-shot first-frame stage breakdown (32-bit vs 64-bit perf) ----
+        // The [PERF] line above only prints on an 8-frame burst, so the very
+        // FIRST render_all -- the one that paints the whole desktop from cold --
+        // was never broken down.  Emit the split exactly once so that a 32/64
+        // difference -- or a before/after optimisation -- can be attributed to a
+        // stage instead of guessed at.
+        //   desk = managed desktop layer (C# PaintDesktop / wallpaper blit)
+        //   win  = native window compositing
+        //   over = taskbar + Start overlay (C# PaintOverlay)
+        //   pres = retro post-process + LFB flip
+        {
+            static bool s_first_perf_done = false;
+            if (!s_first_perf_done) {
+                s_first_perf_done = true;
+                serial_puts("[PERF1] desk="); serial_putdec((int)perf_desk_ms);
+                serial_puts(" win=");  serial_putdec((int)perf_win_ms);
+                serial_puts(" over="); serial_putdec((int)perf_over_ms);
+                serial_puts(" pres="); serial_putdec((int)perf_pres_ms);
+                serial_puts(" post="); serial_putdec((int)perf_post_ms);
+                serial_puts(" flip="); serial_putdec((int)perf_flip_ms);
+                serial_puts(" dmgpx="); serial_putdec((int)perf_dmgpx);
+                serial_puts(" px="); serial_putdec((int)(gfx.width * gfx.height));
+                serial_puts(" snap="); serial_putdec(g_snap ? 1 : 0);
+                serial_puts(" wall="); serial_putdec(g_wall_ok ? 1 : 0);
+                serial_puts(" bpp=");  serial_putdec(gfx.bpp);
+                serial_puts(" pitch="); serial_putdec(gfx.pitch);
+                serial_puts("\n");
+            }
+        }
 
         // ---------------------------------------------------------------
         // Frame-rate instrumentation.  Prints AT MOST once per second, so it
