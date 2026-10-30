@@ -236,11 +236,80 @@ static void serial_u32(unsigned int v) {
     serial_puts(out);
 }
 
-// Low 32 bits of the TSC, for timing a boot phase rather than guessing at it.
-static inline unsigned int boot_rdtsc(void) {
+// Unsigned 64-bit decimal over serial.  Needed because the TSC is 64 bits wide
+// on x86_64 and the low half alone wraps every ~1.2 s (see boot_rdtsc).
+static void serial_u64(uint64_t v) {
+    char b[24];
+    int n = 0;
+    if (!v) b[n++] = '0';
+    while (v && n < 21) { b[n++] = (char)('0' + (int)(v % 10u)); v /= 10u; }
+    char out[24];
+    int k = 0;
+    while (n > 0) out[k++] = b[--n];
+    out[k] = 0;
+    serial_puts(out);
+}
+
+// TSC read for timing boot phases.
+//
+// BUG (fixed here): this used to return only EAX, throwing EDX away.  The TSC
+// wraps every 2^32 cycles -- about 1.2 s at 3.5 GHz -- so ANY interval longer
+// than that silently produced a wrapped (meaningless) duration.  The
+// "mforms_boot cycles=3209575299" figure quoted during task-19 planning came
+// from exactly this bug and was off by however many wraps elapsed.
+//
+// On x86_64 the full 64-bit counter is returned.  The 32-bit build keeps the
+// original 32-bit read so its timing behaviour is byte-for-byte unchanged.
+static inline uint64_t boot_rdtsc(void) {
+#if defined(__x86_64__)
+    unsigned int lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+#else
     unsigned int lo;
     __asm__ __volatile__("rdtsc" : "=a"(lo) : : "edx");
-    return lo;
+    return (uint64_t)lo;
+#endif
+}
+
+// ---- [TIM] phase timing ---------------------------------------------------
+// One line per boot phase: raw cycles plus microseconds when the PIT
+// calibration has already produced a rate.  `dt` is the time since the
+// previous tim_mark(), so the marks read as a breakdown of the whole path.
+static uint64_t g_tim_last_tsc   = 0;
+static uint64_t g_tim_tsc_per_ms = 0;
+
+static void tim_mark(const char* tag) {
+    uint64_t now = boot_rdtsc();
+    // Keep the elapsed-time math honest on BOTH counters.
+    //
+    // On x86_64 boot_rdtsc() returns the full 64-bit TSC, which will not wrap
+    // in any realistic run.  The 32-bit build cannot afford a 64-bit read (that
+    // kernel is size-limited), so it gets a 32-bit counter zero-extended to
+    // uint64_t -- and that wraps every 2^32 cycles (~1.2 s here).  A plain
+    // 'now - last' then UNDERFLOWS to ~1.8e19 and prints nonsense such as
+    //   [TIM] ... cyc=18446744070484665492 us=5234854012245   (5234 s)
+    // which is worse than printing no number at all.
+    //
+    // Subtracting in 32 bits when the counter is 32 bits wide makes the wrap
+    // cancel itself, so dt stays the true elapsed count for any interval
+    // shorter than one full wrap (which every marked phase is).
+    uint64_t dt;
+#if defined(__x86_64__)
+    dt = g_tim_last_tsc ? (now - g_tim_last_tsc) : 0;
+#else
+    dt = g_tim_last_tsc ? (uint64_t)((uint32_t)now - (uint32_t)g_tim_last_tsc) : 0;
+#endif
+    g_tim_last_tsc = now;
+    serial_puts("[TIM] ");
+    serial_puts(tag);
+    serial_puts(" cyc=");
+    serial_u64(dt);
+    if (g_tim_tsc_per_ms) {
+        serial_puts(" us=");
+        serial_u64((dt * 1000ULL) / g_tim_tsc_per_ms);
+    }
+    serial_puts("\n");
 }
 
 // Which driver is currently owning the cursor plane.  Both look identical to
@@ -8059,60 +8128,49 @@ struct Win11Desktop {
             int cw = MouseCursor::CURSOR_SIZE, ch = MouseCursor::CURSOR_SIZE;
             int cx0 = cursor.x, cy0 = cursor.y;   // hotspot at (0,0): top-left = (x,y)
 
-            // Only peel off the PREVIOUS cursor pixels when this frame did NOT
-            // repaint the ENTIRE area under the pointer.  If a dirty rectangle
-            // covered the whole cursor box this frame (e.g. a window moved under
-            // it, or the desktop repainted), the backbuffer already holds the
-            // NEW pixels and the saved background is stale; restoring it would
-            // overwrite the new pixels, so the change never appears.
+            // The saved snapshot is only valid while the backbuffer pixels under
+            // the pointer are UNCHANGED.  Exactly two things rewrite them, and
+            // both leave the snapshot stale -- restoring it then paints old
+            // pixels over fresh content:
+            //   1. a real desktop-layer repaint (wallpaper + icons), and
+            //   2. a visible window whose rect fully covers the cursor box,
+            //      because the compositor re-draws every visible window on
+            //      every frame.
             //
-            // BUG-CURSOR1 fix: the old test was "damage INTERSECTS the cursor
-            // box".  That is far too permissive.  A hover highlight on a button
-            // damages only the control's own rect (e.g. 60x24), which sits
-            // entirely INSIDE the 32x32 cursor box -- so the old code decided
-            // "covered" and skipped the restore, leaving the cursor pixels that
-            // fell outside the control rect permanently on screen.  Because the
-            // desktop layer is retained, nothing ever erased them, producing the
-            // ghost / trail ("重影") that follows the pointer across controls.
-            // Require the damage to fully CONTAIN the cursor box before skipping.
-            //
-            bool cursor_fully_covered = false;
-            // FIX #ghost-cursor: a dirty rect only proves the area was FLIPPED,
-            // not that the backbuffer pixels under the pointer were REWRITTEN.
-            // The L7715 blanket full-screen flush and the BUG-C1 window rects
-            // mark unwritten regions; trusting them baked stale cursor pixels
-            // into save_bg() (permanent ghost after long-press / menu hover).
-            // Only a real desktop-layer repaint guarantees clean pixels.
-            bool under_covered = bg_repainted_this_frame;
-            for (int n = g_dmg_head; n >= 0; n = g_dnode[n].next) {
-                DmgNode& r = g_dnode[n];
-                if (r.x <= cx0 && r.y <= cy0 &&
-                    r.x + r.w >= cx0 + cw && r.y + r.h >= cy0 + ch)
-                    cursor_fully_covered = true;
+            // The damage list is deliberately NOT consulted: a damage rect only
+            // proves the area was FLIPPED to the LFB, never that the backbuffer
+            // was rewritten.  The managed overlay adds a blanket full-screen
+            // dirty_add() on every animating / settling frame (it only repaints
+            // the taskbar + Start menu) and the BUG-C1 loop adds whole window
+            // rects for popups.  Trusting that list is what made the pointer
+            // disappear for a frame whenever a menu animated, and for the whole
+            // 12 settling frames after every managed click.
+            bool rewritten = bg_repainted_this_frame;
+            if (!rewritten) {
+                for (int i = 0; i < window_count && !rewritten; i++) {
+                    Win11Window& w = windows[i];
+                    if (!w.visible || w.minimized) continue;
+                    if (w.x <= cx0 && w.y <= cy0 &&
+                        w.x + w.w >= cx0 + cw && w.y + w.h >= cy0 + ch)
+                        rewritten = true;
+                }
             }
-            if (cursor.saved_valid && !under_covered) {
-                // Desktop layer retained: old cursor pixels may still linger in
-                // the backbuffer.  Restore the saved (cursor-free) background so
-                // save_bg captures the real pixels and no square ghost is left.
-                // restore_bg() writes back at the snapshot's own origin, so the
-                // damage rect must be that origin too (not the current
-                // cursor.x/y, which may already have advanced).
+            if (cursor.saved_valid && !rewritten) {
+                // Old cursor pixels may still linger in the backbuffer: put the
+                // cursor-free background back BEFORE re-snapshotting.  restore_bg()
+                // writes at the snapshot's own origin, so the damage rect must be
+                // that origin too (not the live cursor position).
                 int ox = cursor.saved_x, oy = cursor.saved_y;
                 cursor.restore_bg(gfx);
                 dirty_add(ox, oy, cw, ch);
             }
-            // FIX(P0-2): only full damage coverage may suppress the cursor.
-            if (cursor_fully_covered && !under_covered) {
-                // Skip drawing only when a rewritten damage rect contains the
-                // complete cursor box. Partial overlap must still draw it.
-                cursor.saved_valid = false;
-                dirty_add(cx0, cy0, cw, ch);
-            } else {
-                cursor.saved_valid = false;
-                cursor.save_bg(gfx);
-                cursor.draw(gfx);
-                dirty_add(cx0, cy0, cw, ch);   // ensure new cursor region is flipped
-            }
+            // Always re-snapshot and always re-draw.  The old code had a
+            // "cursor_fully_covered" branch that skipped the draw, which erased
+            // the pointer and never painted it back -- a blinking pointer.
+            cursor.saved_valid = false;
+            cursor.save_bg(gfx);
+            cursor.draw(gfx);
+            dirty_add(cx0, cy0, cw, ch);   // ensure new cursor region is flipped
         }
 
         // Retro pixel / CRT-monitor post-process over the whole backbuffer
@@ -8230,11 +8288,17 @@ struct Win11Desktop {
         diag_step(111, "enter_gui gfx initialized");
         gfx.enable_vbe_mode();  // Sets BGA mode (emulator) or uses BIOS-set mode (real HW)
         diag_step(112, "enter_gui vbe mode set");
+        tim_mark("enter_gui: entry");
         gfx.force_clear_lfb();  // wipe bootuefi/OVMF residue
+        tim_mark("enter_gui: clear LFB");
         diag_step(113, "enter_gui lfb cleared");
         serial_puts("[GUI] LFB cleared\n");
         gui_mode = true;
-        calibrate_tsc();
+        // Calibrated already by gui_enter() (so the [TIM] marks before this
+        // point could report microseconds); only redo it if that failed.
+        if (anim_tsc_per_ms == 0) calibrate_tsc();
+        g_tim_tsc_per_ms = (uint64_t)anim_tsc_per_ms;
+        tim_mark("enter_gui: vbe+cursor");
         telem_init_early();
         telem_init_full();
         telem_app_register("Terminal", 1);
@@ -8249,7 +8313,9 @@ struct Win11Desktop {
         cursor.saved_valid = false;  // Force background re-capture
         ime_reset();
         serial_puts("[GUI] IME reset done\n");
+        tim_mark("enter_gui: telem init");
         render_all();   // draws everything + cursor + presents to screen
+        tim_mark("enter_gui: FIRST render_all (desktop painted)");
         // Auto-open a Terminal for immediate IME testing
         // (disabled while debugging Win32 window rendering)
         // if (window_count == 0) launch_app(APP_TERMINAL);
@@ -8279,16 +8345,21 @@ struct Win11Desktop {
     void handle_mouse_move(int dx, int dy) {
         if (!gui_mode) return;
         telem_mouse_move(dx, dy);
-        int oldx = cursor.x, oldy = cursor.y;
         bool was_drag = (drag_window >= 0 && drag_window < window_count);
 
         // When we own the cursor (no hardware sprite 鈥?QEMU / headless / VMMDev
         // absent) we must erase the previous soft-cursor pixels *before* moving,
         // otherwise a stale cursor is left pinned where the pointer last was.
         if (g_cursor_backend == CURSOR_SOFT && cursor.visible && cursor.saved_valid) {
+            // restore_bg() puts the pixels back at the SNAPSHOT's origin, so the
+            // LFB flip must be done at that same origin.  Using the live position
+            // (oldx/oldy) only works while the two coincide; set_mouse_position()
+            // already flips at the saved origin and the two paths must agree.
+            int sx = cursor.saved_x, sy = cursor.saved_y;
             cursor.restore_bg(gfx);
-            gfx.present_rect(oldx, oldy, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
+            gfx.present_rect(sx, sy, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
             cursor.saved_valid = false;
+        }
         }
 
         // The pointer position is always recorded so a later click routes right.
@@ -10752,7 +10823,9 @@ static void mforms_boot(void) {
     if (g_mforms_booted) return;
     g_mforms_booted = true;
 
+    tim_mark("mforms: entry");
     tex_load_all();     // SFS textures (fallback: flat colours if absent)
+    tim_mark("mforms: tex_load_all");
     diag_step(321, "mforms_boot textures loaded");
 
     MFormsHost h;
@@ -10817,11 +10890,14 @@ static void mforms_boot(void) {
     h.user_count       = g_cb.user_count;
     h.user_name        = g_cb.user_name;
 
+    tim_mark("mforms: host filled");
     mforms_init(&h);
     diag_step(330, "mforms_init done");
+    tim_mark("mforms: mforms_init");
     int msr = mforms_start();
     if (msr != 0) diag_step(331, "mforms_start FAILED");
     else          diag_step(332, "mforms_start OK");
+    tim_mark("mforms: mforms_start (shell.mex + CLR)");
     serial_puts("[MFORMS] ");
     serial_puts(mforms_report());
     serial_puts("\n");
@@ -11269,13 +11345,29 @@ static void gui_fb_diag(void) {
 #if defined(__x86_64__)   // 32-bit kernel is size-limited (512 KiB) and never carries the logo
 #include "logo.h"
 
-// Crude busy delay.  No calibrated timer is available this early, so we just
-// spin on a volatile counter.  The exact length is unimportant; it only
-// needs to be long enough for the spinner dots to be visually perceptible.
+// Splash frame delay.
+//
+// BUG (fixed here): this used to spin a volatile counter `ms * 800000` times,
+// and the comment claimed the whole thing was "a few hundred milliseconds".
+// The 32-bit splash animates 120 frames at 50 ms, i.e. 120 * 50 * 800000 =
+// 4.8 BILLION iterations -- measured at roughly 5-13 s under QEMU TCG.  The
+// comment was simply false, and because the loop was never tied to the clock
+// it also meant different things on different machines.
+//
+// Now it spins on the real TSC once the PIT calibration has produced a rate,
+// so `ms` means milliseconds.  Only if no rate is available (calibration
+// failed) does it fall back to a counter spin -- and that fallback is capped,
+// because an uncalibrated spin is exactly how this bug happened.
 static void splash_busy_wait(uint32_t ms) {
-    // Simple integer spin.  `pause` is expensive under QEMU TCG and is not
-    // needed here: this only runs for a few hundred milliseconds total.
-    volatile uint64_t n = (uint64_t)ms * 800000ULL;
+    if (ms == 0) return;
+    if (g_tim_tsc_per_ms > 0 && g_tim_tsc_per_ms < 100000000ULL) {
+        uint64_t want = (uint64_t)ms * g_tim_tsc_per_ms;
+        uint64_t t0 = boot_rdtsc();
+        while ((boot_rdtsc() - t0) < want) { /* spin on the real clock */ }
+        return;
+    }
+    // Uncalibrated fallback: bounded so it can never dominate boot time.
+    volatile uint32_t n = ms * 2000u;
     while (n--) { }
 }
 
@@ -11443,6 +11535,14 @@ void gui_enter(void) {
 #endif
     *(volatile uint8_t*)0x5101 = 8;   // milestone: gui_enter reached
     diag_step(333, "gui_enter starting");
+    // ---- [TIM] start the boot-phase clock ----
+    // Calibrate BEFORE measuring: enter_gui() would otherwise calibrate only
+    // after mforms_boot(), i.e. after the phase we most want to measure.
+    // calibrate_tsc() is idempotent and cheap (one 10 ms PIT one-shot).
+    if (g_wm.anim_tsc_per_ms == 0) g_wm.calibrate_tsc();
+    g_tim_tsc_per_ms = (uint64_t)g_wm.anim_tsc_per_ms;   // 0 => cycles only
+    g_tim_last_tsc = 0;
+    tim_mark("gui_enter entry");
     // Tell the GPU driver which mode it has to scan out before it enables the
     // device -- an enabled SVGA device takes the surface size from its own
     // registers, so it must be told what the kernel is actually drawing.
@@ -11479,26 +11579,44 @@ void gui_enter(void) {
         addr_set(ADDR_FB_VIRT, fbv, fbv, 0, ADDR_FLAG_FB);
     }
 #endif
+    tim_mark("cursor+fb setup");
+
 #if defined(__x86_64__)
     // Show the NexOS boot splash (centred logo + spinner) right before the
     // managed shell / local model is loaded.  The splash stays on screen
     // during mforms_boot(); enter_gui() paints the desktop over it once the
     // model finishes loading, so the logo disappears exactly when ready.
+    // Splash BUDGET.  The splash exists to cover the managed-shell load
+    // (mforms_boot, measured ~0.9 s) -- it must not itself become the delay.
+    //
+    // This used to be 120 frames x 50 ms = 6.0 s of animation BEFORE loading
+    // even started, plus ~1.5 s of full-screen redraws: [TIM] measured the
+    // block at 7.57 s of a 9.2 s path to the desktop (82%).  Note the splash
+    // is compiled for x86_64 only (the 32-bit kernel is size-limited and does
+    // not carry the logo), so this cost was specific to the 64-bit boot.
+    const uint32_t SPLASH_FRAMES       = 24;
+    const uint32_t SPLASH_MS_PER_FRAME = 40;   // ~0.96 s of animation
     serial_puts("[SPLASH] starting animation\n");
-    gui_show_splash_animated(120, 50);
+    gui_show_splash_animated((int)SPLASH_FRAMES, (int)SPLASH_MS_PER_FRAME);
     serial_puts("[SPLASH] model load begins\n");
+    tim_mark("splash animation");
 #endif
     // Time the managed-shell bring-up: the boot animation currently hands the
     // screen over BEFORE this, so whatever it costs is a period with a frozen
     // picture.  Measure it before deciding how much machinery to spend on it.
     {
-        unsigned int mt0 = boot_rdtsc();
+        uint64_t mt0 = boot_rdtsc();
         mforms_boot();      // bring the managed (C#) shell online before drawing
-        unsigned int mt1 = boot_rdtsc();
+        uint64_t mt1 = boot_rdtsc();
         serial_puts("[BOOT] mforms_boot cycles=");
-        serial_u32(mt1 - mt0);
+        serial_u64(mt1 - mt0);
+        if (g_tim_tsc_per_ms) {
+            serial_puts(" us=");
+            serial_u64(((mt1 - mt0) * 1000ULL) / g_tim_tsc_per_ms);
+        }
         serial_puts("\n");
     }
+    tim_mark("post-mforms report");   // [BOOT] above is the whole mforms_boot
     // Enter the GUI and paint the desktop unconditionally.  The old
     // g_skip_enter_gui guard (a temporary voice-test workaround for a
     // supposed enter_gui() return-hang) was skipping the ENTIRE native
@@ -11508,6 +11626,7 @@ void gui_enter(void) {
     // (enter_gui() returns cleanly to "Entered GUI mode"), so we no
     // longer skip it.  See 2026-08-18 root-cause notes.
     g_wm.enter_gui();
+    tim_mark("enter_gui total (desktop painted)");
 }
 
 int gui_is_active(void) {
