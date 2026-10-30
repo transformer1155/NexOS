@@ -418,8 +418,16 @@ $(BUILD)/distnet.o: distnet.cpp distnet.h | $(BUILD)
 $(BUILD)/silent_telemetry.o: silent_telemetry.cpp silent_telemetry.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c silent_telemetry.cpp -o $@
 
-$(BUILD)/gui.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h afont_data.h | $(BUILD)
+$(BUILD)/gui.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h afont_data.h src/gui/gfx_engine.h src/gui/gfx_engine.cpp | $(BUILD)
 	$(CC) $(CXXFLAGS) -Iplugins -I. -c gui.cpp -o $@
+
+# Data tables extracted from gui_legacy.cpp (sRGB LUTs + baked 8x16 font).
+# Needed by BOTH kernels, hence one 32-bit and one 64-bit object.
+$(BUILD)/gfx_engine.o: src/gui/gfx_engine.cpp src/gui/gfx_engine.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c src/gui/gfx_engine.cpp -o $@
+
+$(BUILD)/gfx_engine64.o: src/gui/gfx_engine.cpp src/gui/gfx_engine.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c src/gui/gfx_engine.cpp -o $@
 
 # Runtime vector font rasterizer (stb_truetype.h) - 32-bit and 64-bit.
 # Compiled as plain C (-x c) so its kmalloc/kfree calls use C linkage, matching
@@ -520,8 +528,8 @@ $(BUILD)/knowledge_base.o: knowledge_base.c knowledge_base.h | $(BUILD)
 	$(CC) -m32 -ffreestanding -fno-stack-protector -fno-pic -fno-pie -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c knowledge_base.c -o $@
 
 # ----- Link kernel ELF (entry.o first => _start at image offset 0) -----
-$(BUILD)/kernel.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS) linker.ld | $(BUILD)
-	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS)
+$(BUILD)/kernel.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS) linker.ld | $(BUILD)
+	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS)
 
 # ----- Extract flat kernel binary -----
 $(BUILD)/kernel.bin: $(BUILD)/kernel.elf | $(BUILD)
@@ -993,13 +1001,13 @@ ifdef FB_TEST
 DIAG_CXX += -DFB_TEST=$(FB_TEST)
 endif
 
-$(BUILD)/gui_diag.o: gui.cpp src/gui/gui_legacy.cpp | $(BUILD)
+$(BUILD)/gui_diag.o: gui.cpp src/gui/gui_legacy.cpp src/gui/gfx_engine.h src/gui/gfx_engine.cpp | $(BUILD)
 	$(DIAG_CXX) -I. -c gui.cpp -o $@
 
 $(BUILD)/bootuefi_diag.o: uefi/bootuefi.c | $(BUILD)
 	$(CC) $(EFI_CFLAGS) -DFB_DIAG -c uefi/bootuefi.c -o $@
 
-$(BUILD)/kernel_diag.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/gui_diag.o $(BUILD)/font_vec.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o | $(BUILD)
+$(BUILD)/kernel_diag.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/gui_diag.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o | $(BUILD)
 	$(LD) $(LDFLAGS) -o $@ $^
 
 $(BUILD)/kernel_diag.bin: $(BUILD)/kernel_diag.elf | $(BUILD)
@@ -1048,7 +1056,7 @@ UEFI_LOGO_IMG := $(BUILD)/os_uefi_logo.img
 $(BUILD)/kernel_logo.o: kernel.cpp | $(BUILD)
 	$(CC) $(CXXFLAGS) -DBOOT_LOGO_TEST -c kernel.cpp -o $@
 
-$(BUILD)/kernel_logo.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_logo.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/gui.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o | $(BUILD)
+$(BUILD)/kernel_logo.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_logo.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o | $(BUILD)
 	$(LD) $(LDFLAGS) -o $@ $^
 
 $(BUILD)/kernel_logo.bin: $(BUILD)/kernel_logo.elf | $(BUILD)
@@ -1099,8 +1107,8 @@ TEXTBOOT_IMG := $(BUILD)/os_textboot.img
 $(BUILD)/kernel_textboot.o: kernel.cpp | $(BUILD)
 	$(CC) $(CXXFLAGS) -DTEXT_BOOT -c kernel.cpp -o $@
 
-$(BUILD)/kernel_textboot.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_textboot.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS) linker.ld | $(BUILD)
-	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_textboot.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS)
+$(BUILD)/kernel_textboot.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_textboot.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS) linker.ld | $(BUILD)
+	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_textboot.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS)
 
 $(BUILD)/kernel_textboot.bin: $(BUILD)/kernel_textboot.elf | $(BUILD)
 	$(OBJCOPY) -O binary $< $@
@@ -1597,7 +1605,7 @@ $(BUILD)/svga64.o: svga.cpp svga.h | $(BUILD)
 $(BUILD)/nexos_ai64.o: nexos_ai.cpp nexos_ai.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c nexos_ai.cpp -o $@
 
-$(BUILD)/gui64.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h afont_data.h | $(BUILD)
+$(BUILD)/gui64.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h afont_data.h | $(BUILD) src/gui/gfx_engine.h src/gui/gfx_engine.cpp
 	$(CC64) $(CXX64FLAGS) -I plugins -c gui.cpp -o $@
 
 $(BUILD)/ai_engine64.o: ai_engine.cpp | $(BUILD)
@@ -1692,7 +1700,7 @@ $(BUILD)/linux_guest_backend64.o: plugins/linux_guest_backend.cpp | $(BUILD)
 # strict re-link used by tools/check_k64_undefined.sh must never diverge,
 # otherwise the gate would validate a different binary than we ship.
 KERNEL64_OBJS := $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o $(BUILD)/systemalgo64.o \
-	$(BUILD)/vmm64.o $(BUILD)/vnc_client64.o $(BUILD)/linux_manager64.o $(BUILD)/linux_guest_backend64.o $(BUILD)/svga64.o $(BUILD)/nexos_ai64.o
+	$(BUILD)/vmm64.o $(BUILD)/vnc_client64.o $(BUILD)/linux_manager64.o $(BUILD)/linux_guest_backend64.o $(BUILD)/svga64.o $(BUILD)/nexos_ai64.o $(BUILD)/gfx_engine64.o
 
 $(BUILD)/kernel64.elf: $(KERNEL64_OBJS) .attic64/linker64.ld | $(BUILD)
 	$(LD64) $(LDFLAGS64) -o $@ $(KERNEL64_OBJS)
