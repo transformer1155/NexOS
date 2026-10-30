@@ -8524,6 +8524,31 @@ struct Win11Desktop {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // True when the pointer rests over the BARE desktop surface: above the
+    // managed taskbar strip and not inside any visible, non-minimised window.
+    //
+    // The managed ICON layer (desktop icons / portal tiles / search bar) is
+    // drawn by mforms_paint_desk_icons(), which only runs when the desktop
+    // layer is invalidated.  A mouse move never invalidates it, so hovering an
+    // icon used to change nothing at all: measured 0/1408 pixels inside the
+    // 'This PC' tile while the taskbar Start button changed 306/357 in the very
+    // same run (the overlay layer repaints on every frame, the desk layer does
+    // not).  gui_tick()'s rest-refresh uses this to ask for an icon-layer
+    // repaint; the cheap path (blit cached wallpaper + PaintIcons) is ~10 ms.
+    // ---------------------------------------------------------------------
+    bool pointer_over_desktop_surface() {
+        // Taskbar / Start menu strip is the overlay's business, not the icons'.
+        if (mouse_y >= gfx.height - MANAGED_TASKBAR_H) return false;
+        for (int i = 0; i < window_count; i++) {
+            Win11Window& w = windows[i];
+            if (!w.visible || w.minimized) continue;
+            if (mouse_x >= w.x && mouse_x < w.x + w.w &&
+                mouse_y >= w.y && mouse_y < w.y + w.h) return false;
+        }
+        return true;
+    }
+
     void handle_mouse_move(int dx, int dy) {
         if (!gui_mode) return;
         telem_mouse_move(dx, dy);
@@ -11972,6 +11997,12 @@ void gui_tick(void) {
             uint32_t hnow = g_wm.tick_ms_now();
             if ((uint32_t)(hnow - g_wm.mouse_hover_ms) >= 120u) {
                 g_wm.mouse_hover_pending = false;
+                // Hovering a desktop icon / portal tile only changes the
+                // managed ICON layer, and that layer is otherwise repainted
+                // solely when the window set changes -- so without this the
+                // icon highlight never appears (0/1408 px measured).  Only on
+                // the rest-refresh (not while moving), so idle stays clean.
+                if (g_wm.pointer_over_desktop_surface()) g_desk_needs_full = true;
                 g_wm.last_ai_repaint_ms  = hnow;
                 g_wm.render_all();
                 // Trace the refresh: one line per second at most (a moving

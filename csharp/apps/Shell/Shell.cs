@@ -302,26 +302,28 @@ namespace NexOS.Forms
 
         // Split desktop-layer entry points (see Desktop.PaintWall/PaintIcons).
         //
-        // Anim.Tick() runs ONLY in PaintWall so that a PaintWall + PaintIcons
-        // pair advances every tween exactly once per frame: the host calls both
-        // on a full repaint (first frame / cache miss) and only PaintIcons when
-        // it re-blits the cached wallpaper.  Putting Tick() in both would double
-        // the animation rate on full-repaint frames.
+        // Anim.Tick() lives in PaintIcons (see below), NOT here.  PaintIcons is
+        // the pass that runs on EVERY desktop repaint -- the host calls only
+        // PaintIcons when it re-blits the cached wallpaper -- so ticking there
+        // advances every tween exactly once per desktop frame.  Ticking in
+        // PaintWall as well would double the animation rate on full repaints;
+        // NOT ticking on an icons-only repaint froze every tween instead (that
+        // is what left the desktop-icon highlight stuck at its accent state).
         public static void PaintWall(int w, int h)
         {
-            Anim.Tick();
             if (Login.IsActive() != 0) { Login.Paint(w, h); return; }
             App.Current = null;
             Voice.BeginFrame();
             Desktop.PaintWall(w, h);
         }
 
-        // Icons-only pass over an already-present wallpaper.  No Anim.Tick():
-        // the tween must advance exactly once per frame (see above).  A voice
-        // frame is still opened because this pass is what registers the desktop
-        // icon controls on repaint frames that reuse the host's wallpaper cache.
+        // Icons-only pass over an already-present wallpaper.  This is the pass
+        // that runs on EVERY desktop repaint, so it owns Anim.Tick() (see above).
+        // A voice frame is still opened because this pass is what registers the
+        // desktop icon controls on repaints that reuse the host's wallpaper cache.
         public static void PaintIcons(int w, int h)
         {
+            Anim.Tick();
             if (Login.IsActive() != 0) return;   // lock screen owns the surface
             App.Current = null;
             Voice.BeginFrame();

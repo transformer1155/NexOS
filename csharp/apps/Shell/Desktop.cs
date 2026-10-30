@@ -540,6 +540,19 @@ namespace NexOS.Forms
             menuOpen = false;
             renameIdx = -1;
 
+            // Reset selection / right-click state EXPLICITLY here.
+            //
+            // Do NOT rely on the static field initialisers for these: the
+            // mini-CLR does not appear to apply them, so `selIdx` started at 0
+            // and the FIRST desktop icon was permanently "selected".  The
+            // selection tint (Desktop.Accent 0x0078D4) is drawn AFTER the
+            // hover tint, so it both painted a sticky accent tile (measured
+            // 5036/7056 px of 0x0078D4 inside the icon cell, even with the
+            // pointer parked far away) and completely hid the IconHot hover
+            // feedback (0 px of 0x1D5A96 ever measured).
+            selIdx        = -1;
+            startRClickIdx = -1;
+
             kName = new string[KINDS];
             kName[0] = "Settings";     kName[1] = "This PC";    kName[2] = "Terminal";
             kName[3] = "Calculator";   kName[4] = "Task Mgr";   kName[5] = "Optimizer";
