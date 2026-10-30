@@ -418,7 +418,7 @@ $(BUILD)/distnet.o: distnet.cpp distnet.h | $(BUILD)
 $(BUILD)/silent_telemetry.o: silent_telemetry.cpp silent_telemetry.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c silent_telemetry.cpp -o $@
 
-$(BUILD)/gui.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h afont_data.h src/gui/gfx_engine.h src/gui/gfx_engine.cpp | $(BUILD)
+$(BUILD)/gui.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h afont_data.h src/gui/gfx_engine.h src/gui/gfx_engine.cpp  src/gui/gfx_graphics.inc | $(BUILD)
 	$(CC) $(CXXFLAGS) -Iplugins -I. -c gui.cpp -o $@
 
 # Data tables extracted from gui_legacy.cpp (sRGB LUTs + baked 8x16 font).
@@ -1001,7 +1001,7 @@ ifdef FB_TEST
 DIAG_CXX += -DFB_TEST=$(FB_TEST)
 endif
 
-$(BUILD)/gui_diag.o: gui.cpp src/gui/gui_legacy.cpp src/gui/gfx_engine.h src/gui/gfx_engine.cpp | $(BUILD)
+$(BUILD)/gui_diag.o: gui.cpp src/gui/gui_legacy.cpp src/gui/gfx_engine.h src/gui/gfx_engine.cpp  src/gui/gfx_graphics.inc | $(BUILD)
 	$(DIAG_CXX) -I. -c gui.cpp -o $@
 
 $(BUILD)/bootuefi_diag.o: uefi/bootuefi.c | $(BUILD)
@@ -1605,7 +1605,7 @@ $(BUILD)/svga64.o: svga.cpp svga.h | $(BUILD)
 $(BUILD)/nexos_ai64.o: nexos_ai.cpp nexos_ai.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c nexos_ai.cpp -o $@
 
-$(BUILD)/gui64.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h afont_data.h | $(BUILD) src/gui/gfx_engine.h src/gui/gfx_engine.cpp
+$(BUILD)/gui64.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h afont_data.h  src/gui/gfx_graphics.inc | $(BUILD) src/gui/gfx_engine.h src/gui/gfx_engine.cpp
 	$(CC64) $(CXX64FLAGS) -I plugins -c gui.cpp -o $@
 
 $(BUILD)/ai_engine64.o: ai_engine.cpp | $(BUILD)
