@@ -112,7 +112,12 @@ LDFLAGS  := -m elf_i386 -nostdlib -T linker.ld -z noexecstack
 # for the long-mode kernel while CC (i686-elf) builds the 32-bit kernel.
 # Default to $(CC) so Linux toolchains that are multilib-capable keep working.
 CC64       ?= $(CC)
-CXX64FLAGS := -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1
+# -fno-strict-aliasing: the kernel type-puns constantly (memory-mapped structs,
+# framebuffer casts, FS entry overlays on raw sectors).  The 32-bit flags have
+# always disabled it; the 64-bit set did not, and gcc 15 at -O2 then miscompiles
+# aliased accesses -- the long-mode desktop died DURING its first paint
+# (serial stopped between mh_* draw calls and [PERF1]).
+CXX64FLAGS := -I. -m64 -mno-red-zone -mcmodel=kernel -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -nostdlib -O2 -fno-strict-aliasing -Wall -Wextra -fpermissive -DMINIOS_HAVE_MFORMS=1 -DNexOS_HAVE_MFORMS=1
 AS64FLAGS  := -f elf64
 LD64       := ld
 LDFLAGS64  := -m elf_x86_64 -nostdlib -T .attic64/linker64.ld -z noexecstack --unresolved-symbols=ignore-all
@@ -432,11 +437,25 @@ $(BUILD)/net.o: net.cpp | $(BUILD)
 $(BUILD)/distnet.o: distnet.cpp distnet.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c distnet.cpp -o $@
 
+# ---- TLS 1.3 client (self-contained; no OpenSSL / mbedTLS) ---------------
+$(BUILD)/tls_crypto.o: tls_crypto.cpp tls_crypto.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c tls_crypto.cpp -o $@
+$(BUILD)/tls13.o: tls13.cpp tls13.h tls_crypto.h tls_x509.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c tls13.cpp -o $@
+$(BUILD)/tls_x509.o: tls_x509.cpp tls_x509.h tls_crypto.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c tls_x509.cpp -o $@
+$(BUILD)/net_tls.o: net_tls.cpp net_tls.h tls13.h tls_x509.h tls_crypto.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -c net_tls.cpp -o $@
+
 $(BUILD)/silent_telemetry.o: silent_telemetry.cpp silent_telemetry.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c silent_telemetry.cpp -o $@
 
+# -Oz on this unit only: gcc 15's -Os output pushed the 32-bit image 972 bytes
+# past the EBDA guard (__kimage_end 0x9FFCC vs limit 0x9FC00).  gui_legacy.cpp is
+# the largest translation unit, so size-optimising it harder buys the room back
+# without changing any behaviour (pure size/speed trade, no semantic effect).
 $(BUILD)/gui.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h afont_data.h src/gui/gfx_engine.h src/gui/gfx_engine.cpp  src/gui/gfx_graphics.inc | $(BUILD)
-	$(CC) $(CXXFLAGS) -Iplugins -I. -c gui.cpp -o $@
+	$(CC) $(CXXFLAGS) -Oz -Iplugins -I. -c gui.cpp -o $@
 
 # Data tables extracted from gui_legacy.cpp (sRGB LUTs + baked 8x16 font).
 # Needed by BOTH kernels, hence one 32-bit and one 64-bit object.
@@ -505,7 +524,7 @@ $(BUILD)/clr.o: clr.cpp clr.h | $(BUILD)
 # (EIP=1, CR2=0xFFFFFFEC). Disabling sibling-call optimisation forces a
 # proper `call *funcptr` and eliminates the crash for every wrapper.
 $(BUILD)/mforms.o: mforms.cpp mforms.h clr.h | $(BUILD)
-	$(CC) $(CXXFLAGS) -fno-optimize-sibling-calls -c mforms.cpp -o $@
+	$(CC) $(CXXFLAGS) -Oz -fno-optimize-sibling-calls -c mforms.cpp -o $@
 
 # ----- Early boot splash (32-bit kernel only) -----
 # Self-contained animation painted straight into the LFB before the heap,
@@ -928,6 +947,19 @@ $(IMG): $(BUILD)/boot.bin $(BUILD)/stage2.bin $(BUILD)/kernel.bin $(BUILD)/kerne
 	# Write the 64-bit (long-mode) kernel at LBA 2048 so the 32-bit
 	# `switch` command can load it and transition to long mode.
 	dd if=$(BUILD)/kernel64.bin of=$@ bs=512 seek=2048 conv=notrunc 2>/dev/null
+	# GUARD: the SFS volume must fit between SFS_LBA and LINUX_SFS_LBA, else the
+	# dd below silently writes over the Linux partition (and the Linux dd then
+	# overwrites the SFS tail).  That is how a user-added wallpaper "vanished":
+	# the tex_wp*.tex files at the end of the volume were clobbered, so the host
+	# could not load them.  Fail the build instead of corrupting the image.
+	@sfsz=$$(stat -c%s $(SFS_IMG)); slot=$$(( ($(LINUX_SFS_LBA) - $(SFS_LBA)) * 512 )); \
+	 if [ $$sfsz -gt $$slot ]; then \
+	   echo "*** ERROR: SFS volume is $$sfsz bytes but its slot is only $$slot bytes"; \
+	   echo "***        ($(SFS_LBA)..$(LINUX_SFS_LBA)); it would overwrite the Linux partition."; \
+	   echo "***        Remove some wallpapers or let tools/tex_pack.py shrink them."; \
+	   exit 1; \
+	 fi; \
+	 echo "    SFS fit:  $$sfsz / $$slot bytes ($$(( ($$slot - $$sfsz) / 1024 )) KiB spare)"
 	# Write SFS image at LBA 3488
 	dd if=$(SFS_IMG) of=$@ bs=512 seek=$(SFS_LBA) conv=notrunc 2>/dev/null
 	# Write the independent Linux user-space partition after the main SFS
@@ -1622,6 +1654,16 @@ $(BUILD)/kernel64.o: .attic64/kernel64.cpp drivers/driver_contract.h font_vec.h 
 $(BUILD)/smp64.o: .attic64/smp64.cpp .attic64/smp64.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c .attic64/smp64.cpp -o $@
 
+# ---- TLS 1.3 client, 64-bit kernel ---------------------------------------
+$(BUILD)/tls_crypto64.o: tls_crypto.cpp tls_crypto.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c tls_crypto.cpp -o $@
+$(BUILD)/tls1364.o: tls13.cpp tls13.h tls_crypto.h tls_x509.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c tls13.cpp -o $@
+$(BUILD)/tls_x50964.o: tls_x509.cpp tls_x509.h tls_crypto.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c tls_x509.cpp -o $@
+$(BUILD)/net_tls64.o: net_tls.cpp net_tls.h tls13.h tls_x509.h tls_crypto.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c net_tls.cpp -o $@
+
 $(BUILD)/silent_telemetry64.o: silent_telemetry.cpp silent_telemetry.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c silent_telemetry.cpp -o $@
 
@@ -1741,7 +1783,7 @@ $(BUILD)/linux_guest_backend64.o: plugins/linux_guest_backend.cpp | $(BUILD)
 # The 64-bit object list lives in ONE variable: the real link and the
 # strict re-link used by tools/check_k64_undefined.sh must never diverge,
 # otherwise the gate would validate a different binary than we ship.
-KERNEL64_OBJS := $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o $(BUILD)/systemalgo64.o \
+KERNEL64_OBJS := $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/net_tls64.o $(BUILD)/tls_crypto64.o $(BUILD)/tls1364.o $(BUILD)/tls_x50964.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o $(BUILD)/systemalgo64.o \
 	$(BUILD)/vmm64.o $(BUILD)/vnc_client64.o $(BUILD)/linux_manager64.o $(BUILD)/linux_guest_backend64.o $(BUILD)/svga64.o $(BUILD)/nexos_ai64.o $(BUILD)/gfx_engine64.o
 
 $(BUILD)/kernel64.elf: $(KERNEL64_OBJS) .attic64/linker64.ld | $(BUILD)

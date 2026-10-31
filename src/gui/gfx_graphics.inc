@@ -1127,7 +1127,19 @@ struct Graphics {
         // (1) Vector outline path (stb_truetype / msyh.ttf) -- crisp native-size
         //     CJK, same rationale as draw_cjk() above.  This is the primary path
         //     now; the baked 24x24 bitmap is only a fallback.
-        if (g_font_mode != 0 && vec_ready()) {
+#if defined(__x86_64__)
+        // 64-bit: SKIP the fontvec driver for CJK.  vec_init() reports
+        // rc=0/ready=1 and ASCII renders fine, but the first CJK glyph goes
+        // through g_vec_api->glyph() and triple-faults (serial: "[T64] text
+        // #29 s=?????? HUD" then dead -- the HUD's Chinese label is the first
+        // non-ASCII string on screen).  Until that driver path is 64-bit clean,
+        // fall through to the baked 24x24 alpha bitmap / embedded 1-bit font,
+        // which are plain blits and cannot fault.
+        const bool cjk_vec_ok = false;
+#else
+        const bool cjk_vec_ok = g_font_mode != 0 && vec_ready();
+#endif
+        if (cjk_vec_ok) {
             int w = 0, h = 0, xo = 0, yo = 0;
             const uint8_t* g = vec_glyph(cp, g_font_px, &w, &h, &xo, &yo);
             if (g) {
@@ -1263,69 +1275,108 @@ struct Graphics {
         return (q << 15) + ((r << 15) / dst) - 0x8000;
     }
 
-    // Stretch-blit a SFS texture into the backbuffer.
-    //   fmt 0 = RGB565 (bilinear), fmt 1 = ARGB32 (nearest + alpha blend).
-    void draw_image(const TexRec& t, int x, int y, int w, int h) {
+    // Stretch-blit a SFS texture into the backbuffer, clipped to a SCREEN-space
+    // box.  fmt 0 = RGB565 (bilinear), fmt 1 = ARGB32 (nearest + alpha blend).
+    //
+    // (x,y,w,h) is the full destination rect and is what the texture is sampled
+    // over; [cx0,cy0,cx1,cy1) only limits which destination pixels are written.
+    // The distinction matters: the old code clipped the DEST RECT and then
+    // derived the texture index from the clipped size, so a partially visible
+    // image was squashed rather than cropped.  Managed windows must never draw
+    // outside their client box, hence this variant.
+    void draw_image_clip(const TexRec& t, int x, int y, int w, int h,
+                         int cx0, int cy0, int cx1, int cy1) {
         if (!t.loaded || !t.data || w <= 0 || h <= 0) return;
-        int sx = x, sy = y, sw = w, sh = h;
-        if (sx < 0) { sw += sx; sx = 0; }
-        if (sy < 0) { sh += sy; sy = 0; }
-        if (sx + sw > (int)width)  sw = width - sx;
-        if (sy + sh > (int)height) sh = height - sy;
-        if (sw <= 0 || sh <= 0) return;
+        int x0 = x, y0 = y, x1 = x + w, y1 = y + h;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > (int)width)  x1 = width;
+        if (y1 > (int)height) y1 = height;
+        if (x0 < cx0) x0 = cx0;
+        if (y0 < cy0) y0 = cy0;
+        if (x1 > cx1) x1 = cx1;
+        if (y1 > cy1) y1 = cy1;
+        if (x1 <= x0 || y1 <= y0) return;
         const int tw = t.w, th = t.h;
         if (tw <= 0 || th <= 0) return;
 
+        // ---- ARGB32: 2x2 BILINEAR + alpha blend --------------------------
+        //
+        // This used to be NEAREST.  The app icons are authored at 128x128 and
+        // drawn at ~40 px, so nearest sampling threw away 2 of every 3 texels
+        // and left hard, stair-stepped edges -- the "icons have no
+        // antialiasing" report.  Bilinear on all four channels (alpha
+        // included) gives the downscaled icon a proper soft edge.
+        //
+        // Note: this is a true 2x2 tap, so the cost per destination pixel is
+        // 4 fetches instead of 1.  Icons are small (<= 48 px square) and the
+        // wallpaper/menu/taskbar textures use fmt 0 (already bilinear), so the
+        // added work is bounded.
         if (t.fmt == 1) {
             const uint8_t* src = t.data;
-            for (int row = 0; row < sh; row++) {
-                int tyi = (row * th) / sh;
-                if (tyi >= th) tyi = th - 1;
-                uint32_t* p = backbuffer + (sy + row) * width + sx;
-                for (int col = 0; col < sw; col++) {
-                    int txi = (col * tw) / sw;
-                    if (txi >= tw) txi = tw - 1;
-                    const uint8_t* q = src + (tyi * tw + txi) * 4;
-                    uint32_t px = (uint32_t)q[0] | ((uint32_t)q[1] << 8) |
-                                  ((uint32_t)q[2] << 16) | ((uint32_t)q[3] << 24);
-                    int a = (int)((px >> 24) & 0xFF);
+            for (int dy = y0; dy < y1; dy++) {
+                int fy = bilinear_fp(dy - y, th, h);
+                int ty0 = fy >> 16; if (ty0 < 0) ty0 = 0;
+                int ty1 = ty0 + 1;  if (ty1 >= th) ty1 = th - 1;
+                int yf = fy & 0xFFFF;
+                const uint8_t* r0 = src + (size_t)ty0 * tw * 4u;
+                const uint8_t* r1 = src + (size_t)ty1 * tw * 4u;
+                uint32_t* p = backbuffer + dy * width + x0;
+                for (int dx = x0; dx < x1; dx++) {
+                    int fx = bilinear_fp(dx - x, tw, w);
+                    int tx0 = fx >> 16; if (tx0 < 0) tx0 = 0;
+                    int tx1 = tx0 + 1;  if (tx1 >= tw) tx1 = tw - 1;
+                    int xf = fx & 0xFFFF;
+                    const uint8_t* q00 = r0 + (size_t)tx0 * 4u;
+                    const uint8_t* q01 = r0 + (size_t)tx1 * 4u;
+                    const uint8_t* q10 = r1 + (size_t)tx0 * 4u;
+                    const uint8_t* q11 = r1 + (size_t)tx1 * 4u;
+                    int a  = tex_bilerp(q00[3], q01[3], q10[3], q11[3], xf, yf);
                     if (a == 0) continue;
-                    uint32_t d = p[col];
+                    int sr = tex_bilerp(q00[2], q01[2], q10[2], q11[2], xf, yf);
+                    int sg = tex_bilerp(q00[1], q01[1], q10[1], q11[1], xf, yf);
+                    int sb = tex_bilerp(q00[0], q01[0], q10[0], q11[0], xf, yf);
+                    uint32_t* dst = p + (dx - x0);
+                    if (a >= 255) { *dst = ((uint32_t)sr << 16) | ((uint32_t)sg << 8) | (uint32_t)sb; continue; }
+                    uint32_t d = *dst;
                     int dr = (int)((d >> 16) & 0xFF), dg = (int)((d >> 8) & 0xFF), db = (int)(d & 0xFF);
-                    int sr = (int)((px >> 16) & 0xFF), sg = (int)((px >> 8) & 0xFF), sb = (int)(px & 0xFF);
-                    if (a == 255) { p[col] = px & 0x00FFFFFF; continue; }
-                    p[col] = ((uint32_t)((sr * a + dr * (255 - a)) / 255) << 16) |
-                             ((uint32_t)((sg * a + dg * (255 - a)) / 255) << 8) |
-                             ((uint32_t)((sb * a + db * (255 - a)) / 255));
+                    *dst = ((uint32_t)((sr * a + dr * (255 - a)) / 255) << 16) |
+                           ((uint32_t)((sg * a + dg * (255 - a)) / 255) << 8) |
+                           ((uint32_t)((sb * a + db * (255 - a)) / 255));
                 }
             }
             return;
         }
 
         const uint16_t* src = (const uint16_t*)t.data;
-        for (int row = 0; row < sh; row++) {
-            int fy = bilinear_fp(row, th, sh);
-            int y0 = fy >> 16; if (y0 < 0) y0 = 0;
-            int y1 = y0 + 1; if (y1 >= th) y1 = th - 1;
+        for (int dy = y0; dy < y1; dy++) {
+            int fy = bilinear_fp(dy - y, th, h);
+            int y0t = fy >> 16; if (y0t < 0) y0t = 0;
+            int y1t = y0t + 1; if (y1t >= th) y1t = th - 1;
             int yf = fy & 0xFFFF;
-            const uint16_t* r0 = src + (uint32_t)y0 * tw;
-            const uint16_t* r1 = src + (uint32_t)y1 * tw;
-            uint32_t* p = backbuffer + (sy + row) * width + sx;
-            for (int col = 0; col < sw; col++) {
-                int fx = bilinear_fp(col, tw, sw);
-                int x0 = fx >> 16; if (x0 < 0) x0 = 0;
-                int x1 = x0 + 1; if (x1 >= tw) x1 = tw - 1;
+            const uint16_t* r0 = src + (uint32_t)y0t * tw;
+            const uint16_t* r1 = src + (uint32_t)y1t * tw;
+            uint32_t* p = backbuffer + dy * width + x0;
+            for (int dx = x0; dx < x1; dx++) {
+                int fx = bilinear_fp(dx - x, tw, w);
+                int x0t = fx >> 16; if (x0t < 0) x0t = 0;
+                int x1t = x0t + 1; if (x1t >= tw) x1t = tw - 1;
                 int xf = fx & 0xFFFF;
-                uint16_t c00 = r0[x0], c01 = r0[x1], c10 = r1[x0], c11 = r1[x1];
+                uint16_t c00 = r0[x0t], c01 = r0[x1t], c10 = r1[x0t], c11 = r1[x1t];
                 int r = tex_bilerp(tex_channel(c00, 0), tex_channel(c01, 0),
                                    tex_channel(c10, 0), tex_channel(c11, 0), xf, yf);
                 int g = tex_bilerp(tex_channel(c00, 1), tex_channel(c01, 1),
                                    tex_channel(c10, 1), tex_channel(c11, 1), xf, yf);
                 int b = tex_bilerp(tex_channel(c00, 2), tex_channel(c01, 2),
                                    tex_channel(c10, 2), tex_channel(c11, 2), xf, yf);
-                p[col] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+                p[dx - x0] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
             }
         }
+    }
+
+    // Stretch-blit a SFS texture into the backbuffer (no extra clip box).
+    void draw_image(const TexRec& t, int x, int y, int w, int h) {
+        draw_image_clip(t, x, y, w, h, 0, 0, (int)width, (int)height);
     }
 
     // Draw a simple icon (colored square with letter)

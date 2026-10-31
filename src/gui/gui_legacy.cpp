@@ -59,6 +59,7 @@ static inline void        mforms_close(int) {}
 static inline const char* mforms_title(int) { return ""; }
 static inline void        mforms_paint(int, int, int, int, int) {}
 static inline int         mforms_click(int, int, int, int, int, int, int) { return 0; }
+static inline int         mforms_drag(int, int, int, int, int, int, int) { return 0; }
 static inline int         mforms_key(int, int) { return 0; }
 static inline void        mforms_set_mouse(int, int) {}
 static inline int         mforms_has_desktop(void) { return 0; }
@@ -68,6 +69,7 @@ static inline void        mforms_paint_desk_icons(int, int) {}
 static inline int         g_mforms_anim = 0;   // 64-bit build: no managed shell
 static inline void        mforms_paint_overlay(int, int) {}
 static inline int         mforms_desktop_click(int, int) { return -2; }
+static inline int         mforms_desktop_drag(int, int, int) { return 0; }
 static inline int         mforms_desktop_rclick(int, int) { return -2; }
 static inline int         mforms_rclick(int, int, int, int, int, int, int) { return 0; }
 static inline int         mforms_desktop_menu_open(void) { return 0; }
@@ -77,6 +79,39 @@ static inline void        mforms_set_running(uint32_t) {}
 static inline void        mforms_set_ime(int) {}
 static inline int         mforms_paint_failed(int) { return 0; }
 #endif
+
+// Window drag & drop state (managed apps): set on a press inside a managed
+// window, consumed by the move / release handlers in this file.
+static int  g_win_drag_id   = -1;   // managed app id being dragged
+static int  g_win_drag_ox   = 0;    // grab offset inside the client area
+static int  g_win_drag_cx   = 0;    // client-area origin on screen (coord conversion)
+
+// Drag ghost: while a FILE is being dragged the item follows the pointer,
+// exactly like a desktop icon drag.  Drawn by render_all above every layer.
+static int  g_ghost_on   = 0;
+static char g_ghost_name[64] = {0};
+static int  g_win_drag_cy   = 0;
+static int  g_win_drag_oy   = 0;
+
+// TEMP UNBLOCK: another agent's in-flight edit calls strcat_safe here before
+// any definition exists, which broke the whole tree (gui.o / gui64.o).
+// Bounded append; no libc in the freestanding kernel.  Drop this if the
+// owner adds their own definition in the same translation unit.
+static void strcat_safe(char* dst, const char* src, int cap) {
+    int d = 0;
+    while (dst[d] && d < cap - 1) d++;
+    int s = 0;
+    while (src && src[s] && d < cap - 1) dst[d++] = src[s++];
+    dst[d] = 0;
+}
+
+// Forward declaration: draw_win32_app() is defined far below but called by
+// draw_window(), which comes first in the file.
+static void draw_win32_app(int id, int x, int y, int w, int h);
+
+// A desktop icon drag is in progress (armed on button-down, cleared on release).
+// Declared outside the #if above so both the managed and the stub build see it.
+static bool g_desk_drag_armed = false;
 
 // ---------------------------------------------------------------------
 //  MForms bridge gap (pre-existing, independent of the VNC work):
@@ -888,6 +923,18 @@ struct GuiCallbacks {
     int      (*mkdir)(int fs, const char* name);
     int      (*remove)(int fs, const char* name);
     int      (*rename)(int fs, const char* old_name, const char* new_name);
+    // Directory navigation (File Explorer folders).  Must stay in the SAME
+    // order as the copy in kernel.cpp: the struct crosses the gui_init() ABI.
+    int      (*enter_dir)(int fs, int idx);
+    int      (*dir_up)(int fs);
+    int      (*cwd_path)(int fs, char* buf, int size);
+    // Move a file into the folder at listing index dst_idx (drag & drop).
+    int  (*move_file)(int fs, const char* name, int dst_idx);
+    int  (*enter_path)(int fs, const char* path);
+    int  (*file_size)(int fs, const char* name);
+    int  (*is_dir_name)(int fs, const char* name);
+    int  (*copy_range)(int src_fs, const char* src_path, const char* name,
+                       int dst_fs, const char* dst_path, int off, int len);
     const char* (*get_os_name)(void);
     bool     (*is_64bit)(void);
     // Browser callbacks
@@ -949,6 +996,17 @@ extern "C" void gui_exit(void);
 // Defined in the extern "C" block at the bottom (session persistence).
 extern "C" int gui_session_save(void);
 extern "C" int gui_session_restore(void);
+
+// Retro post-process / DPI knobs.  DEFINED in mforms.cpp at file scope with
+// C linkage; declared HERE, before the anonymous namespace opens, because a
+// declaration inside that namespace gets INTERNAL linkage -- the 64-bit link
+// then bound these to address 0 (check-k64 catches it, and the first retro
+// pass would run on garbage).
+extern "C" int g_pixel_mode;
+extern "C" int g_pixel_scale;
+extern "C" int g_pixel_scan;
+extern "C" int g_dpr;
+extern "C" int g_text_aa;
 
 // =====================================================================
 //  Graphics Driver
@@ -1253,6 +1311,12 @@ constexpr int TEX_TASK   = 1;    // taskbar tile
 constexpr int TEX_MENU   = 2;    // start/context menu tile
 constexpr int TEX_CHROME = 3;    // title-bar tile
 constexpr int TEX_WINBG  = 4;    // window client-area tile
+// User wallpapers: assets/wallpapers/*.png are packed by tools/tex_pack.py as
+// tex_wp0.tex, tex_wp1.tex, ... and loaded here until one fails, so ADDING A
+// WALLPAPER IS DATA ONLY -- no code change.  Ids start at 10 to stay clear of
+// the five base textures and the icons at TEX_ICON(100).
+constexpr int TEX_WP_BASE = 10;  // + index of the user wallpaper
+static int g_wallpaper_n  = 0;   // how many user wallpapers actually loaded
 constexpr int TEX_ICON   = 100;  // + AppKind -> app icon
 
 struct TexRec {
@@ -1643,7 +1707,47 @@ struct MouseCursor {
         0x00000000, 0x00000000, 0x00000000, 0x00000000,
     };
 
-    void init(int w, int h) { x = w / 2; y = h / 2; visible = false; saved_valid = false; }
+    // A soft-cursor move erases the old sprite into the BACKBUFFER first.  That
+    // erase must NOT be flipped to the screen on its own: flipping it shows a
+    // frame with no cursor at all, and the redraw only follows later (next
+    // save/draw or the next render_all) -- which is exactly the "cursor blinks
+    // while dragging a window / moving the mouse" symptom.  Instead the origin
+    // is remembered here and the flip is batched with the redraw, or handed to
+    // render_all() when a full composite follows.
+    int  erase_x, erase_y;
+    bool erase_pending;
+
+    void init(int w, int h) { x = w / 2; y = h / 2; visible = false; saved_valid = false; erase_pending = false; }
+
+    // Flip everything a cursor move touched in ONE step.  When the old and new
+    // 32x32 boxes overlap, flip their union: two separate flips would let the
+    // second one paint restored background over the freshly drawn sprite.
+    void flip_move(Graphics& g) {
+        if (!erase_pending) {
+            g.present_rect(x, y, CURSOR_SIZE, CURSOR_SIZE);
+            return;
+        }
+        int ex = erase_x, ey = erase_y;
+        bool overlap = !(ex + CURSOR_SIZE <= x || x + CURSOR_SIZE <= ex ||
+                         ey + CURSOR_SIZE <= y || y + CURSOR_SIZE <= ey);
+        if (overlap) {
+            int x0 = ex < x ? ex : x, y0 = ey < y ? ey : y;
+            int x1 = (ex > x ? ex : x) + CURSOR_SIZE;
+            int y1 = (ey > y ? ey : y) + CURSOR_SIZE;
+            g.present_rect(x0, y0, x1 - x0, y1 - y0);
+        } else {
+            g.present_rect(x, y, CURSOR_SIZE, CURSOR_SIZE);
+            g.present_rect(ex, ey, CURSOR_SIZE, CURSOR_SIZE);
+        }
+        erase_pending = false;
+    }
+
+    // Erase into the backbuffer only (no flip); the caller decides when to flip.
+    void erase_to_backbuffer(Graphics& g) {
+        if (!saved_valid) return;
+        erase_x = saved_x; erase_y = saved_y; erase_pending = true;
+        restore_bg(g);
+    }
 
     // BUG-CURSOR1: the snapshot must remember WHERE it was taken.  save_bg() and
     // restore_bg() used to both index with the live (x,y), which is only valid
@@ -1670,26 +1774,17 @@ struct MouseCursor {
             saved_valid = false;
         }
     }
-    // 鐢绘暣涓澶磋疆寤擄紙鎻忚竟+濉厖鍚堝苟锛夋垚鍗曡壊锛屽彲甯﹀亸绉烩€斺€旂敤浜庣敾楂樹寒鍏夋檿銆?
-    void draw_sil(Graphics& g, uint32_t col, int ox, int oy) {
-        uint32_t mask = 0x80000000;
-        for (int dy = 0; dy < CURSOR_SIZE; dy++) {
-            uint32_t ob = cursor_outline[dy];
-            uint32_t fb = cursor_fill[dy];
-            uint32_t bits = ob | fb;
-            if (bits == 0) continue;
-            for (int dx = 0; dx < CURSOR_SIZE; dx++) {
-                if (dx + ox >= CURSOR_SIZE || dy + oy >= CURSOR_SIZE) continue; // 闄愬湪 32x32 鍐咃紝閬垮厤绉诲姩鏃剁暀涓嬫畫褰?
-                if (bits & (mask >> dx))
-                    g.put_pixel(x + dx + ox, y + dy + oy, col);
-            }
-        }
-    }
     void draw(Graphics& g) {
-        // 楂樹寒鍏夋檿锛氬湪绠ご涓嬫柟鍋忕Щ澶勭敾涓ゅ眰闈掕壊锛岀‘淇濅换浣曡儗鏅笅鎸囬拡閮介啋鐩?
-        // 锛堝浼犲綍灞忛噷瑙備紬鑳戒竴鐪肩湅鍒扳€滄寚閽堝湪鍝€佺偣鍦ㄥ摢鈥濓級銆?
-        draw_sil(g, 0x000088C0, 3, 3);
-        draw_sil(g, 0x0000C8FF, 2, 2);
+        // The cursor is a plain Windows arrow: black outline + white fill.
+        //
+        // It USED to also paint two cyan "highlight halo" layers offset by
+        // (+2,+2) and (+3,+3) pixels so the pointer stayed visible over any
+        // background.  In practice that reads as a smudge that is NOT part of
+        // the pointer, sitting at its lower-right: users report it as
+        // "residue below the mouse that only goes away when the pointer
+        // moves", and it also makes the refreshed region look offset towards
+        // the bottom of the cursor.  Removed -- the outline already keeps the
+        // arrow legible on light and dark backgrounds.
         uint32_t mask = 0x80000000;
         for (int dy = 0; dy < CURSOR_SIZE; dy++) {
             uint32_t ob = cursor_outline[dy];
@@ -1744,6 +1839,9 @@ enum AppType {
                          // composited & dirty-tracked like any other window
 };
 
+// TEMP UNBLOCK: used by the window painter below but defined further down.
+static int  managed_kind_for(AppType app);
+
 constexpr int MAX_WINDOWS = 12;   // +headroom: slot 0 is permanently the Start menu
 constexpr int TITLE_BAR_H = 32;
 constexpr int MAX_ICONS = 9;
@@ -1752,6 +1850,16 @@ constexpr int MAX_START_ITEMS = 9;
 // ---- Frosted-glass (姣涚幓鐠? blur helpers (file scope, not class members) ----
 // One reusable scratch buffer for the separable box blur; grown on demand.
 static uint32_t* g_glass_tmp = nullptr;
+
+// ---- P0 input-priority state (see handle_mouse_move / gui_tick) ----------
+// While a window is being dragged (or its scrollbar is), the blur pass is the
+// most expensive part of a frame and the full composite must NOT run inside
+// the mouse handler -- that is what blocked the pointer and made dragging
+// crawl.  These two flags decouple the two: input only moves the window,
+// gui_tick() repaints when it can, and the frosted glass degrades to a plain
+// translucent fill for the duration of the gesture.
+static bool g_drag_glass_off      = false;
+static bool g_drag_repaint_pending = false;
 static int       g_glass_tmp_n = 0;
 static uint32_t* glass_tmp(int n) {
     if (n > g_glass_tmp_n) {
@@ -1842,6 +1950,8 @@ static void glass_blur_rect(Graphics& g, int x, int y, int w, int h, int r, uint
 static void glass_rounded_rect(Graphics& g, int x, int y, int w, int h, int r,
                                Color c, int alpha, int blur_r) {
     if (alpha <= 0) return;
+    // P0 drag fast path: no blur, no scratch buffer -- just the tint.
+    if (g_drag_glass_off) { g.blend_rounded_rect(x, y, w, h, r, c, alpha); return; }
     if (r < 0) r = 0;
     if (r > h / 2) r = h / 2;
     if (r > w / 2) r = w / 2;
@@ -1877,6 +1987,8 @@ static void glass_rounded_rect(Graphics& g, int x, int y, int w, int h, int r,
 // Rectangular frosted glass (no rounding), e.g. the top status bar.
 static void glass_rect(Graphics& g, int x, int y, int w, int h, Color c, int alpha, int blur_r) {
     if (alpha <= 0) return;
+    // P0 drag fast path (see glass_rounded_rect).
+    if (g_drag_glass_off) { g.blend_rect(x, y, w, h, c, alpha); return; }
     int x0 = x, y0 = y, x1 = x + w, y1 = y + h;
     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
     if (x1 > g.width) x1 = g.width;
@@ -2806,9 +2918,22 @@ struct StartMenuItem {
 // shell (Theme -> Host.SetPixel).  DEFINED in mforms.cpp inside an extern "C"
 // block, so the declaration must carry C linkage too -- and it must sit at file
 // scope: a member declaration may not specify a storage class.
-extern "C" int g_pixel_mode;
-extern "C" int g_pixel_scale;
-extern "C" int g_pixel_scan;
+// (declared at file scope, above the anonymous namespace)
+
+// Drag ghost shown by the host while a file is dragged.
+extern "C" void gui_drag_ghost(int on, const char* name) {
+    g_ghost_on = on ? 1 : 0;
+    if (on && name) {
+        int i = 0;
+        while (name[i] && i < 63) { g_ghost_name[i] = name[i]; i++; }
+        g_ghost_name[i] = 0;
+    } else {
+        g_ghost_name[0] = 0;
+    }
+}
+
+// (declared at file scope, above the anonymous namespace)
+// (declared at file scope, above the anonymous namespace)
 
 // ---- BUG-3: high-DPI font scaling + AA-preserving retro mode -----------
 // The GUI is a fixed 16 px vector font, so on a high-resolution framebuffer
@@ -2818,7 +2943,7 @@ extern "C" int g_pixel_scan;
 // shell asks for (1 = 1 GUI px per device px, 2 = supersample 2x).  It is
 // pushed from the managed side through Host.SetDpi() exactly like the pixel
 // knobs above, and 0 means "not set" -> fall back to 1.
-extern "C" int g_dpr;          // device pixel ratio (1..4), 0 = unset
+// (g_dpr declared above)
 
 // 1 = keep full 8-bit anti-aliasing on text while the retro post-process is
 // active.  The RGB565 + Bayer-dither pass quantises every coverage ramp on
@@ -2826,7 +2951,7 @@ extern "C" int g_dpr;          // device pixel ratio (1..4), 0 = unset
 // quantising it is what made the "pre-rendered" font look muddy.  With this
 // flag on, the post-process leaves text pixels alone and only retro-ifies
 // the surrounding chrome (see pixelate_rect).
-extern "C" int g_text_aa;
+// (declared at file scope, above the anonymous namespace)
 
 // BUG-3: setter for the AA-preserving flag above (Host.SetTextAa).  Lives next
 // to the knobs so the retro post-process and the text-quality switch are in
@@ -5182,8 +5307,82 @@ struct Win11Desktop {
     // anim_tsc_per_ms at 0 and animate_frame() paces by main-loop pass
     // instead.  A wrong value here used to strand windows mid-animation for
     // seconds, so the sanity check is deliberately strict.
+    // ---- TSC rate: measurement and cross-check (x86_64 only) -------------
+    // A 10 ms PIT one-shot plus two rdtsc reads gives ticks/ms.  Under load
+    // (several QEMU guests on one vCPU) the guest is preempted mid-window, the
+    // PIT and the TSC stop advancing together, and the derived rate comes out
+    // INFLATED: measured 5.3-5.6M with two guests, 7.28M with more, against
+    // 3,792,888 / 3,792,905 / 3,792,924 when idle (spread 0.001%).  Every
+    // "[TIM] ... us=" value is divided by this rate, so an inflated rate makes
+    // every reported duration smaller than reality, with nothing to show it.
+    //
+    // Sampling 3x and keeping the SMALLEST works because the contamination is
+    // one-directional.  Returns 0 if the PIT never fires.
+#if defined(__x86_64__)
+    uint32_t sample_tsc_per_ms(uint32_t* out_worst) {
+        const uint16_t count = 11932;        // 1.193182 MHz * 10 ms
+        uint32_t best = 0, worst = 0;
+        for (int sample = 0; sample < 3; sample++) {
+            uint8_t pc = inb(0x61);
+            outb(0x61, (uint8_t)(pc & ~0x03));   // speaker off, gate LOW (stop)
+            outb(0x43, 0xB0);                    // ch2, lo/hi byte, mode 0, binary
+            outb(0x42, (uint8_t)(count & 0xFF));
+            outb(0x42, (uint8_t)(count >> 8));
+            outb(0x61, (uint8_t)((pc & ~0x02) | 0x01));   // gate HIGH -> counting
+            uint32_t t0 = rdtsc32();
+            uint32_t guard = 0;
+            bool done = false;
+            while (guard++ < 2000000u) {
+                if (inb(0x61) & 0x20) { done = true; break; }
+            }
+            uint32_t t1 = rdtsc32();
+            outb(0x61, pc);                      // restore original state
+            if (!done) return 0;
+            uint32_t one = (t1 - t0) / 10;
+            if (best == 0 || one < best) best = one;
+            if (one > worst) worst = one;
+        }
+        if (out_worst) *out_worst = worst;
+        return best;
+    }
+
+    // Second opinion, taken late in boot.  If the rate measured now disagrees
+    // with the one the boot timings were derived from by more than 20%, that
+    // earlier reading was taken under load and every us= figure is suspect --
+    // so drop to cycles-only rather than keep publishing wrong microseconds.
+    // This catches the case a within-run spread check cannot: load that is
+    // evenly spread makes all three samples agree, just at the wrong value.
+    void verify_tsc_rate() {
+        if (anim_tsc_per_ms <= 0) return;         // already rejected / absent
+        uint32_t first = (uint32_t)anim_tsc_per_ms;
+        uint32_t second = sample_tsc_per_ms(0);
+        if (second == 0) return;                  // PIT unavailable now; keep first
+        uint32_t d = (second > first) ? (second - first) : (first - second);
+        if ((uint64_t)d * 100u > (uint64_t)first * 20u) {
+            char b[16];
+            uint_to_str(first, b);
+            serial_puts("[ANIM] WARN: TSC rate unstable (boot ");
+            serial_puts(b);
+            uint_to_str(second, b);
+            serial_puts(" vs now ");
+            serial_puts(b);
+            serial_puts(" tsc/ms); [TIM] us= disabled, cycles only\n");
+            anim_tsc_per_ms = 0;
+            g_tim_tsc_per_ms = 0;                 // makes tim_mark() print cycles only
+        }
+    }
+#endif
+
     void calibrate_tsc() {
         anim_tsc_per_ms = 0;
+#if defined(__x86_64__)
+        uint32_t worst = 0;
+        uint32_t per_ms = sample_tsc_per_ms(&worst);
+        if (per_ms == 0) {
+            serial_puts("[ANIM] PIT ch2 never fired; pacing by frame\n");
+            return;
+        }
+#else
         const uint16_t count = 11932;        // 1.193182 MHz * 10 ms
         uint8_t pc = inb(0x61);
         outb(0x61, (uint8_t)(pc & ~0x03));   // speaker off, gate LOW (stop)
@@ -5206,15 +5405,28 @@ struct Win11Desktop {
             return;
         }
         uint32_t per_ms = (t1 - t0) / 10;
+#endif
         char b[16];
-        // Accept 100 MHz .. 10 GHz.  Anything outside means the PIT lied or
-        // the 32-bit TSC wrapped during the wait.
-        if (per_ms < 100000u || per_ms > 10000000u) {
+        // 1.0 .. 4.2 GHz.  Clean readings on this machine are 3.79M with a
+        // 0.001% spread, so 4.2M is +10.8% headroom -- and it now rejects the
+        // 5.3-5.6M mild contamination that the old 10 GHz ceiling let through.
+        if (per_ms < 1000000u || per_ms > 4200000u) {
             uint_to_str(per_ms, b);
             serial_puts("[ANIM] TSC calibration rejected ("); serial_puts(b);
-            serial_puts(" tsc/ms); pacing by frame\n");
+            serial_puts(" tsc/ms); timing by cycles only\n");
             return;
         }
+#if defined(__x86_64__)
+        if (worst > per_ms * 2u) {
+            uint_to_str(worst, b);
+            serial_puts("[ANIM] WARN: TSC samples unstable under load (max ");
+            serial_puts(b);
+            serial_puts(" vs min ");
+            uint_to_str(per_ms, b);
+            serial_puts(b);
+            serial_puts(" tsc/ms); durations may be unreliable -- re-run serially\n");
+        }
+#endif
         anim_tsc_per_ms = (int)per_ms;
         telem_set_ticks_per_ms((uint64_t)per_ms);
         anim_ms_scale   = 0xFFFFFFFFu / per_ms;
@@ -5873,20 +6085,74 @@ struct Win11Desktop {
         win.lgv.scale_w = scale_w; win.lgv.scale_h = scale_h;
     }
 
+    // ---- Overlay damage test -------------------------------------------
+    // The managed overlay (taskbar strip + telemetry HUD) is painted ABOVE the
+    // windows.  A window erase restores pixels from the wallpaper-only snapshot,
+    // so it wipes whatever overlay content was under the window.  Overlay
+    // pixels are therefore clobbered by ANY window movement that touches them,
+    // and the overlay must be repainted in that same frame or the HUD stays
+    // clipped in half until something else forces a repaint.
+    //
+    // The old test only looked at the 48 px taskbar strip, but the HUD reaches
+    // much higher (measured ~y=496..719 on a 720p screen), so window drags over
+    // its upper half left it torn.
+    //
+    // These two bounds are deliberately conservative; they must cover the
+    // managed HUD anchor (bottom-right).  Keep in sync with TelemetryHud in
+    // csharp/apps/Shell/Desktop.cs.
+    static constexpr int OVERLAY_HUD_W = 336;
+    static constexpr int OVERLAY_HUD_H = 260;
+
+    static inline bool rect_hits_overlay(int x, int y, int w, int h,
+                                         int sw, int sh, int taskbar_y) {
+        if (w <= 0 || h <= 0) return false;
+        if (x >= sw || x + w <= 0 || y >= sh || y + h <= 0) return false;
+        if (y + h > taskbar_y) return true;                 // bottom strip
+        int hx = sw - OVERLAY_HUD_W, hy = sh - OVERLAY_HUD_H;
+        return (x + w > hx && y + h > hy);                  // HUD anchor
+    }
+
     void render_all() {
         if (!gfx.initialized) return;
         if (!gui_mode) return;   // never paint after gui_exit() (e.g. "Terminal" shortcut)
         telem_frame_begin();
         frame_counter++;
-        // FIX #ghost-cursor (2026-10-23): blanket dirty rects (L7715 full-screen
-        // flush, BUG-C1 window rects) mark areas that were NOT actually rewritten
-        // this frame.  The cursor block must only skip restore_bg when the REAL
-        // background under the pointer was repainted (desktop full repaint),
-        // otherwise save_bg() bakes the previous frame's cursor pixels into the
-        // snapshot -> permanent ghost.  Set true only in the desktop repaint path.
-        bool bg_repainted_this_frame = false;
         dirty_reset(gfx.width, gfx.height);   // begin damage tracking for this frame
         uint32_t tS = tick_ms_now();          // per-stage timing clock
+
+        // ---------------------------------------------------------------
+        // BUG-CURSOR3: erase the soft cursor BEFORE any layer paints.
+        //
+        // The sprite is composited last, so while the desktop / window /
+        // overlay layers repaint, the backbuffer still holds LAST frame's
+        // cursor pixels.  Restoring the snapshot at the END (the old place)
+        // corrupted it: when a layer rewrote the pixels under the pointer --
+        // e.g. the taskbar painting a NEW hover highlight -- the restore wrote
+        // the previous background back OVER that fresh highlight, and the
+        // following save_bg() then captured the polluted patch as "clean
+        // background".  The highlight ended up looking bitten-out and shifted
+        // towards the cursor, and the stale patch stuck until a full repaint.
+        //
+        // Erasing HERE (into the backbuffer, no flip) means every layer paints
+        // over a cursor-free buffer, so the snapshot taken at the end of the
+        // frame is always the real background.  No "was it rewritten?"
+        // heuristic is needed any more.
+        // ---------------------------------------------------------------
+        if (g_cursor_backend == CURSOR_SOFT && cursor.visible) {
+            if (cursor.saved_valid) {
+                int ox = cursor.saved_x, oy = cursor.saved_y;
+                cursor.restore_bg(gfx);          // backbuffer only, no flip
+                dirty_add(ox, oy, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
+            }
+            // A move may already have restored the sprite into the backbuffer;
+            // this frame's damage list owns that flip.
+            if (cursor.erase_pending) {
+                dirty_add(cursor.erase_x, cursor.erase_y,
+                          MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
+                cursor.erase_pending = false;
+            }
+            cursor.saved_valid = false;
+        }
 
         // Drive the WSL2-style Linux Guest lifecycle (VM boot, connect, frame
         // ingest) from the GUI tick via the backend-agnostic bridge.  Only tick
@@ -6110,7 +6376,6 @@ struct Win11Desktop {
                 g_desk_needs_full = false;
                 g_desk_refresh_pending = 0;   // consumed: next refresh waits a full interval
                 g_desk_sig = cur_sig;
-                bg_repainted_this_frame = true;   // FIX #ghost-cursor: real bg rewrite
                 dirty_add(0, 0, gfx.width, gfx.height);   // full-screen repaint
                 // Cache the freshly painted background (without windows) so a
                 // moving window can be erased by restoring its old rect.
@@ -6258,8 +6523,10 @@ struct Win11Desktop {
             int taskbar_y = gfx.height - MANAGED_TASKBAR_H;
             for (int n = g_dmg_head; n >= 0; n = g_dnode[n].next) {
                 DmgNode& r = g_dnode[n];
-                if (r.x < gfx.width && r.x + r.w > 0 &&
-                    r.y < gfx.height && r.y + r.h > taskbar_y) {
+                // Covers the taskbar strip AND the taller bottom-right HUD
+                // anchor -- see rect_hits_overlay().
+                if (rect_hits_overlay(r.x, r.y, r.w, r.h,
+                                      gfx.width, gfx.height, taskbar_y)) {
                     taskbar_damaged = true;
                     break;
                 }
@@ -6288,7 +6555,12 @@ struct Win11Desktop {
             // window. Defer overlay painting until that refresh restores a clean
             // base; otherwise animated alpha content accumulates on the retained
             // backbuffer between desktop repaints.
-            if (over_dirty && !g_desk_refresh_pending && (repaint_desk || g_snap)) {
+            // SPEED: the clean-base snapshot is an optimisation, not a
+            // requirement.  Requiring it (or escalating to a full desktop
+            // repaint when it is missing) made every Start-menu close re-blit
+            // the wallpaper (~136 ms on QEMU) and blocked input until it
+            // finished.  Composite over the retained backbuffer instead.
+            if (over_dirty && !g_desk_refresh_pending && (repaint_desk || g_snap || 1)) {
                 // BUG-#0 (moire): the overlay is painted ON TOP of a retained
                 // backbuffer that still holds last frame's chrome.  Alpha-blended
                 // chrome (taskbar tint, rounded corners, AA label glyphs) blended
@@ -6374,11 +6646,7 @@ struct Win11Desktop {
                     dirty_add(smn.x, smn.y, smn.w, smn.h);
                 }
                 if (g_over_force_n > 0) g_over_force_n--;
-            } else if (over_dirty && !g_desk_refresh_pending && !g_snap) {
-                // Without a clean snapshot, wait for a full desktop repaint
-                // before blending the translucent overlay again.
-                g_desk_needs_full = true;
-            }
+            }   // close the overlay pass after removing the full-repaint escalation
             g_over_idle++;
         }
         perf_over_ms += tick_ms_now() - tS;   // stage 3: taskbar / Start overlay
@@ -6431,72 +6699,35 @@ struct Win11Desktop {
         // Remote-control security guard overlay (drawn on top of everything)
         draw_remote_guard();
 
-        // The guest draws its own software cursor at its LOGICAL pointer position
-        // (mouse_x/mouse_y).  This is the only way to keep "what you see" aligned
-        // with "where clicks land" while using a relative PS/2 mouse -- QEMU's
-        // host cursor (show-cursor) lives in a different coordinate space and
-        // would drift away from the OS's notion of the pointer.  QEMU's host
-        // cursor is forced OFF in run_nexos.ps1 so the two never appear together.
-        // Redraw cursor on top without hide/show flicker.
-        // CRITICAL: the backbuffer may still hold the cursor pixels left by the
-        // previous move()/frame (the desktop layer is "retained", so it is NOT
-        // always repainted).  If we re-capture the background without first
-        // removing that stale cursor, we snapshot the cursor itself as
-        // "background"; the next move()/restore_bg then can't erase it and a
-        // permanent ghost cursor is left pinned where the click happened.
-        // Restore the previously-saved background first so save_bg captures the
-        // real (cursor-free) pixels.
-        if (g_cursor_backend == CURSOR_SOFT && cursor.visible) {
-            int cw = MouseCursor::CURSOR_SIZE, ch = MouseCursor::CURSOR_SIZE;
-            int cx0 = cursor.x, cy0 = cursor.y;   // hotspot at (0,0): top-left = (x,y)
+        // Composite the sprite on top.  The backbuffer is cursor-free here
+        // (see BUG-CURSOR3 at the top of this function), so this snapshot is
+        // always the real background.
+        //
+        // The old code consulted a "rewritten" heuristic to decide whether to
+        // restore here; that heuristic could not see the managed overlay's
+        // repaint, which is exactly the taskbar hover highlight case: it
+        // restored a stale patch over the new highlight and then snapshotted
+        // it.  Erasing at frame start removes the need for the guess entirely.
+        // ---- drag ghost: the dragged item follows the pointer ---------
+        if (g_ghost_on && g_ghost_name[0]) {
+            int gw = 16, gh2 = g_font_h + 10;
+            for (const char* p = g_ghost_name; *p; p++) gw += g_font_w;
+            int gx = mouse_x + 14, gy = mouse_y + 10;
+            if (gx + gw > gfx.width)   gx = gfx.width - gw - 2;
+            if (gy + gh2 > gfx.height) gy = gfx.height - gh2 - 2;
+            if (gx < 0) gx = 0;
+            if (gy < 0) gy = 0;
+            gfx.fill_rect(gx + 2, gy + 2, gw, gh2, 0x00101010);   // shadow
+            gfx.fill_rect(gx, gy, gw, gh2, 0x002A6DB0);           // accent plate
+            gfx.draw_text_transparent(gx + 8, gy + 5, g_ghost_name, 0x00FFFFFF);
+            dirty_add(gx, gy, gw, gh2);
+        }
 
-            // The saved snapshot is only valid while the backbuffer pixels under
-            // the pointer are UNCHANGED.  Exactly two things rewrite them, and
-            // both leave the snapshot stale -- restoring it then paints old
-            // pixels over fresh content:
-            //   1. a real desktop-layer repaint (wallpaper + icons), and
-            //   2. a visible window whose rect fully covers the cursor box,
-            //      because the compositor re-draws every visible window on
-            //      every frame.
-            //
-            // The damage list is deliberately NOT consulted: a damage rect only
-            // proves the area was FLIPPED to the LFB, never that the backbuffer
-            // was rewritten.  The managed overlay adds a blanket full-screen
-            // dirty_add() on every animating / settling frame (it only repaints
-            // the taskbar + Start menu) and the BUG-C1 loop adds whole window
-            // rects for popups.  Trusting that list is what made the pointer
-            // disappear for a frame whenever a menu animated, and for the whole
-            // 12 settling frames after every managed click.
-            bool rewritten = bg_repainted_this_frame;
-            // An ANIMATING window is composited at its interpolated rect, not at
-            // w.x/w.y, so the containment test below would be wrong;  be
-            // conservative and keep the restore while anything animates (that is
-            // also the case where a stale snapshot would ghost permanently).
-            if (!rewritten && !any_animating()) {
-                for (int i = 0; i < window_count && !rewritten; i++) {
-                    Win11Window& w = windows[i];
-                    if (!w.visible || w.minimized) continue;
-                    if (w.x <= cx0 && w.y <= cy0 &&
-                        w.x + w.w >= cx0 + cw && w.y + w.h >= cy0 + ch)
-                        rewritten = true;
-                }
-            }
-            if (cursor.saved_valid && !rewritten) {
-                // Old cursor pixels may still linger in the backbuffer: put the
-                // cursor-free background back BEFORE re-snapshotting.  restore_bg()
-                // writes at the snapshot's own origin, so the damage rect must be
-                // that origin too (not the live cursor position).
-                int ox = cursor.saved_x, oy = cursor.saved_y;
-                cursor.restore_bg(gfx);
-                dirty_add(ox, oy, cw, ch);
-            }
-            // Always re-snapshot and always re-draw.  The old code had a
-            // "cursor_fully_covered" branch that skipped the draw, which erased
-            // the pointer and never painted it back -- a blinking pointer.
-            cursor.saved_valid = false;
+        if (g_cursor_backend == CURSOR_SOFT && cursor.visible) {
             cursor.save_bg(gfx);
             cursor.draw(gfx);
-            dirty_add(cx0, cy0, cw, ch);   // ensure new cursor region is flipped
+            dirty_add(cursor.x, cursor.y,
+                      MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
         }
 
         // Retro pixel / CRT-monitor post-process over the whole backbuffer
@@ -6653,6 +6884,7 @@ struct Win11Desktop {
         }
     }
 
+
         void enter_gui() {
         diag_step(110, "enter_gui enter");
         if (!gfx.initialized) { serial_puts("[GUI] No VBE\n"); return; }
@@ -6687,6 +6919,9 @@ struct Win11Desktop {
         tim_mark("enter_gui: telem init");
         render_all();   // draws everything + cursor + presents to screen
         tim_mark("enter_gui: FIRST render_all (desktop painted)");
+#if defined(__x86_64__)
+        verify_tsc_rate();   // second opinion on the boot clock
+#endif
         // Auto-open a Terminal for immediate IME testing
         // (disabled while debugging Win32 window rendering)
         // if (window_count == 0) launch_app(APP_TERMINAL);
@@ -6702,7 +6937,17 @@ struct Win11Desktop {
         // Reopen the previous session (apps left running when the GUI was
         // exited) if a saved one exists.  The user can clear it with the
         // `session` shell command.
+#if defined(__x86_64__)
+        // 64-bit: restoring a saved session re-opens managed windows through
+        // mforms while the shell is still settling, and the kernel triple
+        // faults right here (serial stops between the FIRST render_all mark
+        // and "[GUI] Entered GUI mode").  Start with a clean desktop until
+        // that path is fixed -- the window set is restored on demand anyway.
+        serial_puts("[GE64] session restore skipped\n");
+#else
         if (gui_session_restore() > 0) render_all();
+#endif
+        serial_puts("[GE64] enter_gui tail reached\n");
         serial_puts("[GUI] Entered GUI mode\n");
     }
 
@@ -6743,18 +6988,38 @@ struct Win11Desktop {
         telem_mouse_move(dx, dy);
         bool was_drag = (drag_window >= 0 && drag_window < window_count);
 
-        // When we own the cursor (no hardware sprite 鈥?QEMU / headless / VMMDev
-        // absent) we must erase the previous soft-cursor pixels *before* moving,
-        // otherwise a stale cursor is left pinned where the pointer last was.
+        // When we own the cursor (no hardware sprite -- QEMU / headless /
+        // VMMDev absent) the previous soft-cursor pixels must be put back
+        // *before* the pointer moves, otherwise a stale sprite stays pinned
+        // where the pointer last was.
+        //
+        // BUG-CURSOR2: this used to flip the erased rect to the LFB right here
+        // and then redraw + flip again below.  That produced two separate
+        // presents per movement: the first one showed a frame with NO cursor
+        // A press on a managed window may be a FILE drag: forward the motion
+        // (the app decides whether it is inside a draggable row).  No
+        // compositing here -- the cursor keeps full rate; the frame driver
+        // repaints on its own schedule.
+        if (g_win_drag_id >= 0 && mouse_left) {
+            mforms_drag(g_win_drag_id, 1, mouse_x - g_win_drag_cx, mouse_y - g_win_drag_cy, -1, 0, 0);
+        }
+        // Pointer moved with the button held and a desktop icon drag armed:
+        // follow the pointer.  mforms_desktop_drag(..,1) repaints the desktop.
+        if (g_desk_drag_armed && mouse_left) {
+            mforms_desktop_drag(mouse_x, mouse_y, 1);
+            // MOUSE PRIORITY: do NOT composite here.  mforms_desktop_drag already
+            // set the managed dirty flag, so the throttled frame driver repaints on
+            // its own schedule while the cursor keeps moving at full rate.  Calling
+            // render_all() from the input path is exactly what made window dragging
+            // and the earlier cursor work stutter.
+        }
+        // (the "cursor blinks while dragging a window" report), and on the drag
+        // path -- which returns straight into render_all() -- the vacated rect
+        // was never flipped at all, leaving stale pixels behind the gesture.
+        // Erase into the backbuffer only; a single flip follows, either here
+        // (flip_move) or from render_all(), which consumes erase_pending.
         if (g_cursor_backend == CURSOR_SOFT && cursor.visible && cursor.saved_valid) {
-            // restore_bg() puts the pixels back at the SNAPSHOT's origin, so the
-            // LFB flip must be done at that same origin.  Using the live position
-            // (oldx/oldy) only works while the two coincide; set_mouse_position()
-            // already flips at the saved origin and the two paths must agree.
-            int sx = cursor.saved_x, sy = cursor.saved_y;
-            cursor.restore_bg(gfx);
-            gfx.present_rect(sx, sy, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
-            cursor.saved_valid = false;
+            cursor.erase_to_backbuffer(gfx);
         }
 
         // The pointer position is always recorded so a later click routes right.
@@ -6809,7 +7074,7 @@ struct Win11Desktop {
                 int rel = mouse_y - oy - scroll_drag_off;
                 if (rel < 0) rel = 0; if (rel > span) rel = span;
                 w.scroll_y = rel * denom / span;
-                render_all();
+                g_drag_repaint_pending = true;   // P0: repaint from gui_tick
             } else if (scroll_drag_axis == 2 && mw > 0 && w.scroll_cw > mw) {
                 int denom = w.scroll_cw - mw; if (denom < 1) denom = 1;
                 int thumbw = (mw * mw) / w.scroll_cw;
@@ -6819,21 +7084,26 @@ struct Win11Desktop {
                 int rel = mouse_x - ox - scroll_drag_off;
                 if (rel < 0) rel = 0; if (rel > span) rel = span;
                 w.scroll_x = rel * denom / span;
-                render_all();
+                g_drag_repaint_pending = true;   // P0: repaint from gui_tick
             }
             return;
         }
 
-        // Let render_all() composite both the moved window and cursor from a
-        // settled backbuffer; saving cursor pixels before that redraw captures
-        // an intermediate window position and leaves drag trails.
+        // P0 INPUT PRIORITY: dragging must never call render_all() here.  A full
+        // composite takes tens of milliseconds in a VM, which blocked the next
+        // i8042 poll and made the pointer crawl/jump exactly while dragging.
+        // Move the window logically, drop the frosted glass for the duration of
+        // the gesture, and let gui_tick() run the actual repaint when the input
+        // path is idle.  The pointer itself is still redrawn below with a single
+        // present_rect() of its 32x32 box, so it stays at full rate.
         if (was_drag) {
-            windows[drag_window].x = mouse_x - drag_off_x;
-            windows[drag_window].y = mouse_y - drag_off_y;
-            if (windows[drag_window].y < TOPBAR_H)
-                windows[drag_window].y = TOPBAR_H;
-            render_all();
-            return;
+            Win11Window& dw = windows[drag_window];
+            dw.x = mouse_x - drag_off_x;
+            dw.y = mouse_y - drag_off_y;
+            if (dw.y < TOPBAR_H) dw.y = TOPBAR_H;
+            g_drag_glass_off      = true;   // blur pass off while moving (P0)
+            g_drag_repaint_pending = true;  // gui_tick() owns the composite
+            // fall through: the cursor fast path below repaints just the sprite
         }
 
         // No hardware cursor: repaint the soft cursor at its new position and
@@ -6848,7 +7118,7 @@ struct Win11Desktop {
         if (g_cursor_backend == CURSOR_SOFT && cursor.visible) {
             cursor.save_bg(gfx);
             cursor.draw(gfx);
-            gfx.present_rect(cursor.x, cursor.y, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
+            cursor.flip_move(gfx);   // one batched flip: sprite is never absent
         }
     }
 
@@ -6867,10 +7137,7 @@ struct Win11Desktop {
         // cursor stays pinned on screen (ghost / double cursor).  Mirror the
         // restore-before-move sequence used by handle_mouse_move().
         if (g_cursor_backend == CURSOR_SOFT && cursor.visible && cursor.saved_valid) {
-            int ox = cursor.saved_x, oy = cursor.saved_y;
-            cursor.restore_bg(gfx);
-            gfx.present_rect(ox, oy, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
-            cursor.saved_valid = false;
+            cursor.erase_to_backbuffer(gfx);   // see handle_mouse_move()
         }
         cursor.x = x; cursor.y = y;
         mouse_x = x; mouse_y = y;
@@ -6879,8 +7146,11 @@ struct Win11Desktop {
             windows[drag_window].x = mouse_x - drag_off_x;
             windows[drag_window].y = mouse_y - drag_off_y;
             if (windows[drag_window].y < TOPBAR_H) windows[drag_window].y = TOPBAR_H;
+            // P0: same rule as handle_mouse_move -- input never blocks on a
+            // composite; mark the frame and let gui_tick() repaint it.
             drag_counter++;
-            if (drag_counter >= 3) { drag_counter = 0; render_all(); }
+            g_drag_glass_off      = true;
+            g_drag_repaint_pending = true;
         }
         // Repaint the soft cursor at the new (absolute) position and flip its rect.
         // Absolute (tablet / VMMDev) pointer: same hover-refresh contract as
@@ -6890,7 +7160,7 @@ struct Win11Desktop {
         if (g_cursor_backend == CURSOR_SOFT && cursor.visible) {
             cursor.save_bg(gfx);
             cursor.draw(gfx);
-            gfx.present_rect(cursor.x, cursor.y, MouseCursor::CURSOR_SIZE, MouseCursor::CURSOR_SIZE);
+            cursor.flip_move(gfx);   // one batched flip: sprite is never absent
         }
     }
 
@@ -7164,6 +7434,8 @@ struct Win11Desktop {
             // launching requires a double-click, like Windows.  A second
             // click is a double-click when it lands on the same icon
             // within 500 ms.
+            // Arm an icon drag before the click so ONE press can start a drag.
+            g_desk_drag_armed = (mforms_desktop_drag(mouse_x, mouse_y, 0) == 1);
             int r = mforms_desktop_click(mouse_x, mouse_y);
             gui_invalidate_managed();
             if (r >= 0) {
@@ -7485,7 +7757,39 @@ struct Win11Desktop {
     }
 
     void handle_mouse_up() {
+        // Finish a window drag: tell the source which managed window is under
+        // the pointer (so it can drop a file into ANOTHER window).
+        if (g_win_drag_id >= 0) {
+            int src = g_win_drag_id;
+            g_win_drag_id = -1;
+            int hit_id = -1, hx = 0, hy = 0;
+            for (int i = window_count - 1; i >= 0; i--) {
+                Win11Window& w = windows[i];
+                if (!w.visible || w.minimized || w.managed_app < 0) continue;
+                if (!w.contains(mouse_x, mouse_y)) continue;
+                hit_id = w.managed_app;
+                hx = mouse_x - (w.x + 1);
+                hy = mouse_y - w.content_y();
+                break;
+            }
+            mforms_drag(src, 2, mouse_x - g_win_drag_cx, mouse_y - g_win_drag_cy, hit_id, hx, hy);
+            // Safety net: whatever the managed side decided, the ghost must not
+            // survive the release (a click that never became a drag left it
+            // stuck on the pointer before).
+            gui_drag_ghost(0, 0);
+        }
+        // Finish a desktop icon drag (drop: move the icon or pin it).
+        if (g_desk_drag_armed) {
+            g_desk_drag_armed = false;
+            mforms_desktop_drag(mouse_x, mouse_y, 2);
+        }
         mouse_left = false;
+        // P0: end of gesture -- re-enable the frosted glass (it was degraded to
+        // a plain tint while moving) and drop any deferred composite so the
+        // repaint below is the one that draws the full-quality chrome.
+        bool was_scroll_drag = (scroll_drag_win >= 0);
+        g_drag_glass_off       = false;
+        g_drag_repaint_pending = false;
         scroll_drag_win = -1;
         scroll_drag_axis = 0;
         scroll_drag_off = 0;
@@ -7503,6 +7807,8 @@ struct Win11Desktop {
         if (dw >= 0 && gui_mode) {
             apply_snap(dw);
             render_all();
+        } else if (was_scroll_drag && gui_mode) {
+            render_all();   // restore the full-quality chrome after a scroll drag
         }
     }
 
@@ -7611,6 +7917,14 @@ struct Win11Desktop {
             int ox = win.x + 1 - win.scroll_x, oy = win.content_y() - win.scroll_y;
             int mw = win.w - 2, mh = win.content_h();
             mforms_click(win.managed_app, ox, oy, mw, mh, mouse_x, mouse_y);
+            // Arm a window drag: the same press may become a file drag.
+            g_win_drag_id = win.managed_app;
+            g_win_drag_ox = mouse_x - ox;
+            g_win_drag_oy = mouse_y - oy;
+            g_win_drag_cx = ox;              // client origin on screen
+            g_win_drag_cy = oy;
+            // Managed apps work in CLIENT pixels: convert before sending.
+            mforms_drag(g_win_drag_id, 0, mouse_x - ox, mouse_y - oy, -1, 0, 0);
             return;   // caller repaints
         }
 
@@ -8101,7 +8415,7 @@ struct Win11Desktop {
         }
     }
 
-    void launch_app(AppType app) {
+    void launch_app_impl(AppType app, bool force_new) {
         int tk = telem_kind_from_app(app);
         telem_app_launch_start(tk);
         // The Terminal is opened as a managed C# GUI window (just like
@@ -8162,7 +8476,9 @@ struct Win11Desktop {
         }
 
         // Already running?  Focus + restore instead of stacking a clone.
+        if (!force_new)
         {
+            // force_new: same-app multi-instance (two File Explorers, etc.)
             int ex = find_window_for_kind(app);
             if (ex >= 0) {
                 windows[ex].minimized = false;
@@ -8287,6 +8603,11 @@ struct Win11Desktop {
             g_agent_prefill = 0;
         }
     }
+
+    // Reuse-or-focus (desktop icons, taskbar pins): the Windows behaviour.
+    void launch_app(AppType app) { launch_app_impl(app, false); }
+    // Always create another window of the same app ("New window").
+    void launch_app_new_instance(AppType app) { launch_app_impl(app, true); }
 
     // ---- Open a Windows executable file inside the GUI ----
     // Detects the file type (via winloader) and opens a viewer window.
@@ -9042,7 +9363,10 @@ void mh_draw_round (int x,int y,int w,int h,int r,uint32_t c){ diag_step(302, "m
 void mh_draw_rect  (int x,int y,int w,int h,uint32_t c){ diag_step(303, "mh_draw_rect");   g_wm.gfx.draw_rect(x,y,w,h,c); }
 void mh_draw_line  (int x0,int y0,int x1,int y1,uint32_t c){ diag_step(304, "mh_draw_line"); g_wm.gfx.draw_line(x0,y0,x1,y1,c); }
 void mh_fill_grad  (int x,int y,int w,int h,uint32_t t,uint32_t b){ diag_step(305, "mh_fill_grad"); g_wm.gfx.fill_gradient(x,y,w,h,t,b); }
-void mh_text       (int x,int y,const char* s,uint32_t fg){ diag_step(306, "mh_text"); g_wm.gfx.draw_text_utf8_transparent(x,y,s,fg); }
+void mh_text       (int x,int y,const char* s,uint32_t fg){
+    diag_step(306, "mh_text");
+    g_wm.gfx.draw_text_utf8_transparent(x,y,s,fg);
+}
 void mh_text_bg    (int x,int y,const char* s,uint32_t fg,uint32_t bg){ diag_step(307, "mh_text_bg"); g_wm.gfx.draw_text_utf8(x,y,s,fg,bg); }
 void mh_fill_circle(int cx,int cy,int r,uint32_t c){ diag_step(308, "mh_fill_circle"); g_wm.gfx.fill_circle(cx,cy,r,c); }
 void mh_draw_circle(int cx,int cy,int r,uint32_t c){ diag_step(309, "mh_draw_circle"); g_wm.gfx.draw_circle(cx,cy,r,c); }
@@ -9118,6 +9442,22 @@ uint32_t mh_tick_ms(void) { return g_wm.tick_ms_now(); }
 // Managed code (e.g. the File Explorer's "Open"/"Edit" actions) asks the
 // kernel to open or focus an application of a managed Kind.
 void mh_open_app(int kind) { g_wm.launch_app(g_wm.app_for_managed_kind(kind)); }
+// Same, but stack a NEW window instead of focusing an existing one.
+void mh_open_app_new(int kind) { g_wm.launch_app_new_instance(g_wm.app_for_managed_kind(kind)); }
+
+// Focus (and un-minimize) the window that hosts a specific managed app id.
+void mh_activate_managed(int mid) {
+    if (mid < 0) return;
+    for (int i = 0; i < g_wm.window_count; i++) {
+        Win11Window& w = g_wm.windows[i];
+        if (!w.visible || w.managed_app != mid) continue;
+        w.minimized = false;
+        for (int j = 0; j < g_wm.window_count; j++) g_wm.windows[j].active = false;
+        w.active = true;
+        g_wm.active_window = i;
+        return;
+    }
+}
 void mh_close_app(int kind) {
     AppType a = g_wm.app_for_managed_kind(kind);
     if (a != APP_NONE) g_wm.close_window_for_kind(a);
@@ -9149,8 +9489,9 @@ static bool tex_load_one(int id, const char* file) {
     const int kHdr = 24;
     uint8_t hdr[kHdr];
     int nh = g_cb.read_file(1, file, hdr, kHdr);
-    if (nh < kHdr || hdr[0] != 'T' || hdr[1] != 'E' || hdr[2] != 'X' || hdr[3] != '1')
-        goto fail;
+        if (nh < kHdr) { serial_puts("[TEX] short hdr "); serial_puts(file); serial_puts(" got="); serial_putdec(nh); serial_puts("\n"); return false; }
+        if (hdr[0] != 'T' || hdr[1] != 'E' || hdr[2] != 'X' || hdr[3] != '1') {
+            serial_puts("[TEX] bad magic "); serial_puts(file); serial_puts("\n"); return false; }
 
     {
         const uint8_t* p = hdr + 4;
@@ -9164,9 +9505,9 @@ static bool tex_load_one(int id, const char* file) {
 
         // One buffer sized to the payload, read straight into it.
         uint8_t* data = (uint8_t*)kmalloc(bytes ? bytes : 1);
-        if (!data) goto fail;
+        if (!data) { serial_puts("[TEX] oom "); serial_puts(file); serial_puts(" bytes="); serial_putdec((int)bytes); serial_puts("\n"); return false; }
         int got = g_cb.read_file(1, file, data, (int)bytes);
-        if (got != (int)bytes) { kfree(data); goto fail; }
+        if (got != (int)bytes) { serial_puts("[TEX] short payload "); serial_puts(file); serial_puts(" got="); serial_putdec(got); serial_puts(" want="); serial_putdec((int)bytes); serial_puts("\n"); kfree(data); return false; }
 
         t.w = (uint16_t)w; t.h = (uint16_t)h; t.fmt = (uint8_t)fmt;
         t.data = data; t.loaded = true;
@@ -9177,6 +9518,19 @@ fail:
     serial_puts("[TEX] load failed: "); serial_puts(file); serial_puts("\n");
     return false;
 }
+
+// "tex_wp" + decimal index + ".tex" -- freestanding, so no snprintf.
+static void tex_wp_name(int i, char* out) {
+    const char* pre = "tex_wp";
+    int n = 0;
+    while (pre[n]) { out[n] = pre[n]; n++; }
+    if (i >= 100) out[n++] = (char)('0' + (i / 100) % 10);
+    if (i >= 10)  out[n++] = (char)('0' + (i / 10) % 10);
+    out[n++] = (char)('0' + i % 10);
+    out[n++] = '.'; out[n++] = 't'; out[n++] = 'e'; out[n++] = 'x'; out[n] = 0;
+}
+// Count of user wallpapers the folder produced (queried by the managed shell).
+extern "C" int gui_wallpaper_count(void) { return g_wallpaper_n; }
 
 static void tex_load_all(void) {
     if (g_tex_loaded) return;
@@ -9194,12 +9548,47 @@ static void tex_load_all(void) {
         int id = TEX_ICON + i;
         if (id < TEX_MAX) tex_load_one(id, icons[i]);
     }
+    // User wallpapers from assets/wallpapers/ (packed as tex_wp0..tex_wpN).
+    // PROBE ONLY at boot: read each file's 24-byte header to learn the COUNT
+    // and defer the pixel payload.  Loading them all here cost ~5 MB of disk
+    // reads on the boot path (4.5 s in the 64-bit build) for wallpapers the
+    // user may never switch to; tex_lazy_wallpaper() loads one on first use.
+    g_wallpaper_n = 0;
+    for (int i = 0; i < 64 && TEX_WP_BASE + i < TEX_MAX; i++) {
+        char nm[24];
+        tex_wp_name(i, nm);
+        uint8_t hdr[24];
+        if (!g_cb.read_file) break;
+        int nh = g_cb.read_file(1, nm, hdr, 24);
+        if (nh < 24 || hdr[0] != 'T' || hdr[1] != 'E' || hdr[2] != 'X' || hdr[3] != '1') break;
+        g_wallpaper_n++;
+    }
+    serial_puts("[TEX] user wallpapers available: "); serial_putdec(g_wallpaper_n); serial_puts("\n");
+}
+
+// Load one user wallpaper on demand (the first time it is drawn).  Boot only
+// probes their headers, so this is what brings the pixels in.
+static void tex_lazy_wallpaper(int id) {
+    if (id < TEX_WP_BASE || id >= TEX_WP_BASE + g_wallpaper_n) return;
+    if (g_tex[id].loaded) return;
+    char nm[24];
+    tex_wp_name(id - TEX_WP_BASE, nm);
+    tex_load_one(id, nm);
 }
 
 void mh_image(int id, int x, int y, int w, int h) {
     diag_step(320, "mh_image enter");
-    if (id < 0 || id >= TEX_MAX || !g_tex[id].loaded) return;
+    if (id < 0 || id >= TEX_MAX) return;
+    if (!g_tex[id].loaded) {
+        tex_lazy_wallpaper(id);          // wallpapers load on first use
+        if (!g_tex[id].loaded) return;
+    }
     g_wm.gfx.draw_image(g_tex[id], x, y, w, h);
+}
+void mh_image_clip(int id, int x, int y, int w, int h,
+                   int cx0, int cy0, int cx1, int cy1) {
+    if (id < 0 || id >= TEX_MAX || !g_tex[id].loaded) return;
+    g_wm.gfx.draw_image_clip(g_tex[id], x, y, w, h, cx0, cy0, cx1, cy1);
 }
 int mh_has_image(int id) {
     return (id >= 0 && id < TEX_MAX && g_tex[id].loaded) ? 1 : 0;
@@ -9254,6 +9643,7 @@ static void mforms_boot(void) {
     h.measure_px   = mh_measure_px;
     h.has_image    = mh_has_image;
     h.image        = mh_image;
+    h.image_clip   = mh_image_clip;
     h.measure      = mh_measure;
     h.screen_w     = g_wm.gfx.width;
     h.screen_h     = g_wm.gfx.height;
@@ -9273,6 +9663,14 @@ static void mforms_boot(void) {
     h.read_file        = g_cb.read_file;
     h.write_file       = g_cb.write_file;
     h.get_time         = g_cb.get_time;
+    h.enter_dir        = g_cb.enter_dir;
+    h.dir_up           = g_cb.dir_up;
+    h.cwd_path         = g_cb.cwd_path;
+    h.move_file        = g_cb.move_file;
+    h.enter_path       = g_cb.enter_path;
+    h.file_size        = g_cb.file_size;
+    h.is_dir_name      = g_cb.is_dir_name;
+    h.copy_range       = g_cb.copy_range;
     h.mkdir            = g_cb.mkdir;
     h.remove           = g_cb.remove;
     h.rename           = g_cb.rename;
@@ -9288,6 +9686,8 @@ static void mforms_boot(void) {
     h.shutdown         = g_cb.shutdown;
     h.reboot           = g_cb.reboot;
     h.open_app         = mh_open_app;
+    h.open_app_new     = mh_open_app_new;
+    h.activate_managed = mh_activate_managed;
     h.close_app        = mh_close_app;
     h.exit_gui         = mh_exit_gui;
     h.run_exe          = mh_run_exe;
@@ -10116,6 +10516,22 @@ void gui_fill_rect(int x, int y, int w, int h, uint32_t color) {
 void gui_tick(void) {
     if (!g_wm.gui_mode) return;
     g_wm.update_clock();
+
+    // ---- P0: deferred drag/scrollbar composite -------------------------
+    // Input handlers only move the window and set this flag; the actual
+    // repaint happens here, after the input queue has been serviced.  It is
+    // rate-limited so window motion cannot starve the pointer: the pointer is
+    // redrawn in the input path (one present_rect of its 32x32 box), so it
+    // stays smooth even when this composite is skipped for a tick.
+    if (g_drag_repaint_pending) {
+        static uint32_t last_drag_paint_ms = 0;
+        uint32_t dpnow = g_wm.tick_ms_now();
+        if ((uint32_t)(dpnow - last_drag_paint_ms) >= 15u) {
+            last_drag_paint_ms = dpnow;
+            g_drag_repaint_pending = false;
+            g_wm.render_all();
+        }
+    }
     // Repaint ONLY when something actually needs a new frame:
     //  - the managed shell is running an animation (AI thinking dots /
     //    typewriter reveal) and asked for continuous frames via SetAnim(1)
