@@ -7296,6 +7296,17 @@ static int svm_k64_bringup(void){
 
     if (!g_svm64.vmcb_pa || !g_svm64.hsave_pa || !g_svm64.iopm_pa ||
         !g_svm64.msrpm_pa || !g_svm64.guest_pa) {
+        // Name the failing allocation instead of just "out of memory":
+        // a single zero here is a specific bug, not necessarily OOM.
+        serial_puts("[SVM64] alloc fail: vmcb="); serial_hex(g_svm64.vmcb_pa);
+        serial_puts(" hsave="); serial_hex(g_svm64.hsave_pa);
+        serial_puts(" iopm=");  serial_hex(g_svm64.iopm_pa);
+        serial_puts(" msrpm="); serial_hex(g_svm64.msrpm_pa);
+        serial_puts(" guest="); serial_hex(g_svm64.guest_pa);
+        serial_puts(" total_pages="); serial_hex(pmm_total_pages);
+        serial_puts(" free_pages=");  serial_hex(pmm_free_pages);
+        serial_puts(" bss_end=");    serial_hex((uint32_t)(uintptr_t)__bss_end);
+        serial_puts("\n");
         serial_puts("[SVM64] out of physical memory\n");
         svmk_release_all();
         svmk_paint(0, K64_SVM_ERR_NOMEM);
@@ -7462,7 +7473,12 @@ extern "C" void kmain64(){
         uint32_t a1=0, b1=0, c1=0, d1=0;
         __asm__ __volatile__("cpuid" : "=a"(a1), "=b"(b1), "=c"(c1), "=d"(d1) : "a"(1));
         if (c1 & (1u << 31)){
-            if (*(volatile uint8_t*)0x501C == 1){
+            // 0x501C = explicit GUI request (32-bit kernel).  0x5021 = auto
+            // long-mode boot: the user asked for 64-bit, so the desktop is
+            // expected as well -- otherwise `switch64auto on` boots into a text
+            // shell and every managed feature (drag & drop, copy/paste, folder
+            // navigation) looks missing in 64-bit.
+            if (*(volatile uint8_t*)0x501C == 1 || *(volatile uint8_t*)0x5021 == 1){
                 g_auto_gui = 1;
                 serial_puts("[K64] VM detected but GUI requested by 32-bit kernel\n");
             } else {
@@ -7507,13 +7523,15 @@ extern "C" void kmain64(){
     }
 
     // ---- AMD-V (SVM) bring-up, in-kernel (Option C) -------------------
-    //  Runs here because this is the first point where the framebuffer is
-    //  both initialised AND known usable, so the test can report through the
-    //  screen instead of only the serial port.  It is deliberately a
-    //  self-contained call with no return value consumed: any failure paints
-    //  red and returns, and the boot continues exactly as before.  See the
-    //  port notes above svm_k64_bringup() for provenance.
-    svm_k64_bringup();
+    //  MOVED.  This used to run right here, as soon as the framebuffer was
+    //  known usable, so the test could report on-screen.  That was WRONG:
+    //  pmm_init()/heap_init() do not run until further down kmain64, so
+    //  pmm_alloc_page() returned 0 for every frame -- the probe failed with
+    //  "alloc fail: vmcb=00000000 ... total_pages=00000000", i.e. it was
+    //  reporting an uninitialised allocator, not a real OOM.  The call now
+    //  sits just after "[K64-7] memory management init done"; the
+    //  framebuffer is still live there (it is initialised far earlier), so
+    //  the on-screen red/green report is unaffected.
 
     memset_(g_hist,0,sizeof(g_hist));
     memset_(g_diskbuf,0,sizeof(g_diskbuf));
@@ -7559,6 +7577,16 @@ extern "C" void kmain64(){
     vmm_init();
     heap_init();
     serial_puts("[K64-7] memory management init done\n");
+
+    // ---- AMD-V (SVM) bring-up, in-kernel (Option C) -------------------
+    //  Runs AFTER pmm_init()/heap_init(): the VMCB, the host-save area and
+    //  the guest stub page all come from the physical allocator and MUST be
+    //  page aligned, so the PMM has to exist first.  The framebuffer is also
+    //  live by now, which is what lets the result be reported as a red or
+    //  green screen as well as on the serial port.  Self-contained: every
+    //  failure path paints red and returns, so the boot continues unchanged.
+    //  See the port notes above svm_k64_bringup() for provenance.
+    svm_k64_bringup();
 
     // ---- Hot-loadable drivers -------------------------------------------
     // Runs AFTER heap_init() (the ELF loader allocates its image buffer) and
