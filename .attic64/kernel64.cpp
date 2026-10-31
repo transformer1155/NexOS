@@ -243,7 +243,14 @@ static bool g_net_initialized = false;
 extern "C" void switch_to_32bit(void);
 
 #define KERNEL32_LBA     33       // LBA where kernel.bin is stored on disk
-#define KERNEL32_SECTORS 1024     // 512KB max (1024*512); 32-bit kernel.bin is ~427KB / 835 sectors -- 256 was too small and left the image truncated -> silent hang on switch back
+// Window the 32-bit payload occupies, and therefore the number of sectors
+// cmd_switch32() re-reads from LBA 33 before far-jumping into it.  stage2.asm
+// already copies KERNEL_SECTORS=1152 (576 KiB) at boot, and kernel.bin is now
+// 580,356 bytes = 1134 sectors, so 1024 silently dropped the last 110 sectors
+// and `switch32` would have jumped into a truncated image -- precisely the
+// failure the 256 -> 1024 bump was made for.  1152*512 = 589,824 B is the hard
+// ceiling the loader enforces, so this is the largest honest value.
+#define KERNEL32_SECTORS 1152
 #define KERNEL32_ADDR    0x10000  // Load address: 64KB (matches linker.ld)
 
 // =====================================================================
@@ -1474,6 +1481,115 @@ static int g_auto_gui;
 // value MUST stay identical to kernel.cpp's SFS_RAM_MAGIC.
 #define SFS_RAM_MAGIC     0xC0DE5A5Fu
 #define SFS_HANDOFF_ADDR  0x0900u
+
+// =====================================================================
+//  SVM bring-up log:  the sector, its collision guards, and a safe writer
+// =====================================================================
+//  The AMD SVM port has to report a #VMFAILVALID / VMRUN failure, and that
+//  failure tends to freeze the machine *before* anyone has a serial console
+//  attached.  The log therefore lives in ONE raw 512-byte sector that can be
+//  pulled straight out of build/os_v2.img by tools/read_svm_log.py with no
+//  kernel running at all.
+//
+//  Measured occupancy of the shipped image (2026-10 build, os_v2.img):
+//    LBA     0            : MBR / stage2 (boot.bin + stage2.bin)
+//    LBA    33 .. 1184    : kernel.bin  (580,356 B = 1134 sectors) + the
+//                           stage2 1152-sector copy window
+//    LBA  1057 .. 1166    : tail of kernel.bin -- NOT padding; anything that
+//                           claims this gap is reading a stale constant
+//    LBA  1500            : fault_common() / diag_step() 'NEXD' record
+//    LBA  2048 .. 3810    : kernel64.bin (902,640 B = 1763 sectors)
+//    LBA  6144 .. 26171   : SFS volume (build/sfs.img, 10,254,336 B)
+//    LBA 16384+           : GGUF model blob
+//    LBA 25600 ..         : Linux SFS volume (build/linux_sfs.img)
+//  That leaves exactly 1185 .. 2047 untouched, and the log is parked on the
+//  last sector of it (2047) so it sits flush against the long-mode payload
+//  that writes it.
+//
+//  legacy hazard, deliberately not asserted away because it predates this
+//  code and the values are still used by the MKFS/SFS formatters: CMD_FILE_LBA
+//  (300), MKFS_* (512/513/529) and SFS_* (800/801/817) all name sectors that
+//  the *current* kernel.bin payload occupies -- running those format/save
+//  commands would scribble over the running kernel's own image.  The guard
+//  rail below therefore proves only what this file can prove: that the SVM
+//  log itself is clear of every region, and that editing a region constant
+//  onto it breaks the build instead of the disk.
+//
+//  NOTE ON SPELLING: this TU is compiled as C++ (g++), where the C11 keyword
+//  `_Static_assert` does not exist -- g++ rejects it outright.  `static_assert`
+//  is the identical compile-time mechanism and is what is used below.
+#define SVM_LOG_LBA        2047u   // top of the free gap, one below kernel64.bin
+#define SVM_KERNEL64_LBA   2048u   // keep in sync with Makefile: dd seek=2048
+#define SVM_DIAG_LBA       1500u   // fault_common() / diag_step() record sector
+#define SVM_SECTOR_SIZE    512u    // raw sector size used by tools/read_svm_log.py
+
+#define SVM_K32_LAST       (KERNEL32_LBA + KERNEL32_SECTORS - 1u)   /* 1184 */
+#define SVM_GAP_FIRST      (SVM_K32_LAST + 1u)                      /* 1185 */
+#define SVM_GAP_LAST       (SVM_KERNEL64_LBA - 1u)                  /* 2047 */
+
+// The log must sit inside the honest free gap, and must not have been parked
+// on the fault record that shares that gap.
+static_assert(SVM_GAP_FIRST > SVM_K32_LAST,
+              "SVM gap underflow: KERNEL32_SECTORS no longer describes the kernel.bin window");
+static_assert(SVM_KERNEL64_LBA > SVM_K32_LAST,
+              "kernel.bin window (LBA KERNEL32_LBA..KERNEL32_LBA+KERNEL32_SECTORS-1) now runs into kernel64.bin at LBA 2048");
+static_assert(SVM_LOG_LBA >= SVM_GAP_FIRST && SVM_LOG_LBA <= SVM_GAP_LAST,
+              "SVM_LOG_LBA is no longer inside the free image gap (1185..2047): it would land on a kernel payload");
+static_assert(SVM_LOG_LBA != SVM_DIAG_LBA,
+              "SVM_LOG_LBA collides with the diag/fault record sector (LBA 1500)");
+static_assert(SVM_LOG_LBA < SFS_ALT_LBA,
+              "SVM_LOG_LBA collides with the SFS volume, which starts at SFS_ALT_LBA (Makefile SFS_LBA) and grows upward");
+static_assert(SVM_LOG_LBA != MKFS_SUPER_LBA && SVM_LOG_LBA != MKFS_TABLE_LBA && SVM_LOG_LBA != MKFS_DATA_LBA,
+              "SVM_LOG_LBA collides with a MKFS volume sector (512/513/529)");
+static_assert(SVM_LOG_LBA != SFS_SUPER_LBA && SVM_LOG_LBA != SFS_DIR_LBA && SVM_LOG_LBA != SFS_DATA_LBA,
+              "SVM_LOG_LBA collides with a canonical SFS sector (800/801/817)");
+static_assert(SVM_LOG_LBA != KERNEL32_LBA,
+              "SVM_LOG_LBA collides with the kernel.bin load address sector");
+
+// ---------------------------------------------------------------------
+//  blk_lba_writable / blk_write_sector
+// ---------------------------------------------------------------------
+//  ata_write_sector() above is LBA28-only (28-bit address) and returns void:
+//  a bad LBA silently wraps the sector address and the caller has no way to
+//  learn that the record was lost.  blk_write_sector() is the only writer the
+//  SVM code uses, and it closes all four gaps:
+//    * the LBA is 64-bit -- the natural type for a sector address -- and is
+//      range-checked BEFORE the cast to LBA28, so nothing can truncate;
+//    * the buffer is copied through a 512-byte staging area, so callers may
+//      pass any pointer (no uint16_t* aliasing requirement, which is what the
+//      raw driver imposes);
+//    * protected image regions are refused at run time, mirroring the
+//      static_asserts above, which catch the same mistake at build time;
+//    * the result is returned, so a lost write can be reported on serial
+//      instead of vanishing.
+//  It is deliberately NOT a general-purpose disk writer.
+#define SVM_BLK_OK           0
+#define SVM_BLK_ERR_BUF    (-1)   // null buffer
+#define SVM_BLK_ERR_LBA0   (-2)   // LBA 0 is the MBR / loader handoff
+#define SVM_BLK_ERR_RANGE  (-3)   // outside the LBA28 window: the cast would truncate
+#define SVM_BLK_ERR_PROT   (-4)   // inside a region the image already owns
+
+// True only for sectors the kernel is allowed to overwrite: the free gap
+// between the two kernel payloads, minus the sector the fault record owns.
+static bool blk_lba_writable(uint32_t lba){
+    if (lba == SVM_DIAG_LBA) return false;                    // fault record
+    return (lba >= SVM_GAP_FIRST && lba <= SVM_GAP_LAST);
+}
+
+extern "C" int blk_write_sector(uint64_t lba, const void* buffer){
+    if (!buffer)             return SVM_BLK_ERR_BUF;
+    if (lba == 0)            return SVM_BLK_ERR_LBA0;
+    if (lba > 0x0FFFFFFFULL) return SVM_BLK_ERR_RANGE;   // LBA28: 128 GiB
+    if (!blk_lba_writable((uint32_t)lba)) return SVM_BLK_ERR_PROT;
+
+    uint16_t stage[SVM_SECTOR_SIZE / 2];
+    const uint8_t* src = (const uint8_t*)buffer;
+    uint8_t*       dst = (uint8_t*)stage;
+    for (uint32_t i = 0; i < SVM_SECTOR_SIZE; i++) dst[i] = src[i];
+
+    ata_write_sector((uint32_t)lba, stage);
+    return SVM_BLK_OK;
+}
 
 #define FS_NAME_LEN       20
 #define FS_ENTRY_SIZE     32
@@ -2742,8 +2858,24 @@ extern "C" void kfree(void* ptr){
 // =====================================================================
 //  Command history (persistent via save/load)
 // =====================================================================
+// KNOWN PRE-EXISTING HAZARD, deliberately left in place: 300..303 sits INSIDE
+// the live kernel.bin payload (LBA 33..1184, see SVM_LOG_LBA above), so
+// `hist_save` overwrites four sectors of the on-disk 32-bit kernel.  The
+// running image is unaffected until `switch32` re-reads LBA 33..1184.  Fixing
+// it means moving this constant in BOTH this file and kernel.cpp (the 32-bit
+// build has its own copy of the same constant) at the same time, so it is not
+// moved unilaterally here -- flagged for the maintainer instead.
 constexpr int CMD_FILE_LBA     = 300;  // moved from 256 to avoid kernel overlap
 constexpr int CMD_FILE_SECTORS = 4;
+
+// Guard rail for the SVM log map (SVM_LOG_LBA / SVM_DIAG_LBA above): the log
+// sector and the fault record share the free gap with nothing else, so prove
+// the command file cannot be moved onto either of them.
+static_assert((unsigned)CMD_FILE_LBA != SVM_LOG_LBA,
+              "CMD_FILE_LBA collides with the SVM log sector (LBA 2047)");
+static_assert(!((unsigned)CMD_FILE_LBA <= SVM_DIAG_LBA &&
+               (unsigned)CMD_FILE_LBA + (unsigned)CMD_FILE_SECTORS - 1u >= SVM_DIAG_LBA),
+              "the command-history file overlaps the diag/fault record sector (LBA 1500)");
 constexpr int HIST_MAX         = 64;
 constexpr int HIST_LEN         = 80;
 
@@ -6618,6 +6750,629 @@ extern "C" void vec_last_err(int* code, int* got, int* stb){
     if (got)  *got  = 0;
     if (stb)  *stb  = 0;
 }
+
+// =====================================================================
+//  AMD-V (SVM) bring-up, in-kernel  (Option C)
+// ---------------------------------------------------------------------
+//  WHY THIS LIVES HERE
+//  drivers/svm_driver.c is hot-loaded as a .drv and can only reach the
+//  kernel through the loader's g_exports/g_elf_exports whitelist (printk,
+//  pmm_alloc_page, pmm_free_page, kmalloc).  It cannot reach the
+//  framebuffer, and it cannot reach ata_write_sector -- which is why the
+//  driver could only ever report through the serial port.  This port puts
+//  the same logic directly in the kernel, so the test can draw on the real
+//  screen and record its result on disk.  svm_driver.c is left untouched as
+//  the hot-load demonstration; it is not a build input here.
+//
+//  PROVENANCE  (all line numbers refer to drivers/svm_driver.c as read)
+//    L484-520  svm_vmrun      (CLC + ".byte 0x0F,0x01,0xD8", exitcode check)
+//    L530-569  svm_handle_exit(#VMEXIT dispatch, RIP written back live)
+//    L576-612  svm_run_loop   (budget, -2 == #VMFAILVALID)
+//    L618-645  svm_enter      (EFER.SVME, VM_HSAVE_PA, read-back verify)
+//    L331-354  svm_build_guest_stub
+//    L361-413  svm_build_vmcb
+//    L697-797  svm_init       (frame allocation + alignment check)
+//
+//  KERNEL-PORT ADAPTATIONS (the parts that are NOT a copy)
+//    1. The driver kept the guest stub in pmm_alloc_page()'d memory and the
+//       GDT at a fixed low address; here the stub + GDT share ONE page and
+//       the GDTR base points into it.  Nothing is placed in low memory.
+//    2. The driver rebuilt the VMCB for each single-shot run; this port
+//       writes the resumed RIP back into the live VMCB save area, which is
+//       what makes the run loop able to *continue* the guest.
+//    3. The driver used api->cpuid; here nexos_cpuid() does the same work.
+//    4. Framebuffer colour is decided from the 0x5000 VBE block with the
+//       proven diag_pack()/diag_mark() path, so red/green survives every
+//       pixel format (BGRX32/RGBX32/RGB24/RGB565).
+//    5. The result is also written to SVM_LOG_LBA via blk_write_sector(),
+//       which is range-guarded, so a later partition-table edit cannot
+//       silently overwrite the running kernel.
+// =====================================================================
+
+#define MSR_VM_CR               0xC0010114u
+#define VM_CR_SVM_DISABLE       (1u << 4)
+#define MSR_VM_HSAVE_PA         0xC0010117u
+#define MSR_EFER                0xC0000080u
+#define EFER_SVME               (1u << 12)
+
+#define VMCB_CR_INTERCEPT       0x000u
+#define VMCB_DR_INTERCEPT       0x004u
+#define VMCB_EXC_INTERCEPT      0x008u
+#define VMCB_WORD3_INTERCEPT    0x00Cu
+#define VMCB_WORD4_INTERCEPT    0x010u
+#define VMCB_IOPM_BASE_PA       0x030u
+#define VMCB_MSRPM_BASE_PA      0x038u
+#define VMCB_ASID               0x048u
+#define VMCB_TLB_CTL            0x04Cu
+#define VMCB_EXITCODE           0x058u   /* u64 */
+#define VMCB_EXITINFO1          0x060u
+#define VMCB_EXITINFO2          0x068u
+#define VMCB_NEXT_RIP           0x0A0u
+#define VMCB_EVENT_INJ          0x0A8u
+#define VMCB_CLEAN              0x0F8u
+
+#define VMCB_SAVE_ES            0x400u
+#define VMCB_SAVE_CS            0x410u
+#define VMCB_SAVE_SS            0x420u
+#define VMCB_SAVE_DS            0x430u
+#define VMCB_SAVE_FS            0x440u
+#define VMCB_SAVE_GS            0x450u
+#define VMCB_SAVE_GDTR          0x460u   /* selector=0, attrib=0: limit @+4, base @+8 */
+#define VMCB_SAVE_LDTR          0x470u
+#define VMCB_SAVE_IDTR          0x480u
+#define VMCB_SAVE_TR            0x490u
+#define VMCB_SAVE_EFER          0x4D0u
+#define VMCB_SAVE_CR4           0x548u
+#define VMCB_SAVE_CR3           0x550u
+#define VMCB_SAVE_CR0           0x558u
+#define VMCB_SAVE_DR7           0x560u
+#define VMCB_SAVE_DR6           0x568u
+#define VMCB_SAVE_RFLAGS        0x570u
+#define VMCB_SAVE_RIP           0x578u
+#define VMCB_SAVE_RSP           0x5D8u
+#define VMCB_SAVE_RAX           0x5F8u
+#define VMCB_SAVE_CR2           0x618u
+
+#define SVM_EXITCODE_IOIO       0x7Bu
+#define SVM_EXITCODE_HLT        0x78u
+#define SVM_IOIO_PORT_SHIFT     16
+#define SVM_IOIO_TYPE_IN        (1u << 3)
+
+#define SVM_SEG_ATTRIB_CODE32   0x0C9Bu
+#define SVM_SEG_ATTRIB_DATA32   0x0C93u
+#define SVM_SEG_ATTRIB_TSS      0x008Bu
+
+#define SVM_PAGE_SIZE           4096u
+#define SVM_IOPM_PAGES          4u
+#define SVM_MSRPM_PAGES         2u
+#define SVM_IOPM_BYTES          (SVM_IOPM_PAGES  * SVM_PAGE_SIZE)
+#define SVM_MSRPM_BYTES         (SVM_MSRPM_PAGES * SVM_PAGE_SIZE)
+
+#define SVM_GUEST_STUB_OFF      0x000u
+#define SVM_GUEST_GDT_OFF       0x100u
+#define SVM_GUEST_GDT_LIMIT     0x17u
+#define SVM_GUEST_STACK_TOP     0xF00u
+#define SVM_VMEXIT_BUDGET       64u
+#define SVM_UART_RING           64u
+
+// Result codes for the bring-up (self-contained: the driver's DRIVER_* codes
+// are loader ABI values and do not belong in the kernel body).
+#define K64_SVM_OK              0
+#define K64_SVM_ERR_NOMEM       (-1)
+#define K64_SVM_ERR_NOAMD       (-2)
+#define K64_SVM_ERR_NOSVME      (-3)
+#define K64_SVM_ERR_VMFAIL      (-4)
+#define K64_SVM_ERR_BUSY        (-5)
+
+typedef struct {
+    uint32_t vmcb_pa;
+    uint32_t hsave_pa;
+    uint32_t iopm_pa;
+    uint32_t msrpm_pa;
+    uint32_t guest_pa;
+    uint32_t rip;
+    uint32_t exits;
+    uint32_t halted;
+    uint32_t uart_head;
+    uint32_t uart_tail;
+    uint8_t  uart_tx[SVM_UART_RING];
+    int      svme_enabled;
+} SvmK64;
+
+static SvmK64 g_svm64;
+
+// ---- CPU primitives (port of svm_driver.c L205-217) -------------------
+static uint64_t svmk_rdmsr(uint32_t msr){
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+static void svmk_wrmsr(uint32_t msr, uint64_t val){
+    uint32_t lo = (uint32_t)val, hi = (uint32_t)(val >> 32);
+    __asm__ __volatile__("wrmsr" : : "c"(msr), "a"(lo), "d"(hi));
+}
+
+// ---- VMCB field accessors (port of svm_driver.c L235-265) -------------
+static void vm_put16_(uint8_t* v, uint32_t off, uint16_t x){
+    v[off] = (uint8_t)x; v[off+1] = (uint8_t)(x >> 8);
+}
+static void vm_put32_(uint8_t* v, uint32_t off, uint32_t x){
+    v[off]   = (uint8_t)x;        v[off+1] = (uint8_t)(x >> 8);
+    v[off+2] = (uint8_t)(x >> 16); v[off+3] = (uint8_t)(x >> 24);
+}
+static uint32_t vm_get32_(const uint8_t* v, uint32_t off){
+    return (uint32_t)v[off] | ((uint32_t)v[off+1] << 8) |
+           ((uint32_t)v[off+2] << 16) | ((uint32_t)v[off+3] << 24);
+}
+static void vm_set_seg_(uint8_t* v, uint32_t slot, uint16_t sel,
+                        uint16_t attrib, uint32_t limit){
+    vm_put16_(v, slot, sel);
+    vm_put16_(v, slot + 2, attrib);
+    vm_put32_(v, slot + 4, limit);
+}
+static void svmk_memzero(uint8_t* p, uint32_t len){
+    if (!p) return;
+    for (uint32_t i = 0; i < len; ++i) p[i] = 0;
+}
+
+// ---- Detection (port of svm_driver.c L282-322) ------------------------
+// CRITICAL ordering: the VM_CR MSR read is privileged, so it may only run
+// after CPUID has positively identified AMD.  On any other CPU this returns
+// negative without ever touching an MSR (no #GP, no crash).
+static int svmk_detect(void){
+    uint32_t a, b, c, d;
+    nexos_cpuid(0u, 0u, &a, &b, &c, &d);
+    int is_amd = (b == 0x68747541u && c == 0x444D4163u && d == 0x69746E65u);
+    serial_puts("[SVM64] detect: vendor=");
+    serial_hex(b); serial_puts("/"); serial_hex(c); serial_puts("/"); serial_hex(d);
+    serial_puts(" amd="); serial_dec((uint32_t)is_amd); serial_puts("\n");
+    if (!is_amd) { serial_puts("[SVM64] not AuthenticAMD, refusing\n"); return K64_SVM_ERR_NOAMD; }
+
+    nexos_cpuid(0x80000000u, 0u, &a, &b, &c, &d);
+    serial_puts("[SVM64] max-ext-leaf="); serial_hex(a); serial_puts("\n");
+    if (a < 0x80000001u) { serial_puts("[SVM64] no CPUID.80000001, refusing\n"); return K64_SVM_ERR_NOAMD; }
+
+    nexos_cpuid(0x80000001u, 0u, &a, &b, &c, &d);
+    serial_puts("[SVM64] CPUID.80000001 ECX="); serial_hex(c);
+    serial_puts(" svm-bit="); serial_dec((c >> 2) & 1u); serial_puts("\n");
+    if (!(c & (1u << 2))) { serial_puts("[SVM64] CPUID SVM bit clear, refusing\n"); return K64_SVM_ERR_NOAMD; }
+
+    {
+        uint64_t vmcr = svmk_rdmsr(MSR_VM_CR);
+        serial_puts("[SVM64] VM_CR="); serial_hex((uint32_t)vmcr); serial_puts("\n");
+        if (vmcr & VM_CR_SVM_DISABLE) {
+            serial_puts("[SVM64] VM_CR.SVM_DISABLE set, refusing\n");
+            return K64_SVM_ERR_NOAMD;
+        }
+    }
+    return K64_SVM_OK;
+}
+
+// ---- Guest stub + GDT (port of svm_driver.c L331-354) -----------------
+// One page holds both: stub at 0, GDT at 0x100.  Nothing in low memory.
+static void svmk_build_guest_stub(void){
+    uint8_t*  code = (uint8_t*)(uintptr_t)g_svm64.guest_pa;
+    uint32_t* gd   = (uint32_t*)(uintptr_t)(g_svm64.guest_pa + SVM_GUEST_GDT_OFF);
+
+    svmk_memzero(code, SVM_PAGE_SIZE);
+
+    uint32_t i = SVM_GUEST_STUB_OFF;
+    code[i++] = 0xB0u; code[i++] = (uint8_t)'S';   /* mov al,'S'  */
+    code[i++] = 0xE6u; code[i++] = 0xE9u;          /* out 0xE9,al */
+    code[i++] = 0xB0u; code[i++] = (uint8_t)'V';   /* mov al,'V'  */
+    code[i++] = 0xE6u; code[i++] = 0xE9u;          /* out 0xE9,al */
+    code[i++] = 0xF4u;                             /* hlt         */
+
+    gd[0] = 0;           gd[1] = 0;
+    gd[2] = 0xFFFF0000u; gd[3] = 0x00CF9A00u;      /* flat 32-bit code */
+    gd[4] = 0xFFFF0000u; gd[5] = 0x00CF9300u;      /* flat 32-bit data */
+}
+
+// ---- VMCB construction (port of svm_driver.c L361-413) ----------------
+static void svmk_build_vmcb(void){
+    uint8_t* v = (uint8_t*)(uintptr_t)g_svm64.vmcb_pa;
+    svmk_memzero(v, SVM_PAGE_SIZE);
+
+    /* control intercepts: word3 bit23 = HLT, bit31 = IOIO_PROT (all port I/O)
+     * word4 bit0 = VMRUN (MANDATORY: VMRUN fails with #VMFAILVALID unless it
+     * intercepts itself), bits1-4 VMMCALL/VMLOAD/VMSAVE/STGI/CLGI. */
+    vm_put32_(v, VMCB_WORD3_INTERCEPT, (1u << 23) | (1u << 31));
+    vm_put32_(v, VMCB_WORD4_INTERCEPT, 0x0000001Fu);
+    vm_put32_(v, VMCB_IOPM_BASE_PA,  g_svm64.iopm_pa);
+    vm_put32_(v, VMCB_MSRPM_BASE_PA, g_svm64.msrpm_pa);
+    vm_put32_(v, VMCB_ASID, 1);
+    vm_put32_(v, VMCB_TLB_CTL, 0);
+    vm_put32_(v, VMCB_CLEAN, 0);          /* 0 = all state dirty: always reload */
+
+    vm_set_seg_(v, VMCB_SAVE_ES, 0x10, SVM_SEG_ATTRIB_DATA32, 0xFFFFFFFFu);
+    vm_set_seg_(v, VMCB_SAVE_CS, 0x08, SVM_SEG_ATTRIB_CODE32, 0xFFFFFFFFu);
+    vm_set_seg_(v, VMCB_SAVE_SS, 0x10, SVM_SEG_ATTRIB_DATA32, 0xFFFFFFFFu);
+    vm_set_seg_(v, VMCB_SAVE_DS, 0x10, SVM_SEG_ATTRIB_DATA32, 0xFFFFFFFFu);
+    vm_set_seg_(v, VMCB_SAVE_FS, 0x10, SVM_SEG_ATTRIB_DATA32, 0xFFFFFFFFu);
+    vm_set_seg_(v, VMCB_SAVE_GS, 0x10, SVM_SEG_ATTRIB_DATA32, 0xFFFFFFFFu);
+
+    /* GDTR/IDTR reuse the 16-byte vmcb_seg slot: selector=0, attrib=0,
+     * limit u32 @+4, base u64 @+8.  Base points into OUR page, not low mem. */
+    vm_put32_(v, VMCB_SAVE_GDTR + 4, SVM_GUEST_GDT_LIMIT);
+    vm_put32_(v, VMCB_SAVE_GDTR + 8, g_svm64.guest_pa + SVM_GUEST_GDT_OFF);
+    vm_put32_(v, VMCB_SAVE_IDTR + 4, 0xFFFFu);
+
+    vm_set_seg_(v, VMCB_SAVE_TR, 0x00, SVM_SEG_ATTRIB_TSS, 0xFFFFu);
+
+    vm_put32_(v, VMCB_SAVE_CR4, 0);
+    vm_put32_(v, VMCB_SAVE_CR3, 0);
+    vm_put32_(v, VMCB_SAVE_CR0, 0x11u);       /* PE | ET, no paging */
+    vm_put32_(v, VMCB_SAVE_DR7, 0x400u);
+    vm_put32_(v, VMCB_SAVE_DR6, 0xFFFF0FF0u);
+    vm_put32_(v, VMCB_SAVE_RFLAGS, 0x2u);
+    vm_put32_(v, VMCB_SAVE_RIP, g_svm64.rip);
+    vm_put32_(v, VMCB_SAVE_RSP, g_svm64.guest_pa + SVM_GUEST_STACK_TOP);
+    vm_put32_(v, VMCB_SAVE_RAX, 0);
+    vm_put32_(v, VMCB_SAVE_CR2, 0);
+    /* guest EFER: SVME must be SET in the guest's own EFER too, else the
+     * VMCB is rejected; LME clear (32-bit no-paging guest). */
+    vm_put32_(v, VMCB_SAVE_EFER, EFER_SVME);
+}
+
+static void svmk_dump_vmcb(void){
+    const uint8_t* v = (const uint8_t*)(uintptr_t)g_svm64.vmcb_pa;
+    serial_puts("[SVM64] VMCB @ "); serial_hex(g_svm64.vmcb_pa);
+    serial_puts(" aligned="); serial_dec((uint32_t)((g_svm64.vmcb_pa & 0xFFFu) == 0u));
+    serial_puts("\n");
+    serial_puts("[SVM64] ctrl: asid=");  serial_dec(vm_get32_(v, VMCB_ASID));
+    serial_puts(" iopm=");  serial_hex(vm_get32_(v, VMCB_IOPM_BASE_PA));
+    serial_puts(" msrpm="); serial_hex(vm_get32_(v, VMCB_MSRPM_BASE_PA));
+    serial_puts("\n");
+    serial_puts("[SVM64] int: W3="); serial_hex(vm_get32_(v, VMCB_WORD3_INTERCEPT));
+    serial_puts(" W4=");             serial_hex(vm_get32_(v, VMCB_WORD4_INTERCEPT));
+    serial_puts("\n");
+    serial_puts("[SVM64] state: CR0="); serial_hex(vm_get32_(v, VMCB_SAVE_CR0));
+    serial_puts(" EFER=");              serial_hex(vm_get32_(v, VMCB_SAVE_EFER));
+    serial_puts(" RIP=");               serial_hex(vm_get32_(v, VMCB_SAVE_RIP));
+    serial_puts(" RSP=");               serial_hex(vm_get32_(v, VMCB_SAVE_RSP));
+    serial_puts("\n");
+    serial_puts("[SVM64] gdtr: limit="); serial_hex(vm_get32_(v, VMCB_SAVE_GDTR + 4));
+    serial_puts(" base=");               serial_hex(vm_get32_(v, VMCB_SAVE_GDTR + 8));
+    serial_puts(" cs.sel=");             serial_hex(vm_get32_(v, VMCB_SAVE_CS) & 0xFFFFu);
+    serial_puts("\n");
+}
+
+// ---- vUART tx ring (port of svm_driver.c L468-474) --------------------
+static void svmk_uart_push(uint8_t byte){
+    uint32_t nxt = (g_svm64.uart_head + 1u) % SVM_UART_RING;
+    if (nxt == g_svm64.uart_tail) return;      /* ring full: drop */
+    g_svm64.uart_tx[g_svm64.uart_head] = byte;
+    g_svm64.uart_head = nxt;
+}
+
+// ---- One VMRUN (port of svm_driver.c L484-520) ------------------------
+// RFLAGS alone is NOT a reliable VMFAIL test: host RFLAGS is restored from
+// the hsave area and may carry stale ZF/CF.  So CLC runs before VMRUN and
+// the VMCB EXITCODE is cross-checked.
+static long svmk_vmrun(void){
+    uint32_t flags = 0;
+    uint32_t vmcb  = g_svm64.vmcb_pa;
+
+    __asm__ __volatile__(
+        "clc\n\t"
+        ".byte 0x0F, 0x01, 0xD8\n\t"   /* VMRUN (rAX = VMCB physical addr) */
+        // 64-bit build: `pushfl` / `popl` are 32-bit-only mnemonics and GAS
+        // rejects them in long mode.  They were previously masked by a stale
+        // build/kernel64.o; rebuilding exposed it.  We pushfq into RAX, then
+        // take the low 32 bits into the output operand -- which is a 32-bit
+        // register, so `pop` must not be used directly on it.
+        "pushfq\n\t"
+        "popq %%rax\n\t"
+        "movl %%eax, %1\n\t"
+        : "+a"(vmcb), "=r"(flags)
+        :
+        : "memory", "cc");
+    (void)vmcb;
+
+    {
+        const uint8_t* v = (const uint8_t*)(uintptr_t)g_svm64.vmcb_pa;
+        uint32_t e0 = vm_get32_(v, VMCB_EXITCODE);
+        uint32_t e1 = vm_get32_(v, VMCB_EXITCODE + 4);
+        uint32_t i0 = vm_get32_(v, VMCB_EXITINFO1);
+        uint32_t i1 = vm_get32_(v, VMCB_EXITINFO1 + 4);
+        serial_puts("[SVM64] post-vmrun: exitcode=");
+        serial_hex(e1); serial_puts(":"); serial_hex(e0);
+        serial_puts(" info1="); serial_hex(i1); serial_puts(":"); serial_hex(i0);
+        serial_puts(" rflags="); serial_hex(flags); serial_puts("\n");
+    }
+
+    {
+        uint32_t exitcode = vm_get32_((const uint8_t*)(uintptr_t)g_svm64.vmcb_pa,
+                                      VMCB_EXITCODE);
+        if (exitcode == 0u) return -2;   /* VMCB rejected: #VMFAILVALID */
+        return (long)exitcode;
+    }
+}
+
+// ---- #VMEXIT dispatch (port of svm_driver.c L530-569) -----------------
+// Returns 1 = keep running, 0 = guest halted.  The resumed RIP is written
+// straight back into the live VMCB so the next VMRUN continues the guest.
+static int svmk_handle_exit(uint32_t exitcode){
+    uint8_t* v        = (uint8_t*)(uintptr_t)g_svm64.vmcb_pa;
+    uint32_t info1    = vm_get32_(v, VMCB_EXITINFO1);
+    uint32_t next_rip = vm_get32_(v, VMCB_NEXT_RIP);
+
+    if (exitcode == SVM_EXITCODE_IOIO) {
+        uint32_t port = info1 >> SVM_IOIO_PORT_SHIFT;
+        uint32_t rax  = vm_get32_(v, VMCB_SAVE_RAX);
+        if (info1 & SVM_IOIO_TYPE_IN) {
+            vm_put32_(v, VMCB_SAVE_RAX, 0);      /* IN: deliver 0 */
+        } else {
+            svmk_uart_push((uint8_t)(rax & 0xFFu));
+            serial_puts("[SVM64] vmexit IOIO out port="); serial_hex(port);
+            serial_puts(" val="); serial_hex(rax & 0xFFu);
+            serial_puts(" ('"); 
+            { char ch = (char)(rax & 0xFFu); char s[2]; s[0] = (ch >= 32 && ch < 127) ? ch : '.'; s[1] = 0; serial_puts(s); }
+            serial_puts("')\n");
+        }
+        g_svm64.rip = next_rip ? next_rip : g_svm64.rip;
+        vm_put32_(v, VMCB_SAVE_RIP, g_svm64.rip);
+        vm_put32_(v, VMCB_CLEAN, 0);
+        return 1;
+    }
+
+    if (exitcode == SVM_EXITCODE_HLT) {
+        g_svm64.halted = 1;
+        serial_puts("[SVM64] vmexit HLT: guest halted\n");
+        return 0;
+    }
+
+    /* unknown exit: advance past it so we cannot spin forever */
+    g_svm64.rip = next_rip ? next_rip : (g_svm64.rip + 1u);
+    vm_put32_(v, VMCB_SAVE_RIP, g_svm64.rip);
+    vm_put32_(v, VMCB_CLEAN, 0);
+    return 1;
+}
+
+// ---- Run loop (port of svm_driver.c L576-612) -------------------------
+static int svmk_run_loop(uint32_t budget){
+    g_svm64.halted = 0;
+    g_svm64.exits  = 0;
+
+    for (uint32_t i = 0; i < budget && !g_svm64.halted; ++i) {
+        long exit_code = svmk_vmrun();
+        if (exit_code == -2) {
+            serial_puts("[SVM64] #VMFAILVALID: VMCB rejected by the CPU\n");
+            return K64_SVM_ERR_VMFAIL;
+        }
+        if (exit_code < 0) {
+            serial_puts("[SVM64] VMRUN failed, code=");
+            serial_dec((uint32_t)(-exit_code)); serial_puts("\n");
+            return K64_SVM_ERR_VMFAIL;
+        }
+        g_svm64.exits++;
+        serial_puts("[SVM64] #VMEXIT code=");
+        serial_hex((uint32_t)exit_code);
+        serial_puts(" (run "); serial_dec(g_svm64.exits); serial_puts(")\n");
+        if (svmk_handle_exit((uint32_t)exit_code) == 0) break;   /* HLT */
+    }
+
+    serial_puts("[SVM64] run loop done: exits="); serial_dec(g_svm64.exits);
+    serial_puts(" halted="); serial_dec(g_svm64.halted); serial_puts("\n");
+
+    if (g_svm64.halted) return K64_SVM_OK;
+    serial_puts("[SVM64] vmexit budget exhausted before guest HLT\n");
+    return K64_SVM_ERR_BUSY;
+}
+
+// ---- SVM entry (port of svm_driver.c L618-645) ------------------------
+static int svmk_enter(void){
+    uint64_t efer = svmk_rdmsr(MSR_EFER);
+    svmk_wrmsr(MSR_EFER, efer | (uint64_t)EFER_SVME);
+    g_svm64.svme_enabled = 1;
+    svmk_wrmsr(MSR_VM_HSAVE_PA, (uint64_t)g_svm64.hsave_pa);
+
+    /* verify the write landed (a CPU model without EFER would drop it) */
+    if (!(svmk_rdmsr(MSR_EFER) & (uint64_t)EFER_SVME)) {
+        serial_puts("[SVM64] FAIL: EFER.SVME did not stick (no SVM on this cpu?)\n");
+        return K64_SVM_ERR_NOSVME;
+    }
+    serial_puts("[SVM64] EFER.SVME=1, VM_HSAVE_PA=");
+    serial_hex(g_svm64.hsave_pa); serial_puts("\n");
+
+    svmk_build_vmcb();
+    svmk_dump_vmcb();
+    return svmk_run_loop(SVM_VMEXIT_BUDGET);
+}
+
+// ---- Teardown: clear EFER.SVME, release every frame -------------------
+// Idempotent: each pa is cleared as it is freed, so a double call is safe.
+static void svmk_release_all(void){
+    if (g_svm64.svme_enabled) {
+        uint64_t efer = svmk_rdmsr(MSR_EFER);
+        svmk_wrmsr(MSR_EFER, efer & ~(uint64_t)EFER_SVME);
+        g_svm64.svme_enabled = 0;
+    }
+    if (g_svm64.vmcb_pa)  { pmm_free_page(g_svm64.vmcb_pa);              g_svm64.vmcb_pa  = 0; }
+    if (g_svm64.hsave_pa) { pmm_free_page(g_svm64.hsave_pa);             g_svm64.hsave_pa = 0; }
+    if (g_svm64.iopm_pa)  { pmm_free_range(g_svm64.iopm_pa, SVM_IOPM_PAGES);   g_svm64.iopm_pa  = 0; }
+    if (g_svm64.msrpm_pa) { pmm_free_range(g_svm64.msrpm_pa, SVM_MSRPM_PAGES); g_svm64.msrpm_pa = 0; }
+    if (g_svm64.guest_pa) { pmm_free_page(g_svm64.guest_pa);             g_svm64.guest_pa = 0; }
+}
+
+// ---- On-disk record ---------------------------------------------------
+// Written to SVM_LOG_LBA through the range-guarded writer, so this can
+// never land inside kernel.bin / SFS / the diagnostic sector.
+typedef struct {
+    uint32_t magic;        /* 'S''V''M''K' */
+    uint32_t rc;           /* K64_SVM_* */
+    uint32_t exits;
+    uint32_t halted;
+    uint32_t rip;
+    uint32_t vmcb_pa;
+    uint32_t hsave_pa;
+    uint32_t guest_pa;
+    uint32_t uart_n;
+    char     uart[SVM_UART_RING];
+    uint8_t  pad[512 - (4*9 + SVM_UART_RING)];
+} SvmLogRec;
+static_assert(sizeof(SvmLogRec) == 512u, "SVM log record must be exactly one sector");
+
+// ---- Framebuffer result display ---------------------------------------
+// Direct pixel writes through the 0x5000 VBE block, using the same
+// format-aware packing the boot markers use.  Green = success, red =
+// failure, with the failure code drawn as a bar along the bottom so the
+// screen itself carries the reason even with no serial attached.
+static void svmk_paint(int ok, int rc){
+    volatile uint8_t* vb = (volatile uint8_t*)0x5000;
+    uint16_t w     = *(volatile uint16_t*)(vb + 0x04);
+    uint16_t h     = *(volatile uint16_t*)(vb + 0x06);
+    uint16_t pitch = *(volatile uint16_t*)(vb + 0x09);
+    uint8_t  fmt   = *(volatile uint8_t*)(vb + 0x0F);
+    if (w == 0 || h == 0) return;
+
+    uint64_t fb64 = *(volatile uint64_t*)(vb + 0x10);
+    uintptr_t fbva;
+    if (fb64 > 0xFFFFFFFFULL) fbva = (uintptr_t)fb64;
+    else                      fbva = (uintptr_t)(*(volatile uint32_t*)(vb + 0x00));
+    if (fbva == 0) return;
+
+    uint32_t pstride = (pitch != 0) ? (pitch / 4u) : (uint32_t)w;
+    volatile uint32_t* fb = (volatile uint32_t*)fbva;
+
+    uint32_t bg = ok ? diag_pack(fmt, 0, 200, 0)      /* green */
+                     : diag_pack(fmt, 200, 0, 0);     /* red   */
+    for (uint32_t y = 0; y < h; y++) {
+        volatile uint32_t* row = fb + (uint32_t)y * pstride;
+        for (uint32_t x = 0; x < w; x++) row[x] = bg;
+    }
+
+    /* Status band: |rc| encoded as N white blocks followed by the code in
+     * "bits".  Also draw a black band first so the count is legible. */
+    if (!ok) {
+        uint32_t band = (uint32_t)h > 48u ? (uint32_t)h - 40u : 0u;
+        uint32_t white = diag_pack(fmt, 255, 255, 255);
+        uint32_t black = diag_pack(fmt, 0, 0, 0);
+        for (uint32_t y = band; y < (uint32_t)h && y < band + 24u; y++) {
+            volatile uint32_t* row = fb + y * pstride;
+            for (uint32_t x = 0; x < w; x++) row[x] = black;
+        }
+        uint32_t code = (uint32_t)(-rc);
+        uint32_t x0 = 16u;
+        for (int bit = 7; bit >= 0; --bit) {
+            uint32_t cw = 16u;
+            uint32_t ch = ((code >> bit) & 1u) ? 20u : 6u;   /* tall = 1 */
+            for (uint32_t y = band + 2u; y < band + 2u + ch && y < (uint32_t)h; y++) {
+                volatile uint32_t* row = fb + y * pstride;
+                for (uint32_t x = x0; x < x0 + cw && x < (uint32_t)w; x++) row[x] = white;
+            }
+            x0 += cw + 6u;
+            if (x0 + cw >= (uint32_t)w) break;
+        }
+        (void)white;
+    }
+}
+
+// ---- Entry point: called from kmain64 after the framebuffer is live ----
+// Runs the whole bring-up, paints the outcome, and records it on disk.
+// Failure-tolerant: every failure path paints red and returns a code, it
+// never faults the boot.
+static int svm_k64_bringup(void){
+    int rc;
+
+    svmk_memzero((uint8_t*)&g_svm64, (uint32_t)sizeof(g_svm64));
+
+    serial_puts("\n[SVM64] ===== AMD-V bring-up (in-kernel, Option C) =====\n");
+
+    rc = svmk_detect();
+    if (rc != K64_SVM_OK) {
+        serial_puts("[SVM64] detection failed, rc="); serial_dec((uint32_t)(-rc)); serial_puts("\n");
+        svmk_paint(0, rc);
+        return rc;
+    }
+
+    /* Physical frames the CPU requires: VMCB / hsave must be 4 KiB page
+     * aligned, so they come from the PMM, never from kmalloc. */
+    g_svm64.vmcb_pa  = pmm_alloc_page();
+    g_svm64.hsave_pa = pmm_alloc_page();
+    g_svm64.iopm_pa  = pmm_alloc_range(SVM_IOPM_PAGES);
+    g_svm64.msrpm_pa = pmm_alloc_range(SVM_MSRPM_PAGES);
+    g_svm64.guest_pa = pmm_alloc_page();
+
+    if (!g_svm64.vmcb_pa || !g_svm64.hsave_pa || !g_svm64.iopm_pa ||
+        !g_svm64.msrpm_pa || !g_svm64.guest_pa) {
+        serial_puts("[SVM64] out of physical memory\n");
+        svmk_release_all();
+        svmk_paint(0, K64_SVM_ERR_NOMEM);
+        return K64_SVM_ERR_NOMEM;
+    }
+
+    /* Page alignment is an architectural requirement, not a nicety. */
+    if ((g_svm64.vmcb_pa & 0xFFFu) || (g_svm64.hsave_pa & 0xFFFu) ||
+        (g_svm64.iopm_pa & 0xFFFu) || (g_svm64.msrpm_pa & 0xFFFu) ||
+        (g_svm64.guest_pa & 0xFFFu)) {
+        serial_puts("[SVM64] PMM returned a non-page-aligned frame\n");
+        svmk_release_all();
+        svmk_paint(0, K64_SVM_ERR_NOMEM);
+        return K64_SVM_ERR_NOMEM;
+    }
+
+    serial_puts("[SVM64] frames: vmcb=");  serial_hex(g_svm64.vmcb_pa);
+    serial_puts(" hsave="); serial_hex(g_svm64.hsave_pa);
+    serial_puts(" iopm=");  serial_hex(g_svm64.iopm_pa);
+    serial_puts(" msrpm="); serial_hex(g_svm64.msrpm_pa);
+    serial_puts(" guest="); serial_hex(g_svm64.guest_pa);
+    serial_puts("\n");
+
+    /* All-zero bitmaps: intercept nothing beyond the VMCB control bits. */
+    svmk_memzero((uint8_t*)(uintptr_t)g_svm64.iopm_pa,  SVM_IOPM_BYTES);
+    svmk_memzero((uint8_t*)(uintptr_t)g_svm64.msrpm_pa, SVM_MSRPM_BYTES);
+
+    svmk_build_guest_stub();
+    g_svm64.rip = g_svm64.guest_pa + SVM_GUEST_STUB_OFF;
+
+    rc = svmk_enter();
+    if (rc != K64_SVM_OK) {
+        serial_puts("[SVM64] entry/run failed, rc="); serial_dec((uint32_t)(-rc)); serial_puts("\n");
+    } else {
+        serial_puts("[SVM64] Init Success: guest ran and halted\n");
+    }
+
+    /* Record the outcome on disk BEFORE tearing the machine down. */
+    {
+        SvmLogRec rec;
+        svmk_memzero((uint8_t*)&rec, (uint32_t)sizeof(rec));
+        rec.magic    = 0x4B4D5653u;   /* 'S''V''M''K' little-endian */
+        rec.rc       = (uint32_t)rc;
+        rec.exits    = g_svm64.exits;
+        rec.halted   = g_svm64.halted;
+        rec.rip      = g_svm64.rip;
+        rec.vmcb_pa  = g_svm64.vmcb_pa;
+        rec.hsave_pa = g_svm64.hsave_pa;
+        rec.guest_pa = g_svm64.guest_pa;
+        {
+            uint32_t n = 0, t = g_svm64.uart_tail;
+            while (t != g_svm64.uart_head && n < SVM_UART_RING) {
+                rec.uart[n++] = (char)g_svm64.uart_tx[t];
+                t = (t + 1u) % SVM_UART_RING;
+            }
+            rec.uart_n = n;
+        }
+        {
+            int wrc = blk_write_sector((uint64_t)SVM_LOG_LBA, &rec);
+            serial_puts("[SVM64] log write to LBA "); serial_dec(SVM_LOG_LBA);
+            serial_puts(" rc="); serial_dec((uint32_t)wrc); serial_puts("\n");
+        }
+        serial_puts("[SVM64] vUART captured: \"");
+        { char s[2]; for (uint32_t k = 0; k < rec.uart_n; ++k) { s[0] = rec.uart[k]; s[1] = 0; serial_puts(s); } }
+        serial_puts("\"\n");
+    }
+
+    svmk_paint(rc == K64_SVM_OK, rc);
+    serial_puts("[SVM64] ===== bring-up complete, rc=");
+    serial_dec((uint32_t)(rc < 0 ? -rc : rc));
+    serial_puts(rc == K64_SVM_OK ? " (GREEN screen)\n" : " (RED screen)\n");
+    serial_puts("\n\n");
+
+    svmk_release_all();
+    return rc;
+}
+
 // read_file adapter handed to the fontvec driver: the same SFS bridge that
 // gui.cpp's private g_cb.read_file wraps (kern_fs_read -> sfs.read), reachable
 // from this translation unit.
@@ -6750,6 +7505,15 @@ extern "C" void kmain64(){
         g_vbe_active = true;
         serial_puts("[K64-VBE] VBE info available (GUI ready)\n");
     }
+
+    // ---- AMD-V (SVM) bring-up, in-kernel (Option C) -------------------
+    //  Runs here because this is the first point where the framebuffer is
+    //  both initialised AND known usable, so the test can report through the
+    //  screen instead of only the serial port.  It is deliberately a
+    //  self-contained call with no return value consumed: any failure paints
+    //  red and returns, and the boot continues exactly as before.  See the
+    //  port notes above svm_k64_bringup() for provenance.
+    svm_k64_bringup();
 
     memset_(g_hist,0,sizeof(g_hist));
     memset_(g_diskbuf,0,sizeof(g_diskbuf));
