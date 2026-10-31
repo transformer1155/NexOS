@@ -34,7 +34,19 @@ PYTHON  ?= python3
 #  (nasm, g++, binutils, gnu-efi, ovmf, qemu, mtools, xorriso, ...).
 #  Override detection with:  make WSL=0 ...   (force non-WSL behaviour)
 # =====================================================================
-ifeq ($(origin WSL),default)
+# ROOT-CAUSE FIX (2026-10-31): this used to read
+#     ifeq ($(origin WSL),default)
+# WSL is NOT a GNU-make built-in, so when it is unset its origin is
+# "undefined" -- never "default" -- and that test therefore NEVER matched.
+# The include was skipped on every WSL host, which silently left XORRISO
+# empty.  The ISO recipe is "$(XORRISO) -as mkisofs ...", so make ran the
+# *system assembler* on "-as mkisofs" instead:
+#     as: unrecognized option '-b'    (make iso, Error 1)
+# MFORMAT/MCOPY/MMD survived only because of the explicit ?= fallbacks
+# further down.  Same bug class the OBJCOPY/QEMU notes above describe.
+# WSL may legitimately arrive from the environment (WSLENV/WSL_DISTRO_NAME
+# setups export WSL), so detect unless it was set on the command line.
+ifneq ($(origin WSL),command line)
   ifneq ($(shell uname -r 2>/dev/null | grep -i -c microsoft),0)
     WSL := 1
   else
@@ -44,6 +56,11 @@ endif
 ifeq ($(WSL),1)
   include tools/wsl_setup.mk
 endif
+# XORRISO is not a make built-in either, and it is ONLY defined inside
+# tools/wsl_setup.mk.  Give it the same ?= fallback as MFORMAT/MCOPY/MMD
+# below so a skipped/failed include degrades to a working xorriso from
+# PATH rather than to an empty variable that runs the wrong program.
+XORRISO ?= $(shell command -v xorriso 2>/dev/null)
 
 # Tool defaults that MUST resolve even when the WSL auto-provisioning block
 # above is skipped (e.g. $(origin WSL) is not "default" because the environment
@@ -515,6 +532,30 @@ $(BUILD)/svga.o: svga.cpp svga.h | $(BUILD)
 $(BUILD)/nexos_ai.o: nexos_ai.cpp nexos_ai.h | $(BUILD)
 	$(CC) $(CXXFLAGS) -c nexos_ai.cpp -o $@
 
+# DOS compatibility layer
+$(BUILD)/dos_prim_kernel.o: dos_compat/dos_prim_kernel.cpp dos_compat/dos_prim.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -I. -Idos_compat -c dos_compat/dos_prim_kernel.cpp -o $@
+
+$(BUILD)/dos_int21.o: dos_compat/dos_int21.c dos_compat/dos_int21.h dos_compat/dos_prim.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -I. -Idos_compat -c dos_compat/dos_int21.c -o $@
+
+$(BUILD)/dos_psp.o: dos_compat/dos_psp.c dos_compat/dos_psp.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -I. -Idos_compat -c dos_compat/dos_psp.c -o $@
+
+$(BUILD)/dos_exec.o: dos_compat/dos_exec.c dos_compat/dos_exec.h dos_compat/dos_psp.h dos_compat/dos_int21.h dos_compat/dos_prim.h vfs.h proc.h syscall.h mm.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -I. -Idos_compat -c dos_compat/dos_exec.c -o $@
+
+$(BUILD)/dos_int21_isr.o: dos_compat/dos_int21_isr.cpp dos_compat/dos_int21.h dos_compat/dos_prim.h | $(BUILD)
+	$(CC) $(CXXFLAGS) -I. -Idos_compat -c dos_compat/dos_int21_isr.cpp -o $@
+
+# The sample .COM programs ship inside SFS so `dos <name>.com` can find them.
+# Raw binary: DOS .COM has no header at all (org 0x100, loaded as-is).
+DOS_COM_SRCS   := dos_compat/hello.com.asm dos_compat/fileio.com.asm
+DOS_COM_STAGED := $(patsubst dos_compat/%.asm,$(SFS_DIR)/%,$(DOS_COM_SRCS))
+
+$(SFS_DIR)/%.com: dos_compat/%.com.asm | $(BUILD)
+	$(AS) -f bin $< -o $@
+
 # ----- System-algo native backend (32-bit kernel only) -----
 # Native implementations behind NexOS.SystemAlgo icalls (top-k, LRU, Bloom,
 # Levenshtein, cosine, dot-product, A*, spatial trees).
@@ -528,8 +569,9 @@ $(BUILD)/knowledge_base.o: knowledge_base.c knowledge_base.h | $(BUILD)
 	$(CC) -m32 -ffreestanding -fno-stack-protector -fno-pic -fno-pie -fno-strict-aliasing -fno-asynchronous-unwind-tables -nostdlib -Os -Wall -Wextra -c knowledge_base.c -o $@
 
 # ----- Link kernel ELF (entry.o first => _start at image offset 0) -----
-$(BUILD)/kernel.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS) linker.ld | $(BUILD)
-	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS)
+$(BUILD)/kernel.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(BUILD)/dos_prim_kernel.o $(BUILD)/dos_int21.o $(BUILD)/dos_psp.o $(BUILD)/dos_exec.o $(BUILD)/dos_int21_isr.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS) linker.ld | $(BUILD)
+	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(BUILD)/dos_prim_kernel.o $(BUILD)/dos_int21.o $(BUILD)/dos_psp.o $(BUILD)/dos_exec.o $(BUILD)/dos_int21_isr.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS)
+	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(BUILD)/dos_prim_kernel.o $(BUILD)/dos_int21.o $(BUILD)/dos_psp.o $(BUILD)/dos_exec.o $(BUILD)/dos_int21_isr.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS)
 
 # ----- Extract flat kernel binary -----
 $(BUILD)/kernel.bin: $(BUILD)/kernel.elf | $(BUILD)
@@ -564,7 +606,7 @@ $(SFS_DIR)/%.bc: $(SFS_DIR)/%.skill tools/skillc.py | $(BUILD)
 
 skillbc: $(SKILL_BCS)
 
-$(SFS_IMG): $(wildcard $(SFS_DIR)/*) $(wildcard $(SFS_DIR)/*/*) $(STUB_STAGED) $(FONTVEC_STAGED) tools/sfs_gen.py tools/tex_pack.py $(SKILL_BCS) $(SFS_DIR)/userdemo $(SFS_DIR)/hello.mex $(SFS_DIR)/shell.mex $(SFS_DIR)/hello.nex | $(BUILD)
+$(SFS_IMG): $(wildcard $(SFS_DIR)/*) $(wildcard $(SFS_DIR)/*/*) $(wildcard assets/wallpapers/*) $(STUB_STAGED) $(FONTVEC_STAGED) $(DOS_COM_STAGED) tools/sfs_gen.py tools/tex_pack.py $(SKILL_BCS) $(SFS_DIR)/userdemo $(SFS_DIR)/hello.mex $(SFS_DIR)/shell.mex $(SFS_DIR)/hello.nex | $(BUILD)
 	$(PYTHON) tools/tex_pack.py
 	$(PYTHON) tools/sfs_gen.py $(SFS_DIR) $@
 
@@ -1178,7 +1220,7 @@ $(BUILD)/boot_cd.bin: boot_cd.asm | $(BUILD)
 # image off the CD into high RAM.  Textures (tex_*) are only used by the
 # native fallback drawer, never by the managed C# shell, so they are excluded
 # to keep the embedded image small.
-$(BUILD)/sfs_cd.img: $(wildcard $(SFS_DIR)/*) tools/sfs_gen.py tools/tex_pack.py $(SFS_DIR)/shell.mex | $(BUILD)
+$(BUILD)/sfs_cd.img: $(wildcard $(SFS_DIR)/*) $(wildcard assets/wallpapers/*) tools/sfs_gen.py tools/tex_pack.py $(SFS_DIR)/shell.mex | $(BUILD)
 	$(PYTHON) tools/tex_pack.py
 	$(PYTHON) tools/sfs_gen.py $(SFS_DIR) $@ --exclude-tex
 
