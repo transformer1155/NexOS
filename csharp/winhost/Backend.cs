@@ -836,6 +836,11 @@ namespace NexOS.Forms
         // kernel framebuffer, so it is a no-op.  Kept for Theme.ApplyPixel
         // parity between the two build targets.
         public static void SetPixel(int mode, int scale, int scan) { }
+        // P2 text gamma.  The Windows harness has no 64-bit glyph rasteriser, so
+        // this mirrors the kernel contract without doing anything: it validates
+        // and echoes the selector actually stored (same fallback rule as
+        // mforms.cpp h_set_text_gamma), keeping the shared shell code honest.
+        public static int  SetTextGamma(int sel) { return (sel >= 0 && sel <= 3) ? sel : 2; }
 
         // ---- network downloads ---------------------------------------
         // Backing store for the three kernel-facing download InternalCalls.

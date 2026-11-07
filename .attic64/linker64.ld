@@ -35,6 +35,22 @@ SECTIONS
         __bss_end = .;
     }
 
+    /* Link-time capacity assertion, symmetric to the 32-bit linker.ld
+       (ASSERT(__kimage_end <= 0x9FC00)).
+
+       Why it matters: without it an over-large .bss simply runs past the heap
+       start, the heap then overlaps kernel data, and the machine dies silently
+       at the first big allocation -- no fault, no diagnostic.  That is exactly
+       what happened when the AI modules pushed .bss past HEAP_START: a
+       200-second mystery instead of a one-line build error.
+
+       SECOND SOURCE OF TRUTH: HEAP_START is a C++ constant in kernel64.cpp:2381
+       (0x500000), not a linker symbol.  If you change one, change BOTH.  The
+       durable fix (have the constant reference this symbol) is deliberate
+       technical debt, not an oversight. */
+    ASSERT(__bss_end <= 0x500000,
+        "kernel64 .bss overruns HEAP_START (see kernel64.cpp:2381) -- raise HEAP_START or shrink .bss")
+
     /DISCARD/ : {
         *(.comment)
         *(.eh_frame)

@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "id": "invalid",
+  "title": "故意有缺陷的模板（验证失败路径）",
+  "version": "1.0.0",
+  "summary": "NOT usable. Phase fix names role fixer which is not declared in roles[], so coop_validate must reject it with phase-references-unknown-role instead of running a phase nobody can be assigned to. Kept in the tree so the negative path is reproducible.",
+  "tags": ["probe"],
+  "skill": { "exposed": false, "tool": "cooperation.run" },
+  "inputs": [ { "name": "symptom", "type": "text", "required": true } ],
+  "roles": [
+    { "role": "reproducer", "capability": ["build", "run-qemu"], "count": 1, "fallback": "" }
+  ],
+  "phases": [
+    {
+      "phase": "reproduce",
+      "role": "reproducer",
+      "goal": "step 1 is valid",
+      "action": { "kind": "report" },
+      "context_in": [],
+      "context_out": ["repro.steps"],
+      "handoff": { "requires": ["repro.steps"], "to": "fix" }
+    },
+    {
+      "phase": "fix",
+      "role": "fixer",
+      "goal": "fixer is NOT declared -> must be rejected",
+      "action": { "kind": "task", "subject": "fix" },
+      "context_in": ["repro.steps"],
+      "context_out": ["fix.diff"],
+      "handoff": { "requires": ["fix.diff"], "to": "" }
+    }
+  ],
+  "guards": { "max_phases": 8, "require_handoff_artifacts": true, "fail_closed": true }
+}

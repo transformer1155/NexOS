@@ -274,6 +274,55 @@ static void test_distributed_fault(void){
     lan_teardown(&L);
 }
 
+/* ---------------- Oversized-payload guard -------------------------------- */
+/* A TASK whose payload exceeds DCN_MAX_PAYLOAD must never reach dcn_op_run:
+   DCN_OP_ECHO returns exactly as many bytes as it received, so an unbounded
+   payload would run off the worker's fixed result buffer. Both sides guard -
+   the worker drops the datagram, the dispatcher refuses to build it. */
+static void test_oversize_guard(void){
+    printf("[Oversized payload guard]\n");
+    struct dlan L;
+    lan_setup(&L, 1);
+
+    /* --- worker side: hand-craft an oversized ECHO TASK --- */
+    uint8_t pkt[10 + DCN_MAX_PAYLOAD * 2];
+    size_t  plen = sizeof(pkt) - 10;
+    memset(pkt, 0x5a, sizeof(pkt));
+    pkt[0] = DCN_PKT_TASK;
+    pkt[1] = DCN_OP_ECHO;
+    dcn_wr32be(pkt + 2, 1);                 /* block id */
+    dcn_wr32be(pkt + 6, (uint32_t)plen);    /* payload length */
+    dcn_transport_send(L.ct, L.wmac[0], pkt, sizeof(pkt));
+    T("worker drops oversized TASK instead of overflowing", dcn_worker_pump(L.wk[0], 0) == 0);
+
+    /* --- the worker must still be healthy afterwards --- */
+    uint8_t small[10 + 16];
+    memset(small, 0, sizeof(small));
+    small[0] = DCN_PKT_TASK;
+    small[1] = DCN_OP_ECHO;
+    dcn_wr32be(small + 2, 2);
+    dcn_wr32be(small + 6, 16);
+    for (int i = 0; i < 16; i++) small[10 + i] = (uint8_t)i;
+    dcn_transport_send(L.ct, L.wmac[0], small, sizeof(small));
+    T("worker still processes a normal TASK afterwards", dcn_worker_pump(L.wk[0], 0) == 1);
+
+    /* --- dispatcher side: an oversized block never becomes a TASK --- */
+    static uint8_t big[DCN_MAX_PAYLOAD * 2];
+    memset(big, 0x33, sizeof(big));
+    dcn_chunk_plan_t* bp = dcn_chunk_create(big, sizeof(big));
+    dcn_chunk_split_by_size(bp, sizeof(big));          /* one 8192-byte block */
+    dcn_node_t peers[DCN_MAX_NODES];
+    int n = dcn_discovery_list(L.cd, peers, DCN_MAX_NODES);
+    /* discriminate: the block must really be ASSIGNED, otherwise a plain
+       "nothing sent" would pass for the wrong reason (no peer at all). */
+    T("oversized block is assigned to the peer", n == 1 && dcn_chunk_assign(bp, peers, n) == 1);
+    T("dispatcher refuses to send an oversized block",
+      dcn_sched_dispatch(bp, L.cd, L.ct, DCN_OP_ECHO) == 0);
+    dcn_chunk_destroy(bp);
+
+    lan_teardown(&L);
+}
+
 /* ---------------- Kernel thin interface ----------------------------------- */
 static void test_kernel_iface(void){
     printf("[Kernel thin interface]\n");
@@ -284,6 +333,18 @@ static void test_kernel_iface(void){
     uint8_t out[256]; size_t outlen = 0;
     int rc = dcn_kernel_distribute((const uint8_t*)msg, len, 8, identity, NULL, out, sizeof(out), &outlen);
     T("dcn_kernel_distribute merges correctly", rc == DCN_OK && outlen == len && memcmp(out, msg, len) == 0);
+
+    /* An oversized block must be refused up front with a specific code, not
+       silently skipped and then reported as a generic merge failure. */
+    {
+        static uint8_t big2[DCN_MAX_PAYLOAD * 2 + 64];
+        memset(big2, 0x11, sizeof(big2));
+        uint8_t smallout[256]; size_t sl = 0;
+        T("dcn_kernel_distribute rejects block_size > DCN_MAX_PAYLOAD",
+          dcn_kernel_distribute(big2, sizeof(big2), DCN_MAX_PAYLOAD * 2,
+                                identity, NULL, smallout, sizeof(smallout), &sl)
+            == DCN_ERR_PARAM);
+    }
 
     /* WPA2 connect through the thin interface via a mock AP */
     const uint8_t aa[6]  = {0x00,0x0b,0x85,0x11,0x59,0xac};
@@ -330,6 +391,7 @@ int main(void){
     test_chunk();
     test_distributed();
     test_distributed_fault();
+    test_oversize_guard();
     test_kernel_iface();
 
     printf("==================================================\n");

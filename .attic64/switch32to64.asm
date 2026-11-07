@@ -40,6 +40,9 @@ extern __lm_pd
 extern __lm_pd2
 extern __lm_pdpt2
 extern __lm_stack_top
+; First of the eight 2 MiB-page PDs reserved in linker.ld.  Only the base is
+; referenced: the eight pages are contiguous, so PD_g<i> = __lm_pd_g0 + i*0x1000.
+extern __lm_pd_g0
 
 %define PML4_ADDR       __lm_pml4
 %define PDPT_ADDR       __lm_pdpt
@@ -164,15 +167,27 @@ switch_to_64bit:
     ; symbol is 4 KiB-aligned, so + and | are equivalent here.
     mov dword [PML4_ADDR], PDPT_ADDR + 0x03
 
-    ; PDPT[0..7] -> 1GiB pages, identity mapped, present=1, writable=1, PS=1.
-    ; This covers 0..8 GiB of physical RAM so GB-scale model weights (loaded
-    ; from NTFS) are directly accessible. The 3-4GB VBE LFB range is naturally
-    ; included, so no separate PD2 mapping is needed.
-    ;
-    ; NOTE: 1 GiB pages need CPUID.80000001:EDX bit 26 (pdpe1gb).  QEMU's
-    ; default CPU advertises it; VirtualBox's default feature set does not
-    ; (and its NEM fallback rejects PS=1 at the PDPT level), so VBox users
-    ; must enable the feature via  VBoxManage modifyvm --cpuidset 80000001.
+    ; ---- Identity-map 0..8 GiB, choosing the page size the CPU supports ----
+    ; 1 GiB pages need CPUID.80000001h:EDX bit 26 (pdpe1gb).  QEMU advertises
+    ; it; VirtualBox does NOT, and its NEM backend rejects PS=1 at the PDPT
+    ; level outright.  That distinction matters more than it looks: a region the
+    ; hypervisor refuses to translate is NOT a guest fault -- there is no #PF,
+    ; the IDT is never entered and no fault record is written.  The VM just
+    ; reports Guru Meditation 1155.  That is exactly how the long-mode desktop
+    ; died on VirtualBox at its first framebuffer store (the VBE LFB at
+    ; 0xE0000000 lives inside the 3-4 GiB 1 GiB page) while QEMU ran the very
+    ; same image fine.  So: use 1 GiB pages when the CPU has them, otherwise
+    ; fall back to 2 MiB pages (PS=1 at the PD level, which everyone supports).
+    mov eax, 0x80000000
+    cpuid
+    cmp eax, 0x80000001
+    jb  .use_2mib                 ; no extended leaf -> no pdpe1gb
+    mov eax, 0x80000001
+    cpuid
+    test edx, (1 << 26)           ; pdpe1gb
+    jz  .use_2mib
+
+    ; ---- 1 GiB pages (preferred: 8 entries cover the whole window) ----
     mov edi, PDPT_ADDR
     mov eax, 0x00000083           ; addr=0 | P=1 | W=1 | PS=1 (1GiB page)
     mov ecx, 8
@@ -181,14 +196,66 @@ switch_to_64bit:
     add eax, 0x40000000           ; next 1GiB block
     add edi, 8
     loop .fill_pdpt
+    jmp .maps_done
 
-    ; Mark the 3-4 GiB 1GiB page (PDPT[3], covering 0xC0000000-0xFFFFFFFF) as
-    ; cache-disabled (PCD bit 4).  This region holds the LAPIC MMIO at
-    ; 0xFEE00000 (and the VBE LFB); without PCD, reads of MMIO return stale
-    ; cache lines (BIOS ROM shadow) instead of live LAPIC state.
+    ; ---- 2 MiB pages: PDPT[i] -> PD_g<i>, each PD 512 x 2 MiB ----
+    ; The eight PDs are contiguous (linker.ld declares __lm_pd_g0..__lm_pd_g7
+    ; in order), so the per-GiB base is simply __lm_pd_g0 + gi*0x1000.
+.use_2mib:
+    xor ebx, ebx                  ; gi = 0..7
+    mov esi, __lm_pd_g0           ; this GiB's PD page
+.gib_loop:
+    mov eax, esi
+    or  eax, 0x03                 ; P|W
+    mov [PDPT_ADDR + ebx*8], eax
+
+    ; The 16 KiB clear at the top covered PML4/PDPT/PD/PD2 only; these pages
+    ; are new, so zero this one before filling it.
+    push ecx
+    mov edi, esi
+    xor eax, eax
+    mov ecx, 1024
+    rep stosd
+    pop ecx
+
+    mov edi, esi
+    mov eax, ebx
+    shl eax, 30                   ; identity base = gi GiB
+    or  eax, 0x83                 ; P|W|PS (2 MiB page)
+    mov ecx, 512
+.fill_pd_g:
+    mov [edi], eax
+    add eax, 0x200000             ; next 2 MiB block
+    add edi, 8
+    loop .fill_pd_g
+
+    add esi, 0x1000               ; next PD page
+    inc ebx
+    cmp ebx, 8
+    jb  .gib_loop
+
+.maps_done:
+
+    ; Mark the whole 3-4 GiB window as cache-disabled.  It holds the LAPIC MMIO
+    ; at 0xFEE00000 and the VBE LFB; without PCD, cached reads return stale
+    ; lines (e.g. shadow BIOS ROM) instead of live device state.
+    ; Auto-detect which layout we just built: PS=1 in PDPT[3] => one 1 GiB page,
+    ; otherwise PDPT[3] points at a PD and every 2 MiB entry needs the bit.
     mov eax, [PDPT_ADDR + 24]
+    test eax, 0x80
+    jz  .pcd_2mib
     or  eax, 0x10                 ; PCD (cache disable)
     mov [PDPT_ADDR + 24], eax
+    jmp .pcd_done
+.pcd_2mib:
+    mov edi, eax
+    and edi, 0xFFFFF000
+    mov ecx, 512
+.pcd_loop:
+    or  dword [edi], 0x10
+    add edi, 8
+    loop .pcd_loop
+.pcd_done:
 
     popad
 

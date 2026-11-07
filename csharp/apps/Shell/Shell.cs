@@ -30,6 +30,14 @@ namespace NexOS.Forms
         public const int AiLauncher   = 13;  // AI command console / launcher
         public const int NetDefense    = 14;  // network routing & attack-defense sim
         public const int WebView       = 15;  // Linux guest VNC framebuffer viewer
+        // ---- media players (added 2026-11-07) ----------------------------
+        // Deliberately NOT pinned to the taskbar and NOT seeded onto the
+        // desktop: the user asked for these to be reachable but not to clutter
+        // the default surface, so they live only under Start > All apps.
+        // Desktop.LoadDefaults() and the taskbar pin list must keep excluding
+        // them; both iterate KINDS, so "excluded" means "no explicit Put()".
+        public const int VideoPlayer    = 16;  // video file previewer/player
+        public const int AudioPlayer    = 17;  // audio file previewer/player
     }
 
     public static class Shell
@@ -47,6 +55,7 @@ namespace NexOS.Forms
         static int   pendingSettingsPage;
         static int   pendingSettingsArmed;
         static string pendingNotepadFile = null;
+        static int    pendingNotepadFs   = 0;   // volume the file came from (0=MKFS, 3=Desktop)
 
         // ---- lifecycle ------------------------------------------------
         public static void Init()
@@ -78,6 +87,12 @@ namespace NexOS.Forms
             // (nexos.cfg on the MKFS data disk).  Safe no-op if the file is
             // missing or empty.
             Theme.Load();
+            // One-line boundary report for the gamma persistence path (see
+            // Theme.GammaSelfCheck).  bad=0 means every case matched expectations.
+            NexOS.Sys.Print("[SHELL] gamma selfcheck bad=");
+            NexOS.Sys.PrintInt(Theme.GammaSelfCheck());
+            NexOS.Sys.Print(" textgamma=");
+            NexOS.Sys.PrintInt(Theme.TextGamma);
             Theme.ApplyPixel();      // push pixel-mode settings to the kernel
 
             apps = new App[MAX];   // heap_alloc zeroes -> all null
@@ -129,6 +144,8 @@ namespace NexOS.Forms
             if (kind == Kind.AiLauncher)   return new AiLauncherApp();
             if (kind == Kind.NetDefense)   return new NetDefenseApp();
             if (kind == Kind.WebView)      return new WebViewApp();
+            if (kind == Kind.VideoPlayer)  return new VideoPlayerApp();
+            if (kind == Kind.AudioPlayer)  return new AudioPlayerApp();
             return null;
         }
 
@@ -172,6 +189,52 @@ namespace NexOS.Forms
             App.Current = a;
             a.OnClick(mx, my);
             return 1;
+        }
+
+        // Window drag & drop from the host.  The source app gets the phases; on
+        // release the host also names the window under the pointer so a drop can
+        // target a DIFFERENT instance (file dragged between two Explorers).
+        public static int WindowDrag(int id, int phase, int mx, int my, int hitId, int hx, int hy)
+        {
+            if (id < 0 || id >= MAX) return 0;
+            App a = apps[id];
+            if (a == null) return 0;
+            App.Current = a;
+            a.OnDrag(phase, mx, my, hitId, hx, hy);
+            return 1;
+        }
+
+        // Look an app up by window id (drop targets).
+        public static App ById(int id) { return (id >= 0 && id < MAX) ? apps[id] : null; }
+
+        // ---- running-window enumeration (taskbar buttons) ----------------
+        // One entry per live window, so TWO File Explorers get two buttons.
+        public static int RunningCount()
+        {
+            int n = 0;
+            for (int i = 0; i < MAX; i++) if (apps[i] != null) n++;
+            return n;
+        }
+        // id of the nth running app (0-based), or -1.
+        public static int RunningId(int nth)
+        {
+            int n = 0;
+            for (int i = 0; i < MAX; i++)
+                if (apps[i] != null) { if (n == nth) return i; n++; }
+            return -1;
+        }
+        public static string RunningTitle(int nth)
+        {
+            int id = RunningId(nth);
+            return (id >= 0) ? apps[id].GetTitle() : "";
+        }
+        // Is this instance the one the user is interacting with?
+        public static bool IsActive(int id)
+        { return id >= 0 && id < MAX && apps[id] != null && apps[id] == App.Current; }
+        public static int RunningKind(int nth)
+        {
+            int id = RunningId(nth);
+            return (id >= 0) ? apps[id].KindId : -1;
         }
 
         public static int Key(int id, int ch)
@@ -342,6 +405,11 @@ namespace NexOS.Forms
         }
 
         // -1 == "handled, do not open anything"; -2 == "not mine".
+        // Desktop drag phases from the host: 0 = down (arm), 1 = move, 2 = up.
+        // Returns 1 when the desktop consumed it (a drag actually started).
+        public static int DesktopDrag(int mx, int my, int phase)
+        { return Desktop.Drag(mx, my, phase); }
+
         public static int DesktopClick(int mx, int my)
         {
             if (Login.IsActive() != 0) { Login.Click(mx, my); return -1; }
@@ -394,14 +462,23 @@ namespace NexOS.Forms
         // must create the native window, so we hand the request back to
         // the host instead of Shell.Open() (which would only make a C#
         // instance with nothing to paint it).
-        public static void OpenNotepad(string file)
+        public static void OpenNotepad(string file) { OpenNotepadFs(0, file); }
+
+        // Open a file from a KNOWN volume.  The volume matters: Save() writes
+        // back to it.  It used to always use fs 0, so a document opened from
+        // the desktop (fs 3) was read from the wrong place and then "saved"
+        // into the MKFS root instead of its own folder -- data looked lost.
+        public static void OpenNotepadFs(int fs, string file)
         {
             Host.Log(U.Cat("[FILES] opening in Notepad: ", file));
             pendingNotepadFile = file;
+            pendingNotepadFs   = fs;
             Host.OpenApp(Kind.Notepad);
         }
         public static string TakeNotepadFile()
         { string f = pendingNotepadFile; pendingNotepadFile = null; return f; }
+        public static int TakeNotepadFs()
+        { int f = pendingNotepadFs; pendingNotepadFs = 0; return f; }
 
         // Close every window of the given managed Kind (taskbar
         // right-click "Close window" / "End process").

@@ -107,6 +107,14 @@ int  set_mode(int m);                             /* set current AIMode (+ai_eng
 int  quota_remaining(void);                       /* pooled quota left              */
 int  ai_request(const char* prompt, int mode,
                char* out, int outsize);           /* returns JSON result string     */
+/* Plain-text ask through the guest's own NIC (host gateway), with the local
+   engine as fallback.  Returns bytes written (0 = no answer / gateway error
+   left in out when non-empty). */
+int  ai_ask_text(const char* prompt, char* out, int outsize);
+/* Host the kernel's TCP stack dials for /ai.  QEMU SLIRP maps the host to
+   10.0.2.2; override with the "ai gateway <ip>" shell command. */
+const char* ai_gateway_host(void);
+void ai_gateway_set_host(const char* host);
 /* Validate MCP_Client_Access, then dispatch.  Returns a JSON string
    {"code":N,"json":"<tool result>"} held in a static buffer. */
 const char* mcp_dispatch_request(const char* source_app_id,

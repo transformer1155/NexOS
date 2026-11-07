@@ -1,3 +1,9 @@
+
+#if defined(__x86_64__)
+#  define SERIAL_LINKAGE   /* external: gfx_ime.cpp (64-bit) calls these */
+#else
+#  define SERIAL_LINKAGE static
+#endif
 // =====================================================================
 //  gui.cpp  -  Win11-style Graphical User Interface for NexOS
 // ---------------------------------------------------------------------
@@ -40,6 +46,10 @@ extern "C" svc_fn svc_lookup(const char* name);
 // Used by blend_pixel_lin() for gamma-correct, crisp anti-aliased text.
 // Computed offline (pow-free) so the kernel stays freestanding (no libm).
 
+#if defined(__x86_64__)
+#include "mforms_bridge.h"   // host API for the 64-bit IME TU
+#include "gfx_ime.h"         // declarations of the moved IME symbols
+#else
 // ---------------------------------------------------------------------
 //  NexOS.Forms managed (C#) GUI shell bridge.
 //  The shell is driven by MiniCLR, which only ships in the 32-bit kernel;
@@ -79,6 +89,7 @@ static inline void        mforms_set_running(uint32_t) {}
 static inline void        mforms_set_ime(int) {}
 static inline int         mforms_paint_failed(int) { return 0; }
 #endif
+#endif  // __x86_64__ bridge selection (original block kept for 32-bit)
 
 // Window drag & drop state (managed apps): set on a press inside a managed
 // window, consumed by the move / release handlers in this file.
@@ -321,10 +332,32 @@ static int g_cursor_hw_svga = 0;
 static void select_cursor_backend(void) {
     if (g_cursor_backend_chosen) return;
     g_cursor_backend_chosen = 1;
-#if !defined(__x86_64__)
-    // VMware SVGA-II first: a real GPU cursor plane, and the only accelerated
-    // device available here that can actually be exercised under QEMU (the
-    // Intel path needs real silicon to verify, so it stays second).
+    // VMware SVGA-II: a real GPU cursor plane.
+    //
+    // 64-BIT IS DISABLED ON PURPOSE -- measured, not assumed.
+    // Un-guarding this call (attempted 2026-11-06) hung the 64-bit GUI boot
+    // solid: the serial stopped right after "[DIAG] step=333 gui_enter
+    // starting" and the guest burned ZERO CPU afterwards, so it was not slow,
+    // it was stuck.  svga_init() logs nothing before "[SVGA] found SVGA-II",
+    // and that line never appeared, so the hang is inside the PCI scan --
+    // before any BAR mapping.  svga64.o's four externs (kmalloc, vmm_map_page,
+    // serial_enter, serial_leave) all resolve, and kernel64.cpp's
+    // vmm_map_page returns (virt==phys) only, which would merely make the
+    // MMIO window unusable (svga.cpp falls back to port I/O).  None of that
+    // explains a hang, so enabling it needs real investigation (likely the
+    // 0xCF8/0xCFC config path under long mode) before the guard can move.
+    // Keeping the guard costs nothing: the 64-bit desktop draws through the
+    // CPU path and reaches the Win11 GUI.
+    // SVGA-II is enabled on BOTH kernels now.
+    //
+    // It was guarded off on 64-bit after an attempt that hung in the PCI scan.
+    // That diagnosis was made without any way to see inside svga_init()
+    // (serial output was being interleaved by other boot writers at the time,
+    // and the trace buffer did not exist yet).  Since then the HD Audio driver
+    // proved the same 0xCF8/0xCFC config path and the same "identity-mapped
+    // BAR under long mode" assumption work fine on this kernel, and svga.cpp
+    // now reports every probe step to the serial line, so a hang would be
+    // attributable instead of a mystery.
     if (svga_init()) {
         if (svga_cursor_selftest()) {    // must be acknowledged, not assumed
             g_cursor_hw_svga = 1;
@@ -338,6 +371,9 @@ static void select_cursor_backend(void) {
         // keep painting the arrow.
         serial_puts("[CURSOR] SVGA-II cursor unverified; keeping the painted arrow\n");
     }
+#if !defined(__x86_64__)
+    // The Intel iGPU cursor path stays 32-bit-only: it needs real silicon to
+    // verify and its registers were only scanned on the 32-bit build.
     if (intel_cursor_probe()) {          // GPU cursor plane (real hardware)
         g_cursor_backend = CURSOR_HW;
         serial_puts("[CURSOR] backend = GPU hardware cursor\n");
@@ -547,6 +583,8 @@ static bool g_bga_available = false;  // true if Bochs VBE ports detected
 //  Global state bound to the active Terminal window. Typing a-z composes
 //  pinyin; digits pick a candidate; space picks #1; ESC cancels.
 // =====================================================================
+// ---- Pinyin IME: 32-bit keeps it here; 64-bit uses src/gui/gfx_ime.cpp
+#if !defined(__x86_64__)
 static char   g_ime_py[16];         // composing pinyin
 static int    g_ime_len = 0;
 static bool   g_ime_active = false;
@@ -634,6 +672,7 @@ static void utf8_encode(uint32_t cp, char out[4]) {
         out[3] = 0;
     }
 }
+#endif  // !__x86_64__  (in-file IME for the 32-bit build)
 
 // Display width in pixels of a mixed UTF-8 string (ASCII 8px, CJK 16px).
 static int utf8_display_width(const char* s) {
@@ -682,17 +721,17 @@ static void serial_putc(char c) {
     g_gui_line[g_gui_len++] = c;
     if (c == '\n') gui_sio_flush();
 }
-static void serial_puts(const char* s) {
+SERIAL_LINKAGE void serial_puts(const char* s) {
     while (*s) serial_putc(*s++);
 }
-static void serial_putdec(int v) {
+SERIAL_LINKAGE void serial_putdec(int v) {
     char buf[12]; int n = 0;
     if (v < 0) { serial_putc('-'); v = -v; }
     if (v == 0) buf[n++] = '0';
     while (v > 0) { buf[n++] = (char)('0' + (v % 10)); v /= 10; }
     while (n > 0) serial_putc(buf[--n]);
 }
-static void serial_puthex32(uint32_t v) {
+SERIAL_LINKAGE void serial_puthex32(uint32_t v) {
     const char* h = "0123456789ABCDEF";
     for (int s = 28; s >= 0; s -= 4) serial_putc(h[(v >> s) & 0xF]);
 }
@@ -973,6 +1012,21 @@ struct GuiCallbacks {
     int         (*login_uid)(void);
     int         (*user_count)(void);
     const char* (*user_name)(int idx);
+    // Audio output.  Only the 64-bit kernel fills these in (its load window
+    // has room for hda64.cpp); on the 32-bit build they stay NULL and the
+    // managed Audio Player reports "no device" instead of pretending.
+    //
+    // GUARDED because 32-bit kernel.bin has 68 bytes of headroom: adding three
+    // pointers here pushed it past the EBDA at 0x9FC00 and the linker refused
+    // ("kernel.bin grew into the EBDA").  The 32-bit kernel has no audio driver
+    // and no room for one, so it simply does not carry these slots -- the
+    // managed side sees a 0 (NULL) call and reports "no device", which is the
+    // truth on that kernel.
+#if defined(__x86_64__)
+    int         (*audio_available)(void);
+    int         (*audio_play)(const int16_t* frames, int nframes);
+    void        (*audio_info)(char* buf, int n);
+#endif
 };
 
 static GuiCallbacks g_cb;
@@ -6646,7 +6700,8 @@ struct Win11Desktop {
                     dirty_add(smn.x, smn.y, smn.w, smn.h);
                 }
                 if (g_over_force_n > 0) g_over_force_n--;
-            }   // close the overlay pass after removing the full-repaint escalation
+            }
+   // close the overlay pass after removing the full-repaint escalation
             g_over_idle++;
         }
         perf_over_ms += tick_ms_now() - tS;   // stage 3: taskbar / Start overlay
@@ -9695,6 +9750,14 @@ static void mforms_boot(void) {
     h.login_uid        = g_cb.login_uid;
     h.user_count       = g_cb.user_count;
     h.user_name        = g_cb.user_name;
+    // Audio output.  Only the 64-bit kernel has these slots (see the guarded
+    // GuiCallbacks fields); on the 32-bit build mforms.h's MFormsHost audio
+    // pointers stay NULL, and Host.AudioAvailable() honestly reports 0.
+#if defined(__x86_64__)
+    h.audio_available  = g_cb.audio_available;
+    h.audio_play       = g_cb.audio_play;
+    h.audio_info       = g_cb.audio_info;
+#endif
 
     tim_mark("mforms: host filled");
     mforms_init(&h);
@@ -10352,6 +10415,24 @@ void gui_enter(void) {
     // Tell the GPU driver which mode it has to scan out before it enables the
     // device -- an enabled SVGA device takes the surface size from its own
     // registers, so it must be told what the kernel is actually drawing.
+    // Tell the device to scan the BACKBUFFER, not the VBE LFB.  The compositor
+    // draws into the backbuffer, so if the device scans the LFB instead, every
+    // frame still costs a full 3.7 MB CPU copy and the 2D engine cannot help.
+    // Passing the backbuffer's physical address (identity-mapped RAM in both
+    // kernels) makes present() a single C_UPDATE command.
+    // SCANOUT STAYS ON THE VBE LFB.
+    //
+    // Taking the scanout over onto the compositor's backbuffer made the screen
+    // go completely BLACK (measured: 0.0% non-black pixels, 1 distinct hue, via
+    // tools/shot_check.py).  The device accepted the mode -- it programmed
+    // 1024x768 bpp=32 pitch=4096 fb=0x01500000 and read that back unchanged --
+    // yet nothing appeared, so on this VMM the scanout surface cannot simply be
+    // an arbitrary guest-RAM block; it has to be the firmware-provided
+    // framebuffer.
+    //
+    // So the driver keeps the firmware scanout (the proven path) and the 2D
+    // acceleration stays available for RECT_FILL, which the compositor can still
+    // use for large solid fills without changing where pixels are displayed.
     svga_mode_hint(g_wm.gfx.width, g_wm.gfx.height, g_wm.gfx.bpp, g_wm.gfx.pitch);
     // The SVGA-II driver now enables itself by DEFAULT, but FAIL-SAFE: in
     // sv_fifo_init() it writes the mode to the registers and reads them back,
@@ -11431,10 +11512,31 @@ extern "C" void fb_console_clear(void) {
     // Nor while the early boot splash owns the screen.
     if (g_boot_splash_owns) return;
     if (!fb_console_active || !fb_lfb) return;
-    // Clear entire framebuffer to black
+    // Clear entire framebuffer to black.
+    //
+    // 32-bit stores, not bytes.  The old byte loop issued one volatile store
+    // per pixel byte: 768 * 4096 = 3,145,728 stores for a 1024x768x32 mode.
+    // On real hardware that is merely slow; under an emulator that routes
+    // every store through an address-translation helper it dominated the
+    // whole boot.  Measured: 15.0M of the 24.1M boot instructions (62%) sat
+    // in this loop, and the [K-VBE] -> [K3] gap was 91% of the boot.
+    //
+    // Clearing to zero is format-independent (0 means black in RGB565,
+    // RGB24 and BGRX32 alike), so widening the store cannot change the
+    // image.  Alignment is handled explicitly -- head bytes, aligned body,
+    // tail bytes -- so a framebuffer that is not 4-byte aligned still
+    // cannot fault.
     int total_bytes = fb_height * fb_pitch;
     volatile uint8_t* p = (volatile uint8_t*)fb_lfb;
-    for (int i = 0; i < total_bytes; i++) p[i] = 0;
+    int i = 0;
+    while (i < total_bytes && (((uint32_t)(p + i)) & 3u) != 0u) p[i++] = 0;
+    int q = (total_bytes - i) >> 2;
+    if (q > 0) {
+        volatile uint32_t* w = (volatile uint32_t*)(p + i);
+        for (int k = 0; k < q; k++) w[k] = 0;
+        i += q << 2;
+    }
+    while (i < total_bytes) p[i++] = 0;
 }
 
 extern "C" int gui_bga_available(void) {
@@ -11446,3 +11548,4 @@ extern "C" int gui_vbe_mode_set_by_bios(void) {
 }
 
 } // extern "C"
+

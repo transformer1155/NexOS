@@ -172,7 +172,15 @@ static void exec_task(char* task, char result[400]){
     int nt = tokenize(task, tok, tl, 16);
     // expect: TASK <id> <type> <args...>
     if (nt < 4){ rcat(result, &rp, "RESULT ? err bad_task"); return; }
-    const char* id   = tok[1];
+    /* `id` is an identifier we echo back, not a payload. Bound it HERE: taken
+       straight off the wire it could be ~500 bytes, and the three rcat() calls
+       below would then drive rp past result[400] - and every numeric branch below
+       (sum/compute/neg/fib/prime/gcd) appends without an rp bound either. Clamping
+       the identifier is what makes all of them provably safe: with id <= 15 the
+       prefix is rp <= 26 and the largest branch appends 20 more (u64 fib) -> <= 46. */
+    char idbuf[16]; { int k = 0; const char* s = tok[1];
+                      while (s[k] && k < 15){ idbuf[k] = s[k]; k++; } idbuf[k] = 0; }
+    const char* id   = idbuf;
     const char* type = tok[2];
 
     rcat(result, &rp, "RESULT ");

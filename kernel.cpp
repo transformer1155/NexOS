@@ -727,11 +727,20 @@ static void pci_scan(){
                 // Check for network controllers (class 0x02xx)
                 if (base_class == 0x02 && !g_hw.nic_present){
                     g_hw.nic_type = 2;
-                    // Read BAR0 for I/O base
+                    // BUG: presence used to be decided INSIDE `if (bar0 & 1)`,
+                    // i.e. only when BAR0 is a PORT-I/O window.  Every
+                    // memory-mapped NIC -- including QEMU's e1000
+                    // (vendor 8086 dev 100E, class 0200) -- has bit0=0, so
+                    // nic_present was never set, Host.NicPresent() returned 0
+                    // and the desktop HUD painted "NIC: DOWN" on a machine
+                    // whose network stack was demonstrably up ([NET] Network
+                    // ready).  Presence is now decided by the PCI class alone;
+                    // nic_io_base is still only recorded for an I/O BAR.
+                    g_hw.nic_present = true;
+                    // Read BAR0 for I/O base (only meaningful for an I/O BAR)
                     uint32_t bar0 = pci_read_config(bus, dev, func, 0x10);
                     if (bar0 & 1){
                         g_hw.nic_io_base = bar0 & 0xFFFC;
-                        g_hw.nic_present = true;
                         serial_puts("[HW]   -> Network controller at I/O 0x");
                         {
                             char buf[8]; const char* hex="0123456789ABCDEF";
@@ -740,6 +749,11 @@ static void pci_scan(){
                             serial_puts(buf);
                         }
                         serial_puts("\n");
+                    }
+                    else {
+                        // MMIO controller: still log that it was recognised, so a
+                        // serial-only check can see it without a pixel capture.
+                        serial_puts("[HW]   -> Network controller (MMIO BAR0)\n");
                     }
                     // Enable I/O space and bus master
                     uint32_t cmd = pci_read_config(bus, dev, func, 0x04);
@@ -1187,7 +1201,13 @@ static void ata_write_sector_disk(uint16_t base, uint8_t drv, uint32_t lba, cons
 // ---- Find the first ATA HARD disk (excludes ATAPI CD-ROMs) ----
 // Returns true + fills base/drv if a hard disk exists on any IDE slot.
 static bool ata_find_hdd(uint16_t* out_base, uint8_t* out_drv){
-    uint16_t bases[] = {0x1F0, 0x170};
+    // ---- Prefer the SECONDARY channel: that is the dedicated user-data disk
+    // (build/data.vdi, attached as IDE-1-0).  The boot image is ALSO an ATA
+    // hard disk on the primary channel, so probing primary first always returned
+    // the boot disk and the real data filesystem was never found: MKFS reported
+    // "not formatted" and every create/rename/delete in the shell silently failed
+    // (fs 0 and the Desktop folder fs 3 had no volume behind them).
+    uint16_t bases[] = {0x170, 0x1F0};
     uint8_t  drvs[]  = {0xE0, 0xF0};
     for(int b = 0; b < 2; b++){
         for(int d = 0; d < 2; d++){
@@ -1942,6 +1962,19 @@ struct GuiCallbacks {
     int      (*mkdir)(int fs, const char* name);
     int      (*remove)(int fs, const char* name);
     int      (*rename)(int fs, const char* old_name, const char* new_name);
+    // Directory navigation (File Explorer enters folders / goes up).
+    int      (*enter_dir)(int fs, int idx);
+    int      (*dir_up)(int fs);
+    int      (*cwd_path)(int fs, char* buf, int size);
+    // Move a file into the folder at listing index dstIdx (drag & drop).
+    int      (*move_file)(int fs, const char* name, int dst_idx);
+    // Resolve a printable path and make it the medium's current directory.
+    int      (*enter_path)(int fs, const char* path);
+    // Chunked / recursive copy support.
+    int      (*file_size)(int fs, const char* name);
+    int      (*is_dir_name)(int fs, const char* name);
+    int      (*copy_range)(int src_fs, const char* src_path, const char* name,
+                           int dst_fs, const char* dst_path, int off, int len);
     const char* (*get_os_name)(void);
     bool     (*is_64bit)(void);
     // Browser callbacks
@@ -2041,6 +2074,12 @@ static bool g_vbe_active = false;
 // freestanding .data section is not reliably loaded for new globals on
 // this linker script (observed: static = 1 became 0 at runtime).
 static int g_auto_gui;
+// Auto-switch to the 64-bit kernel (long mode) at the end of boot instead of
+// entering the 32-bit desktop.  Set by the 0x5021 boot flag, or at runtime by
+// the `switch64auto` command (which writes that byte back, so the choice
+// survives a reboot).  Initialised at runtime for the same .data reason as
+// g_auto_gui above, so no initialiser here.
+static bool g_boot_switch64 = false;
 // Framebuffer console mode (when VBE mode set by BIOS, no BGA ports)
 static bool g_fb_console_mode = false;
 
@@ -2114,7 +2153,16 @@ static bool g_fb_console_mode = false;
 #define FS_TYPE_DIR       1
 #define FS_ROOT_PARENT    0xFFFF
 
-struct FileEntry {
+// PACKED: this struct mirrors the 32-byte on-disk entry written by
+// tools/sfs_gen.py (name[20] | size | start_lba | type | parent | reserved).
+// Unpacked it rounded up to 36 bytes and put 'parent' at offset 30 instead of
+// 29, so:
+//   * memcpy_(&fent, g_fsbuf + e*FS_ENTRY_SIZE, sizeof(FileEntry)) copied 4
+//     bytes PAST the entry (into the next one), and
+//   * 'parent' was read from the wrong offset -- while 'size' and 'start_lba'
+//     survived because no padding precedes them (why the directory still worked).
+// static_assert pins the layout so it cannot drift again silently.
+struct __attribute__((packed)) FileEntry {
     char     name[FS_NAME_LEN];
     uint32_t size;
     uint32_t start_lba;
@@ -2122,6 +2170,7 @@ struct FileEntry {
     uint16_t parent;
     uint8_t  reserved;
 };
+static_assert(sizeof(FileEntry) == FS_ENTRY_SIZE, "FileEntry must match the 32-byte on-disk entry");
 
 // =====================================================================
 //  User / Permission / sudo system
@@ -2413,7 +2462,7 @@ public:
                         memset_(g_fsbuf, 0, 512);
                         int off = i * 512;
                         int to_copy = (size - off > 512) ? 512 : (size - off);
-                        if (to_copy > 0) memcpy_(g_fsbuf, src + off, to_copy);
+                        if (to_copy > 0 && src) memcpy_(g_fsbuf, src + off, to_copy);   // src==0 -> zeros
                         fs_write_sector(lba + i, (const uint16_t*)g_fsbuf);
                     }
 
@@ -2439,6 +2488,11 @@ public:
         }
         return -4;  // table full
     }
+
+    // Allocate a file entry of `size` bytes (zero filled) without a data
+    // pointer.  Reuses create(); just let it skip the memcpy.  (A separate
+    // implementation pushed kernel.bin over the EBDA limit.)
+    int create_sized(const char* name, int size){ return create(name, (const void*)0, size); }
 
     // Create a directory entry
     int mkdir(const char* name){
@@ -2617,14 +2671,25 @@ public:
     // Unified sector read: from RAM when ram_mode, else from the ATA disk.
     // lba is the canonical SFS LBA (superblock=800, dir=801+, data=817+);
     // in RAM the image is laid out from byte 0, so offset = (lba-800)*512.
-    void rd(uint32_t lba, uint16_t* buf){
+    // Returns false when the sector could not be read.  The caller MUST NOT
+    // trust buf in that case: ata_read_sector_dev() already documents that a
+    // failed PIO read leaves the buffer holding whatever was there before.
+    // Previously this was 'void', so every failure was silent and Sfs::read()
+    // happily memcpy'd stale bytes (the same shape as the incident recorded at
+    // kernel.cpp:1122-1127, where a 64-bit switch staged a freed SFS superblock).
+    bool rd(uint32_t lba, uint16_t* buf){
         if (ram_mode) {
             const uint8_t* src = (const uint8_t*)ram_base
                                 + (int32_t)((int32_t)lba - (int32_t)SFS_SUPER_LBA) * 512;
             memcpy_(buf, src, 512);
         } else {
-            fs_read_sector(lba, buf);
+            // SFS ships on the BOOT disk (primary master), while fs_read_sector()
+            // now targets the dedicated DATA disk used by MKFS.  Reading through
+            // fs_read_sector here made the SFS look missing ("[SFS] not found")
+            // as soon as a data disk was attached.
+            if (!ata_read_sector(lba, buf)) return false;   // boot disk
         }
+        return true;
     }
 
     // The image is always generated with the canonical 800/801/817 layout, but
@@ -2646,7 +2711,13 @@ public:
             }
             return;
         }
-        // Makefile places the SFS at LBA 3508 (2048 + KERNEL64_SECTORS=1460).
+        // Makefile places the SFS at LBA 6144 (2048 + KERNEL64_SECTORS=4096).
+        // The trailing 3536 below is a legacy fallback probe, not the current SFS.
+        // Probe order: 800 = the canonical in-image SFS; 6144 = the current
+        // relocated SFS (SFS_ALT_LBA, matching Makefile SFS_LBA); 3536 = the
+        // relocated position used BEFORE the move to 6144, kept so a disk image
+        // built by an older Makefile still mounts.  It is a compatibility probe,
+        // not dead code -- do not remove without deciding to drop that support.
         static const uint32_t cand[] = { SFS_SUPER_LBA, SFS_ALT_LBA, 3536 };
         for (unsigned i = 0; i < sizeof(cand)/sizeof(cand[0]); i++) {
             rd(cand[i], (uint16_t*)g_fsbuf);
@@ -2667,7 +2738,7 @@ public:
     // independent Linux user-space partition).  delta is derived from the
     // canonical SFS_SUPER_LBA layout, exactly like the probing init() does.
     bool mount_at(uint32_t lba){
-        fs_read_sector(lba, (uint16_t*)g_fsbuf);
+        ata_read_sector(lba, (uint16_t*)g_fsbuf);   // SFS lives on the boot disk
         if (!(g_fsbuf[0]=='S' && g_fsbuf[1]=='F' && g_fsbuf[2]=='S' && g_fsbuf[3]==0)) {
             serial_puts("[SFS] mount_at(");
             serial_puts_dec(lba);
@@ -2720,7 +2791,7 @@ public:
         if (idx < 0) return -1;
         int s = idx / FS_ENTRY_PER_SEC;
         int e = idx % FS_ENTRY_PER_SEC;
-        rd(dir_lba(s), (uint16_t*)g_fsbuf);
+        if (!rd(dir_lba(s), (uint16_t*)g_fsbuf)) return -1;   // directory sector unreadable
         // IMPORTANT: private copy - the loop below reloads g_fsbuf with file
         // data, so a pointer into g_fsbuf would decay into garbage after the
         // first sector and every following LBA would be random.
@@ -2732,7 +2803,10 @@ public:
         uint8_t* dst = (uint8_t*)buf;
         int remaining = size;
         for (int i = 0; i < sectors && remaining > 0; i++) {
-            rd(data_lba(fent.start_lba + (uint32_t)i), (uint16_t*)g_fsbuf);
+            // A failed data read must NOT be copied: g_fsbuf would still hold the
+            // previous sector (or unrelated bytes), and the caller would receive
+            // plausible-looking garbage.  Report it as a read failure instead.
+            if (!rd(data_lba(fent.start_lba + (uint32_t)i), (uint16_t*)g_fsbuf)) return -1;
             int to_copy = (remaining > 512) ? 512 : remaining;
             memcpy_(dst, g_fsbuf, to_copy);
             dst += to_copy;
@@ -4077,13 +4151,19 @@ static void cmd_meminfo(){
     term.write("Memory Map:\n");
     term.write("  0x000000 - 0x000FFF  Real-mode IVT + BDA\n");
     term.write("  0x007C00 - 0x007DFF  Boot sector\n");
-    term.write("  0x010000 - 0x027FFF  Kernel image (~92 KiB)\n");
+    term.write("  0x010000 - 0x0A0000  Kernel image (588 KiB, ends below the EBDA at 0x9FC00)\n");
     term.write("  0x070000 - 0x07FFFF  Page directory + page tables\n");
     term.write("  0x080000 - 0x081FFF  PMM bitmap (8 KiB)\n");
     term.write("  0x090000 - 0x09FFFF  Kernel stack\n");
     term.write("  0x0B8000 - 0x0BFFFF  VGA text buffer\n");
-    term.write("  0x100000 - 0x1FFFFF  Free (PMM-managed)\n");
-    term.write("  0x200000 - 0x2FFFFF  Kernel heap (1 MiB)\n");
+    term.write("  0x100000 - 0x1FFFFF  64-bit blit window (target must stay below 0x200000)\n");
+    // Printed from the real constants.  The old text claimed
+    // "0x200000 - 0x2FFFFF  Kernel heap (1 MiB)", which contradicted
+    // HEAP_START = 0x10000000 (256 MiB) and misled exactly the kind of analysis
+    // that .attic64/KERNEL64_BYTES_AUDIT.md section 5 had to correct.
+    term.write("  Kernel heap:  "); term.write_hex(HEAP_START);
+    term.write(" - "); term.write_hex(HEAP_END);
+    term.write("  (256-384 MiB supervisor window)\n");
     term.write("  0x300000+            Free (PMM-managed)\n");
 
     // Address Management Registry (single source of truth for key addresses)
@@ -4194,7 +4274,8 @@ static void cmd_pagetest(){
     term.write(") = "); term.write_hex(phys);
     term.write(phys == test_addr ? " (identity OK)\n" : " (MISMATCH!)\n");
 
-    test_addr = 0x200000;  // 2 MiB (heap)
+    test_addr = 0x200000;  // 2 MiB: K64_STAGE_FLOOR, i.e. the 64-bit blit window's
+                           // ceiling -- NOT the heap (that is at 0x10000000)
     phys = vmm_get_phys(test_addr);
     term.write("  vmm_get_phys("); term.write_hex(test_addr);
     term.write(") = "); term.write_hex(phys);
@@ -6181,15 +6262,31 @@ static void cmd_ai(const char* args){
         const char* av[3];
         av[0] = "python"; av[1] = arg1;
         linux_run("python", 2, av);
-    } else if(!strcmp_(sub,"reason") || !strcmp_(sub,"infer")){
-        if(!*args){ term.write("Usage: ai reason <prompt>\n"); return; }
-        term.write("NexOS AI reasoning framework:\n");
-        char out[1400];
-        int n = ai_reason(args, out, (int)sizeof(out));
-        if(n>0) term.write(out);
-        else term.write("(reasoning failed)\n");
+    } else if(!strcmp_(sub,"gateway")){
+        // Where the kernel TCP stack dials for /ai.  QEMU SLIRP exposes the
+        // host as 10.0.2.2, so the guest NIC reaches the host gateway there.
+        if(!*args){
+            term.write("AI gateway host: ");
+            term.write(ai_gateway_host());
+            term.write("\n  (guest NIC -> host gateway; set with 'ai gateway <ip>')\n");
+            return;
+        }
+        ai_gateway_set_host(args);
+        term.write("AI gateway host set to ");
+        term.write(ai_gateway_host());
+        term.put_char('\n');
+    } else if(!strcmp_(sub,"ask") || !strcmp_(sub,"reason") || !strcmp_(sub,"infer")){
+        if(!*args){ term.write("Usage: ai ask <prompt>\n"); return; }
+        // Real answer path: POST /ai through the guest NIC to the host
+        // gateway (OpenCode Zen free models, no account), local fallback.
+        char out[2000];
+        int n = ai_ask_text(args, out, (int)sizeof(out));
+        if(n > 0) term.write(out);
+        else if(out[0]) term.write(out);
+        else term.write("(no AI backend: start tools/net/gateway_server.py on the host)\n");
+        term.put_char('\n');
     } else {
-        term.write("Usage: ai [init|info|mode|test|cleanup|py|reason]\n");
+        term.write("Usage: ai [init|info|mode|test|cleanup|py|ask|gateway]\n");
     }
 }
 
@@ -7393,6 +7490,41 @@ static void cmd_nogui(const char* args){
     term.set_color(make_color(WHITE, BLACK));
 }
 
+// switch64auto on|off -- control the 0x5021 boot flag that makes a plain
+// boot enter the 64-bit kernel (long mode) unattended, without typing
+// switch64.  The choice is written back to the VbeInfo reserve byte, so it
+// PERSISTS across reboots with no rebuild and no bootloader change; QEMU can
+// also set it directly with -device loader,addr=0x5021,data=1,data-len=1.
+// With no argument the current state is reported.
+static void cmd_switch64auto(const char* args){
+    while (args && (*args == ' ' || *args == 9)) args++;
+    char c = (args && *args) ? args[0] : 0;
+
+    if (c == 'o' || c == 'O' || c == '1') {            // on
+        g_boot_switch64 = true;
+        *(volatile uint8_t*)0x5021 = 1;
+        term.set_color(make_color(GREEN, BLACK));
+        term.write("Auto long-mode boot ENABLED (0x5021=1).\n");
+        term.write("Next boot goes straight to the 64-bit kernel; the\n");
+        term.write("32-bit desktop is skipped.\n");
+    } else if (c == 'f' || c == 'F' || c == '0') {     // off
+        g_boot_switch64 = false;
+        *(volatile uint8_t*)0x5021 = 0;
+        term.set_color(make_color(CYAN, BLACK));
+        term.write("Auto long-mode boot disabled (0x5021=0).\n");
+        term.write("Next boot returns to the 32-bit desktop.\n");
+    } else {
+        term.set_color(make_color(CYAN, BLACK));
+        term.write("Auto long-mode boot is ");
+        term.write(g_boot_switch64 ? "ON" : "OFF");
+        term.write(" (0x5021=");
+        term.write_dec((int)*(volatile uint8_t*)0x5021);
+        term.write(").\n");
+        term.write("Usage: switch64auto on | off\n");
+    }
+    term.set_color(make_color(WHITE, BLACK));
+}
+
 // =====================================================================
 //  Switch to 64-bit long-mode kernel
 //  Reads kernel64.bin from disk (LBA 2048) into memory at 0x100000,
@@ -7419,8 +7551,13 @@ extern "C" void switch_to_64bit(uint32_t stage_phys);
 // bytes; SFS_LBA (Makefile) was moved 3508 -> 3520 to keep the gap large
 // enough.  The rounded-rect clipping pipeline (Graphics::push_round_clip /
 // fill_rect / blend_rect honour the clip mask) pushed it to ~754912 bytes,
-// so SFS_LBA moved 3520 -> 3536 (gap = (3536-2048)*512 = 762368 and
-// KERNEL64_SECTORS=1475 => 755200 bytes still fits with margin).
+// so SFS_LBA was moved to 3536 (its computed gap is deliberately not repeated --
+// see the Makefile guard for the live numbers).
+// HISTORICAL ONLY: the 3508/3520/3536 and 1460/1461/1475 figures above are
+// superseded.  The CURRENT layout is SFS_LBA = 6144 with KERNEL64_SECTORS = 4096
+// (2 MiB at LBA 2048..6144, gap = (6144-2048)*512 = 2097152 bytes).  Do not
+// trust any number written here for the current values -- the Makefile guard
+// reads both definitions out of this file and prints the live fit.
 #define KERNEL64_SECTORS    4096    // 2 MiB region at LBA 2048..6144, matching the new
                                     // SFS_LBA (2048 + 4096 = 6144 exactly).  The old
                                     // 1616 was the whole LBA 2048..3664 gap and had been
@@ -7428,6 +7565,18 @@ extern "C" void switch_to_64bit(uint32_t stage_phys);
                                     // the number bumped again.  kernel64.bin is ~0.83 MiB,
                                     // leaving ~1.2 MiB of headroom for future growth.
                                     // The Makefile guard verifies it fits.
+
+// The staging buffer's floor.  switch_to_64bit() blits the 64-bit image to
+// KERNEL64_ENTRY (0x100000), so the blit TARGET occupies
+//     0x100000 .. 0x100000 + k64sz
+// and the staging buffer (the blit SOURCE) must sit ABOVE that window -- the
+// check below enforces the floor.  This constant is therefore also the target's
+// upper bound:
+//     k64sz <= K64_STAGE_FLOOR - 0x100000        (1 MiB at 0x200000)
+// The Makefile guard reads THIS definition with sed and asserts that bound, so
+// the constant and the guard cannot drift apart.  See
+// .attic64/KERNEL64_BYTES_AUDIT.md sections 2 and 5.
+#define K64_STAGE_FLOOR     0x00200000u
 
 // Load kernel64.bin from the disk into a staging buffer and jump to long
 // mode.  Shared by `switch` and `ask64`; never returns on success.
@@ -7491,8 +7640,8 @@ static void do_switch64(void){
         serial_hex(h->size);
         serial_puts("\n");
     } else {
-        // Staging buffer: heap lives at 3-19 MiB, well clear of both the
-        // destination window (1-1.5 MiB) and our own .bss.
+        // Staging buffer: heap lives at 256-384 MiB (HEAP_START = 0x10000000), far above both the
+        // destination window (0x100000 .. K64_STAGE_FLOOR = 1-2 MiB) and our own .bss.
         stage = kmalloc(KERNEL64_SECTORS * 512);
         if (!stage) {
             term.set_color(make_color(RED, BLACK));
@@ -7539,7 +7688,7 @@ static void do_switch64(void){
         // was unreachable.  Track the real identity-mapped ceiling instead of
         // a hard-coded number so this cannot drift again.
         const uint32_t IDENT_TOP = 0x18000000u;   // HEAP_END: end of the identity map
-        if (stage_phys < 0x00200000u || stage_phys + KERNEL64_SECTORS * 512 > IDENT_TOP) {
+        if (stage_phys < K64_STAGE_FLOOR || stage_phys + KERNEL64_SECTORS * 512 > IDENT_TOP) {
             // Must be outside the destination window and inside the identity map.
             term.set_color(make_color(RED, BLACK));
             term.write("ERROR: staging buffer at a bad address.\n");
@@ -8555,6 +8704,115 @@ static void cmd_user(const char* args){
     term.write("Ring-3 demo finished.\n");
 }
 
+// ---------------------------------------------------------------------
+//  cmd_probe -- ring-3 bisect tool
+// ---------------------------------------------------------------------
+// Loads an arbitrary blob from SFS at USER_BASE and enters ring 3 with a
+// choice of stack, so the iret regression can be narrowed without a
+// rebuild between attempts:
+//
+//     probe <name>            enter at USER_BASE, stack = USER_END-16
+//     probe <name> low        ... stack = USER_BASE + 0xFF00 (inside page 0)
+//     probe <name> tiny       ... stack = USER_BASE + 0x1000
+//
+// The name is printed to serial before entering, and a distinct marker is
+// printed after the return, so a hang is unambiguous.
+static void cmd_probe(const char* args){
+    char name[64]; int n = 0;
+    while (args[n] && args[n] != ' ' && n < 63){ name[n] = args[n]; n++; }
+    name[n] = 0;
+    if (!n){ term.write("usage: probe <sfsname> [low|tiny]\n"); return; }
+
+    const char* mode = args + n;
+    while (*mode == ' ') mode++;
+
+    uint32_t stk;
+    if      (mode[0] == 'l') stk = USER_BASE + 0xFF00;    // same 4MiB page
+    else if (mode[0] == 't') stk = USER_BASE + 0x1000;    // low in page 0
+    else                     stk = USER_END - 16;         // the cmd_user value
+
+    serial_puts("[probe] name=");  serial_puts(name);
+    serial_puts(" stack=0x");      serial_hex(stk);
+    serial_puts("\n");
+
+    uint8_t* dst = (uint8_t*)USER_BASE;
+    int sz = sfs.read(name, dst, (int)USER_SIZE);
+    if (sz <= 0){
+        serial_puts("[probe] FAILED: not in SFS\n");
+        term.write("probe: file not found\n");
+        return;
+    }
+    serial_puts("[probe] loaded "); serial_hex((uint32_t)sz);
+    serial_puts(" bytes, about to iret...\n");
+
+    Process* p = 0;
+    if (proc_spawn(name, 1000, "/apps/probe", &p) != 0){
+        serial_puts("[probe] proc_spawn failed\n");
+        return;
+    }
+    p->entry = USER_BASE;
+
+    Process* prev = g_current;
+    g_current = p;
+    int rc = enter_user(USER_BASE, stk);
+    g_current = prev;
+
+    serial_puts("[probe] RETURNED rc="); serial_hex((uint32_t)rc); serial_puts("\n");
+    term.write("probe: returned\n");
+}
+
+// ---------------------------------------------------------------------
+//  cmd_flag -- read back the byte that spinloop.S writes in ring 3
+// ---------------------------------------------------------------------
+// The spinloop payload stores one byte then does `jmp $`.  A successful
+// `probe spinloop` therefore hangs BY DESIGN, but leaves that byte changed.
+// Reading it back after a reset separates the two hypotheses cleanly:
+//     flag == 0xAB  -> ring-3 code really executed (iret landed)
+//     flag == 0x00  -> ring-3 never ran at all (the iret is the blocker)
+#define PROBE_FLAG_ADDR (USER_BASE + 0x800)
+static void cmd_flag(const char* args){
+    (void)args;
+    volatile uint8_t v = *(volatile uint8_t*)PROBE_FLAG_ADDR;
+    serial_puts("[flag] *(USER_BASE+0x800) = 0x");
+    serial_hex((uint32_t)v);
+    serial_puts(v == 0xAB ? "  (ring-3 STORE EXECUTED)\n"
+                          : "  (no store -- ring-3 never ran)\n");
+    term.write(v == 0xAB ? "flag: ring-3 store executed\n"
+                         : "flag: ring-3 never ran\n");
+}
+
+#include "dos_compat/dos_exec.h"
+#include "dos_compat/dos_prim.h"
+
+// DOS console output goes to COM1 by default, which the VBox GUI does not
+// show.  Install a sink so whatever a .COM program prints also lands in the
+// on-screen terminal -- visible in both VBox and headless/QEMU runs.
+static void dos_term_sink(const char* s){
+    if (!s) return;
+    term.write(s);
+    // Repaint when a GUI session owns the screen so the text appears at once.
+    if (gui_is_active()) gui_render();
+}
+
+static void cmd_dos(const char* args){
+    if (!args || !args[0]){
+        term.write("Usage: dos <file.com>\n");
+        term.write("Loads a .COM program and executes it in ring-3\n");
+        return;
+    }
+    // Mirror the program's console output to the GUI terminal too.
+    dos_console_set_sink(dos_term_sink);
+
+    term.write("DOS: loading ");
+    term.write(args);
+    term.write("\n");
+
+    dos_exec_com(args);
+
+    dos_console_set_sink(0);           // back to serial-only for the shell
+    term.write("DOS: program returned\n");
+}
+
 // Inspect the VFS: mount state, the caller's sandbox root, and a couple of
 // resolves.  Run as the kernel process, so every check takes the SYSTEM
 // bypass - that contrast is the point of the demo.
@@ -8667,6 +8925,9 @@ static void run_command(const char* line){
     else if(!strcmp_(cmd,"clrapp"))                          cmd_clrapp(args);
     // Foundation 0: ring-3 user-mode demo (proves isolation + syscall ABI)
     else if(!strcmp_(cmd,"user"))                          cmd_user(args);
+    else if(!strcmp_(cmd,"probe"))                         cmd_probe(args);
+    else if(!strcmp_(cmd,"flag"))                          cmd_flag(args);
+    else if(!strcmp_(cmd,"dos"))                           cmd_dos(args);
     else if(!strcmp_(cmd,"vfs"))                           cmd_vfs(args);
     else if(!strcmp_(cmd,"perm"))                          cmd_perm(args);
     // AI engine commands
@@ -8690,6 +8951,7 @@ static void run_command(const char* line){
     // GUI
     else if(!strcmp_(cmd,"gui"))  cmd_gui(args);
     else if(!strcmp_(cmd,"nogui")) cmd_nogui(args);
+    else if(!strcmp_(cmd,"switch64auto")) cmd_switch64auto(args);
     else if(!strcmp_(cmd,"serialecho")){
         if(!strcmp_(args,"off"))      g_term_serial = false;
         else if(!strcmp_(args,"on"))  g_term_serial = true;
@@ -8921,16 +9183,163 @@ static void seed_desktop_shortcuts(void) {
     if (di < 0) { g_cwd = saved; return; }
     g_cwd = (uint16_t)di;
     struct { const char* name; const char* kind; } seed[] = {
-        {"This PC.lnk", "1"}, {"Terminal.lnk", "3"}, {"Calculator.lnk", "4"},
-        {"Task Mgr.lnk", "2"}, {"Settings.lnk", "0"}, {"Optimizer.lnk", "6"},
-        {"Notepad.lnk", "7"}, {"About.lnk", "5"}, {"Browser.lnk", "8"},
-        {"AI Setup.lnk", "9"}, {"AI Agent.lnk", "10"}, {"Demo.lnk", "11"},
+        // BODY = the TARGET FILE, not an opaque Kind number.  The shortcuts now
+        // point at the real application image in SFS (apps ship as *.mex), which
+        // is what a shortcut is supposed to be.  Legacy desktops that already
+        // hold a decimal body keep working: the managed resolver accepts both.
+        {"This PC.lnk",  "FileExplorer.mex"}, {"Terminal.lnk", "Terminal.mex"},
+        {"Calculator.lnk","Calculator.mex"},  {"Task Mgr.lnk", "TaskManager.mex"},
+        {"Settings.lnk", "ControlPanel.mex"}, {"Optimizer.lnk","MemOptimizer.mex"},
+        {"Notepad.lnk",  "Notepad.mex"},      {"About.lnk",    "About.mex"},
+        {"Browser.lnk",  "Browser.mex"},      {"AI Setup.lnk", "AiSetup.mex"},
+        {"AI Agent.lnk", "AiAgent.mex"},      {"Demo.lnk",     "Demo.mex"},
     };
     for (unsigned i = 0; i < sizeof(seed)/sizeof(seed[0]); i++) {
-        if (mkfs.find(seed[i].name) < 0)
-            mkfs.create(seed[i].name, seed[i].kind, 1);
+        if (mkfs.find(seed[i].name) < 0) {
+            // Third argument is the BODY LENGTH, not a flag.  It used to be a
+            // hard-coded 1 because every body was a single Kind digit; now the
+            // body is a target file name ("Notepad.mex"), so it must be the
+            // real length or only the first character gets stored.
+            int bl = 0; while (seed[i].kind[bl]) bl++;
+            mkfs.create(seed[i].name, seed[i].kind, bl);
+        }
     }
     g_cwd = saved;
+}
+
+// ===== Directory navigation (File Explorer folders) ===================
+// The filesystem has ONE current directory (g_cwd), shared by the terminal
+// and the GUI.  These callbacks let the managed shell move it: enter a
+// subfolder, go back up, and ask for the printable path.
+static int mkfs_read_entry_raw(int rawIdx, FileEntry* out) {
+    if (rawIdx < 0) return -1;
+    int s = rawIdx / FS_ENTRY_PER_SEC, e = rawIdx % FS_ENTRY_PER_SEC;
+    if (s >= MKFS_TABLE_SECT) return -1;
+    fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+    FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
+    memcpy_(out, fe, FS_ENTRY_SIZE);
+    return 0;
+}
+// Raw table index of the nth listing entry whose parent is `parent`.
+static int mkfs_raw_for_nth(int parent, int nth) {
+    int n = 0;
+    for (int s = 0; s < MKFS_TABLE_SECT; s++) {
+        fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+        for (int e = 0; e < FS_ENTRY_PER_SEC; e++) {
+            FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
+            if (fe->name[0] && fe->parent == (uint16_t)parent) {
+                if (n == nth) return s * FS_ENTRY_PER_SEC + e;
+                n++;
+            }
+        }
+    }
+    return -1;
+}
+// Volume root: fs 3 is the Desktop folder, fs 0 is the MKFS root.
+static int fs_volume_root(int fs) {
+    if (fs == 3) return desktop_dir_index();
+    return (int)FS_ROOT_PARENT;
+}
+static int gui_cb_enter_dir(int fs, int idx) {
+    if (!mkfs.mounted) return -1;
+    if (fs == 1) return -1;                       // SFS is read-only / flat
+    int root = fs_volume_root(fs);
+    if (root < 0) return -1;
+    if (idx < 0) { g_cwd = (uint16_t)root; return 0; }
+    int raw = mkfs_raw_for_nth((int)g_cwd, idx);
+    if (raw < 0) return -1;
+    FileEntry e;
+    if (mkfs_read_entry_raw(raw, &e) != 0) return -1;
+    if (e.type != FS_TYPE_DIR) return -1;         // only folders are enterable
+    g_cwd = (uint16_t)raw;
+    return 0;
+}
+static int gui_cb_dir_up(int fs) {
+    if (!mkfs.mounted) return -1;
+    int root = fs_volume_root(fs);
+    if (root < 0) return -1;
+    if ((int)g_cwd == root) return 1;             // already at the volume root
+    FileEntry e;
+    if (mkfs_read_entry_raw((int)g_cwd, &e) != 0) return -1;
+    int p = (int)e.parent;
+    if (p < 0 || p < root) p = root;              // never escape the volume
+    g_cwd = (uint16_t)p;
+    return 0;
+}
+// Raw index of the child of `parent` named `name` (0 if absent).
+static int mkfs_find_child(int parent, const char* name) {
+    for (int s = 0; s < MKFS_TABLE_SECT; s++) {
+        fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+        for (int e = 0; e < FS_ENTRY_PER_SEC; e++) {
+            FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
+            if (fe->name[0] && fe->parent == (uint16_t)parent && strcmp_(fe->name, name) == 0)
+                return s * FS_ENTRY_PER_SEC + e;
+        }
+    }
+    return -1;
+}
+// Resolve a printable path ("MKFS/Desktop/sub") and make it the current dir.
+// Two File Explorer windows each keep their own path string and re-assert it
+// through this before touching the filesystem, so they do not fight over the
+// single per-medium cwd.
+static int gui_cb_enter_path(int fs, const char* path) {
+    if (!mkfs.mounted) return -1;
+    if (fs == 1) return -1;
+    int root = fs_volume_root(fs);
+    if (root < 0) return -1;
+    g_cwd = (uint16_t)root;
+    if (!path || !path[0]) return 0;
+    const char* p = path;
+    // Drop the volume prefix when the caller passed the full path.
+    const char* slash = 0;
+    for (const char* q = p; *q; q++) if (*q == '/') { slash = q; break; }
+    if (slash) p = slash;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        char comp[FS_NAME_LEN];
+        int n = 0;
+        while (*p && *p != '/' && n < FS_NAME_LEN - 1) comp[n++] = *p++;
+        comp[n] = 0;
+        int raw = mkfs_find_child((int)g_cwd, comp);
+        if (raw < 0) return -1;
+        FileEntry e;
+        if (mkfs_read_entry_raw(raw, &e) != 0) return -1;
+        if (e.type != FS_TYPE_DIR) return -1;
+        g_cwd = (uint16_t)raw;
+    }
+    return 0;
+}
+
+static int gui_cb_cwd_path(int fs, char* buf, int size) {
+    if (!buf || size <= 0) return 0;
+    buf[0] = 0;
+    if (!mkfs.mounted) return 0;
+    // Build the ancestor chain from the current dir up to the volume root,
+    // then emit it front-to-back.
+    const char* name[16];
+    char names[16][FS_NAME_LEN];
+    int n = 0;
+    int root = fs_volume_root(fs);
+    int cur = (int)g_cwd;
+    while (cur != root && cur >= 0 && n < 16) {
+        FileEntry e;
+        if (mkfs_read_entry_raw(cur, &e) != 0) break;
+        int i = 0; while (e.name[i] && i < FS_NAME_LEN - 1) { names[n][i] = e.name[i]; i++; }
+        names[n][i] = 0;
+        name[n] = names[n];
+        n++;
+        cur = (int)e.parent;
+    }
+    const char* vol = (fs == 1) ? "SFS" : (fs == 3 ? "Desktop" : "MKFS");
+    int pos = 0;
+    for (const char* p = vol; *p && pos < size - 1; p++) buf[pos++] = *p;
+    for (int k = n - 1; k >= 0; k--) {
+        if (pos < size - 1) buf[pos++] = '/';
+        for (const char* p = name[k]; *p && pos < size - 1; p++) buf[pos++] = *p;
+    }
+    buf[pos] = 0;
+    return pos;
 }
 
 static int gui_cb_list_files(int fs_type, char* outbuf, int bufsize) {
@@ -9291,6 +9700,97 @@ static int gui_cb_remove(int fs, const char* name) {
     if (!mkfs.mounted) return -1;
     return mkfs.remove(name);
 }
+// Move a file into the folder at listing index `dstIdx` of the CURRENT dir.
+// Used by file drag & drop in the File Explorer.  Implemented as read+create+
+// remove because MKFS has no cheap way to re-parent an entry (and a directory
+// move would need a recursive copy, which this deliberately refuses).
+// Move a file from one window's directory into another's (cross-window drop).
+// srcPath/dstPath are the printable paths each Explorer keeps for itself; both
+// are re-asserted here because the medium has a single current directory.
+// Copy a file from one window's directory into another's (copy & paste).
+// Same plumbing as move_file_to, minus the removal at the source.
+// ---- chunked / recursive copy support ---------------------------------
+// Size of a named file in the current directory of `fs` (-1 if absent).
+static int gui_cb_file_size(int fs, const char* name) {
+    if (!mkfs.mounted || fs == 1) return -1;
+    int e = mkfs.find(name);
+    if (e < 0) return -1;
+    FileEntry fe;
+    if (mkfs_read_entry_raw(e, &fe) != 0) return -1;
+    return (int)fe.size;
+}
+// Is the named entry a directory? (1 = yes, 0 = no, -1 = missing)
+static int gui_cb_is_dir_name(int fs, const char* name) {
+    if (!mkfs.mounted || fs == 1) return -1;
+    int e = mkfs.find(name);
+    if (e < 0) return -1;
+    FileEntry fe;
+    if (mkfs_read_entry_raw(e, &fe) != 0) return -1;
+    return (fe.type == FS_TYPE_DIR) ? 1 : 0;
+}
+// Copy [off, off+len) of a file from one directory into another.  The first
+// call (off == 0) allocates the destination; later calls only move sectors, so
+// a huge file streams in chunks and the shell can paint a progress bar.
+static int gui_cb_copy_range(int srcFs, const char* srcPath, const char* name,
+                             int dstFs, const char* dstPath,
+                             int off, int len) {
+    if (srcFs == 1 || dstFs == 1) return KERN_EROFS;
+    if (!mkfs.mounted || len <= 0) return -1;
+    if (gui_cb_enter_path(srcFs, srcPath) != 0) return -1;
+    int se = mkfs.find(name);
+    if (se < 0) return -1;
+    FileEntry e;
+    if (mkfs_read_entry_raw(se, &e) != 0) return -1;
+    if (e.type != FS_TYPE_FILE) return -2;
+    int total = (int)e.size;
+    if (off >= total) return 0;
+    if (off + len > total) len = total - off;
+    if (gui_cb_enter_path(dstFs, dstPath) != 0) return -1;
+    int de = mkfs.find(name);
+    if (off == 0) {
+        int r = mkfs.create_sized(name, total);
+        if (r < 0) return r;
+        de = mkfs.find(name);
+    }
+    if (de < 0) return -1;
+    FileEntry d;
+    if (mkfs_read_entry_raw(de, &d) != 0) return -1;
+    uint32_t first = (uint32_t)off / 512u;
+    uint32_t last  = ((uint32_t)(off + len) + 511u) / 512u;
+    for (uint32_t s = first; s < last; s++) {
+        fs_read_sector(e.start_lba + s, (uint16_t*)g_fsbuf);
+        fs_write_sector(d.start_lba + s, (const uint16_t*)g_fsbuf);
+    }
+    return len;
+}
+
+
+
+static int gui_cb_move_file(int fs, const char* name, int dstIdx) {
+    while (name && *name == ' ') name++;
+    if (!name || !name[0]) return -1;
+    if (fs == 1) return KERN_EROFS;                 // SFS is read-only
+    if (!mkfs.mounted) return -1;
+    uint16_t src = g_cwd;
+    int raw = mkfs_raw_for_nth((int)src, dstIdx);
+    if (raw < 0) return -1;
+    FileEntry e;
+    if (mkfs_read_entry_raw(raw, &e) != 0) return -1;
+    if (e.type != FS_TYPE_DIR) return -1;           // drop target must be a dir
+    if (raw == (int)src) return -1;                 // already there
+    int sz = mkfs.read(name, (void*)g_iobuf, FS_IOBUF_SIZE - 1);
+    if (sz < 0) {                                   // not a regular file (e.g. a
+        serial_puts("[FS] move refused (not a file): "); // directory) -- refuse
+        serial_puts(name); serial_puts("\n");
+        return -2;
+    }
+    g_cwd = (uint16_t)raw;                          // create inside the target
+    int r = mkfs.create(name, (const void*)g_iobuf, sz);
+    g_cwd = src;
+    if (r < 0) return r;
+    return mkfs.remove(name);
+}
+
 static int gui_cb_rename(int fs, const char* old_name, const char* new_name) {
     while (old_name && *old_name == ' ') old_name++;
     while (new_name && *new_name == ' ') new_name++;
@@ -9525,6 +10025,14 @@ static void register_gui_callbacks(void) {
     cb.get_heap_free_count = gui_cb_heap_free_count;
     cb.optimize_memory     = gui_cb_optimize_memory;
     cb.list_files          = gui_cb_list_files;
+    cb.enter_dir           = gui_cb_enter_dir;
+    cb.dir_up              = gui_cb_dir_up;
+    cb.cwd_path            = gui_cb_cwd_path;
+    cb.move_file           = gui_cb_move_file;
+    cb.enter_path          = gui_cb_enter_path;
+    cb.file_size           = gui_cb_file_size;
+    cb.is_dir_name         = gui_cb_is_dir_name;
+    cb.copy_range          = gui_cb_copy_range;
     cb.read_file           = gui_cb_read_file;
     cb.write_file          = gui_cb_write_file;
     cb.get_time            = gui_cb_get_time;
@@ -9645,6 +10153,11 @@ __asm__ (
     "    iret\n"
 );
 
+// MS-DOS INT 21h / INT 20h entry points (dos_compat/dos_int21_isr.cpp).
+// Declared at file scope: an `extern "C"` declaration inside a function
+// body is ill-formed C++ and was rejected by the compiler.
+#include "dos_compat/dos_int21_isr.h"
+
 static void idt_set_gate(uint8_t num, uint32_t offset, uint16_t selector, uint8_t flags){
     g_idt[num].offset_low  = (uint16_t)(offset & 0xFFFF);
     g_idt[num].selector    = selector;
@@ -9762,6 +10275,13 @@ static void idt_init(){
     // use it; it is also callable from ring 0 for the Milestone-0 proof).
     idt_set_gate(0x80, (uint32_t)&sys_enter, 0x08, 0xEE);   // unified syscall ABI
 
+    // MS-DOS INT 21h (DPL 3 so .COM programs can call it).
+    // NOTE: do NOT install a gate at vector 0x20 -- pic_init() maps IRQ0
+    // (the PIT timer) to 0x20, so overwriting it hijacks the system timer.
+    // INT 20h termination is therefore handled by the loader's exit stub,
+    // which uses INT 21h AH=4Ch instead.
+    idt_set_gate(0x21, (uint32_t)&isr_int21, 0x08, 0xEE);   // DPL 3 interrupt gate
+
     g_idtp.limit = (uint16_t)(sizeof(g_idt) - 1);
     g_idtp.base  = (uint32_t)&g_idt;
     __asm__ __volatile__("lidt %0" :: "m"(g_idtp));
@@ -9877,6 +10397,50 @@ extern "C" void kmain(){
             gui_agent_prefill("create file demo.txt containing 'hello nexos' then cat it to verify");
         }
     }
+
+    // ---- 0x5021: AUTO-SWITCH TO LONG MODE ON BOOT ----------------------
+    // The 64-bit kernel (kmain64 in .attic64/kernel64.cpp) is normally NOT
+    // entered at boot: do_switch64() is on-demand only, via the `switch64` /
+    // `ask64` shell commands.  That is fine for a human at a keyboard, but it
+    // makes any bring-up living in kmain64 (e.g. the AMD-V probe,
+    // svm_k64_bringup) invisible on a plain boot -- the code under test only
+    // runs after you type a command.
+    //
+    // Setting this byte makes the boot enter long mode immediately, with no
+    // command needed, so a burned CD / fresh disk runs the 64-bit path
+    // unattended.  Same mechanism as the other 0x50xx boot flags: set it from
+    // QEMU with
+    //     -device loader,addr=0x5021,data=1,data-len=1
+    // or from the shell with `switch64auto on`, which writes the byte too, so
+    // the choice survives a reboot without rebuilding anything.
+    //
+    // ADDRESS CHOICE: VbeInfo is 32 bytes (0x5000..0x501F; packed struct in
+    // src/gui/gui_legacy.cpp).  0x5020 is already taken by boot_agent above,
+    // so this uses 0x5021, the next free byte -- verified unused across the
+    // active tree (kernel.cpp, boot*.asm, switch32to64.asm, uefi/, src/,
+    // .attic64/kernel64.cpp) before claiming it.
+    //
+    // Gated on g_vbe_active: enabling this on a text-only boot would leave no
+    // console and no GUI, so it is honoured only when a framebuffer exists.
+    // When set we deliberately do NOT start the 32-bit desktop -- the point is
+    // to run the 64-bit kernel unattended.
+#ifdef TEXT_BOOT
+    // A text-boot image exists precisely to stay at the textual shell, but
+    // stage2.bin is SHARED with the normal image and burns 0x5021=1, so
+    // honouring the flag here would auto-switch straight into the 64-bit GUI
+    // and the keystrokes meant for the shell would land on the desktop.
+    // Forced off here only; the runtime `switch64` and `switch64auto`
+    // commands still work, so long mode remains reachable on demand.
+    uint8_t boot_switch64 = 0;
+    g_boot_switch64 = (boot_switch64 != 0);
+    serial_puts("[K] boot: TEXT_BOOT image -> 0x5021 auto-switch suppressed\n");
+#else
+    uint8_t boot_switch64 = *(volatile uint8_t*)0x5021;
+    g_boot_switch64 = (boot_switch64 != 0);
+    if (g_boot_switch64) {
+        serial_puts("[K] boot: 0x5021 set -> auto-switch to long mode\n");
+    }
+#endif
 
     // ---- Early boot animation -------------------------------------------
     // Start it as early as the framebuffer is addressable.  vmm_init() above
@@ -10252,7 +10816,22 @@ extern "C" void kmain(){
     //   * boot_no_gui (0x501E, set by QEMU -device loader) -> switch to the
     //         64-bit kernel in TEXT mode (real GGUF LLM + agent/HTTP stack),
     //         stable.  Used for headless/server scenarios.
-    if (g_auto_gui && g_vbe_active) {
+    // ---- 0x5021 wins: go straight to long mode, unattended --------------
+    // Checked BEFORE the GUI branch so a burned disc / fresh disk runs the
+    // 64-bit kernel without anyone typing `switch64`.  Whatever lives in
+    // kmain64 (the AMD-V bring-up, svm_k64_bringup) therefore executes on a
+    // plain boot instead of only after a manual command.
+    if (g_boot_switch64 && g_vbe_active) {
+        serial_puts("[K] boot: auto-switching to 64-bit kernel (0x5021)\n");
+        boot_stage(6);
+        do_switch64();
+        // Only reached if the switch was REFUSED (no LM support, or the
+        // handoff blob is missing).  do_switch64() prints the reason, so fall
+        // through to the normal 32-bit desktop rather than leave the user
+        // with a dead screen.
+        serial_puts("[K] boot: 64-bit switch refused, falling back to 32-bit\n");
+        cmd_gui("");
+    } else if (g_auto_gui && g_vbe_active) {
         // Default: boot straight into the 32-bit Win11 GUI desktop (the
         // managed C# NexOS.Forms shell).  This path is stable under both
         // QEMU and real hardware, so it is the default desktop.  The 64-bit

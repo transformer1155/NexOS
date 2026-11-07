@@ -34,8 +34,16 @@ int dcn_kernel_init(void){
     s->now = 1000;
     s->t = dcn_transport_loopback_create(s->self);
     s->disc = dcn_discovery_create(s->t, "nexos-core", 8);
+    if (!s->t || !s->disc){
+        /* Do not leave a half-built node installed: every later call would
+           dereference whichever pointer failed to allocate. */
+        if (s->disc) dcn_discovery_destroy(s->disc);
+        if (s->t)    dcn_transport_destroy(s->t);
+        free(s);
+        return DCN_ERR;
+    }
     g_k = s;
-    return (s->t && s->disc) ? DCN_OK : DCN_ERR;
+    return DCN_OK;
 }
 void dcn_kernel_shutdown(void){
     if (!g_k) return;
@@ -84,6 +92,11 @@ int dcn_kernel_distribute(const uint8_t* data, size_t len, size_t block_size,
                           dcn_kernel_compute_fn fn, void* u,
                           uint8_t* out, size_t outcap, size_t* outlen){
     if (!g_k) return DCN_ERR;
+    /* Reject an oversized block up front. Without this, a block larger than
+       DCN_MAX_PAYLOAD is silently skipped by dcn_chunk_run_local (so it never
+       completes) and the caller only sees a generic DCN_ERR from the merge -
+       a failure with no stated cause. */
+    if (block_size == 0 || block_size > DCN_MAX_PAYLOAD) return DCN_ERR_PARAM;
     dcn_chunk_plan_t* p = dcn_chunk_create(data, len);
     if (!p) return DCN_ERR_NOMEM;
     int r = dcn_chunk_split_by_size(p, block_size);

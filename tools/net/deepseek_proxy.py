@@ -26,6 +26,9 @@ USAGE
     # Force a model name (so the guest can keep its default "nexos" model)
     python3 tools/net/deepseek_proxy.py --force-model deepseek-chat
 
+    # OpenCode Zen free models (no account; anonymous "public" sentinel key)
+    python3 tools/net/deepseek_proxy.py --preset opencode-free
+
     # For local end-to-end testing (no external network):
     #   start a local HTTPS mock and point the proxy at it
     python3 tools/net/deepseek_proxy.py --host 127.0.0.1 --port 8443 \
@@ -67,6 +70,11 @@ def main():
                     help="API key injected if the guest omits Authorization")
     ap.add_argument("--force-model", default=env_or("DEEPSEEK_MODEL", ""),
                     help="if set, rewrite the request body's model field to this")
+    ap.add_argument("--preset", choices=["opencode-free"], default="",
+                    help="opencode-free: OpenCode Zen free models, anonymous "
+                         "'public' key, no account (overrides host/path/key/model)")
+    ap.add_argument("--force-path", action="store_true",
+                    help="always forward to --path, ignoring the guest's path")
     ap.add_argument("--insecure", action="store_true",
                     help="do not verify the upstream TLS certificate (local mocks)")
     ap.add_argument("--cert", default=env_or("DEEPSEEK_TLS_CERT", ""),
@@ -75,12 +83,25 @@ def main():
                     help="client key for the upstream (rarely needed)")
     args = ap.parse_args()
 
+    # Keyless OpenCode Zen free tier: the endpoint accepts the literal sentinel
+    # key "public" -- no account, no OAuth.  Rate limited per IP server-side.
+    if args.preset == "opencode-free":
+        args.host = "opencode.ai"
+        args.port = "443"
+        args.path = "/zen/v1/chat/completions"
+        args.key = "public"
+        args.force_path = True
+        if not args.force_model:
+            args.force_model = os.environ.get("OPENCODE_ZEN_MODEL",
+                                              "deepseek-v4.1-flash-free")
+
     LISTEN_PORT = int(args.listen)
     UP_HOST = args.host
     UP_PORT = int(args.port)
     UP_PATH = args.path
     API_KEY = args.key
     FORCE_MODEL = args.force_model
+    FORCE_PATH = args.force_path
     INSECURE = args.insecure
 
     print("[deepseek_proxy] listening on http://%s:%d" % (args.listen_host, LISTEN_PORT))
@@ -132,11 +153,14 @@ def main():
             try:
                 conn = http.client.HTTPSConnection(
                     UP_HOST, UP_PORT, context=ctx, timeout=30)
-                # Use the path the guest requested, falling back to the
-                # configured upstream path.
-                up_path = self.path if self.path.startswith("/") else UP_PATH
-                if up_path == "/" or up_path == "":
+                # Preset mode pins the upstream path; otherwise use the path
+                # the guest requested, falling back to the configured one.
+                if FORCE_PATH:
                     up_path = UP_PATH
+                else:
+                    up_path = self.path if self.path.startswith("/") else UP_PATH
+                    if up_path == "/" or up_path == "":
+                        up_path = UP_PATH
                 conn.request(self.command, up_path, body=body, headers=fwd)
                 resp = conn.getresponse()
                 data = resp.read()

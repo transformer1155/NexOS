@@ -103,20 +103,35 @@ void serial_puts(const char* s){
         outb(0x3F8, (uint8_t)*s++);
     }
 }
+// EVERY character goes through this one wait.  serial_puts already throttles,
+// but serial_hex / serial_puthex / serial_dec did NOT: they fired bytes at
+// 0x3F8 back to back, and the UART FIFO is only 16 bytes deep.  Printing
+// anything longer than 15 characters that way silently drops characters.
+//
+// That was not cosmetic.  The HDA probe prints a BAR value with serial_puthex
+// and the resulting serial looked like corrupt noise ("[bciP   nl",
+// "5F0404000[cnol  00A0"), which made it impossible to tell a failed register
+// read from a broken log.  Diagnosis was blocked on a logging bug.
+static inline void serial_tx(uint8_t b){
+    for (uint32_t spin = 0; spin < 100000u; ++spin) {
+        if (inb(0x3FD) & 0x20) break;       // THRE: transmitter holding empty
+    }
+    outb(0x3F8, b);
+}
 void serial_hex(uint32_t v){
     const char* h = "0123456789ABCDEF";
-    for (int i = 28; i >= 0; i -= 4) outb(0x3F8, (uint8_t)h[(v >> i) & 0xF]);
+    for (int i = 28; i >= 0; i -= 4) serial_tx((uint8_t)h[(v >> i) & 0xF]);
 }
 void serial_puthex(uint8_t b){
     const char* h = "0123456789ABCDEF";
-    outb(0x3F8, (uint8_t)h[(b >> 4) & 0xF]);
-    outb(0x3F8, (uint8_t)h[b & 0xF]);
+    serial_tx((uint8_t)h[(b >> 4) & 0xF]);
+    serial_tx((uint8_t)h[b & 0xF]);
 }
 void serial_dec(uint32_t v){
     char b[12]; int i = 0;
-    if (v == 0) { outb(0x3F8, '0'); return; }
+    if (v == 0) { serial_tx('0'); return; }
     while (v > 0 && i < 11) { b[i++] = (char)('0' + (v % 10)); v /= 10; }
-    while (i > 0) outb(0x3F8, (uint8_t)b[--i]);
+    while (i > 0) serial_tx((uint8_t)b[--i]);
 }
 void serial_putdec(uint32_t v){ serial_dec(v); }  // alias used by SFS probe
 
@@ -228,7 +243,19 @@ extern "C" {
     int  browser_status(void);
     int  browser_get_page(char* buf, int bufsize);
     void browser_reset(void);
+    // ---- Intel HD Audio (hda64.cpp) ----
+    int  hda_init(void);
+    int  hda_available(void);
+    int  hda_play_pcm(const int16_t* frames, int nframes);
+    void hda_report(char* buf, int n);
+    void hda_selftest_result(int played, int frames);
     int  net_http_get(const char* url, char* out, int outsize);
+    // Wall-clock bounded GET (max_ms is MILLISECONDS, not a poll count -- see
+    // net.cpp net_http_get_budget, which adds a TSC deadline as well as a much
+    // smaller poll cap).  The interactive Browser uses this so a stalled or
+    // absent network cannot freeze the desktop; the unbounded form is left for
+    // the agent/LLM paths that legitimately need many seconds.
+    int  net_http_get_budget(const char* url, char* out, int outsize, int max_ms);
     int  net_agent_remote(const char* prompt, const char* url, char* out, int outsize);
     void net_set_agent_remote_url(const char* url);
     void net_set_agent_api_key(const char* key);
@@ -254,53 +281,99 @@ extern "C" void switch_to_32bit(void);
 #define KERNEL32_ADDR    0x10000  // Load address: 64KB (matches linker.ld)
 
 // =====================================================================
-//  ATA PIO disk driver (primary master, LBA28)
-//  QEMU exposes the raw image here. Used to persist the command file.
+//  ATA PIO disk driver (BOTH channels, LBA28)
+//
+//  There are two ATA channels and this kernel needs both:
+//    primary   (0x1F0) - the boot disk holding the 32-bit kernel, SFS and
+//                        kernel64.bin
+//    secondary (0x170) - the dedicated USER DATA disk (MKFS)
+//
+//  The driver used to be hard-wired to 0x1F0, which meant "the MKFS volume"
+//  and "the boot disk" were silently the same device as far as this kernel was
+//  concerned.  That produced a long chain of confusing symptoms:
+//    * mkfs.init() read MKFS_SUPER_LBA far enough into the boot image that a
+//      stale copy of the filesystem table happened to live there, so it
+//      reported "mounted" and listed plausible-looking files;
+//    * every WRITE (Notepad Ctrl+S, desktop shortcuts, session save, the HDA
+//      diagnostic trace) went to the boot disk instead of the data disk, so it
+//      either failed outright (VirtualBox keeps the boot vdi read-only while it
+//      is the running disk) or corrupted a volume nobody was looking at;
+//    * the data disk, which the 32-bit kernel mounts correctly on 0x170, was
+//      never touched at all by this kernel.
+//
+//  Every access now names its channel explicitly.  ata_fs_base selects the
+//  volume backing the filesystem; ata_read_sector keeps its old signature and
+//  defaults to the PRIMARY channel so the kernel64.bin staging path (which
+//  really does read the boot disk) is unchanged.
 // =====================================================================
 static uint8_t  ata_last_status;   // last status reg read (for diagnostics)
 static uint8_t  ata_last_err;       // 0 = ok, else stage where it failed
 
-// Wait until the device is not busy (BSY clear).  Returns false on timeout
-// or if the ERR bit latches.
-static bool ata_nobsy(int to){
+#define ATA_PRIMARY     0x1F0
+#define ATA_SECONDARY   0x170
+#define ATA_IRQ         0x07             // offset of the alternate status reg
+#define ATA_CMD         0x07             // offset of the command/status reg
+
+// The channel that backs the filesystem.  Defaults to PRIMARY so a boot that
+// never probes still reads *something*; mkfs.init() overrides it once it has
+// decided which disk actually carries the MKFS superblock.
+static uint16_t ata_fs_base = ATA_PRIMARY;
+
+static bool ata_nobsy_base(uint16_t base, int to){
     for(int i=0;i<to;i++){
-        uint8_t s = inb(0x1F7);
+        uint8_t s = inb(base + ATA_CMD);
         if(!(s & 0x80)) return true;
         if(s & 0x01) return false;   // ERR
     }
     return false;
 }
+// Wait until the device is not busy (BSY clear).  Returns false on timeout
+// or if the ERR bit latches.
+static bool ata_nobsy(int to){ return ata_nobsy_base(0x1F0, to); }
 // Wait until data is ready to transfer (BSY clear AND DRQ set).
-static bool ata_drq(int to){
+static bool ata_drq_base(uint16_t base, int to){
     for(int i=0;i<to;i++){
-        uint8_t s = inb(0x1F7);
+        uint8_t s = inb(base + ATA_CMD);
         if((s & 0x88) == 0x08) return true;   // !BSY && DRQ
         if(s & 0x01) return false;            // ERR
     }
     return false;
 }
+static bool ata_drq(int to){ return ata_drq_base(0x1F0, to); }
 
-static void ata_read_sector(uint32_t lba, uint16_t* buf){
+// Read one sector from the given channel, master device (drv = 0xA0).
+static void ata_read_sector_base(uint16_t base, uint32_t lba, uint16_t* buf){
     ata_last_err = 0;
     // 1) device must be idle before we touch any registers
-    if(!ata_nobsy(50000)) { ata_last_status = inb(0x1F7); ata_last_err = 1; return; }
+    if(!ata_nobsy_base(base, 50000)) { ata_last_status = inb(base+ATA_CMD); ata_last_err = 1; return; }
     // 2) select drive + LBA mode, THEN wait again: selecting a device can
     //    assert BSY, and any register write while BSY is set is dropped by the
     //    controller -- which is exactly why the old driver always read LBA0
     //    (the LBA registers never latched and the drive used its default CHS).
-    outb(0x1F6, 0xE0 | ((lba>>24)&0x0F));
-    if(!ata_nobsy(50000)) { ata_last_status = inb(0x1F7); ata_last_err = 2; return; }
+    outb(base+6, 0xE0 | ((lba>>24)&0x0F));
+    if(!ata_nobsy_base(base, 50000)) { ata_last_status = inb(base+ATA_CMD); ata_last_err = 2; return; }
     // 3) now the parameters will actually latch
-    outb(0x1F1, 0x00);
-    outb(0x1F2, 1);
-    outb(0x1F3, (uint8_t)(lba & 0xFF));
-    outb(0x1F4, (uint8_t)((lba>>8) & 0xFF));
-    outb(0x1F5, (uint8_t)((lba>>16) & 0xFF));
-    outb(0x1F7, 0x20);                 // READ SECTORS
+    outb(base+1, 0x00);
+    outb(base+2, 1);
+    outb(base+3, (uint8_t)(lba & 0xFF));
+    outb(base+4, (uint8_t)((lba>>8) & 0xFF));
+    outb(base+5, (uint8_t)((lba>>16) & 0xFF));
+    outb(base+ATA_CMD, 0x20);          // READ SECTORS
     // 4) wait for the data to be ready (BSY clear + DRQ set)
-    if(!ata_drq(2000000)) { ata_last_status = inb(0x1F7); ata_last_err = 3; return; }
-    __asm__ __volatile__("cld; rep insw" :: "d"((uint16_t)0x1F0), "D"(buf), "c"(256) : "memory");
-    ata_last_status = inb(0x1F7);      // final status / clear IRQ
+    if(!ata_drq_base(base, 2000000)) { ata_last_status = inb(base+ATA_CMD); ata_last_err = 3; return; }
+    __asm__ __volatile__("cld; rep insw" :: "d"(base), "D"(buf), "c"(256) : "memory");
+    ata_last_status = inb(base+ATA_CMD);   // final status / clear IRQ
+}
+
+// Boot-disk read: unchanged signature and unchanged channel (PRIMARY), because
+// cmd_switch32() and the kernel64.bin staging path really do read the boot disk.
+static void ata_read_sector(uint32_t lba, uint16_t* buf){
+    ata_read_sector_base(ATA_PRIMARY, lba, buf);
+}
+
+// Filesystem read: goes to whichever channel mkfs.init() chose.
+static void ata_fs_read_sector(uint32_t lba, uint16_t* buf){
+    ata_read_sector_base(ata_fs_base, lba, buf);
 }
 
 // Multi-sector PIO read: issues ONE READ SECTORS command for `count` sectors
@@ -600,19 +673,36 @@ static bool virtio_blk_read(uint32_t lba, uint8_t* buf, uint32_t nsect){
     return status == 0;
 }
 
+static void ata_write_sector_base(uint16_t base, uint32_t lba, const uint16_t* buf){
+    if(!ata_nobsy_base(base, 50000)) return;
+    outb(base+6, 0xE0 | ((lba>>24)&0x0F));
+    if(!ata_nobsy_base(base, 50000)) return;
+    outb(base+2, 1);
+    outb(base+3, (uint8_t)(lba & 0xFF));
+    outb(base+4, (uint8_t)((lba>>8) & 0xFF));
+    outb(base+5, (uint8_t)((lba>>16) & 0xFF));
+    outb(base+ATA_CMD, 0x30);          // WRITE SECTORS
+    if(!ata_drq_base(base, 2000000)) return;
+    for(int i=0;i<256;i++) outw(base, buf[i]);
+    outb(base+ATA_CMD, 0xE7);          // CACHE FLUSH
+    ata_nobsy_base(base, 50000);
+}
+
+// Filesystem write: goes to the channel that backs the MKFS volume.  Writing
+// to the boot disk (the old behaviour) could never succeed in VirtualBox,
+// where the running boot vdi is held read-only.
+static void ata_fs_write_sector(uint32_t lba, const uint16_t* buf){
+    ata_write_sector_base(ata_fs_base, lba, buf);
+}
+
+// Boot-disk write: kept under the original name because these callers really
+// do target the boot image --
+//   * SVM fault records (LBA 1500, the free gap below kernel64.bin),
+//   * the blk_* SVM block shim,
+//   * kernel64 staging.
+// Everything that touches the FILESYSTEM uses ata_fs_write_sector instead.
 static void ata_write_sector(uint32_t lba, const uint16_t* buf){
-    if(!ata_nobsy(50000)) return;
-    outb(0x1F6, 0xE0 | ((lba>>24)&0x0F));
-    if(!ata_nobsy(50000)) return;
-    outb(0x1F2, 1);
-    outb(0x1F3, (uint8_t)(lba & 0xFF));
-    outb(0x1F4, (uint8_t)((lba>>8) & 0xFF));
-    outb(0x1F5, (uint8_t)((lba>>16) & 0xFF));
-    outb(0x1F7, 0x30);                 // WRITE SECTORS
-    if(!ata_drq(2000000)) return;
-    for(int i=0;i<256;i++) outw(0x1F0, buf[i]);
-    outb(0x1F7, 0xE7);                 // CACHE FLUSH
-    ata_nobsy(50000);
+    ata_write_sector_base(ATA_PRIMARY, lba, buf);
 }
 
 // (ata_diag_probe removed — debug-only, no longer needed)
@@ -757,10 +847,34 @@ static void build_idt(){
     // Get this function's ACTUAL runtime address via a RIP-relative LEA.
     // (Writing the LEA explicitly avoids GCC's flaky optimizer transform of
     // the classic "call 1f; pop %0" idiom into a mis-encoded `lea`.)
+    //
+    // BUG FIX: the label used for the link-time address MUST sit at exactly the
+    // address the LEA produces (i.e. the instruction right after it).  It used
+    // to be placed a few statements later, so "delta" came out as the CODE
+    // DISTANCE between the two points -- the serial log showed
+    //     [K64-IDT] delta=000000000000002E     (46 bytes, not a load offset)
+    // With that value g_idt_desc.base is shifted by 46 bytes, so after `lidt`
+    // the CPU reads GARBAGE gates: the first synchronous fault cannot be
+    // dispatched at all and the machine triple-faults with no diagnostic --
+    // exactly the silent VirtualBox crash (the #PF handler never printed
+    // anything).  Keep the label immediately after the LEA.
     __asm__ __volatile__("lea 0(%%rip), %0" : "=r"(actual_self));
-    link_self = (uint64_t)&&idt_self;
 idt_self:
-    uint64_t delta = actual_self - link_self;
+    link_self = (uint64_t)&&idt_self;
+    // delta MUST BE ZERO on every path we take.  The 32-bit loader stages
+    // kernel64.bin in a kmalloc'd buffer and switch_to_64bit() BLITS it to
+    // KERNEL64_ENTRY (0x100000) -- exactly the link address -- so runtime ==
+    // link.  Proof that the old arithmetic was meaningless: it printed
+    //     [K64-IDT] delta=000000000000002E
+    // i.e. 46 bytes, which is the CODE DISTANCE between the LEA and its label,
+    // not a load offset.  With that in g_idt_desc.base the whole IDT was shifted
+    // by 46 bytes, so after `lidt` every gate was garbage and the first
+    // synchronous fault triple-faulted with NO diagnostic at all (the handler
+    // was never reached) -- the silent VirtualBox crash.  If a future loader
+    // ever leaves the image somewhere other than the link address, compute the
+    // delta from that loader's real entry address, not from label arithmetic.
+    uint64_t delta = 0;
+    (void)actual_self; (void)link_self;
     serial_puts("[K64-IDT] delta=");
     serial_hex64(delta);
     serial_puts("\n");
@@ -1149,7 +1263,12 @@ private:
 enum KbdType {
     K_NONE, K_CHAR, K_UP, K_DOWN, K_LEFT, K_RIGHT, K_TAB,
     K_CTRL_C, K_CTRL_V, K_CTRL_L, K_CTRL_UP, K_CTRL_DOWN,
-    K_PAGEUP, K_PAGEDN, K_HOME, K_END
+    K_PAGEUP, K_PAGEDN, K_HOME, K_END,
+    // The Windows/Super key (scancode set 1: E0 5B).  Needed as its own event
+    // because the desktop toggles the Start menu with it, and the old event
+    // table had no representation for a non-character modifier key at all --
+    // so pressing Win opened the menu and pressing it again could not close it.
+    K_WIN
 };
 struct KbdEvent { KbdType type; char ch; };
 
@@ -1202,6 +1321,12 @@ public:
             else if(key==0x51) e.type=K_PAGEDN;
             else if(key==0x47) e.type=K_HOME;
             else if(key==0x4F) e.type=K_END;
+            // Windows/Super keys: E0 5B (left) and E0 5C (right).  Reported as
+            // their own event so the desktop can toggle the Start menu.  Without
+            // this the byte fell through m_ext and vanished: the menu could be
+            // opened (via its own internal path) but never closed by the same
+            // key, which read as "the Win key only works once".
+            else if(key==0x5B || key==0x5C) e.type=K_WIN;
             return e;
         }
         if(key==SC_LSHIFT||key==SC_RSHIFT){ m_shift=true; return e; }
@@ -1348,6 +1473,23 @@ struct GuiCallbacks {
     int      (*mkdir)(int fs, const char* name);
     int      (*remove)(int fs, const char* name);
     int      (*rename)(int fs, const char* old_name, const char* new_name);
+    // ---- directory navigation / chunked copy (added for File Explorer) ----
+    // These MUST exist here even though the 64-bit kernel leaves them NULL:
+    // gui64.o is compiled from src/gui/gui_legacy.cpp, whose copy of this
+    // struct already has them, and the layout is shared through gui_init().
+    // Without them every field below (get_os_name, is_64bit, browser_*,
+    // exec_command, ...) was read at the WRONG OFFSET by gui64 -- the first
+    // desktop paint dereferenced the shift and triple-faulted.  NULL is safe:
+    // the managed bridge checks each op before calling it.
+    int      (*enter_dir)(int fs, int idx);
+    int      (*dir_up)(int fs);
+    int      (*cwd_path)(int fs, char* buf, int size);
+    int      (*move_file)(int fs, const char* name, int dst_idx);
+    int      (*enter_path)(int fs, const char* path);
+    int      (*file_size)(int fs, const char* name);
+    int      (*is_dir_name)(int fs, const char* name);
+    int      (*copy_range)(int src_fs, const char* src_path, const char* name,
+                           int dst_fs, const char* dst_path, int off, int len);
     const char* (*get_os_name)(void);
     bool     (*is_64bit)(void);
     // Browser callbacks
@@ -1383,6 +1525,11 @@ struct GuiCallbacks {
     int         (*login_uid)(void);
     int         (*user_count)(void);
     const char* (*user_name)(int idx);
+    // Audio output (64-bit only; see hda64.cpp).  Must match mforms.h's
+    // MFormsHost field order so gui.cpp can copy them straight across.
+    int         (*audio_available)(void);
+    int         (*audio_play)(const int16_t* frames, int nframes);
+    void        (*audio_info)(char* buf, int n);
 };
 
 extern "C" {
@@ -1396,6 +1543,11 @@ extern "C" {
     void gui_mouse_up(void);
     void gui_mouse_down_right(void);
     int  gui_handle_key(char ch);
+    // Keyboard-driven desktop control.  These were EXPORTED by gui_legacy.cpp
+    // but never declared or called here, so the arrows / Tab / Win key had no
+    // effect even though the driver recognised them.
+    void gui_toggle_start_menu(void);
+    void gui_desktop_nav(int code);
     int  gui_bga_available(void);
     int  gui_vbe_mode_set_by_bios(void);
     void gui_create_window(int x, int y, int w, int h, const char* title);
@@ -1451,11 +1603,28 @@ static int g_auto_gui;
 //    type: 0=file, 1=directory
 //    parent: entry index of parent directory (0xFFFF = root)
 
-#define MKFS_SUPER_LBA    512
-#define MKFS_TABLE_LBA    513
+// MKFS layout -- MUST MATCH kernel.cpp AND tools/make_data_vdi.py.
+//
+// These were 512 / 513 / 529, i.e. the layout of some earlier disk, while the
+// 32-bit kernel and the data-disk generator both use 900 / 901 / 917 with
+// 15200 data sectors.  Measured on the real VirtualBox data disk: LBA 900 holds
+// "MKFS\x02", and LBA 512 is all zeroes.
+//
+// The consequence was not subtle: mkfs.init() read LBA 512, found no magic,
+// set mounted = false, and from then on EVERY file operation on the 64-bit
+// desktop silently did nothing -- Notepad saving (the write_file callback
+// returned -1 before writing), desktop shortcut creation, session persistence,
+// and the HDA diagnostic trace this driver tried to write.  All of it looked
+// like "the callback is missing" when the real fault was reading the wrong
+// sector.
+//
+// Values below are taken from kernel.cpp:2117-2120 and tools/make_data_vdi.py,
+// which are the two things that actually define the on-disk format.
+#define MKFS_SUPER_LBA    900
+#define MKFS_TABLE_LBA    901
 #define MKFS_TABLE_SECT   16
-#define MKFS_DATA_LBA     529
-#define MKFS_DATA_SECTORS 271
+#define MKFS_DATA_LBA     917
+#define MKFS_DATA_SECTORS 15200
 
 #define SFS_SUPER_LBA     800
 #define SFS_DIR_LBA       801
@@ -1655,10 +1824,40 @@ public:
     Superblock sb;
 
     void init(){
-        ata_read_sector(MKFS_SUPER_LBA, (uint16_t*)g_fsbuf);
+        // PROBE BOTH CHANNELS.  The user data disk lives on the SECONDARY
+        // channel in every configuration this project targets (QEMU
+        // -drive if=ide,index=1 and VirtualBox IDE-1-0), while the boot disk is
+        // on the PRIMARY channel.  Choosing by assumption is what made this
+        // kernel read the boot image and report a bogus "mounted" with a stale
+        // copy of the filesystem table.
+        //
+        // Selection rule, in order:
+        //   1. the channel whose MKFS_SUPER_LBA really holds the "MKFS" magic;
+        //   2. failing that, SECONDARY, because that is where the user data
+        //      disk is wired -- and an empty, unformatted data disk is a
+        //      legitimate state the caller must see as "not mounted".
+        ata_fs_base = ATA_SECONDARY;
+        ata_fs_read_sector(MKFS_SUPER_LBA, (uint16_t*)g_fsbuf);
         memcpy_(&sb, g_fsbuf, sizeof(sb));
-        mounted = (sb.magic[0]=='M' && sb.magic[1]=='K' &&
-                   sb.magic[2]=='F' && sb.magic[3]=='S');
+        if (sb.magic[0]=='M' && sb.magic[1]=='K' && sb.magic[2]=='F' && sb.magic[3]=='S'){
+            mounted = true;
+            serial_puts("[K64-6] MKFS on the SECONDARY channel (data disk)\n");
+            return;
+        }
+        // Secondary had no magic: check the primary before declaring failure.
+        // (A single-disk layout puts MKFS on the boot disk, e.g. an ISO/flash
+        // install where there is no second channel at all.)
+        ata_fs_base = ATA_PRIMARY;
+        ata_fs_read_sector(MKFS_SUPER_LBA, (uint16_t*)g_fsbuf);
+        memcpy_(&sb, g_fsbuf, sizeof(sb));
+        if (sb.magic[0]=='M' && sb.magic[1]=='K' && sb.magic[2]=='F' && sb.magic[3]=='S'){
+            mounted = true;
+            serial_puts("[K64-6] MKFS on the PRIMARY channel (single-disk layout)\n");
+            return;
+        }
+        mounted = false;
+        ata_fs_base = ATA_SECONDARY;      // writes must target the data disk
+        serial_puts("[K64-6] MKFS not found on either channel\n");
     }
 
     void format(){
@@ -1670,11 +1869,11 @@ public:
         sb.total_sectors = MKFS_DATA_SECTORS;
         memset_(g_fsbuf, 0, 512);
         memcpy_(g_fsbuf, &sb, sizeof(sb));
-        ata_write_sector(MKFS_SUPER_LBA, (const uint16_t*)g_fsbuf);
+        ata_fs_write_sector(MKFS_SUPER_LBA, (const uint16_t*)g_fsbuf);
 
         memset_(g_fsbuf, 0, 512);
         for (int s = 0; s < MKFS_TABLE_SECT; s++)
-            ata_write_sector(MKFS_TABLE_LBA + s, (const uint16_t*)g_fsbuf);
+            ata_fs_write_sector(MKFS_TABLE_LBA + s, (const uint16_t*)g_fsbuf);
 
         mounted = true;
     }
@@ -1684,7 +1883,7 @@ public:
         if (!mounted) { term.write("MKFS not formatted. Use 'mkfs' first.\n"); return; }
         int count = 0;
         for (int s = 0; s < MKFS_TABLE_SECT; s++) {
-            ata_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+            ata_fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
             for (int e = 0; e < FS_ENTRY_PER_SEC; e++) {
                 FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
                 if (fe->name[0] != 0 && fe->parent == g_cwd) {
@@ -1708,7 +1907,7 @@ public:
     // Find entry by name in current directory
     int find(const char* name){
         for (int s = 0; s < MKFS_TABLE_SECT; s++) {
-            ata_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+            ata_fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
             for (int e = 0; e < FS_ENTRY_PER_SEC; e++) {
                 FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
                 if (fe->name[0] != 0 && fe->parent == g_cwd &&
@@ -1730,7 +1929,7 @@ public:
         uint8_t* dst = (uint8_t*)buf;
         int remaining = size;
         for (int i = 0; i < sectors && remaining > 0; i++) {
-            ata_read_sector(fe->start_lba + i, (uint16_t*)g_fsbuf);
+            ata_fs_read_sector(fe->start_lba + i, (uint16_t*)g_fsbuf);
             int to_copy = (remaining > 512) ? 512 : remaining;
             memcpy_(dst, g_fsbuf, to_copy);
             dst += 512;
@@ -1745,7 +1944,7 @@ public:
         if (existing >= 0) remove_idx(existing);
 
         for (int s = 0; s < MKFS_TABLE_SECT; s++) {
-            ata_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+            ata_fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
             for (int e = 0; e < FS_ENTRY_PER_SEC; e++) {
                 FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
                 if (fe->name[0] == 0) {
@@ -1761,11 +1960,11 @@ public:
                         int off = i * 512;
                         int to_copy = (size - off > 512) ? 512 : (size - off);
                         if (to_copy > 0) memcpy_(g_fsbuf, src + off, to_copy);
-                        ata_write_sector(lba + i, (const uint16_t*)g_fsbuf);
+                        ata_fs_write_sector(lba + i, (const uint16_t*)g_fsbuf);
                     }
 
                     // Re-read table sector and write entry
-                    ata_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+                    ata_fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
                     fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
                     memset_((void*)fe, 0, FS_ENTRY_SIZE);
                     int i=0; while(name[i] && i<FS_NAME_LEN-1){ fe->name[i]=name[i]; i++; }
@@ -1775,7 +1974,7 @@ public:
                     fe->type = FS_TYPE_FILE;
                     fe->parent = g_cwd;
                     fe->reserved = 0;
-                    ata_write_sector(MKFS_TABLE_LBA + s, (const uint16_t*)g_fsbuf);
+                    ata_fs_write_sector(MKFS_TABLE_LBA + s, (const uint16_t*)g_fsbuf);
 
                     sb.file_count++;
                     sb.free_lba += sectors;
@@ -1794,7 +1993,7 @@ public:
         if (existing >= 0) return -2;  // already exists
 
         for (int s = 0; s < MKFS_TABLE_SECT; s++) {
-            ata_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+            ata_fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
             for (int e = 0; e < FS_ENTRY_PER_SEC; e++) {
                 FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
                 if (fe->name[0] == 0) {
@@ -1806,7 +2005,7 @@ public:
                     fe->type = FS_TYPE_DIR;
                     fe->parent = g_cwd;
                     fe->reserved = 0;
-                    ata_write_sector(MKFS_TABLE_LBA + s, (const uint16_t*)g_fsbuf);
+                    ata_fs_write_sector(MKFS_TABLE_LBA + s, (const uint16_t*)g_fsbuf);
 
                     sb.file_count++;
                     flush_sb();
@@ -1894,7 +2093,7 @@ public:
         if (fe->type == FS_TYPE_DIR) {
             // Check if directory has children
             for (int s = 0; s < MKFS_TABLE_SECT; s++) {
-                ata_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+                ata_fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
                 for (int e = 0; e < FS_ENTRY_PER_SEC; e++) {
                     FileEntry* child = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
                     if (child->name[0] != 0 && child->parent == (uint16_t)idx)
@@ -1918,17 +2117,17 @@ private:
     void read_entry(int idx){
         int s = idx / FS_ENTRY_PER_SEC;
         int e = idx % FS_ENTRY_PER_SEC;
-        ata_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+        ata_fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
         memcpy_(g_fsbuf, g_fsbuf + e * FS_ENTRY_SIZE, FS_ENTRY_SIZE);
     }
 
     void remove_idx(int idx){
         int s = idx / FS_ENTRY_PER_SEC;
         int e = idx % FS_ENTRY_PER_SEC;
-        ata_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+        ata_fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
         FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
         memset_((void*)fe, 0, FS_ENTRY_SIZE);
-        ata_write_sector(MKFS_TABLE_LBA + s, (const uint16_t*)g_fsbuf);
+        ata_fs_write_sector(MKFS_TABLE_LBA + s, (const uint16_t*)g_fsbuf);
         if (sb.file_count > 0) sb.file_count--;
         flush_sb();
     }
@@ -1936,7 +2135,7 @@ private:
     void flush_sb(){
         memset_(g_fsbuf, 0, 512);
         memcpy_(g_fsbuf, &sb, sizeof(sb));
-        ata_write_sector(MKFS_SUPER_LBA, (const uint16_t*)g_fsbuf);
+        ata_fs_write_sector(MKFS_SUPER_LBA, (const uint16_t*)g_fsbuf);
     }
 };
 
@@ -1969,13 +2168,23 @@ public:
     // Unified sector read: from RAM when ram_mode, else from the ATA disk.
     // lba is the canonical SFS LBA (superblock=800, dir=801+, data=817+); in
     // RAM the image is laid out from byte 0, so offset = (lba-800)*512.
+    //
+    // PRIMARY CHANNEL, NOT ata_fs_read_sector.
+    //
+    // The SFS volume lives on the BOOT disk (primary, 0x1F0) -- it is part of
+    // the image, alongside the kernels.  Only the MKFS user-data volume is on
+    // the secondary channel.  A mechanical rewrite of the Mkfs call sites also
+    // caught this function, which silently pointed every SFS read at the data
+    // disk: the mount reported no superblock and EVERY file lookup failed
+    // ("[SFS-FIND] not found: shell.mex", all textures, all fonts), so the
+    // managed desktop could not start at all.
     void rd(uint32_t lba, uint16_t* buf){
         if (ram_mode) {
             const uint8_t* src = (const uint8_t*)ram_base
                                 + (int32_t)((int32_t)lba - (int32_t)SFS_SUPER_LBA) * 512;
             memcpy_(buf, src, 512);
         } else {
-            ata_read_sector(lba, buf);
+            ata_read_sector(lba, buf);          // boot disk (primary)
         }
     }
 
@@ -2014,7 +2223,7 @@ public:
         // link address rather than the load address, yielding 0 and making every
         // probe read LBA0.  g_fsbuf (BSS) and instruction immediates are fine.
         //   SFS_SUPER_LBA (800)  : canonical in-image SFS layout
-        //   SFS_ALT_LBA   (3488) : relocated SFS on the BIOS disk image
+        //   SFS_ALT_LBA   (6144) : relocated SFS on the BIOS disk image (see the #define above)
         // ---- Probe 1: SFS_SUPER_LBA (800) ----
         ata_read_sector(SFS_SUPER_LBA, (uint16_t*)g_fsbuf);
         if (g_fsbuf[0]=='S' && g_fsbuf[1]=='F' && g_fsbuf[2]=='S' && g_fsbuf[3]==0) {
@@ -2024,7 +2233,7 @@ public:
             mounted = true;
             return;
         }
-        // ---- Probe 2: SFS_ALT_LBA (3488) ----
+        // ---- Probe 2: SFS_ALT_LBA (6144) ----
         ata_read_sector(SFS_ALT_LBA, (uint16_t*)g_fsbuf);
         if (g_fsbuf[0]=='S' && g_fsbuf[1]=='F' && g_fsbuf[2]=='S' && g_fsbuf[3]==0) {
             memcpy_(&sb, g_fsbuf, sizeof(sb));
@@ -2070,6 +2279,13 @@ public:
                 }
             }
         }
+        /* Same wording, character for character, as the 32-bit kernel's
+           kernel.cpp:2763.  The log vocabulary is shared: rewriting it here
+           would create a second spelling that every grep has to enumerate.
+           Deliberately NOT printed when !mounted -- 'not mounted' and
+           'searched but absent' are different conditions and must not share
+           one message. */
+        serial_puts("[SFS-FIND] not found: "); serial_puts(name); serial_puts("\n");
         return -1;
     }
 
@@ -2415,6 +2631,40 @@ static uint32_t pmm_reserve_range(uint32_t start, uint32_t end){
     return n;
 }
 
+// ---------------------------------------------------------------------------
+// pmm_layout_panic - run-time layout guard that STOPS the machine.
+//
+// The two FATAL checks at the bottom of pmm_init() used to only print and
+// then CONTINUE booting, which is the worst outcome: every later symptom
+// (random #PF, corrupted PTEs, heap eating .bss) looks nothing like the
+// layout bug that caused it.  This helper prints the reason forever and
+// parks the CPU, so the failure is impossible to miss.
+//
+// CRITERIA (by design, do not "improve" them away):
+//   * NO heap allocation on this path: no kmalloc/kfree, no pmm_alloc_*.
+//     serial_puts/serial_hex are pure 0x3F8/0x3FD port I/O (see L90-108),
+//     and the only data touched is the static string literal.  The heap is
+//     exactly what a layout overlap corrupts, so a panic path that allocates
+//     would be printing its own error message through corrupted memory.
+//   * cli + hlt loop: interrupts are off and the CPU is parked, so nothing
+//     can advance past the guard.
+//   * Repeats the message: the first lines of a boot log can scroll away or
+//     be lost to a serial hiccup; a stuck kernel that keeps shouting is
+//     findable from the tail of the capture alone.
+static void pmm_layout_panic(const char* reason){
+    __asm__ __volatile__("cli");
+    for (;;) {
+        serial_puts("\n[PMM] *** FATAL LAYOUT PANIC: ");
+        serial_puts(reason);
+        serial_puts(" *** kernel halted here (repeat)\n");
+        // Throttle: ~0.4 s at TSC scale between repeats.  Volatility does not
+        // matter -- serial_puts itself blocks on THRE per byte, so even a
+        // fully elided loop only speeds the repeat up, never allocates.
+        for (volatile uint32_t d = 0; d < 400000u; ++d) {}
+        __asm__ __volatile__("hlt");
+    }
+}
+
 static void pmm_init(){
     // Manage the full low 4 GiB the bootloader/QEMU provides. (CMOS detection
     // caps far below this, so size the bitmap directly.)
@@ -2491,11 +2741,16 @@ static void pmm_init(){
 
     // Loud guard: if the heap ever overlaps the boot scratch region the
     // symptom is a random late #PF that looks nothing like a heap bug.
+    //
+    // These used to print FATAL and then KEEP BOOTING, which defeats the
+    // entire purpose of the check: the operator sees one line early in a long
+    // log and the machine goes on to fail somewhere unrelated.  They now stop
+    // the machine on a visible, repeating panic (see pmm_layout_panic).
     if (HEAP_END > LMBOOT_BASE) {
-        serial_puts("[PMM] FATAL: heap end overlaps LMBOOT_BASE -- move .lmboot in linker.ld\n");
+        pmm_layout_panic("heap end overlaps LMBOOT_BASE -- move .lmboot in linker.ld");
     }
     if ((uint32_t)(uintptr_t)__bss_end > HEAP_START) {
-        serial_puts("[PMM] FATAL: .bss end overlaps HEAP_START -- raise HEAP_START\n");
+        pmm_layout_panic(".bss end overlaps HEAP_START -- raise HEAP_START");
     }
 }
 
@@ -3239,7 +3494,7 @@ static void build_prompt_path(char* buf, int maxlen){
         // Read entry to get parent
         int s = cur / FS_ENTRY_PER_SEC;
         int e = cur % FS_ENTRY_PER_SEC;
-        ata_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+        ata_fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
         FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
         cur = fe->parent;
     }
@@ -3248,7 +3503,7 @@ static void build_prompt_path(char* buf, int maxlen){
     for (int i = depth - 1; i >= 0 && pos < maxlen - 1; i--) {
         int s = path[i] / FS_ENTRY_PER_SEC;
         int e = path[i] % FS_ENTRY_PER_SEC;
-        ata_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+        ata_fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
         FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
         int j = 0;
         while (fe->name[j] && pos < maxlen - 2) {
@@ -4513,7 +4768,7 @@ static int match_files(const char* prefix, char matches[][FS_NAME_LEN], int max)
     int count = 0;
     int prefixlen = strlen_(prefix);
     for(int s=0; s<MKFS_TABLE_SECT && count<max; s++){
-        ata_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+        ata_fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
         for(int e=0; e<FS_ENTRY_PER_SEC; e++){
             FileEntry* fe = (FileEntry*)(g_fsbuf + e*FS_ENTRY_SIZE);
             if(fe->name[0] != 0 && fe->parent == g_cwd){
@@ -5248,12 +5503,12 @@ static void cmd_chmod(const char* args){
     perm_set(fname, uid, gid, mode);
     if(mkfs.mounted){
         for(int s = 0; s < MKFS_TABLE_SECT; s++){
-            ata_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+            ata_fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
             for(int e = 0; e < FS_ENTRY_PER_SEC; e++){
                 FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
                 if(fe->name[0] != 0 && fe->parent == g_cwd && strcmp_(fe->name, fname) == 0){
                     fe->reserved = (uint8_t)(mode & 0xFF);
-                    ata_write_sector(MKFS_TABLE_LBA + s, (const uint16_t*)g_fsbuf);
+                    ata_fs_write_sector(MKFS_TABLE_LBA + s, (const uint16_t*)g_fsbuf);
                     break;
                 }
             }
@@ -5285,7 +5540,7 @@ static void cmd_stat(const char* name){
     term.write(" (octal)\n");
     if(mkfs.mounted){
         for(int s = 0; s < MKFS_TABLE_SECT; s++){
-            ata_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+            ata_fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
             for(int e = 0; e < FS_ENTRY_PER_SEC; e++){
                 FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
                 if(fe->name[0] != 0 && fe->parent == g_cwd && strcmp_(fe->name, name) == 0){
@@ -5818,7 +6073,7 @@ static int gui_cb_list_files(int fs_type, char* outbuf, int bufsize) {
         // MKFS
         if (!mkfs.mounted) return 0;
         for (int s = 0; s < MKFS_TABLE_SECT; s++) {
-            ata_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
+            ata_fs_read_sector(MKFS_TABLE_LBA + s, (uint16_t*)g_fsbuf);
             for (int e = 0; e < FS_ENTRY_PER_SEC; e++) {
                 FileEntry* fe = (FileEntry*)(g_fsbuf + e * FS_ENTRY_SIZE);
                 if (fe->name[0] != 0 && fe->parent == g_cwd) {
@@ -6005,13 +6260,31 @@ static void gui_cb_browser_reset(void) {
     if (!g_net_initialized) return;
     browser_reset();
 }
-// Synchronous HTTP GET for the managed Browser control.  Drives the kernel
-// network state machine (via net_poll) until the response is in, then
-// returns the body through a static buffer the icall copies into a string.
+// Synchronous HTTP GET for the managed Browser control.
+//
+// WALL-CLOCK BOUNDED ON PURPOSE.  This runs on the GUI thread: Browser.cs calls
+// Host.HttpGet() straight from the Go button handler, so however long this
+// takes, the whole desktop is frozen for exactly that long -- no repaint, no
+// mouse, no way to cancel.  net_http_get()'s only bound is "300,000,000 calls
+// to net_poll()", which is a COUNT, not a time: on a machine with no NIC,
+// net_poll() returns immediately (its first line is `if (!nic_present) return;`),
+// so the loop spins at full CPU speed and that count can take minutes.
+//
+// net_http_get_budget() is the variant written for exactly this hazard: it
+// bounds the loop by TSC wall-clock time AND by a much smaller call count.  Its
+// own comment says it was added because "a stalled network can never hold up
+// boot" -- the same argument applies to holding up the desktop, which is worse.
+//
+// 2000 ms is chosen to be long enough for a LAN/serverside page on real
+// hardware and short enough that a frozen desktop is bearable.  The interactive
+// Browser is the ONLY caller that gets a visible offline page back (see
+// Browser.cs BuildOfflinePage), so timing out here degrades gracefully.
+// An LLM endpoint that legitimately needs longer must not go through this
+// path -- net_ask_host()/net_agent_execute() keep their generous budget.
 static const char* gui_cb_http_get(const char* url) {
     static char buf[16384];
     buf[0] = 0;
-    if (g_net_initialized) net_http_get(url, buf, (int)sizeof(buf));
+    if (g_net_initialized) net_http_get_budget(url, buf, (int)sizeof(buf), 2000);
     return buf;
 }
 
@@ -6033,6 +6306,117 @@ static int gui_cb_mkdir(int fs, const char* name) {
     if (fs != 0 || !mkfs.mounted) return -1;
     return mkfs.mkdir(name);
 }
+// ---- Directory navigation callbacks ----------------------------------
+// kernel64's mkfs is RELATIVE: mkfs.find/mkdir/create all operate on the
+// entries whose `parent == g_cwd`, and there is no fs_volume_root() /
+// mkfs_find_child() / mkfs_read_entry_raw() here (those exist only in
+// kernel.cpp's absolute-index model).  So these two are written against the
+// relative model rather than copied from the 32-bit versions.
+//
+// They were declared in the callback struct but never assigned, which is why
+// Host.CwdPath()/Host.EnterPath() did nothing in the 64-bit desktop: the File
+// Explorer could not show its location and the Notepad has no way to present a
+// "save into this folder" picker.
+//
+// fs contract matches the rest of this file: 0 = MKFS root, 3 = Desktop
+// (a directory that lives under the MKFS root).
+static int gui_cb_enter_path(int fs, const char* path) {
+    if (!mkfs.mounted) return -1;
+    if (fs != 0 && fs != 3) return -1;           // SFS / FAT32 are read-only
+    g_cwd = FS_ROOT_PARENT;                      // always start at the root
+    if (fs == 3) {
+        int di = mkfs.find("Desktop");
+        if (di < 0) return -1;
+        g_cwd = (uint16_t)di;
+    }
+    // Walk the remaining components, creating nothing -- a save target must
+    // already exist, otherwise the caller would silently write into a folder
+    // it just invented.
+    const char* p = path;
+    if (!p || !p[0]) return 0;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        char comp[FS_NAME_LEN];
+        int n = 0;
+        while (*p && *p != '/' && n < FS_NAME_LEN - 1) comp[n++] = *p++;
+        comp[n] = 0;
+        // mkfs.cd() is the directory-entry primitive here: it resolves the
+        // name under the current g_cwd, verifies FS_TYPE_DIR, and moves g_cwd.
+        // (mkfs.find only compares names, so it would happily return a regular
+        // file and let a "save into" picker point at a file.)
+        if (mkfs.cd(comp) != 0) return -1;
+    }
+    return 0;
+}
+
+static int gui_cb_cwd_path(int fs, char* buf, int size) {
+    if (!buf || size <= 0) return 0;
+    buf[0] = 0;
+    if (!mkfs.mounted) return 0;
+    // The 64-bit mkfs keeps no ancestor chain, so the honest answer is the
+    // volume root plus the CURRENT directory name.  Reporting a fabricated
+    // multi-level path would be worse than reporting what is actually known.
+    const char* vol = (fs == 3) ? "Desktop" : "MKFS";
+    int pos = 0;
+    for (const char* p = vol; *p && pos < size - 1; p++) buf[pos++] = *p;
+    // mkfs.cwd_name(buf, maxlen) already exists and writes the CURRENT
+    // directory's name (or "/" at the root), so no extra accessor is needed.
+    char cur[FS_NAME_LEN];
+    cur[0] = 0;
+    mkfs.cwd_name(cur, FS_NAME_LEN);
+    if (cur[0] && strcmp_(cur, "/") != 0) {
+        if (pos < size - 1) buf[pos++] = '/';
+        for (int i = 0; cur[i] && pos < size - 1; i++) buf[pos++] = cur[i];
+    }
+    buf[pos] = 0;
+    return pos;
+}
+
+// Write a file, mirroring kernel.cpp's gui_cb_write_file.
+//
+// WHY THIS EXISTS: the 64-bit kernel declared `write_file` in its callback
+// struct but never assigned it, so h_write_text's `if (!g_h.write_file)
+// return -1;` always fired.  Every Ctrl+S in the 64-bit desktop Notepad has
+// been reporting "[EDITOR] SAVE FAILED" and writing nothing -- the 32-bit
+// kernel had this callback (kernel.cpp:10037), the 64-bit one did not.  Editing
+// text worked, saving silently did not.
+//
+// fs type contract, identical to the 32-bit side:
+//   0 = MKFS root (read/write)     3 = Desktop folder inside MKFS (read/write)
+//   1 = SFS, 2 = FAT32             read-only volumes, refused with EROFS
+//
+// EROFS is defined here rather than inherited from kernel.cpp: the two kernels
+// are separate translation units and only kernel.cpp carries that macro.
+// The value matches kernel.cpp:9502 exactly so the managed side (which compares
+// against the same negative code) keeps one contract.
+#define KERN_EROFS (-30)
+static int gui_cb_write_file(int fs_type, const char* name, const uint8_t* buf, int size) {
+    while (name && *name == ' ') name++;
+    if (!name || !name[0]) return -1;
+    if (fs_type == 3) {                       // Desktop folder lives inside MKFS
+        if (!mkfs.mounted) return -1;
+        int di = mkfs.find("Desktop");
+        if (di < 0) return -1;
+        uint16_t saved = g_cwd; g_cwd = (uint16_t)di;
+        int r = mkfs.create(name, buf, size);
+        g_cwd = saved;
+        return r;
+    }
+    if (fs_type != 0) {                       // SFS(1) / FAT32(2) = read-only
+        serial_puts("[FS] EROFS write refused fs=");
+        // serial_putdec is defined at line 121 (serial_puts_dec only appears later,
+        // at 6787, so it is not visible here).
+        serial_putdec((uint32_t)fs_type);
+        serial_puts(" path=");
+        serial_puts(name);
+        serial_puts("\n");
+        return KERN_EROFS;
+    }
+    if (!mkfs.mounted) return -1;
+    return mkfs.create(name, buf, size);
+}
+
 static int gui_cb_remove(int fs, const char* name) {
     while (name && *name == ' ') name++;
     if (!name || !name[0]) return -1;
@@ -6269,6 +6653,9 @@ static void register_gui_callbacks(void) {
     cb.shutdown            = cmd_shutdown;
     cb.reboot              = cmd_reboot;
     // File-mutation (context-menu New Folder / Rename / Delete) + exec.
+    cb.write_file          = gui_cb_write_file;   // Notepad Ctrl+S etc.
+    cb.cwd_path            = gui_cb_cwd_path;     // File Explorer / Save-as picker
+    cb.enter_path          = gui_cb_enter_path;   // navigate to a folder to save into
     cb.mkdir               = gui_cb_mkdir;
     cb.remove              = gui_cb_remove;
     cb.rename              = gui_cb_rename;
@@ -6285,6 +6672,12 @@ static void register_gui_callbacks(void) {
     cb.get_bga_available   = gui_cb_bga_available;
     cb.get_vbe_mode_set    = gui_cb_vbe_mode_set;
     // Graphical lock screen (Login.cs).
+    // Audio output: this kernel has the HD Audio driver (the 32-bit one has
+    // no room for it).  hda_init() returns 0 when no codec responds, and the
+    // managed side reports that honestly rather than pretending to play.
+    cb.audio_available     = hda_available;
+    cb.audio_play          = hda_play_pcm;
+    cb.audio_info          = hda_report;
     cb.login_check         = gui_cb_login_check;
     cb.login_uid           = gui_cb_login_uid;
     cb.user_count          = gui_cb_user_count;
@@ -6483,8 +6876,17 @@ static void fb_mapping_selfcheck(void){
     serial_puts(" fb32="); serial_hex(fb32); serial_puts("\n");
 
     if (fb64 <= 0xFFFFFFFFULL) {
-        serial_puts("[FBMAP] low framebuffer: covered by the 0-8GiB identity pages\n");
-        fbmap_report("low-fb", (uint64_t)(fb64 ? fb64 : fb32));
+        // VBox-safe: do NOT walk the tables for the low VBE framebuffer.  The
+        // mapping is already proven on this boot by a direct CR3/PDPT dump
+        // (pdpt0 = 0xE3 for VA 0-1 GiB, pdpt3 = 0xC0000093 for VA 3-4 GiB, both
+        // 1 GiB pages), and halting just BEFORE this function keeps the VM
+        // "running" while halting just after it still dies -- so the fault is
+        // inside this block.  It kills VirtualBox with Guru Meditation 1155 and
+        // NO exception record at all (empty LBA1500 fault block, no
+        // [DIAG-FAULT]), while a deliberate #PF at the same point DOES print a
+        // full dump: this is not a dispatchable guest fault.  The real check is
+        // for >4 GiB UEFI GOP framebuffers, which still runs below.
+        serial_puts("[FBMAP] low framebuffer: identity-mapped (probe skipped)\n");
         return;
     }
 
@@ -6800,13 +7202,27 @@ extern "C" void vec_last_err(int* code, int* got, int* stb){
 #define VMCB_EXC_INTERCEPT      0x008u
 #define VMCB_WORD3_INTERCEPT    0x00Cu
 #define VMCB_WORD4_INTERCEPT    0x010u
-#define VMCB_IOPM_BASE_PA       0x030u
-#define VMCB_MSRPM_BASE_PA      0x038u
-#define VMCB_ASID               0x048u
-#define VMCB_TLB_CTL            0x04Cu
-#define VMCB_EXITCODE           0x058u   /* u64 */
-#define VMCB_EXITINFO1          0x060u
-#define VMCB_EXITINFO2          0x068u
+/* NOTE (2026-11-01): the next group was 0x18 too low, inherited from vmm.cpp.
+ * The authoritative layout is QEMU's target/i386/svm.h struct vmcb_control_area
+ * (QEMU_PACKED), which implements the AMD APM layout byte-for-byte:
+ *   0x040 iopm_base_pa(u64)  0x048 msrpm_base_pa(u64)  0x050 tsc_offset(u64)
+ *   0x058 asid(u32)          0x05C tlb_ctl(u8)         0x060 int_ctl(u32)
+ *   0x064 int_vector         0x068 int_state          0x070 exit_code(u64)
+ *   0x078 exit_info_1(u64)   0x080 exit_info_2(u64)   0x088 exit_int_info
+ *   0x08C exit_int_info_err  0x090 nested_ctl(u64)    0x0A0 nRIP
+ *   0x0A8 event_inj          0x0AC event_inj_err
+ * The intercept u64 at 0x00C was already correct, and the SAVE area really does
+ * start at 0x400 -- this file's VMCB_SAVE_* constants were right all along.
+ * Do NOT "shift" anything by +0x18: that assumption was wrong and a dual-write
+ * based on it actively corrupted msrpm_base_pa and tsc_offset. */
+#define VMCB_IOPM_BASE_PA       0x040u
+#define VMCB_MSRPM_BASE_PA      0x048u
+#define VMCB_ASID               0x058u
+#define VMCB_TLB_CTL            0x05Cu
+#define VMCB_INT_CTL            0x060u
+#define VMCB_EXITCODE           0x070u   /* u64 */
+#define VMCB_EXITINFO1          0x078u
+#define VMCB_EXITINFO2          0x080u
 #define VMCB_NEXT_RIP           0x0A0u
 #define VMCB_EVENT_INJ          0x0A8u
 #define VMCB_CLEAN              0x0F8u
@@ -6831,7 +7247,7 @@ extern "C" void vec_last_err(int* code, int* got, int* stb){
 #define VMCB_SAVE_RIP           0x578u
 #define VMCB_SAVE_RSP           0x5D8u
 #define VMCB_SAVE_RAX           0x5F8u
-#define VMCB_SAVE_CR2           0x618u
+#define VMCB_SAVE_CR2           0x618u   /* spec 0x640: low, but NOT on this bring-up path (flagged, not fixed) */
 
 #define SVM_EXITCODE_IOIO       0x7Bu
 #define SVM_EXITCODE_HLT        0x78u
@@ -6973,14 +7389,23 @@ static void svmk_build_vmcb(void){
     uint8_t* v = (uint8_t*)(uintptr_t)g_svm64.vmcb_pa;
     svmk_memzero(v, SVM_PAGE_SIZE);
 
-    /* control intercepts: word3 bit23 = HLT, bit31 = IOIO_PROT (all port I/O)
-     * word4 bit0 = VMRUN (MANDATORY: VMRUN fails with #VMFAILVALID unless it
-     * intercepts itself), bits1-4 VMMCALL/VMLOAD/VMSAVE/STGI/CLGI. */
-    vm_put32_(v, VMCB_WORD3_INTERCEPT, (1u << 23) | (1u << 31));
+    /* control intercepts.  A bitmap bit number IS its exit code (AMD APM
+     * Vol 2 App. C), i.e. for word3 the bit is (exit_code - 96):
+     *   word3 (0x0C, global 96..127): HLT = 0x78 -> bit 24, IOIO_PROT = 0x7B
+     *     -> bit 27.  (bit 23 is PAUSE and bit 31 is SHUTDOWN -- the old
+     *     (1<<23)|(1<<31) meant neither HLT nor port I/O ever trapped.)
+     *   word4 (0x10, global 128..159): VMRUN = 0x80 -> bit 0 (MANDATORY:
+     *     VMRUN fails with #VMFAILVALID unless it intercepts itself),
+     *     bits1-4 VMMCALL/VMLOAD/VMSAVE/STGI/CLGI.
+     * Fixed 2026-10-31; the same bug was in vmm.cpp and svm_driver.c. */
+    vm_put32_(v, VMCB_WORD3_INTERCEPT, (1u << 24) | (1u << 27));
     vm_put32_(v, VMCB_WORD4_INTERCEPT, 0x0000001Fu);
     vm_put32_(v, VMCB_IOPM_BASE_PA,  g_svm64.iopm_pa);
     vm_put32_(v, VMCB_MSRPM_BASE_PA, g_svm64.msrpm_pa);
     vm_put32_(v, VMCB_ASID, 1);
+    /* (The old +0x18 ASID probe that stood here is deleted.  VMCB_ASID is now
+     * the spec offset 0x058, so that write would have landed on QEMU's
+     * exit_code at 0x070 -- it was removed before this build.) */
     vm_put32_(v, VMCB_TLB_CTL, 0);
     vm_put32_(v, VMCB_CLEAN, 0);          /* 0 = all state dirty: always reload */
 
@@ -7012,6 +7437,13 @@ static void svmk_build_vmcb(void){
     /* guest EFER: SVME must be SET in the guest's own EFER too, else the
      * VMCB is rejected; LME clear (32-bit no-paging guest). */
     vm_put32_(v, VMCB_SAVE_EFER, EFER_SVME);
+
+    /* (The +0x18 dual-write that stood here is DELETED.  The +0x18 premise was
+     * wrong: the control area was never uniformly shifted, it was missing 44
+     * bytes of reserved space after the 0x00C intercept u64 plus int_state and
+     * its reserved word.  Mirroring fields 0x18 high corrupted
+     * QEMU's msrpm_base_pa, tsc_offset, int_ctl, dr7, rflags, rip and five
+     * segment descriptors.  The constants above now carry the spec offsets. */
 }
 
 static void svmk_dump_vmcb(void){
@@ -7071,6 +7503,8 @@ static long svmk_vmrun(void){
 
     {
         const uint8_t* v = (const uint8_t*)(uintptr_t)g_svm64.vmcb_pa;
+        /* The constants above now carry the spec offsets (exit_code 0x070,
+         * exit_info_1 0x078), so no +0x18 adjustment is needed or wanted. */
         uint32_t e0 = vm_get32_(v, VMCB_EXITCODE);
         uint32_t e1 = vm_get32_(v, VMCB_EXITCODE + 4);
         uint32_t i0 = vm_get32_(v, VMCB_EXITINFO1);
@@ -7209,7 +7643,14 @@ typedef struct {
     uint32_t guest_pa;
     uint32_t uart_n;
     char     uart[SVM_UART_RING];
-    uint8_t  pad[512 - (4*9 + SVM_UART_RING)];
+    /* Raw snapshot of the VMCB control area (0x000-0x0FF) taken right after
+     * VMRUN returned.  QEMU's cpu_vmexit() writes control.exit_code BEFORE it
+     * exits, so if one of its rejection branches fired, 0xFFFFFFFF must be
+     * visible somewhere in here -- and WHICH offset it lands at tells us the
+     * layout QEMU actually uses (we read 0 at our assumed 0x058, which is the
+     * whole puzzle this experiment is meant to settle). */
+    uint8_t  vmcb[256];
+    uint8_t  pad[512 - (4*9 + SVM_UART_RING + 256)];
 } SvmLogRec;
 static_assert(sizeof(SvmLogRec) == 512u, "SVM log record must be exactly one sector");
 
@@ -7363,6 +7804,12 @@ static int svm_k64_bringup(void){
                 t = (t + 1u) % SVM_UART_RING;
             }
             rec.uart_n = n;
+        }
+        {
+            /* Snapshot the VMCB control area while the page is still ours:
+             * svmk_release_all() runs after this block. */
+            const uint8_t* vp = (const uint8_t*)(uintptr_t)g_svm64.vmcb_pa;
+            for (uint32_t k = 0; k < 256u; ++k) rec.vmcb[k] = vp[k];
         }
         {
             int wrc = blk_write_sector((uint64_t)SVM_LOG_LBA, &rec);
@@ -7667,6 +8114,70 @@ extern "C" void kmain64(){
         }
     }
 
+    // ---- Audio output (Intel HD Audio) -------------------------------
+    //  Runs here, after pmm_init/heap_init (the driver needs identity-mapped
+    //  static buffers, which are already valid by this point) and before the
+    //  GUI starts, so the Audio Player knows at first paint whether a codec
+    //  exists.  The driver is linked into THIS kernel only: the 32-bit
+    //  kernel's load window is full (68 bytes spare), so audio is a 64-bit
+    //  feature by construction.
+    serial_puts("[K64-A] Initializing HD Audio...\n");
+    {
+        int audio_ok = hda_init();
+        serial_puts(audio_ok ? "[K64-A] HD Audio ready\n"
+                             : "[K64-A] HD Audio unavailable (no codec / no controller)\n");
+
+        // ---- boot-time playback self-test ----------------------------
+        // The player needs a mouse click, and this VM is driven headless, so
+        // the only way to prove the OUTPUT path end to end is to push a short
+        // tone through it here.  A 440 Hz burst of 200 ms is enough: if the
+        // stream accepts the descriptor and advances LPIB, the whole chain
+        // (converter -> stream tag -> BDL -> DMA) is proven.  The result is
+        // written into the same trace file the managed side reads back.
+        if (audio_ok) {
+            // ALLOCATED, NOT STATIC.  .bss must end below HEAP_START (0x500000)
+            // and this kernel already sits close to it, so a 17 KiB static tone
+            // buffer pushed the link over:
+            //   "kernel64 .bss overruns HEAP_START"
+            // The same mistake the HDA DMA rings made earlier.  kmalloc is
+            // free-standing here and the buffer is used once at boot.
+            int16_t* tone = (int16_t*)kmalloc(4410 * 2 * sizeof(int16_t));
+            int frames = 4410;
+            if (!tone) {
+                serial_puts("[K64-A] selftest skipped (no memory for the tone)\n");
+                audio_ok = 0;
+            }
+            for (int i = 0; tone && i < frames; i++) {
+                // one cycle of a sine is overkill here; a square wave at 440 Hz
+                // is an unambiguous, audible signal and needs no float math.
+                int period = 44100 / 440;                     // 100 samples
+                int16_t s = ((i % period) < (period / 2)) ? 12000 : -12000;
+                tone[i * 2]     = s;
+                tone[i * 2 + 1] = s;
+            }
+            int played = tone ? hda_play_pcm(tone, frames) : -1;
+            serial_puts(played > 0 ? "[K64-A] playback self-test OK\n"
+                                   : "[K64-A] playback self-test FAILED\n");
+            hda_selftest_result(played, frames);
+        }
+
+        // Persist the probe trace to the MKFS data disk.
+        //
+        // The UART is shared and unlocked, so the HDA log interleaves with other
+        // boot output and arrives as garbage -- diagnosis was blocked on that.
+        // Writing the buffer to disk sidesteps the port entirely: this file is
+        // authored by the driver alone, so what it says really happened.
+        if (mkfs.mounted) {
+            static char hda_trace[1536];
+            hda_trace[0] = 0;
+            hda_report(hda_trace, (int)sizeof(hda_trace));
+            int wrote = mkfs.create("hda_trace.txt", (const uint8_t*)hda_trace,
+                                    (int)strlen_(hda_trace));
+            serial_puts(wrote >= 0 ? "[K64-A] trace -> hda_trace.txt\n"
+                                   : "[K64-A] trace write FAILED\n");
+        }
+    }
+
     term.set_color(make_color(GREEN,BLACK));
     term.write("Hello world from C++ 64-bit kernel!\n");
     serial_puts("[K64-5] Hello world written\n");
@@ -7856,7 +8367,7 @@ extern "C" void kmain64(){
                     } else {
                         // ----- Keyboard event -----
                         KbdEvent e = kbd.process(data);
-                        if(e.type == K_CHAR){
+                        if (e.type == K_CHAR) {
                             // ESC used to call gui_exit() here, so a single
                             // stray keypress tore the desktop down and looked
                             // like a crash.  It is now an ordinary key: the
@@ -7864,6 +8375,38 @@ extern "C" void kmain64(){
                             // terminal stays reachable through the Start menu
                             // / desktop "Terminal" shortcut.
                             gui_handle_key(e.ch);
+                        } else {
+                            // NON-CHARACTER KEYS WERE SILENTLY DROPPED HERE.
+                            //
+                            // The driver already distinguishes the arrows, Tab
+                            // and the Ctrl combos (enum KbdType), and the GUI
+                            // already exports handlers for them (gui_desktop_nav,
+                            // gui_toggle_start_menu) -- but this loop only
+                            // forwarded K_CHAR, so those handlers were never
+                            // called and had no callers anywhere in the tree.
+                            // Measured consequence: pressing Down twice on the
+                            // desktop changed ZERO pixels, and the second Win
+                            // keypress did nothing (the Start menu could be
+                            // opened but never closed from the keyboard).
+                            //
+                            // The scancodes are the driver's business; this
+                            // table is just the wiring from event to GUI.
+                            switch (e.type) {
+                                case K_UP:         gui_desktop_nav(1); break;
+                                case K_DOWN:       gui_desktop_nav(2); break;
+                                case K_LEFT:       gui_desktop_nav(3); break;
+                                case K_RIGHT:      gui_desktop_nav(4); break;
+                                case K_TAB:        gui_desktop_nav(5); break;
+                                case K_PAGEUP:     gui_desktop_nav(1); break;
+                                case K_PAGEDN:     gui_desktop_nav(2); break;
+                                case K_HOME:       gui_desktop_nav(1); break;
+                                case K_END:        gui_desktop_nav(2); break;
+                                case K_WIN:        gui_toggle_start_menu(); break;
+                                // Win key: the driver reports it as K_WIN
+                                // (added below) precisely so the desktop can
+                                // toggle the Start menu with one keypress.
+                                default: break;
+                            }
                         }
                     }
                 }

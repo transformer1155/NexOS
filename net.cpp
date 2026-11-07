@@ -1546,11 +1546,65 @@ static void handle_tcp_client(const IpHeader* ip, const TcpHeader* tcp,
     }
 }
 
-// Send data on client connection
+// Send data on client connection.
+//
+// The state guard accepts TCPC_RECEIVING as well: the HTTP client only ever
+// sends a request and then reads a response, so "send is only legal while
+// ESTABLISHED" was harmless there.  TLS is a back-and-forth protocol (send
+// ClientHello, receive ServerHello, send Finished), so after the first read
+// the connection sits in RECEIVING and every later send would be silently
+// dropped -- a hang with no error message.
 static void tcp_client_send(const uint8_t* data, int len){
-    if (tcp_client.state != TCPC_ESTABLISHED) return;
+    if (tcp_client.state != TCPC_ESTABLISHED &&
+        tcp_client.state != TCPC_RECEIVING) return;
     tcp_client_send_raw(TCP_ACK | TCP_PSH, data, len);
     tcp_client.seq += len;
+}
+
+// ---- TLS transport hooks (used by net_tls.cpp) -----------------------
+// These expose the single kernel TCP client to the TLS 1.3 record layer as a
+// blocking byte stream.  Kept tiny and dumb on purpose: all protocol
+// knowledge lives in tls13.cpp.
+extern "C" int net_tcp_open(const char* host, int port){
+    if (!host || !host[0] || port <= 0 || port > 65535) return -1;
+    if (!nic_present || !g_net_up) return -1;
+    tcp_client_connect(host, (uint16_t)port);
+    int guard = 0;
+    while (tcp_client.state == TCPC_SYN_SENT ||
+           tcp_client.state == TCPC_DNS_RESOLVING){
+        net_poll();
+        if (++guard > 20000000) return -1;
+    }
+    return (tcp_client.state == TCPC_ESTABLISHED) ? 0 : -1;
+}
+
+extern "C" int net_tcp_write(const uint8_t* data, int len){
+    if (!data || len <= 0) return -1;
+    if (tcp_client.state != TCPC_ESTABLISHED &&
+        tcp_client.state != TCPC_RECEIVING) return -1;
+    tcp_client_send(data, len);
+    return len;
+}
+
+// Blocking read: drives net_poll until bytes arrive, peer closes, or timeout.
+// Returns >0 bytes, 0 on clean close, <0 on error.
+extern "C" int net_tcp_read(uint8_t* buf, int maxlen){
+    if (!buf || maxlen <= 0) return -1;
+    int guard = 0;
+    while (tcp_client.rx_len == 0){
+        if (tcp_client.state == TCPC_COMPLETE || tcp_client.state == TCPC_IDLE)
+            return 0;
+        if (tcp_client.state == TCPC_ERROR) return -1;
+        net_poll();
+        if (++guard > 20000000) return -1;
+    }
+    int n = tcp_client.rx_len;
+    if (n > maxlen) n = maxlen;
+    net_memcpy(buf, tcp_client.rx_buf, n);
+    if (n < tcp_client.rx_len)
+        net_memmove(tcp_client.rx_buf, tcp_client.rx_buf + n, tcp_client.rx_len - n);
+    tcp_client.rx_len -= n;
+    return n;
 }
 
 // Close client connection
@@ -2305,9 +2359,23 @@ extern "C" void net_poll(void);
 // network state machine (via net_poll) until the response is received or
 // errors out, then copies the body into out (NUL-terminated).  Returns the
 // number of bytes copied, or -1 on a bad URL / when already busy.
+// Shared no-network predicate (see the note inside net_http_get).
+static inline int net_cannot_http(void){
+    return (!nic_present || !g_net_up) ? 1 : 0;
+}
+
 extern "C" int net_http_get(const char* url, char* out, int outsize)
 {
     if (outsize > 0) out[0] = 0;
+
+    // Single predicate for the case where the HTTP layer cannot make progress:
+    // without a NIC, net_poll() returns immediately, so every wait loop would
+    // burn its whole budget and then report a timeout that looks like a slow
+    // server. Factored into ONE predicate because three copies cost 512 bytes
+    // of .text and the 32-bit kernel has only 36 bytes of headroom below the
+    // EBDA at 0x9FC00.
+    if (net_cannot_http()) return -1;
+
     if (httpc_get(url) != 0) return -1;          // busy or malformed URL
     int guard = 0;
     // Generous guard: an LLM endpoint (DeepSeek via the TLS proxy) can take
@@ -2349,6 +2417,17 @@ static inline uint64_t nhg_tsc(void) {
 extern "C" int net_http_get_budget(const char* url, char* out, int outsize, int max_ms)
 {
     if (outsize > 0) out[0] = 0;
+
+    /* Same fast fail as net_http_get(): with no NIC there is nothing for
+     * net_poll() to drive (its first line is `if (!nic_present) return;`), so
+     * the bounded loop below would still burn its FULL budget -- 8,000,000
+     * polls or max_ms of wall-clock -- before giving up.  The Browser's Go
+     * button is the interactive caller, so "burn the full budget" means "freeze
+     * the desktop for the whole budget".  Report the truth immediately instead.
+     * Checked before httpc_get() so we never leave httpc_state non-IDLE on a
+     * connection that cannot complete. */
+    if (net_cannot_http()) return -1;
+
     if (httpc_get(url) != 0) return -1;          // busy or malformed URL
     // ~3 GHz assumption: 3,000,000 ticks per millisecond.  Bounded either way.
     uint64_t deadline = nhg_tsc() + (uint64_t)max_ms * 3000000ULL;
@@ -2371,6 +2450,14 @@ extern "C" int net_http_get_budget(const char* url, char* out, int outsize, int 
 extern "C" int net_http_post(const char* url, const char* body, char* out, int outsize)
 {
     if (outsize > 0) out[0] = 0;
+
+    /* Same no-NIC fast fail as the GET paths.  This one backs the agent / LLM
+     * calls, which are the highest-value network users: without an NIC their
+     * 300M-poll loop spins doing nothing for minutes and then reports a
+     * timeout, which reads like "the model is slow" instead of "there is no
+     * network".  Answering immediately makes the real cause visible. */
+    if (net_cannot_http()) return -1;
+
     if (httpc_post(url, body) != 0) return -1;     // busy or malformed URL
     int guard = 0;
     // Generous guard: an LLM endpoint (DeepSeek via the TLS proxy) can take
@@ -2638,16 +2725,12 @@ static void url_decode(char* s){
         if (*s == '%' && s[1] && s[2]){
             int hi = s[1] >= 'A' ? s[1] - 'A' + 10 : s[1] - '0';
             int lo = s[2] >= 'A' ? s[2] - 'A' + 10 : s[2] - '0';
-            *d++ = (char)((hi << 4) | lo);
             s += 3;
         } else if (*s == '+'){
-            *d++ = ' ';
             s++;
         } else {
-            *d++ = *s++;
         }
     }
-    *d = 0;
 }
 
 // Extract value from "key=value" body
@@ -2847,9 +2930,6 @@ static void http_screen(TcpConn* conn){
         return;
     }
     buf[0]='N'; buf[1]='X'; buf[2]='F'; buf[3]='B';
-    *(uint32_t*)(buf+4)  = fb.width;
-    *(uint32_t*)(buf+8)  = fb.height;
-    *(uint32_t*)(buf+12) = fb.format;
     uint8_t* p = buf + 16;
     uint8_t* pend = buf + need;
     const uint8_t* fb32 = (const uint8_t*)(uintptr_t)fb.phys;
@@ -2866,16 +2946,12 @@ static void http_screen(TcpConn* conn){
             else {
                 if (cnt>0){
                     if (p+5 > pend){ y=fb.height; x=fb.width; break; }
-                    *p++=(uint8_t)(cnt&0xFF); *p++=(uint8_t)((cnt>>8)&0xFF);
-                    *p++=r; *p++=g; *p++=b;
                 }
                 r=nr; g=ng; b=nb; cnt=1;
             }
         }
     }
     if (cnt>0 && p+5<=pend){
-        *p++=(uint8_t)(cnt&0xFF); *p++=(uint8_t)((cnt>>8)&0xFF);
-        *p++=r; *p++=g; *p++=b;
     }
     if (p+2<=pend){ *p++=0; *p++=0; }   /* terminator */
     uint32_t len = (uint32_t)(p - buf);
@@ -3414,7 +3490,7 @@ static int mcp_json_value(const char* body, const char* key, char* out, int outs
                 if (*p == 34) p++;
             } else {
                 while (*p && *p != ',' && *p != '}' && *p != ' ' &&
-                       *p != '\t' && *p != '\n' && *p != '\r' && i < outsize - 1)
+                       i < outsize - 1)
                     out[i++] = *p++;
             }
             out[i] = 0;
@@ -4158,7 +4234,6 @@ static void bn_add_mod(Bn* r, const Bn* a, const Bn* b, const Bn* m){
             t.w[i] = (uint32_t)s; carry = (s >> 32) & 1;
         }
     }
-    *r = t;
 }
 // r = (a - b) mod m  (a,b < m)
 static void bn_sub_mod(Bn* r, const Bn* a, const Bn* b, const Bn* m){
@@ -4175,7 +4250,6 @@ static void bn_sub_mod(Bn* r, const Bn* a, const Bn* b, const Bn* m){
             t.w[i] = (uint32_t)s; borrow = s >> 32;
         }
     }
-    *r = t;
 }
 // Full 2048x2048 -> 4096-bit product into a 128-word (little-endian) buffer.
 static void bn_full_mul(const Bn* a, const Bn* b, uint32_t out[BN_WORDS*2]){
@@ -4291,7 +4365,6 @@ static void bn_pow_mod(Bn* r, const Bn* a, const Bn* e, const Bn* m){
         }
         bn_mul_mod(&base, &base, &base, m);
     }
-    *r = result;
 }
 
 // DH group14 prime (RFC 3526, 2048-bit MODP group) -- correct 256-byte value
@@ -4692,7 +4765,6 @@ static int ssh_try_parse(SshSession* s, uint8_t** payload_out){
         pd[pn++]='\n'; net_serial(pd);
     }
     if (payload_len < 0) return -2;
-    *payload_out = s->pb + 5;
     return payload_len;
 }
 

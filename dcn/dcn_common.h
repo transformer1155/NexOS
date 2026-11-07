@@ -21,6 +21,10 @@ extern "C" {
 #define DCN_MAX_NODES    64
 #define DCN_MAX_BLOCKS   256
 #define DCN_MAX_NAME     64
+/* Largest payload one TASK/block may carry. A worker holds input and result
+   in fixed 4 KiB buffers and DCN_OP_ECHO returns exactly as many bytes as it
+   received, so the dispatcher AND the worker must both reject anything larger. */
+#define DCN_MAX_PAYLOAD  4096
 #define DCN_MIC_LEN      16
 #define DCN_PMK_LEN      32
 #define DCN_PTK_LEN      64

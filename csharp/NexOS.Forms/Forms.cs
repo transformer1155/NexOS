@@ -108,6 +108,22 @@ namespace NexOS.Forms
         // (AI desktop thinking dots / typewriter reveal) can progress.
         // The GUI loop throttles render_all() to ~30 fps while set.
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void SetAnim(int on);
+        // Drop the host's cached wallpaper/desktop-layer copy.  The host keeps a
+        // full-screen snapshot of the managed desktop and re-blits it instead of
+        // re-running the (expensive) managed paint; anything that changes the
+        // wallpaper CONTENT must invalidate it or the host keeps showing the old
+        // frame.  The desktop switch (classic <-> AI desktop) and the animated AI
+        // desktop (which redraws every frame) are the two callers.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void WallInvalid();
+        // Current content scroll offset applied to this paint (0 when the window
+        // is not scrolled).  The host shifts every primitive by (-panX,-panY);
+        // viewport-fixed chrome must add it back to stay pinned.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int PanX();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int PanY();
+        // Number of user wallpapers packed from assets/wallpapers/ (see
+        // tools/tex_pack.py).  Wallpaper index 0 is the built-in one, then
+        // 1..count are the folder's images in sorted file-name order.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int WallpaperCount();
         // Push the already-painted backbuffer to the screen right now.  Used by
         // the "semi-blocking" pattern: draw a busy placeholder, Repaint() it,
         // then run the long blocking call -- the placeholder stays visible for
@@ -131,6 +147,18 @@ namespace NexOS.Forms
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int FileCount(int fs);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern string FileName(int fs, int idx);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int FileIsDir(int fs, int idx);
+        // Folder navigation: idx < 0 = volume root, else the listing entry to
+        // enter (must be a directory).  DirUp returns 1 at the volume root.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int EnterDir(int fs, int idx);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int DirUp(int fs);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern string CwdPath(int fs);
+        // Re-assert a window's directory (each Explorer instance keeps its own).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int EnterPath(int fs, string path);
+        // Chunked copy support: size / type by name, and a byte-range copy so a
+        // large file streams in pieces (and a progress bar can be painted).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int FileSize(int fs, string name);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int IsDirByName(int fs, string name);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int CopyRange(int srcFs, string srcPath, string name, int dstFs, string dstPath, int off, int len);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int FileRefresh();
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern string ReadText(int fs, string name);
         // Raw bytes of a file as a lower-case hex string (2 chars/byte), so a
@@ -169,6 +197,14 @@ namespace NexOS.Forms
         // (e.g. Notepad from the File Explorer): Shell.Open() alone would
         // only create a C# instance with no native window to paint it.
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void OpenApp(int kind);
+        // Multi-instance: always opens another window of that app instead of
+        // focusing the existing one (two File Explorers side by side).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void OpenAppNew(int kind);
+        // Focus the window that hosts this managed instance (one taskbar button
+        // per live window, so multi-instance apps stay reachable).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void ActivateManaged(int mid);
+        // Show/hide the drag ghost (the dragged file follows the pointer).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void DragGhost(int on, string name);
         // Ask the kernel to close every window of this Kind (taskbar
         // right-click "Close window" / "End process").
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void CloseApp(int kind);
@@ -196,6 +232,15 @@ namespace NexOS.Forms
         // Push the retro "pixel / CRT monitor" settings down to the kernel
         // framebuffer post-process: mode (on/off), scale (block size), scan (scanlines).
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void   SetPixel(int mode, int scale, int scan);
+        // P2 text-gamma selector for the 64-bit glyph rasteriser.
+        //   sel: 0 = off (historical look), 1 = 1.15, 2 = 1.30, 3 = 1.45.
+        //   Any other value falls back to 2; the value actually stored is
+        //   returned so the caller can show what took effect.
+        // 64-BIT ONLY: the kernel implementation and its registration both live
+        // inside `#if defined(__x86_64__)` in mforms.cpp, so this icall is NOT
+        // bound in the 32-bit image.  Calling it there would fault, so every
+        // call site must be guarded by `if (Host.Is64Bit() != 0)`.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int    SetTextGamma(int sel);
         // Toggle "whole window fully transparent":  on != 0 drops every window's
         // glassy chrome to zero opacity so the desktop shows straight through it.
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void   SetWindowTransparent(int on);
@@ -236,6 +281,20 @@ namespace NexOS.Forms
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int LinuxInput(int mx, int my, int buttons, int key);
         // LinuxBlit: host-side row-by-row blit from LinuxGuestFB into managed window.
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int LinuxBlit(int dstX, int dstY, int dstW, int dstH, int srcX, int srcY);
+
+        // ---- audio output -------------------------------------------------
+        // Only the 64-bit kernel has a sound driver (the 32-bit one's load
+        // window is full), so AudioAvailable() is 0 there and every caller
+        // MUST check it before offering playback controls.
+        //
+        //   AudioAvailable()   1 when an HD Audio codec is up.
+        //   AudioInfo()        one-line driver status for the Control Panel.
+        //   AudioPlay(pcm, n)  pcm is a string holding 16-bit little-endian
+        //                      stereo samples; n is the frame count offered.
+        //                      Returns bytes consumed, or -1 when unavailable.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int AudioAvailable();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern string AudioInfo();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int AudioPlay(string pcm, int nframes);
     }
 #endif // !WINHOST
 
@@ -397,6 +456,10 @@ namespace NexOS.Forms
         public const uint AccentHi  = 0x0B6FB8;   // hovered accent (accent @0.90)
         public const uint AccentLo  = 0x0A639F;   // pressed accent (accent @0.80)
         public const uint AccentText= 0x0067C0;   // WinUI3 AccentTextFill
+        // Ink for text drawn on a WHITE panel (input boxes, dialogs).  The
+        // desktop's own Ink is near-white, so reusing it on a white input box
+        // produced invisible text -- always use this on light surfaces.
+        public const uint OnLight   = 0xFF1B1B1B;
         public const uint Text      = 0x171717;   // primary text (rgba(0,0,0,0.89))
         public const uint TextSub   = 0x5E5E5E;   // secondary text (rgba(0,0,0,0.62))
         public const uint TextFaint = 0x737373;   // tertiary/disabled (rgba(0,0,0,0.45))
@@ -419,6 +482,10 @@ namespace NexOS.Forms
     {
         public static uint  WallTop   = 0x218FD9;   // wallpaper gradient top (Win11 blue)
         public static uint  WallBot   = 0x05216B;   // wallpaper gradient base (Win11 deep blue)
+        // Which wallpaper to draw: 0 = original bloom texture, 1 = mesh
+        // gradient, 2 = dusk ridge.  Cycled from the desktop right-click menu
+        // and persisted in nexos.cfg.
+        public static int   WallIdx   = 0;
         public static uint  Accent    = 0x0067C0;   // primary accent (standard WinUI 3 blue)
         public static int    Dark      = 1;         // 0 light, 1 dark (default dark)
         public static int    TaskbarLeft = 0;       // 0 centred, 1 left-aligned
@@ -439,6 +506,26 @@ namespace NexOS.Forms
         public static int    PixelMode  = 1;
         public static int    PixelScale = 1;
         public static int    PixelScan  = 0;
+        // P2: glyph anti-aliasing gamma for the 64-bit rasteriser.
+        //   0 = off, 1 = 1.15, 2 = 1.30 (default), 3 = 1.45.
+        // Only meaningful where Host.SetTextGamma exists (64-bit); the 32-bit
+        // image has no such icall and simply ignores this value.
+        // NOTE: the "= GammaDefault" below is DOCUMENTATION ONLY under MiniCLR --
+        // static initialisers never run (measured: "NOT APPLIED (0/4) | pStr=null"),
+        // so the value really has to be established by Theme.Load(), which primes it
+        // before parsing nexos.cfg.  0 is a *legal* selector ("off"), so an unprimed
+        // 0 would silently ship the feature disabled AND persist that wrong value.
+        public const  int    GammaDefault = 2;
+        public static int    TextGamma  = GammaDefault;
+
+        // Clamp a gamma selector coming from the cfg file (or anywhere else).
+        // Out-of-range and unparseable values (ParseInt returns 0 for junk, so a
+        // corrupt cfg would otherwise look like "off") fall back to 1.30.
+        // Range test written without `v + 1` so it cannot overflow.
+        public static int ClampGamma(int v)
+        {
+            return (v >= 0 && v <= 3) ? v : GammaDefault;
+        }
         // BUG-3: device pixel ratio used by the kernel font rasteriser.
         // 1 = rasterise 1:1 (fastest), 2 = supersample 2x and box-filter down
         // (sharpest small glyphs -- the default), 3/4 = even smoother at more
@@ -471,7 +558,26 @@ namespace NexOS.Forms
         //  format is one "key=value" line per field; values are plain
         //  decimal integers (colours fit in a signed int: max 0xFFFFFF).
         // -----------------------------------------------------------------
-        public static string CfgName = "nexos.cfg";
+        // const, NOT static.  The mini-CLR does not run static field
+        // initialisers (measured by InitProbe: they are dropped), and a dropped
+        // string literal becomes NULL -- which handed Host.WriteText/ReadText an
+        // empty file name and silently broke settings persistence, because the
+        // literal is the only place this name was ever assigned.  `const` is
+        // inlined at compile time and is not a static field at all, so it is
+        // immune to that whole class of bug.  Same pattern as Desktop.cs's
+        // `const string CFG_NAME`.
+        public const string CfgName = "nexos.cfg";
+
+        // Advance to the next built-in wallpaper.  The caller invalidates the
+        // host's cached desktop layer so the new image is painted immediately.
+        public static void CycleWallpaper()
+        {
+            // 1 built-in wallpaper + however many PNGs are in assets/wallpapers/.
+            int total = 1 + Host.WallpaperCount();
+            if (total < 1) total = 1;
+            WallIdx = (WallIdx + 1) % total;
+            Save();
+        }
 
         public static void Save()
         {
@@ -481,6 +587,9 @@ namespace NexOS.Forms
             cfg = NexOS.Sys.StrConcat(cfg, "\n");
             cfg = NexOS.Sys.StrConcat(cfg, "wallbot=");
             cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr((int)WallBot));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "wallidx=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(WallIdx));
             cfg = NexOS.Sys.StrConcat(cfg, "\n");
             cfg = NexOS.Sys.StrConcat(cfg, "accent=");
             cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr((int)Accent));
@@ -515,6 +624,9 @@ namespace NexOS.Forms
             cfg = NexOS.Sys.StrConcat(cfg, "fontdpr=");
             cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(FontDpr));
             cfg = NexOS.Sys.StrConcat(cfg, "\n");
+            cfg = NexOS.Sys.StrConcat(cfg, "textgamma=");
+            cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(TextGamma));
+            cfg = NexOS.Sys.StrConcat(cfg, "\n");
             cfg = NexOS.Sys.StrConcat(cfg, "widgetson=");
             cfg = NexOS.Sys.StrConcat(cfg, NexOS.Sys.IntToStr(WidgetsOn));
             cfg = NexOS.Sys.StrConcat(cfg, "\n");
@@ -532,6 +644,13 @@ namespace NexOS.Forms
 
         public static void Load()
         {
+            // Establish the default FIRST.  Static initialisers are dropped by
+            // MiniCLR (see Theme.TextGamma above), so without this line TextGamma
+            // would still be 0 when ApplyPixel() pushes it, and 0 means "gamma off"
+            // -- the feature would ship disabled on a fresh install and the wrong
+            // value would then be persisted to nexos.cfg by the first Save().
+            // Parsing the cfg below still overrides it, so a saved choice wins.
+            TextGamma = GammaDefault;
             string s = Host.ReadText(0, CfgName);
             if (s == null) return;
             if (NexOS.Sys.StrLen(s) == 0) return;
@@ -550,6 +669,7 @@ namespace NexOS.Forms
                 if      (NexOS.Sys.StrEq(key, "walltop"))     WallTop     = (uint)v;
                 else if (NexOS.Sys.StrEq(key, "wallbot"))     WallBot     = (uint)v;
                 else if (NexOS.Sys.StrEq(key, "accent"))      Accent      = (uint)v;
+                else if (NexOS.Sys.StrEq(key, "wallidx"))     WallIdx = (v >= 0 && v <= 2) ? v : 0;
                 else if (NexOS.Sys.StrEq(key, "dark"))        Dark        = v;
                 else if (NexOS.Sys.StrEq(key, "taskbarleft")) TaskbarLeft = v;
                 else if (NexOS.Sys.StrEq(key, "showlabels"))  ShowLabels  = v;
@@ -560,10 +680,49 @@ namespace NexOS.Forms
                 else if (NexOS.Sys.StrEq(key, "pixelscale"))  PixelScale = (v > 1) ? v : 1;
                 else if (NexOS.Sys.StrEq(key, "pixelscan"))   PixelScan  = v;
                 else if (NexOS.Sys.StrEq(key, "fontdpr"))     FontDpr = (v >= 1 && v <= 4) ? v : 2;
+                else if (NexOS.Sys.StrEq(key, "textgamma"))
+                {
+                    // A corrupt value must NOT reach the clamp: ParseInt("abc")
+                    // returns 0 and 0 is a legitimate selector ("off"), so without
+                    // this shape check a damaged cfg silently disables gamma.
+                    // An out-of-range number is still handled by ClampGamma.
+                    TextGamma = LooksLikeInt(val) ? ClampGamma(v) : GammaDefault;
+                }
                 else if (NexOS.Sys.StrEq(key, "widgetson"))   WidgetsOn = v;
                 else if (NexOS.Sys.StrEq(key, "termcellh"))   { TermCellH = v; if (TermCellH < 12) TermCellH = 12; if (TermCellH > 28) TermCellH = 28; }
                 else if (NexOS.Sys.StrEq(key, "termbgmode"))  TermBgMode = v;
             }
+        }
+
+        // Boundary self-test for the gamma persistence path.  Called once from
+        // Shell.Init() after Theme.Load(); prints exactly one line so it can be
+        // grepped from the serial log ("gamma selfcheck=").  It exercises the SAME
+        // ClampGamma / LooksLikeInt code the parser uses -- not a re-implementation
+        // -- so a pass means the shipped logic is right, and a fail names the case.
+        // Expect: 16 ok cases, bad=0.
+        public static int GammaSelfCheck()
+        {
+            int bad = 0;
+            // valid selectors must pass through untouched, including 0 ("off")
+            if (ClampGamma(0) != 0) bad++;
+            if (ClampGamma(1) != 1) bad++;
+            if (ClampGamma(2) != 2) bad++;
+            if (ClampGamma(3) != 3) bad++;
+            // just outside the range on both sides, plus extremes -> default 2
+            if (ClampGamma(4) != GammaDefault) bad++;
+            if (ClampGamma(-1) != GammaDefault) bad++;
+            if (ClampGamma(99) != GammaDefault) bad++;
+            if (ClampGamma(2147483647) != GammaDefault) bad++;
+            if (ClampGamma(-2147483648) != GammaDefault) bad++;
+            // shape checks: what the parser refuses before it even clamps
+            if (LooksLikeInt("0") != true) bad++;
+            if (LooksLikeInt("3") != true) bad++;
+            if (LooksLikeInt("-1") != true) bad++;
+            if (LooksLikeInt("") != false) bad++;
+            if (LooksLikeInt("abc") != false) bad++;
+            if (LooksLikeInt("2x") != false) bad++;
+            if (LooksLikeInt("-") != false) bad++;
+            return bad;
         }
 
         // Push the current pixel-mode settings to the kernel framebuffer
@@ -576,11 +735,36 @@ namespace NexOS.Forms
             // pre-rendered font look blurred: the post-process quantised every
             // glyph coverage ramp to 5/6/5 bits.
             Host.SetDpi(FontDpr);
+            // P2 text gamma.  Guarded because the icall only exists in the
+            // 64-bit build (see the declaration above); the assignment keeps
+            // Theme in sync with whatever the kernel actually accepted.
+            if (Host.Is64Bit() != 0) TextGamma = Host.SetTextGamma(TextGamma);
         }
 
         // Decimal (optionally signed) integer parse.  No BCL int.Parse in
         // MiniCLR, so this is a hand-rolled scanner over the managed string
         // API.  Stops at the first non-digit.
+        // True when s is a non-empty, optionally sign-prefixed decimal integer.
+        // Written with the managed string API only (MiniCLR has no ranges or
+        // foreach over strings) and it never allocates.
+        public static bool LooksLikeInt(string s)
+        {
+            int n = NexOS.Sys.StrLen(s), i = 0;
+            if (n == 0) return false;
+            char c0 = NexOS.Sys.StrCharAt(s, 0);
+            if (c0 == '-' || c0 == '+')
+            {
+                if (n < 2) return false;      // a bare sign is not a number
+                i = 1;
+            }
+            for (; i < n; i++)
+            {
+                char c = NexOS.Sys.StrCharAt(s, i);
+                if (c < '0' || c > '9') return false;
+            }
+            return true;
+        }
+
         private static int ParseInt(string s)
         {
             int n = NexOS.Sys.StrLen(s), i = 0, v = 0, sign = 1;
@@ -610,6 +794,9 @@ namespace NexOS.Forms
         public const int Menu   = 2;
         public const int Chrome = 3;
         public const int WinBg  = 4;
+        // User wallpapers: Tex.WallDyn + i, i = 0..Host.WallpaperCount()-1.
+        // The host loads a contiguous block starting at id 10 (TEX_WP_BASE).
+        public const int WallDyn = 10;
         public const int Icon   = 100;   // + Kind
     }
 
@@ -725,8 +912,17 @@ namespace NexOS.Forms
 
         // Flat window backdrop.
         public static void Clear() {
-            if (Gfx.HasImage(Tex.WinBg) != 0) Gfx.Image(Tex.WinBg, 0, 0, Gfx.Width(), Gfx.Height());
-            else Gfx.FillRect(0, 0, Gfx.Width(), Gfx.Height(), C.WinBg);
+        // VIEWPORT-LOCKED backdrop.
+        //
+        // The host implements window scrolling by shifting every primitive by
+        // (-panX,-panY), so a fill at (0,0) scrolls away with the content and leaves
+        // the strip it vacated unpainted -- the window's translucent glass then shows
+        // through ("the background disappears / turns transparent when scrolled").
+        // Filling at (panX,panY) cancels the shift and always lands exactly on the
+        // visible client area.
+        int px = Host.PanX(), py = Host.PanY();
+        if (Gfx.HasImage(Tex.WinBg) != 0) Gfx.Image(Tex.WinBg, px, py, Gfx.Width(), Gfx.Height());
+        else Gfx.FillRect(px, py, Gfx.Width(), Gfx.Height(), C.WinBg);
         }
 
         // A rounded card with a hairline border.
@@ -1012,6 +1208,15 @@ namespace NexOS.Forms
         public virtual void OnMouseUp(int btn, int mx, int my) { }
         public virtual void OnMouseMove(int mx, int my) { }
         public virtual void OnWheel(int dy) { }
+        // Window drag & drop (screen coords).  phase 0=press, 1=move, 2=release;
+        // hitId/hx/hy identify the managed window under the pointer on release,
+        // so an app can drop something into ANOTHER app window.
+        public virtual void OnDrag(int phase, int mx, int my, int hitId, int hx, int hy) { }
+        // Another window dropped a file on this one.  Apps that accept drops
+        // (File Explorer) override it; the default refuses.
+        // (Virtual dispatch instead of an 'as' cast: the mini CLR does not
+        // reliably implement isinst.)
+        public virtual int AcceptDrop(int srcFs, string srcPath, string name) { return -1; }
         public virtual string GetTitle() { return "App"; }
 
         // Context-menu hooks: the selected file in a file-browser window.

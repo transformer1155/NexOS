@@ -35,8 +35,9 @@ static int worker_cb(void* u, dcn_msg_t* m){
     uint32_t block_id = dcn_rd32be(m->data + 2);
     uint32_t plen     = dcn_rd32be(m->data + 6);
     if (plen > m->len - 10) return 0;                 /* malformed */
+    if (plen > DCN_MAX_PAYLOAD) return 0;             /* oversized: drop, never overflow out[] */
 
-    uint8_t out[4096];
+    uint8_t out[DCN_MAX_PAYLOAD];
     size_t  outlen = 0;
     if (dcn_op_run(op, m->data + 10, plen, out, &outlen) != DCN_OK)
         return 0;                                     /* unknown op -> drop */
@@ -81,6 +82,7 @@ int dcn_sched_dispatch(dcn_chunk_plan_t* p, dcn_discovery_t* d,
         if (b->node_idx < 0 || b->node_idx >= n) continue;
 
         /* TASK: [type][op][block_id:4][len:4][payload] */
+        if (b->len > DCN_MAX_PAYLOAD) continue;       /* cannot fit one TASK */
         const uint8_t* src = dcn_chunk_block_data(p, i);
         if (!src) continue;
         uint8_t* pkt = (uint8_t*)malloc(10 + b->len);

@@ -28,7 +28,7 @@ import os, sys, socket, time, subprocess
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
-IMG = sys.argv[1] if len(sys.argv) > 1 else "build/os.img"
+IMG = sys.argv[1] if len(sys.argv) > 1 else "build/os_v2.img"
 WORK = "build/foundation0.img"
 LOG = "build/serial_foundation0.log"
 PORT = 4453

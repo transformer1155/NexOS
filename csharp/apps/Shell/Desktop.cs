@@ -106,7 +106,12 @@ namespace NexOS.Forms
         // truth lives in a MKFS file ("installed.cfg") so the Control Panel
         // "Apps" page and the shell share one source of state across boots.
         static bool[]   Installed;        // index == Kind value (0..11)
-        const  int     KINDS = 15;
+        // Highest Kind is AudioPlayer = 17, so the arrays need 18 slots.
+        // This used to be 15 while Kind.WebView was already 15, so index 15
+        // was written past the end of kName/Installed (both sized [KINDS]).
+        const  int     KINDS = 18;
+        // Desktop icon slots (see the dKind/dName allocation in Init).
+        const  int     DMAX  = 20;
         // Public count so other apps (Control Panel "Apps & features") can
         // enumerate every registered Kind without a magic number.
         public static int KindCount { get { return KINDS; } }
@@ -136,6 +141,9 @@ namespace NexOS.Forms
         // whole desktop.  Track whether the panel is actually on screen and at
         // which rect, so the closing frame can repaint the wallpaper over it.
         static int startMenuDrawn = 0;                 // 1 = panel pixels on screen
+        // 1/2 = an open was requested while the close was still on screen: shut the
+        // old panel FIRST, erase it, then start the open (see BeginStartMenuOpen).
+        static int startMenuReopen = 0;
         static int smDrawnX, smDrawnY, smDrawnW, smDrawnH;
         // BUG-#11 (gap 3): frames of forced animation repaint still owed after a
         // virtual-desktop switch, so the last OPAQUE close frame reaches the LFB.
@@ -167,6 +175,14 @@ namespace NexOS.Forms
         // P2-15: Start-menu Pinned tile drag state.
         static int  dragKind = -1;   // Kind of the tile being dragged (-1 = none)
         static int  dragSrc  = -1;   // source index in dKind[]
+        // Drag & drop for the classic icon grid: per-icon positions, persisted
+        // to deskpos.cfg so a rearranged desktop survives a reboot.
+        // Taskbar: where the per-instance window buttons start and how many.
+        static int  runBarX = 0, runBarN = 0;
+        static int  dragIdx  = -1;     // icon being dragged (-1 = none)
+        static int  dragOffX, dragOffY; // grab offset inside the icon cell
+        static int[] dPosX, dPosY;
+        static bool[] dMoved;
         static bool dragging = false;
         const int START_KEY = 0x51ED270B; // stable Anim key for Start-menu open/close
         const int SCROLL_KEY = 0x6E1A2B3C;  // P0-3: eased All-apps list scroll offset
@@ -438,6 +454,7 @@ namespace NexOS.Forms
         // ---- context-menu action codes (dispatched by HandleAction) --
         public const int A_SORT_NAME  = 1, A_SORT_SIZE = 2, A_SORT_TYPE = 3, A_SORT_DATE = 4;
         public const int A_REFRESH    = 5, A_PERSONALIZE = 6, A_TERMINAL = 7, A_NEWFOLDER = 8;
+        public const int A_WALLPAPER  = 15;   // desktop: switch to the next built-in wallpaper
         public const int A_TASKMGR    = 9, A_TASKBAR = 10;
         public const int A_VOICE      = 11, A_NET_ETH = 12, A_NET_WIFI = 13, A_NET_SETTINGS = 14;
         public const int A_TASKS_BASE = 100;   // + kind for a running app
@@ -475,7 +492,7 @@ namespace NexOS.Forms
         public const int A_VIEW       = 30, A_NEW = 31, A_DISPLAY = 32, A_MORE = 33;
         public const int A_VIEW_LRG   = 34, A_VIEW_MED = 35, A_VIEW_SM = 36;
         public const int A_VIEW_ICONS = 37, A_VIEW_AUTO = 38, A_VIEW_GRID = 39;
-        public const int A_NEW_FOLDER = 40, A_NEW_SHC = 41;       // desktop "New folder" / "New shortcut"
+        public const int A_NEW_FOLDER = 40, A_NEW_SHC = 41, A_NEW_FILE = 42;       // desktop "New folder" / "New shortcut"
         // ---- Win+X power-user menu (right-click Start / taskbar) ----
         public const int A_WINX_BASE  = 500;   // + index into the WinX entry table
         // ---- taskbar jump-list actions (File Explorer pin) ----
@@ -512,10 +529,15 @@ namespace NexOS.Forms
         // -------------------------------------------------------------
         public static void Init()
         {
-            dKind = new int[16];
-            dName = new string[16];
-            dCol  = new int[16];
-            dLet  = new int[16];
+            // DMAX must exceed the number of Put() calls in LoadDefaults()
+            // PLUS every shortcut the user can drop on the desktop.  These were
+            // fixed at 16 while LoadDefaults() already Put() into index 14 (15
+            // entries), so only one spare slot remained and a couple of extra
+            // desktop shortcuts would have written past the end.
+            dKind = new int[DMAX];
+            dName = new string[DMAX];
+            dCol  = new int[DMAX];
+            dLet  = new int[DMAX];
             dN    = 0;
 
             // Desktop icons are read from the "Desktop" folder on MKFS.
@@ -550,6 +572,7 @@ namespace NexOS.Forms
             // 5036/7056 px of 0x0078D4 inside the icon cell, even with the
             // pointer parked far away) and completely hid the IconHot hover
             // feedback (0 px of 0x1D5A96 ever measured).
+            startMenuReopen = 0;
             selIdx         = -1;
             startRClickIdx = -1;
             // Same reason for the drag / file-menu sentinels: their field
@@ -564,6 +587,9 @@ namespace NexOS.Forms
             //     narrow -- the menu path itself always assigns these first.
             dragKind       = -1;
             dragSrc        = -1;
+            dPosX = new int[16]; dPosY = new int[16]; dMoved = new bool[16];
+            for (int i = 0; i < 16; i++) { dPosX[i] = 0; dPosY[i] = 0; dMoved[i] = false; }
+            LoadDeskPos();
             fileOwner      = -1;
             fileFs         =  0;
             fileSel        = -1;
@@ -574,12 +600,40 @@ namespace NexOS.Forms
             deskShowIcons  = 1;
             deskGrid       = 1;
 
+            // task-24: SAME rule as the sentinels above.  These seven are also
+            // declared as "= -1", but the mini-CLR does not run that initialiser
+            // (measured at boot: "static initialisers NOT APPLIED (0/3)"), so
+            // without these lines they really hold 0.  Zero is a VALID index,
+            // not "none", so each one silently refers to item 0:
+            //   * dragIdx        icon-drag index  -> "dragging icon 0" at boot
+            //   * winOwner       which app owns the generic window menu
+            //   * taskWinKind    taskbar-menu target Kind
+            //   * jumpKind       jump-list target Kind
+            //   * pendingClickIdx Pinned-tile click index (drag detection origin)
+            //   * dropIdx        tile that draws the "just dropped" pop
+            //   * dragHover      tile that draws the drop-target ring
+            // They are only READ behind a "are we dragging / is a menu open"
+            // guard, which is why this has stayed invisible; the guard is not a
+            // substitute for a correct sentinel.
+            dragIdx         = -1;
+            winOwner        = -1;
+            taskWinKind     = -1;
+            jumpKind        = -1;
+            pendingClickIdx = -1;
+            dropIdx         = -1;
+            dragHover       = -1;
+
+            // NOTE: this table must cover every Kind value.  It was 15 entries
+            // (0..14) while Kind.WebView was already 15, so WebView's name read
+            // past the end until this was corrected -- and any new Kind would
+            // have hit the same hole.  Keep this in step with Shell.Kind.
             kName = new string[KINDS];
             kName[0] = "Settings";     kName[1] = "This PC";    kName[2] = "Terminal";
             kName[3] = "Calculator";   kName[4] = "Task Mgr";   kName[5] = "Optimizer";
             kName[6] = "Notepad";      kName[7] = "About";      kName[8] = "Browser";
             kName[9] = "AI Setup";     kName[10] = "AI Agent";  kName[11] = "Demo";
             kName[12] = "Net Tools";   kName[13] = "AI 命令台";   kName[14] = "NetDefense";
+            kName[15] = "WebView";     kName[16] = "Video Player"; kName[17] = "Audio Player";
 
             Popup.Init();
 
@@ -604,7 +658,9 @@ namespace NexOS.Forms
             // executes static initialisers at all, plus the ACTUAL values of the
             // sentinel fields that must be explicit because it does not.
             InitProbe.Report(selIdx, startRClickIdx, dragKind, dragSrc,
-                             fileOwner, fileFs, fileSel, deskShowIcons, deskGrid);
+                             fileOwner, fileFs, fileSel, deskShowIcons, deskGrid,
+                             dragIdx, winOwner, taskWinKind, jumpKind,
+                             pendingClickIdx, dropIdx, dragHover);
         }
 
         // Rebuild the desktop icon table from the "Desktop" folder (fs==3).
@@ -621,7 +677,16 @@ namespace NexOS.Forms
             {
                 string nm = Host.FileName(3, i);
                 dName[i] = StripLnk(nm);
-                int kind = ParseKind(Host.ReadText(3, nm));
+                int kind = KindForTarget(Host.ReadText(3, nm));
+                // Anything that is not a shortcut payload (a plain file or a folder
+                // created on the desktop) has no Kind digit.  Without this it fell
+                // through to kind 0 == Kind.ControlPanel, i.e. every new file showed
+                // the Settings icon.  Give folders a folder icon and files a page icon.
+                // Bound against KINDS, not a single Kind constant: the old
+                // `kind > Kind.WebView` check silently tracked the LAST kind added,
+                // so it stopped being a real bound the moment anything new arrived.
+                if (kind < 0 || kind >= KINDS)
+                    kind = Host.FileIsDir(3, i) != 0 ? Kind.FileExplorer : Kind.Notepad;
                 dKind[i] = kind;
                 KindStyle(kind);
                 dCol[i] = (int)gCol;
@@ -632,7 +697,14 @@ namespace NexOS.Forms
         // Built-in desktop set, used only as a fallback before seeding.
         static void LoadDefaults()
         {
-            dN = 12;
+            // Count MUST equal the number of Put() calls below.  It was 12 while
+            // 15 Put()s wrote indices 0..14, so three of the seeded icons were
+            // never drawn.
+            //
+            // Video Player and Audio Player are INTENTIONALLY ABSENT: they are
+            // installable and openable from Start > All apps, but they are not
+            // given a desktop shortcut by default.
+            dN = 15;
             Put(0, Kind.FileExplorer, "This PC",    0xFFC83D, 'P');
             Put(1, Kind.Terminal,     "Terminal",   0x2F3A45, '>');
             Put(2, Kind.Calculator,   "Calculator", 0x00A3A3, '=');
@@ -676,6 +748,9 @@ namespace NexOS.Forms
             else if (kind == Kind.NetTools)   { gCol = 0x1FB85A; gLet = 'W'; }
             else if (kind == Kind.AiLauncher) { gCol = 0x9B6BFF; gLet = 'K'; }
             else if (kind == Kind.NetDefense)  { gCol = 0x00C8C8; gLet = 'N'; }
+            else if (kind == Kind.WebView)     { gCol = 0x5A6ACF; gLet = 'V'; }
+            else if (kind == Kind.VideoPlayer) { gCol = 0xB83A3A; gLet = 'V'; }
+            else if (kind == Kind.AudioPlayer) { gCol = 0xC77A11; gLet = 'M'; }
             else { gCol = 0x888888; gLet = '?'; }
         }
 
@@ -697,6 +772,34 @@ namespace NexOS.Forms
             return s;
         }
 
+        // A desktop shortcut's body is now the TARGET FILE (e.g. "Notepad.mex",
+        // pointing at the real image in SFS) instead of an opaque Kind digit.
+        // Legacy shortcuts that still hold a number keep working.
+        static int KindForTarget(string body)
+        {
+            if (body == null) return -1;
+            if (body.Length > 0 && (int)body[0] >= '0' && (int)body[0] <= '9')
+                return ParseKind(body);        // legacy numeric shortcut
+            if (NexOS.Sys.StrEq(body, "FileExplorer.mex")) return Kind.FileExplorer;
+            if (NexOS.Sys.StrEq(body, "Terminal.mex"))     return Kind.Terminal;
+            if (NexOS.Sys.StrEq(body, "Calculator.mex"))   return Kind.Calculator;
+            if (NexOS.Sys.StrEq(body, "TaskManager.mex"))  return Kind.TaskManager;
+            if (NexOS.Sys.StrEq(body, "ControlPanel.mex")) return Kind.ControlPanel;
+            if (NexOS.Sys.StrEq(body, "MemOptimizer.mex")) return Kind.MemOptimizer;
+            if (NexOS.Sys.StrEq(body, "Notepad.mex"))      return Kind.Notepad;
+            if (NexOS.Sys.StrEq(body, "About.mex"))        return Kind.About;
+            if (NexOS.Sys.StrEq(body, "Browser.mex"))      return Kind.Browser;
+            if (NexOS.Sys.StrEq(body, "AiSetup.mex"))      return Kind.AiSetup;
+            if (NexOS.Sys.StrEq(body, "AiAgent.mex"))      return Kind.AiAgent;
+            if (NexOS.Sys.StrEq(body, "Demo.mex"))         return Kind.Demo;
+            if (NexOS.Sys.StrEq(body, "NetTools.mex"))     return Kind.NetTools;
+            if (NexOS.Sys.StrEq(body, "AiLauncher.mex"))   return Kind.AiLauncher;
+            if (NexOS.Sys.StrEq(body, "NetDefense.mex"))   return Kind.NetDefense;
+            if (NexOS.Sys.StrEq(body, "WebView.mex"))      return Kind.WebView;
+            if (NexOS.Sys.StrEq(body, "VideoPlayer.mex"))  return Kind.VideoPlayer;
+            if (NexOS.Sys.StrEq(body, "AudioPlayer.mex"))  return Kind.AudioPlayer;
+            return -1;
+        }
         // Parse the first decimal integer from a string like "4".
         static int ParseKind(string s)
         {
@@ -707,7 +810,11 @@ namespace NexOS.Forms
                 if (d >= 0 && d <= 9) { v = v * 10 + d; started = 1; }
                 else if (started != 0) break;
             }
-            return v;
+
+            // No digits at all => NOT a shortcut payload (a plain file or a
+            // directory dropped on the desktop).  Returning 0 made every such
+            // entry look like Kind.ControlPanel and drew the Settings icon.
+            return started != 0 ? v : -1;
         }
 
         public static string KindName(int k)
@@ -724,6 +831,14 @@ namespace NexOS.Forms
             if (k == Kind.AiSetup) return "AI Setup";
             if (k == Kind.AiAgent) return "AI Agent";
             if (k == Kind.Demo)    return "Demo";
+            // These four were missing entirely, so the Start menu / Apps page
+            // listed them as "Unknown".
+            if (k == Kind.NetTools)    return "Net Tools";
+            if (k == Kind.AiLauncher)  return "AI 命令台";
+            if (k == Kind.NetDefense)  return "NetDefense";
+            if (k == Kind.WebView)     return "WebView";
+            if (k == Kind.VideoPlayer) return "Video Player";
+            if (k == Kind.AudioPlayer) return "Audio Player";
             return "Unknown";
         }
 
@@ -945,6 +1060,17 @@ namespace NexOS.Forms
         {
             // Detailed wallpaper image when the SFS texture pack is present;
             // otherwise fall back to the gradient + bloom (flat look).
+            // User-selectable wallpapers (right-click desktop -> Change wallpaper).
+            // WallIdx: 0 = original bloom texture, 1 = mesh gradient, 2 = dusk ridge.
+            // Each falls through gracefully: a missing .tex just drops to the next.
+            // Index 0 = built-in wallpaper; 1..N = user wallpapers packed from
+            // assets/wallpapers/ (sorted by file name).  N comes from the host,
+            // so dropping another PNG in that folder needs no code change.
+            if (Theme.WallIdx > 0)
+            {
+                int wid = Tex.WallDyn + (Theme.WallIdx - 1);
+                if (Gfx.HasImage(wid) != 0) { Gfx.Image(wid, 0, 0, w, h); return; }
+            }
             if (Gfx.HasImage(Tex.Wall) != 0)
             {
                 Gfx.Image(Tex.Wall, 0, 0, w, h);
@@ -1113,7 +1239,7 @@ namespace NexOS.Forms
                     Gfx.DrawRound(bx, by, bw, bh, 4, Accent);
                     string shown = renameBuf;
                     if ((Host.Ticks() / 30) % 2 == 0) shown = U.Cat(shown, "|");
-                    Gfx.Text(bx + 6, by + 4, shown, Ink);
+                    Gfx.Text(bx + 6, by + 4, shown, C.OnLight);
                 }
                 else
                 {
@@ -1197,6 +1323,9 @@ namespace NexOS.Forms
         // by the MiniCLR interpreter's call convention).
         static int ClassicRect(int i, int w, int h)
         {
+            // Dragged icons keep the position the user dropped them at.
+            if (dMoved != null && i >= 0 && i < 16 && dMoved[i])
+                return (dPosX[i] << 16) | (dPosY[i] & 0xFFFF);
             int perCol = PerCol(h);
             int col = i / perCol;
             int row = i % perCol;
@@ -1252,7 +1381,7 @@ namespace NexOS.Forms
                     Gfx.DrawRound(bx, by, bw, bh, 4, Accent);
                     string shown = renameBuf;
                     if ((Host.Ticks() / 30) % 2 == 0) shown = U.Cat(shown, "|");
-                    Gfx.Text(bx + 4, by + 3, shown, Ink);
+                    Gfx.Text(bx + 4, by + 3, shown, C.OnLight);   // white box -> dark ink
                 }
                 else
                 {
@@ -1277,13 +1406,18 @@ namespace NexOS.Forms
         public static void SwitchDesktop(int d) {
             if (d == CurrentDesktop) return;
             CurrentDesktop = d;
+            // The host caches the desktop layer and re-blits it instead of re-running
+            // this paint.  Switching desktops changes the whole layer, so invalidate
+            // the cache: without this the host keeps re-blitting the PREVIOUS desktop
+            // and the AI desktop never appears at all.
+            Host.WallInvalid();
             // BUG-#11 (gap 3): keep the close tween ANIMATING rather than
             // snapping it to 0.  Anim.Set() sets a target, not a value, so the
             // panel now slides/fades out over DUR_SLIDE ms and the StartMenu
             // erase branch (startMenuDrawn) fires on the final frame.  Snapping
             // to 0 here made gui.cpp see menu_transition == false and
             // g_mforms_anim == false, so the closing frame was never flushed.
-            menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1);
+            menuOpen = false; Anim.Set(START_KEY, 0, 0, 1);
             Host.Log(U.Cat("[DESK] switched to ", U.I(d), "\n"));
             // Keep (or stop) requesting animation repaints: the typewriter
             // pauses while the user is on the other desktop and resumes on
@@ -1312,11 +1446,22 @@ namespace NexOS.Forms
                 if (t >= 0) { OpenTrayPopup(t, mx, my); return -1; }
                 int bx = GroupX(w);
                 int by = h - TaskH + (TaskH - BtnSz) / 2;
-                if (U.In(mx, my, bx, by, BtnSz, BtnSz)) { menuOpen = true; Host.SetAnim(1); Anim.Set(START_KEY, 1000, Anim.DUR_SLIDE, 1); return -1; }
+                if (U.In(mx, my, bx, by, BtnSz, BtnSz)) { BeginStartMenuOpen(0, w, h); return -1; }
                 for (int i = 0; i < tN; i++) {
                     if (tKind[i] < 0) continue;
                     int x = bx + (i + 1) * (BtnSz + BtnGap);
                     if (U.In(mx, my, x, by, BtnSz, BtnSz)) return tKind[i];
+                }
+                // Live windows: one button per instance, activate by app id.
+                for (int r = 0; r < runBarN; r++)
+                {
+                    int rx = runBarX + r * (BtnSz + BtnGap);
+                    if (U.In(mx, my, rx, by, BtnSz, BtnSz))
+                    {
+                        int rid = Shell.RunningId(r);
+                        if (rid >= 0) Host.ActivateManaged(rid);
+                        return -1;
+                    }
                 }
                 return -1;
             }
@@ -1328,6 +1473,11 @@ namespace NexOS.Forms
                 static void AiDesktopPaint(int w, int h) {
             AiEnsure();
             AiTypeTick();                  // advance the typewriter each frame
+            // The AI desktop is animated (typewriter / thinking dots): ask the host to
+            // redraw it every frame instead of re-blitting a cached copy.  The host
+            // collapses these requests to ~5 Hz, which keeps the shell responsive while
+            // the text still advances.
+            Host.WallInvalid();
             Wallpaper(w, h);               // restore the Win11 wallpaper behind the AI panel
             int pw = AiPw(w), px = AiPx(w), py = AiPy(h), ph = AiPh(h);
             // Dark pill behind the branding so the label stays readable on the wallpaper.
@@ -1627,6 +1777,32 @@ namespace NexOS.Forms
                     Gfx.FillRound(x + 13, dy + BtnSz - 3, 14, 3, 1, Theme.Accent);
             }
 
+            // ---- running windows: ONE BUTTON PER LIVE INSTANCE ------------
+            // Pinned buttons are per KIND, so two File Explorers would share a
+            // single plate and the second window could not be reached from here.
+            // Draw the live instances after the pins and activate by app id.
+            int runN = Shell.RunningCount();
+            int runX = bx + (tN + 1) * (BtnSz + BtnGap);
+            for (int r = 0; r < runN; r++)
+            {
+                int rid = Shell.RunningId(r);
+                int rk  = Shell.RunningKind(r);
+                if (rid < 0) continue;
+                int x = runX + r * (BtnSz + BtnGap);
+                if (x + BtnSz > w - 120) break;      // keep clear of the tray
+                int lift = (2 * W.Hover(x, by, BtnSz, BtnSz)) / 1000;
+                int dy = by - lift;
+                if (W.Hot(x, by, BtnSz, BtnSz) || Shell.IsActive(rid))
+                    Gfx.FillRound(x, dy, BtnSz, BtnSz, 8, BarHot);
+                if (rk >= 0 && Gfx.HasImage(Tex.Icon + rk) != 0)
+                    Gfx.Image(Tex.Icon + rk, x + 8, dy + 8, 24, 24);
+                else
+                    Gfx.Icon(x + 8, dy + 8, 24, 0x5A5A5A, '?', 0xFFFFFF);
+                if (Shell.IsActive(rid))
+                    Gfx.FillRound(x + 13, dy + BtnSz - 3, 14, 3, 1, Theme.Accent);
+            }
+            runBarX = runX; runBarN = runN;
+
             TrayLayout(w, h);
             int tx = trayRect[0], ty = trayRect[1], tb = trayRect[2], tg = trayRect[3];
             int cw3 = 3 * tb + 2 * tg;
@@ -1802,6 +1978,41 @@ namespace NexOS.Forms
             Gfx.Gradient(rx, ry, rw, rh, WallC(h, ry), WallC(h, ry + rh));
         }
 
+// Start the Start-menu open transition, but never on top of a still-closing
+// panel.
+//
+// The close runs a DUR_SLIDE tween.  If the user re-opens during it, the click
+// handlers set menuOpen = true again -- and StartMenu()'s erase branch only
+// runs while (!menuOpen && enter == 0), so it never fires and the OLD panel's
+// pixels are never replaced.  The new panel is then drawn over the old one:
+// two Start menus on screen, and it takes two closes to clear both.
+//
+// Fix: if ANY residue exists (pixels still recorded, or a tween still running),
+// snap the old panel fully shut and let the erase branch run for one frame;
+// that branch re-opens us afterwards via startMenuReopen.  Cost is one extra
+// frame (~16 ms) and the open always starts from a clean base.
+static void BeginStartMenuOpen(int showAll, int w, int h)
+{
+    if (menuOpen && Anim.Get(START_KEY) != 0) { startView = (showAll != 0) ? 1 : 0; return; }
+    int enter = (int)Anim.Get(START_KEY);
+    if (startMenuDrawn != 0 || enter != 0)
+    {
+        menuOpen = false;
+        Anim.Set(START_KEY, 0, 0, 1);            // snap shut (0 ms)
+        startMenuReopen = (showAll != 0) ? 2 : 1;
+        Host.SetAnim(1);                          // keep frames coming so the erase runs
+        return;
+    }
+    menuOpen = true;
+    startMenuReopen = 0;
+    smEraseWait = 0;
+    Host.SetAnim(1);
+    Anim.Set(START_KEY, 1000, Anim.DUR_SLIDE, 1);
+    startView = (showAll != 0) ? 1 : 0;
+    startMenuW = MenuW(w); startMenuH = MenuH(h);
+    startMenuX = MenuX(w); startMenuY = MenuY(h);
+}
+
         static void StartMenu(int w, int h)
         {
             // open/close transition is now event-driven (Menu()/open/close sites),
@@ -1866,6 +2077,19 @@ namespace NexOS.Forms
                     smEraseWait = 0;
                     Host.SetAnim(1);       // let this frame reach the LFB
                     menuCloseFrames = 3;
+                }
+                // Residue-safety: an open requested while the old panel was still on
+                // screen was deferred until this erase completed -- start it now, on a
+                // clean base, instead of drawing a second panel over the stale pixels.
+                if (startMenuReopen != 0)
+                {
+                    int sa = (startMenuReopen == 2) ? 1 : 0;
+                    startMenuReopen = 0;
+                    menuOpen = true;
+                    smEraseWait = 0;
+                    Anim.Set(START_KEY, 1000, Anim.DUR_SLIDE, 1);
+                    startView = sa;
+                    Host.SetAnim(1);
                 }
                 return;
             }
@@ -2105,6 +2329,125 @@ namespace NexOS.Forms
         }
 
         // P2-15: persist dKind[] order to pinned.cfg.
+        // ---- desktop icon drag & drop ----------------------------------
+        // phase 0 = button down (arm), 1 = pointer moved, 2 = released.
+        // Returns 1 when the desktop consumed the phase.
+        public static int Drag(int mx, int my, int phase)
+        {
+            if (CurrentDesktop == 1) return 0;
+            if (dMoved == null) return 0;          // Init() has not run yet
+            int w = Gfx.Width(), h = Gfx.Height();
+            if (phase == 0)
+            {
+                dragIdx = -1;
+                if (my >= h - TaskH) return 0;     // taskbar is not a drag source
+                if (Theme.DesktopMode != 0) return 0;   // classic grid only
+                for (int i = 0; i < dN; i++)
+                {
+                    int r = ClassicRect(i, w, h);
+                    int x = (r >> 16) & 0xFFFF, y = r & 0xFFFF;
+                    if (U.In(mx, my, x, y, Cell, Cell))
+                    {
+                        dragIdx = i; dragOffX = mx - x; dragOffY = my - y;
+                        return 1;
+                    }
+                }
+                return 0;
+            }
+            if (dragIdx < 0 || dragIdx >= dN) return 0;
+            if (phase == 1)
+            {
+                int nx = mx - dragOffX, ny = my - dragOffY;
+                if (nx < 0) nx = 0;
+                if (ny < 0) ny = 0;
+                if (nx > w - Cell) nx = w - Cell;
+                if (ny > h - TaskH - Cell) ny = h - TaskH - Cell;
+                dPosX[dragIdx] = nx; dPosY[dragIdx] = ny; dMoved[dragIdx] = true;
+                return 1;
+            }
+            // phase 2 -- drop
+            int di = dragIdx; dragIdx = -1;
+            if (my >= h - TaskH)
+            {
+                // Dropped on the taskbar: pin it there and keep the icon where
+                // it was (a pin is an addition, not a move).
+                dMoved[di] = false;
+                PinKind(dKind[di]);
+                Host.Log(U.Cat("[DESK] pinned from drag: ", KindName(dKind[di])));
+                return 1;
+            }
+            SaveDeskPos();
+            Host.Log(U.Cat("[DESK] icon moved: ", dName[di]));
+            return 1;
+        }
+
+        // Add a kind to the pinned taskbar set (no duplicates).
+        static void PinKind(int kind)
+        {
+            if (kind < 0 || tKind == null) return;
+            for (int i = 0; i < tN; i++) if (tKind[i] == kind) return;
+            if (tN < 10) { tKind[tN] = kind; tN++; }
+            SavePinned();
+        }
+
+        // Persist the positions of dragged icons ("name=x,y" per line).
+        static void SaveDeskPos()
+        {
+            string cfg = "";
+            for (int i = 0; i < dN; i++)
+            {
+                if (!dMoved[i]) continue;
+                cfg = U.Cat(cfg, dName[i], "=", U.I(dPosX[i]), ",", U.I(dPosY[i]), "\n");
+            }
+            Host.WriteText(CFG_FS, "deskpos.cfg", cfg);
+        }
+
+        // Restore those positions after SyncFromFs() rebuilt the icon list.
+        static void LoadDeskPos()
+        {
+            string cfg = Host.ReadText(CFG_FS, "deskpos.cfg");
+            if (cfg == null || cfg.Length == 0) return;
+            int i = 0, n = cfg.Length;
+            while (i < n && dN > 0)
+            {
+                int e = i;
+                while (e < n && cfg[e] != '\n') e++;
+                // name=x,y
+                int eq = -1, cm = -1;
+                for (int k = i; k < e; k++)
+                {
+                    if (eq < 0 && cfg[k] == '=') eq = k;
+                    else if (eq >= 0 && cfg[k] == ',') { cm = k; break; }
+                }
+                if (eq > i && cm > eq)
+                {
+                    string nm = U.Sub(cfg, i, eq - i);
+                    string sx = U.Sub(cfg, eq + 1, cm - eq - 1);
+                    int ey = e;
+                    string sy = U.Sub(cfg, cm + 1, ey - cm - 1);
+                    int px = AtoI(sx), py = AtoI(sy);
+                    for (int j = 0; j < dN; j++)
+                        if (dName[j] == nm)
+                        { dPosX[j] = px; dPosY[j] = py; dMoved[j] = true; break; }
+                }
+                i = e + 1;
+            }
+        }
+
+        // Small decimal parser (no System.Convert in the mini CLR).
+        static int AtoI(string s)
+        {
+            int v = 0, sign = 1, k = 0;
+            if (s.Length > 0 && s[0] == '-') { sign = -1; k = 1; }
+            for (; k < s.Length; k++)
+            {
+                int d = (int)s[k] - '0';
+                if (d < 0 || d > 9) break;
+                v = v * 10 + d;
+            }
+            return v * sign;
+        }
+
         static void SavePinned()
         {
             string cfg = "";
@@ -2140,13 +2483,9 @@ namespace NexOS.Forms
 
         internal static void OpenStartMenu(int showAll, int w, int h)
         {
-            menuOpen = true;
-            smEraseWait = 0;   // BUG-#10: fresh close sequence
-            Host.SetAnim(1);   // kick open/close transition repaints
-            Anim.Set(START_KEY, 1000, Anim.DUR_SLIDE, 1);   // real open tween (event-driven)
-            startView = (showAll != 0) ? 1 : 0;
-            startMenuW = MenuW(w); startMenuH = MenuH(h);
-            startMenuX = MenuX(w); startMenuY = MenuY(h);
+            // Residue-safe open: if a previous close is still on screen this defers
+            // the open by one frame so the stale panel is erased first.
+            BeginStartMenuOpen(showAll, w, h);
             // FIX: reload Installed[] from installed.cfg so the All-apps list
             // reflects newly installed / uninstalled apps on every open.
             LoadInstalled();
@@ -2277,7 +2616,7 @@ namespace NexOS.Forms
                 if (t >= 0) { OpenTrayPopup(t, mx, my); return -1; }
                 int bx = GroupX(w);
                 int by = h - TaskH + (TaskH - BtnSz) / 2;
-                if (U.In(mx, my, bx, by, BtnSz, BtnSz)) { menuOpen = true; Host.SetAnim(1); Anim.Set(START_KEY, 1000, Anim.DUR_SLIDE, 1); return -1; }
+                if (U.In(mx, my, bx, by, BtnSz, BtnSz)) { BeginStartMenuOpen(0, w, h); return -1; }
                 for (int i = 0; i < tN; i++)
                 {
                     int x = bx + (i + 1) * (BtnSz + BtnGap);
@@ -2303,7 +2642,7 @@ namespace NexOS.Forms
             }
             // Search bar -> open the Start menu (which has its own box).
             if (U.In(mx, my, pSearchX, pSearchY, pSearchW, pSearchH))
-            { menuOpen = true; Host.SetAnim(1); Anim.Set(START_KEY, 1000, Anim.DUR_SLIDE, 1); return -1; }
+            { BeginStartMenuOpen(0, w, h); return -1; }
             // Nav tabs (Home/Apps/System/Tools): select and consume.
             {
                 int tabW = 88, tabGap = 6, tabH = 30;
@@ -2339,7 +2678,7 @@ namespace NexOS.Forms
                 // the erase branch below is never reached, and the opaque panel
                 // stays on screen forever.  Arm the driver exactly like the
                 // keyboard paths do.
-                menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1);
+                menuOpen = false; Anim.Set(START_KEY, 0, 0, 1);
                 Host.SetAnim(1);
                 menuCloseFrames = 3;
                 return -1;
@@ -2387,7 +2726,7 @@ namespace NexOS.Forms
                         // the menu, and this is the path that left the panel
                         // pixels behind.  Arm the host frame driver so the close
                         // tween + the wallpaper-band erase actually reach the LFB.
-                        menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1);
+                        menuOpen = false; Anim.Set(START_KEY, 0, 0, 1);
                         Host.SetAnim(1);
                         menuCloseFrames = 3;
                         return dKind[i];
@@ -2410,7 +2749,7 @@ namespace NexOS.Forms
                     if (U.In(mx, my, lx, ry, listW, rowH - 1))
                     {
                         // BUG-#menu-residue: same as the Pinned-tile path above.
-                        menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1);
+                        menuOpen = false; Anim.Set(START_KEY, 0, 0, 1);
                         Host.SetAnim(1);
                         menuCloseFrames = 3;
                         return i;
@@ -2440,7 +2779,7 @@ namespace NexOS.Forms
                 return -1;
             }
             if (!menuOpen) return -1;
-            if (code == 4) { menuOpen = false; Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1); Host.SetAnim(1); return -1; }
+            if (code == 4) { menuOpen = false; Anim.Set(START_KEY, 0, 0, 1); Host.SetAnim(1); return -1; }
 
             int n = (startView == 0) ? dN : InstalledCount();
             if (n <= 0) return -1;
@@ -2452,7 +2791,7 @@ namespace NexOS.Forms
             {
                 int kind = (startView == 0) ? dKind[menuSel] : InstalledKindAt(menuSel);
                 menuOpen = false;
-                Anim.Set(START_KEY, 0, Anim.DUR_SLIDE, 1);   // animate menu closed on activate
+                Anim.Set(START_KEY, 0, 0, 1);   // close instantly (no close tween)
                 Host.SetAnim(1);
                 return kind;
             }
@@ -2621,12 +2960,14 @@ namespace NexOS.Forms
             else if (c == A_VIEW_ICONS){ deskShowIcons ^= 1; Host.Log("[VIEW] show-icons"); Refresh(); }
             else if (c == A_VIEW_AUTO) { deskAuto ^= 1; Host.Log("[VIEW] auto-arrange"); Refresh(); }
             else if (c == A_VIEW_GRID) { deskGrid ^= 1; Host.Log("[VIEW] align-grid"); Refresh(); }
-            else if (c == A_NEW_SHC)  { Host.Log("[NEW] shortcut (placeholder)"); }
+            else if (c == A_NEW_SHC)  { NewShortcutOnDesktop(); }
+            else if (c == A_NEW_FILE) { NewFileOnDesktop(); }
             else if (c == A_SORT_NAME)  SortBy(0);
             else if (c == A_SORT_SIZE)  SortBy(1);
             else if (c == A_SORT_TYPE)  SortBy(2);
             else if (c == A_SORT_DATE)  SortBy(3);
             else if (c == A_REFRESH)    Refresh();
+            else if (c == A_WALLPAPER)  { Theme.CycleWallpaper(); Host.WallInvalid(); Refresh(); }
             else if (c == A_PERSONALIZE) Shell.OpenSettings(6);
             else if (c == A_TERMINAL)    Host.OpenApp(Kind.Terminal);
             else if (c == A_NEWFOLDER || c == A_NEW_FOLDER) MkdirOnDesktop();
@@ -2642,7 +2983,7 @@ namespace NexOS.Forms
             else if (c == A_DESK_DEF) { SwitchDesktop(0); }
             // Taskbar jump-list actions.
             else if (c == A_JUMP_UNPIN)    { UnpinFromTaskbar(jumpKind); }
-            else if (c == A_JUMP_NEWWIN)   { Host.OpenApp(jumpKind >= 0 ? jumpKind : Kind.FileExplorer); }
+            else if (c == A_JUMP_NEWWIN)   { Host.OpenAppNew(jumpKind >= 0 ? jumpKind : Kind.FileExplorer); }
             else if (c == A_JUMP_CLOSEALL) { Shell.CloseApp(jumpKind >= 0 ? jumpKind : Kind.FileExplorer); }
         }
 
@@ -2671,11 +3012,14 @@ namespace NexOS.Forms
                 Host.RunExe(nm);
                 return;
             }
-            if (code == A_F_NOTEPAD) { Shell.OpenNotepad(nm); return; }
+            if (code == A_F_NOTEPAD) { Shell.OpenNotepadFs(3, nm); return; }
             if (code == A_F_OPEN || code == A_F_EDIT)
             {
                 string body = Host.ReadText(3, nm);
-                int k = ParseKind(body);
+                int k = KindForTarget(body);
+                // No Kind digit => a plain file, not a shortcut: open it in Notepad
+                // instead of launching Kind -1 (which used to mean "open Settings").
+                if (k < 0) { Shell.OpenNotepadFs(3, nm); return; }
                 if (k == Kind.Terminal) Shell.ExitGui();   // Terminal shortcut exits GUI
                 else { Host.OpenApp(k); }
             }
@@ -2718,6 +3062,58 @@ namespace NexOS.Forms
             for (int i = 0; i < dN; i++)
                 if (dName[i] == name) { BeginRename(i, U.Cat(name, ".lnk")); break; }
         }
+
+        // Create an empty text file on the desktop and start renaming it.
+        static void NewFileOnDesktop()
+        {
+            string baseName = "New File.txt";
+            string name = baseName;
+            int n = Host.FileCount(3), k = 1;
+            while (true)
+            {
+                bool clash = false;
+                for (int i = 0; i < n; i++)
+                    if (Host.FileName(3, i) == name) { clash = true; break; }
+                if (!clash) break;
+                name = U.Cat("New File (", U.I(k), ").txt");
+                k++;
+                n = Host.FileCount(3);
+            }
+            int wr = Host.WriteText(3, name, "");
+            Host.Log(U.Cat(wr >= 0 ? "[NEW] file created: " : "[NEW] file FAILED: ", name));
+            if (wr < 0) return;
+            Host.FileRefresh();
+            SyncFromFs();
+            for (int i = 0; i < dN; i++)
+                if (dName[i] == name) { BeginRename(i, U.Cat(name, ".lnk")); break; }
+            Host.SetAnim(1);
+        }
+
+        // Create a real shortcut: a .lnk whose body is the TARGET IMAGE in SFS
+        // (the same format the seeded shortcuts use), defaulting to Notepad.
+        static void NewShortcutOnDesktop()
+        {
+            string baseName = "New Shortcut.lnk";
+            string name = baseName;
+            int n = Host.FileCount(3), k = 1;
+            while (true)
+            {
+                bool clash = false;
+                for (int i = 0; i < n; i++)
+                    if (Host.FileName(3, i) == name) { clash = true; break; }
+                if (!clash) break;
+                name = U.Cat("New Shortcut (", U.I(k), ").lnk");
+                k++;
+                n = Host.FileCount(3);
+            }
+            int wr = Host.WriteText(3, name, "Notepad.mex");
+            Host.Log(U.Cat(wr >= 0 ? "[NEW] shortcut -> Notepad.mex: " : "[NEW] shortcut FAILED: ", name));
+            if (wr < 0) return;
+            Host.FileRefresh();
+            SyncFromFs();
+            Host.SetAnim(1);
+        }
+
 
         static void BeginRename(int idx, string lnkName)
         {
@@ -2781,7 +3177,7 @@ namespace NexOS.Forms
 
         static void OpenDesktopPopup(int mx, int my)
         {
-            int cap = 8;
+            int cap = 9;
             string[] labs = new string[cap];
             int[]    acts = new int[cap];
             int k = 0;
@@ -2791,6 +3187,7 @@ namespace NexOS.Forms
             labs[k] = "> New";               acts[k] = A_NEW;        k++;
             labs[k] = "Display settings";    acts[k] = A_DISPLAY;    k++;
             labs[k] = "Personalize";         acts[k] = A_PERSONALIZE;k++;
+            labs[k] = "Change wallpaper";    acts[k] = A_WALLPAPER; k++;
             labs[k] = "Show more options";   acts[k] = A_MORE;       k++;
             Popup.Open(OWNER_DESKTOP, mx, my, labs, acts, k);
         }
@@ -2816,11 +3213,12 @@ namespace NexOS.Forms
         // "New" flyout: create a folder or a shortcut on the desktop.
         static void OpenNewSub(int sx, int sy)
         {
-            int cap = 2;
+            int cap = 3;
             string[] labs = new string[cap];
             int[]    acts = new int[cap];
             int k = 0;
             labs[k] = "Folder";    acts[k] = A_NEW_FOLDER; k++;
+            labs[k] = "Text file";  acts[k] = A_NEW_FILE;   k++;
             labs[k] = "Shortcut";   acts[k] = A_NEW_SHC;    k++;
             Popup.Open(OWNER_DESKTOP, sx, sy, labs, acts, k);
         }
@@ -3040,6 +3438,25 @@ namespace NexOS.Forms
         // "Show more options" escapes to the classic Windows-10-style menu.
         // Opened by FileExplorerApp.OnRightClick and by the desktop; sx,sy
         // are screen coordinates so the menu lines up under the cursor.
+        // Right-click on empty space in a File Explorer window: folder verbs.
+        // Paste lives here because that is where users reach for it.
+        public static void OpenFolderMenu(int id, int fs, int sx, int sy)
+        {
+            fileOwner = id; fileFs = fs; fileSel = -1;
+            fileMenuX = sx; fileMenuY = sy;
+            string[] labs = new string[4];
+            int[]    acts = new int[4];
+            int k = 0;
+            labs[k] = "Paste";        acts[k] = A_F_PASTE;  k++;
+            if (fs != 1)
+            {
+                labs[k] = "";             acts[k] = -1;         k++;
+                labs[k] = "New folder";   acts[k] = A_F_MKDIR;  k++;
+                labs[k] = "New file";     acts[k] = A_F_NEWFILE; k++;
+            }
+            Popup.Open(OWNER_FILE, sx, sy, labs, acts, k);
+        }
+
         public static void OpenFileMenu(int id, int fs, int sel, int sx, int sy)
         {
             fileOwner = id; fileFs = fs; fileSel = sel;
@@ -3079,7 +3496,8 @@ namespace NexOS.Forms
             fileOwner = id; fileFs = fs; fileSel = sel;
             fileMenuX = sx; fileMenuY = sy;
             bool readOnly = (fs == 1);
-            bool canNewFile = (fs == 0);
+            // Any writable volume can gain a file; only SFS is read-only.
+            bool canNewFile = (fs != 1);
             string[] labs = new string[13];
             int[]    acts = new int[13];
             int k = 0;
@@ -3264,6 +3682,12 @@ namespace NexOS.Forms
         static int  pNeg1 = -1;
         static int  pHex  = 0x0078D4;
         static bool pTrue = true;
+        // task-24 follow-up: the first three samples were int/int/bool, so the
+        // STRING case was only ever asserted in a comment.  A dropped string
+        // literal is the dangerous one (it becomes null rather than 0), so test
+        // it explicitly -- otherwise a field like Forms.cs CfgName could be null
+        // with nothing in this probe to reveal it.
+        static string pStr = "p";
 
         static void Pair(string tag, int v)
         {
@@ -3273,35 +3697,60 @@ namespace NexOS.Forms
             NexOS.Sys.PrintInt(v);
         }
 
+        // Like Pair(), but also returns 1 when the value is not the expected
+        // sentinel, so Report() can print ONE number to grep for ("mismatches=").
+        static int PairCk(string tag, int have, int want)
+        {
+            Pair(tag, have);
+            return have == want ? 0 : 1;
+        }
+
         public static void Report(int selIdx, int startRClickIdx, int dragKind,
                                   int dragSrc, int fileOwner, int fileFs, int fileSel,
-                                  int deskShowIcons, int deskGrid)
+                                  int deskShowIcons, int deskGrid,
+                                  int dragIdx, int winOwner, int taskWinKind,
+                                  int jumpKind, int pendingClickIdx, int dropIdx,
+                                  int dragHover)
         {
             int applied = 0;
             if (pNeg1 == -1)       applied++;
             if (pHex == 0x0078D4)  applied++;
             if (pTrue)             applied++;
+            if (pStr != null && NexOS.Sys.StrEq(pStr, "p")) applied++;
             NexOS.Sys.Print("[CLR] static initialisers ");
-            if (applied == 3)
-                NexOS.Sys.Print("APPLIED (3/3)");
+            if (applied == 4)
+                NexOS.Sys.Print("APPLIED (4/4)");
             else if (applied == 0)
-                NexOS.Sys.Print("NOT APPLIED (0/3) -- statics MUST be assigned explicitly in Init()");
+                NexOS.Sys.Print("NOT APPLIED (0/4) -- statics MUST be assigned explicitly in Init()");
             else
             {
                 NexOS.Sys.Print("PARTIAL (");
                 NexOS.Sys.PrintInt(applied);
-                NexOS.Sys.Print("/3)");
+                NexOS.Sys.Print("/4)");
             }
+            NexOS.Sys.Print(" | pStr=");
+            NexOS.Sys.Print(pStr == null ? "null" : pStr);
             NexOS.Sys.Print(" | sentinels:");
-            Pair("selIdx", selIdx);
-            Pair("startRClickIdx", startRClickIdx);
-            Pair("dragKind", dragKind);
-            Pair("dragSrc", dragSrc);
-            Pair("fileOwner", fileOwner);
-            Pair("fileFs", fileFs);
-            Pair("fileSel", fileSel);
-            Pair("deskShowIcons", deskShowIcons);
-            Pair("deskGrid", deskGrid);
+            // Every one of these must be -1 (or the noted value) after Init().
+            int bad = 0;
+            bad += PairCk("selIdx",         selIdx,         -1);
+            bad += PairCk("startRClickIdx", startRClickIdx, -1);
+            bad += PairCk("dragKind",       dragKind,       -1);
+            bad += PairCk("dragSrc",        dragSrc,        -1);
+            bad += PairCk("fileOwner",      fileOwner,      -1);
+            bad += PairCk("fileFs",         fileFs,          0);
+            bad += PairCk("fileSel",        fileSel,        -1);
+            bad += PairCk("deskShowIcons",  deskShowIcons,   1);
+            bad += PairCk("deskGrid",       deskGrid,        1);
+            bad += PairCk("dragIdx",        dragIdx,        -1);
+            bad += PairCk("winOwner",       winOwner,       -1);
+            bad += PairCk("taskWinKind",    taskWinKind,    -1);
+            bad += PairCk("jumpKind",       jumpKind,       -1);
+            bad += PairCk("pendingClickIdx",pendingClickIdx,-1);
+            bad += PairCk("dropIdx",        dropIdx,        -1);
+            bad += PairCk("dragHover",      dragHover,      -1);
+            NexOS.Sys.Print(" | mismatches=");
+            NexOS.Sys.PrintInt(bad);
             NexOS.Sys.Print("\n");
         }
     }

@@ -52,6 +52,7 @@ extern "C" void* kmalloc(unsigned int);
 extern "C" int   ai_reason(const char* prompt, char* out, int outsize);
 extern "C" int   ai_set_mode(int mode);
 extern "C" int   net_http_get(const char* url, char* out, int outsize);
+extern "C" int   net_http_post(const char* url, const char* body, char* out, int outsize);
 extern "C" int   kern_fs_read(const char* name, unsigned char* buf, int bufsize);
 
 /* Built-in app services, implemented by the kernel itself.  These are the
@@ -473,9 +474,25 @@ static McpDispatchFn tool_impl_find(const char* tool_name){
 struct AppRegistry g_app_registry[NEXOS_AI_MAX_APPS];
 int g_app_registry_count = 0;
 
+/* Guest-side gateway address.  Under QEMU user-mode networking (SLIRP) the
+ * host is reachable at 10.0.2.2, so the kernel own NIC can speak to the
+ * host gateway directly.  127.0.0.1 would be the GUEST itself (nothing
+ * listening there), which is why the old hard-coded loopback URL never
+ * produced an answer.  The "ai gateway <ip>" command overrides it. */
+static char g_gateway_host[64] = "10.0.2.2";
+
 struct AIGateway g_ai_gateway = {
-    AI_BALANCED, "127.0.0.1", NEXOS_AI_GATEWAY_PORT, 1000, 0
+    AI_BALANCED, g_gateway_host, NEXOS_AI_GATEWAY_PORT, 1000, 0
 };
+
+const char* ai_gateway_host(void){ return g_gateway_host; }
+
+void ai_gateway_set_host(const char* h){
+    if(!h || !h[0]) return;
+    int i = 0;
+    while(h[i] && i < 63){ g_gateway_host[i] = h[i]; i++; }
+    g_gateway_host[i] = 0;
+}
 
 struct AppRegistry* app_registry_find(const char* app_id){
     for(int i=0;i<g_app_registry_count;i++)
@@ -750,22 +767,180 @@ int set_mode(int m){
 
 int quota_remaining(void){ return g_ai_gateway.quota_remaining; }
 
+/* =====================================================================
+ *  Kernel-side AI request path
+ * ---------------------------------------------------------------------
+ *  The kernel speaks plain HTTP only, and the request must leave through the
+ *  guest's OWN NIC: under QEMU user-mode networking (SLIRP) the host is
+ *  10.0.2.2, so POSTing to http://10.0.2.2:19387/ai reaches the host gateway
+ *  (tools/net/gateway_server.py), which in turn calls OpenCode Zen free models
+ *  with the anonymous "public" key -- no account anywhere in the chain.
+ * ===================================================================== */
+
+/* Decode 4 hex digits into *out. Returns 1 on success. */
+static int ai_hex4(const char* p, unsigned* out){
+    unsigned v = 0;
+    for(int i = 0; i < 4; i++){
+        char h = p[i]; unsigned d;
+        if(h >= '0' && h <= '9') d = (unsigned)(h - '0');
+        else if(h >= 'a' && h <= 'f') d = (unsigned)(h - 'a' + 10);
+        else if(h >= 'A' && h <= 'F') d = (unsigned)(h - 'A' + 10);
+        else return 0;
+        v = (v << 4) | d;
+    }
+    *out = v;
+    return 1;
+}
+
+/* Decode a JSON string body (stops at the closing quote), including \uXXXX
+ * escapes.  The gateway emits UTF-8 nowadays, but older replies / other
+ * OpenAI-compatible peers may still escape non-ASCII text. */
+static int ai_json_unescape(const char* src, char* out, int cap){
+    int o = 0;
+    if(!out || cap <= 0) return 0;
+    out[0] = 0;
+    if(!src) return 0;
+    for(int i = 0; src[i] && src[i] != '"'; ){
+        char c = src[i];
+        if(c != '\\'){ if(o < cap - 1) out[o++] = c; i++; continue; }
+        char e = src[++i];
+        if(!e) break;
+        i++;
+        if(e == 'n'){ if(o < cap - 1) out[o++] = '\n'; }
+        else if(e == 'r'){ if(o < cap - 1) out[o++] = '\r'; }
+        else if(e == 't'){ if(o < cap - 1) out[o++] = '\t'; }
+        else if(e == 'b'){ if(o < cap - 1) out[o++] = '\b'; }
+        else if(e == 'f'){ if(o < cap - 1) out[o++] = '\f'; }
+        else if(e == 'u'){
+            unsigned cp = 0;
+            if(!ai_hex4(src + i, &cp)) break;
+            i += 4;
+            if(cp >= 0xD800 && cp <= 0xDBFF && src[i] == '\\' && src[i + 1] == 'u'){
+                unsigned lo = 0;
+                if(ai_hex4(src + i + 2, &lo) && lo >= 0xDC00 && lo <= 0xDFFF){
+                    cp = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u);
+                    i += 6;
+                }
+            }
+            if(cp < 0x80){ if(o < cap - 1) out[o++] = (char)cp; }
+            else if(cp < 0x800){
+                if(o < cap - 2){ out[o++] = (char)(0xC0 | (cp >> 6));
+                                 out[o++] = (char)(0x80 | (cp & 0x3F)); }
+            } else if(cp < 0x10000){
+                if(o < cap - 3){ out[o++] = (char)(0xE0 | (cp >> 12));
+                                 out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                                 out[o++] = (char)(0x80 | (cp & 0x3F)); }
+            } else {
+                if(o < cap - 4){ out[o++] = (char)(0xF0 | (cp >> 18));
+                                 out[o++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                                 out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                                 out[o++] = (char)(0x80 | (cp & 0x3F)); }
+            }
+        }
+        else { if(o < cap - 1) out[o++] = e; }
+    }
+    out[o] = 0;
+    return o;
+}
+
+/* Find the string member named by key in a flat JSON object; decode into out. */
+static int ai_json_string(const char* json, const char* key, char* out, int cap){
+    if(out && cap > 0) out[0] = 0;
+    if(!json || !key || !key[0]) return 0;
+    char pat[40]; int pi = 0;
+    pat[pi++] = '"';
+    for(int i = 0; key[i] && pi < 36; i++) pat[pi++] = key[i];
+    pat[pi++] = '"'; pat[pi] = 0;
+
+    for(const char* p = json; *p; p++){
+        int k = 0;
+        while(pat[k] && p[k] == pat[k]) k++;
+        if(pat[k]) continue;
+        const char* q = p + k;
+        while(*q == ' ' || *q == '\t') q++;
+        if(*q != ':') continue;
+        q++;
+        while(*q == ' ' || *q == '\t') q++;
+        if(*q != '"') continue;
+        return ai_json_unescape(q + 1, out, cap) > 0;
+    }
+    return 0;
+}
+
+/* POST {"prompt":..,"mode":N} to the host gateway over the guest NIC.
+ * Returns 1 = answer in text; 2 = gateway error message in text;
+ *         0 = transport/parse failure (no NIC, gateway down, bad JSON). */
+static int ai_gateway_ask(const char* prompt, int mode, char* text, int cap){
+    static char body[1600];
+    static char resp[4096];
+    if(text && cap > 0) text[0] = 0;
+
+    int b = my_snprintf(body, (int)sizeof(body), "{\"prompt\":\"");
+    json_escape_into(body, &b, prompt ? prompt : "", (int)sizeof(body));
+    my_snprintf(body + b, (int)sizeof(body) - b, "\",\"mode\":%d}", mode);
+
+    char url[96];
+    my_snprintf(url, (int)sizeof(url), "http://%s:%d/ai",
+                g_ai_gateway.gateway_host ? g_ai_gateway.gateway_host : "10.0.2.2",
+                g_ai_gateway.gateway_port);
+
+    int n = net_http_post(url, body, resp, (int)sizeof(resp) - 1);
+    if(n <= 0) return 0;
+    resp[(int)sizeof(resp) - 1] = 0;
+
+    if(ai_json_string(resp, "reply", text, cap)) return 1;
+    if(ai_json_string(resp, "error", text, cap)) return 2;
+    return 0;
+}
+
+/* Kernel-facing plain-text ask: host gateway first (through the VM NIC),
+ * local engine as the offline fallback.  Returns bytes written. */
+int ai_ask_text(const char* prompt, char* out, int cap){
+    if(!out || cap <= 0) return 0;
+    out[0] = 0;
+    if(!prompt || !prompt[0]) return 0;
+    if(!g_ai_gateway.initialized) ai_gateway_init();
+
+    int st = ai_gateway_ask(prompt, AI_BALANCED, out, cap);
+    if(st == 1){
+        if(g_ai_gateway.quota_remaining > 0) g_ai_gateway.quota_remaining--;
+        return my_strlen(out);
+    }
+    if(st == 2) return 0;              /* honest gateway error stays in out */
+
+    int n = ai_reason(prompt, out, cap);   /* offline / no gateway */
+    return (n > 0) ? n : 0;
+}
+
+/* JSON result string consumed by the MiniCLR ICall / apps. */
 int ai_request(const char* prompt, int mode, char* out, int outsize){
     if(!g_ai_gateway.initialized) ai_gateway_init();
     static char reason[1024];
-    static char httpbuf[2048];
-    int code = 0; const char* text; int used_mode = mode;
-    if(mode <= AI_FAST){
-        ai_reason(prompt ? prompt : "", reason, (int)sizeof(reason)-1);
+    static char httpbuf[4096];
+    int code = 0; const char* text = ""; int used_mode = mode;
+    if(used_mode < AI_FAST)  used_mode = AI_FAST;
+    if(used_mode > AI_HEAVY) used_mode = AI_HEAVY;
+
+    if(used_mode <= AI_FAST){
+        /* Fast tier is local by contract: no host round-trip. */
+        ai_reason(prompt ? prompt : "", reason, (int)sizeof(reason) - 1);
         text = reason;
     } else {
-        static char url[128];
-        my_snprintf(url, (int)sizeof(url), "http://127.0.0.1:%d/ai?mode=%d",
-                g_ai_gateway.gateway_port, mode);
-        int r = net_http_get(url, httpbuf, (int)sizeof(httpbuf)-1);
-        if(r <= 0){ code = MCP_ERR_DISPATCH; text = ""; }
-        else { httpbuf[sizeof(httpbuf)-1]=0; text = httpbuf; }
-        if(g_ai_gateway.quota_remaining > 0) g_ai_gateway.quota_remaining--;
+        int st = ai_gateway_ask(prompt ? prompt : "", used_mode,
+                                httpbuf, (int)sizeof(httpbuf) - 1);
+        if(st == 1){
+            text = httpbuf;
+            if(g_ai_gateway.quota_remaining > 0) g_ai_gateway.quota_remaining--;
+        } else if(st == 2){
+            code = MCP_ERR_DISPATCH;   /* gateway refused (e.g. free quota) */
+            text = httpbuf;
+        } else {
+            /* Gateway unreachable: degrade to the built-in engine rather than
+               returning an empty answer. */
+            ai_reason(prompt ? prompt : "", reason, (int)sizeof(reason) - 1);
+            text = reason;
+            code = MCP_ERR_DISPATCH;
+        }
     }
     if(out && outsize > 0){
         int j = my_snprintf(out, outsize, "{\"code\":%d,\"text\":\"", code);

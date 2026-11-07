@@ -60,10 +60,50 @@ static int user_str_ok(uint32_t p){
 static Ctx g_user_ctx;
 
 // ---------------------------------------------------------------------
+//  sys_exit_current: terminate the current ring-3 process
+// ---------------------------------------------------------------------
+//  Exported so non-syscall guests (the MS-DOS INT 21h layer, AH=4Ch) can
+//  end a program through the SAME unwind path SYS_EXIT uses.  g_user_ctx
+//  is static to this file, so this function -- not a direct mini_longjmp
+//  from elsewhere -- is the only correct way to reach it.
+//
+//  Does not return when a user context is active.  If it is called while
+//  no ring-3 program is running (e.g. host-side testing), it records the
+//  code and returns so the caller can carry on.
+// ---------------------------------------------------------------------
+static int g_last_exit_code = 0;
+
+extern "C" int sys_exit_current(int code){
+    g_last_exit_code = code;
+
+    if (g_current && g_current->ring == 3){
+        serial_puts("[sys] exit_current pid=");
+        serial_putdec((int)g_current->pid);
+        serial_puts(" code=");
+        serial_putdec(code);
+        serial_puts("\n");
+        mini_longjmp(&g_user_ctx, 1);
+        __builtin_unreachable();
+    }
+
+    // No active ring-3 context: nothing to unwind into.
+    return code;
+}
+
+extern "C" int sys_last_exit_code(void){ return g_last_exit_code; }
+
+// ---------------------------------------------------------------------
 //  enter_user: switch ring 0 -> ring 3
 // ---------------------------------------------------------------------
 extern "C" int enter_user(uint32_t entry, uint32_t stack_top){
     if (g_current) g_current->ring = 3;
+
+    // Diagnostic: confirm the exact iret frame before executing it.  A hang
+    // with no exception report means either the frame is wrong or the CPU
+    // faults before any handler can run, so print every field we control.
+    serial_puts("[enter_user] entry=");   serial_hex(entry);
+    serial_puts(" esp=");                 serial_hex(stack_top);
+    serial_puts(" cs=1B ss=23 efl=2\n");
 
     if (mini_setjmp(&g_user_ctx) == 0){
         // Build an iret frame on the current (kernel) stack and return to
@@ -78,6 +118,8 @@ extern "C" int enter_user(uint32_t entry, uint32_t stack_top){
             :: [sp]"r"(stack_top), [ep]"r"(entry) : "memory");
         __builtin_unreachable();
     }
+
+    serial_puts("[enter_user] unwound back to ring 0\n");
 
     // Returned here via mini_longjmp (sys_exit). Back in ring 0.
     if (g_current) g_current->ring = 0;

@@ -136,10 +136,11 @@ EFI_CFLAGS  := -I$(EFI_INC) -I$(EFI_INC)/x86_64 -DEFI_FUNCTION_WRAPPER \
 EFI_LDFLAGS := -nostdlib -znocombreloc -T $(EFI_LDS) -shared -Bsymbolic \
                -L$(EFI_LIB) $(EFI_CRT0)
 
-# SFS is written to disk at LBA 3488.  kernel64.bin (long-mode payload) occupies
-# LBA 2048..3488 (KERNEL64_SECTORS=1440); kernel.bin occupies LBA 33..~1200;
-# LBA 1200-3487 is the growth gap.  The BIOS image is 4 MiB, so the SFS
-# region 3488-8191 (~2.4 MB) can hold textures.
+# SFS is written to disk at LBA 6144.  kernel64.bin (long-mode payload) occupies
+# LBA 2048..6143 (KERNEL64_SECTORS=4096); kernel.bin occupies LBA 33..~1200;
+# LBA 1200-2047 is the 32-bit growth gap and 2048..6143 is the 64-bit region.
+# The BIOS image is 4 MiB, so the SFS
+# region after the SFS can hold textures (the SFS length is printed by the guard).
 #
 # ARCHITECTURE: this tree is 32-bit only.  The long-mode kernel (kernel64.cpp,
 # entry64.asm, linker64.ld, switch32to64.asm, switch64to32.asm) and the
@@ -149,8 +150,9 @@ EFI_LDFLAGS := -nostdlib -znocombreloc -T $(EFI_LDS) -shared -Bsymbolic \
 # used to sit immediately after it (LBA 2048..3664).  That gap is 1616 sectors
 # and kernel64 had reached it exactly, so every further byte failed the build.
 # Moving SFS forward gives kernel64 a 4096-sector (2 MiB) region with ~1.2 MiB
-# of headroom.  SFS is 18338 sectors, so it now spans 6144..24482, still clear
-# of LINUX_SFS_LBA (25600) with 1118 sectors to spare.
+# of headroom.  The SFS length and the remaining margin are NOT repeated here:
+# hard-coded copies of those numbers went stale once already, so the build guard
+# below prints the live figures instead (it reads both constants from kernel.cpp).
 # KEEP IN SYNC: kernel.cpp SFS_ALT_LBA, and the build guard below.
 SFS_LBA      := 6144
 SFS_BYTE_OFF := $(shell echo $$(( $(SFS_LBA) * 512 )))
@@ -159,7 +161,7 @@ SFS_BYTE_OFF := $(shell echo $$(( $(SFS_LBA) * 512 )))
 # the image as a raw blob: a one-sector descriptor at LBA 4095, payload from
 # LBA 4096.  Override MODEL_GGUF to embed a different model, e.g.
 #   make MODEL_GGUF=~/models/Qwen3-1.7B-Q4_K_M.gguf
-# NOTE: the SFS image itself is ~3.2k sectors (3488..~6600), so the blob has
+# NOTE: the SFS image starts at SFS_LBA and its length is printed by the guard, so the blob has
 # to start well past it.  LBA 16384 = the 8 MiB mark, leaving the filesystem
 # room to more than double before anything collides.
 MODEL_HDR_LBA  := 16383
@@ -454,7 +456,7 @@ $(BUILD)/silent_telemetry.o: silent_telemetry.cpp silent_telemetry.h | $(BUILD)
 # past the EBDA guard (__kimage_end 0x9FFCC vs limit 0x9FC00).  gui_legacy.cpp is
 # the largest translation unit, so size-optimising it harder buys the room back
 # without changing any behaviour (pure size/speed trade, no semantic effect).
-$(BUILD)/gui.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h afont_data.h src/gui/gfx_engine.h src/gui/gfx_engine.cpp  src/gui/gfx_graphics.inc | $(BUILD)
+$(BUILD)/gui.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h afont_data.h src/gui/gfx_engine.h src/gui/gfx_engine.cpp  src/gui/gfx_graphics.inc  src/gui/gfx_draw.inc | $(BUILD)
 	$(CC) $(CXXFLAGS) -Oz -Iplugins -I. -c gui.cpp -o $@
 
 # Data tables extracted from gui_legacy.cpp (sRGB LUTs + baked 8x16 font).
@@ -464,6 +466,12 @@ $(BUILD)/gfx_engine.o: src/gui/gfx_engine.cpp src/gui/gfx_engine.h | $(BUILD)
 
 $(BUILD)/gfx_engine64.o: src/gui/gfx_engine.cpp src/gui/gfx_engine.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c src/gui/gfx_engine.cpp -o $@
+# Pinyin IME, extracted into its own translation unit -- 64-BIT ONLY.
+# 32-bit keeps the in-file IME in gui_legacy.cpp: its 0x9FC00 EBDA limit
+# leaves only a few hundred bytes, so this refactor must not touch it.
+$(BUILD)/gfx_ime64.o: src/gui/gfx_ime.cpp src/gui/gfx_ime.h src/gui/mforms_bridge.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -I plugins -c src/gui/gfx_ime.cpp -o $@
+
 
 # Runtime vector font rasterizer (stb_truetype.h) - 32-bit and 64-bit.
 # Compiled as plain C (-x c) so its kmalloc/kfree calls use C linkage, matching
@@ -590,7 +598,6 @@ $(BUILD)/knowledge_base.o: knowledge_base.c knowledge_base.h | $(BUILD)
 # ----- Link kernel ELF (entry.o first => _start at image offset 0) -----
 $(BUILD)/kernel.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(BUILD)/dos_prim_kernel.o $(BUILD)/dos_int21.o $(BUILD)/dos_psp.o $(BUILD)/dos_exec.o $(BUILD)/dos_int21_isr.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS) linker.ld | $(BUILD)
 	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(BUILD)/dos_prim_kernel.o $(BUILD)/dos_int21.o $(BUILD)/dos_psp.o $(BUILD)/dos_exec.o $(BUILD)/dos_int21_isr.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS)
-	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(BUILD)/dos_prim_kernel.o $(BUILD)/dos_int21.o $(BUILD)/dos_psp.o $(BUILD)/dos_exec.o $(BUILD)/dos_int21_isr.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS)
 
 # ----- Extract flat kernel binary -----
 $(BUILD)/kernel.bin: $(BUILD)/kernel.elf | $(BUILD)
@@ -625,11 +632,11 @@ $(SFS_DIR)/%.bc: $(SFS_DIR)/%.skill tools/skillc.py | $(BUILD)
 
 skillbc: $(SKILL_BCS)
 
-$(SFS_IMG): $(wildcard $(SFS_DIR)/*) $(wildcard $(SFS_DIR)/*/*) $(wildcard assets/wallpapers/*) $(STUB_STAGED) $(FONTVEC_STAGED) $(DOS_COM_STAGED) tools/sfs_gen.py tools/tex_pack.py $(SKILL_BCS) $(SFS_DIR)/userdemo $(SFS_DIR)/hello.mex $(SFS_DIR)/shell.mex $(SFS_DIR)/hello.nex | $(BUILD)
+$(SFS_IMG): $(wildcard $(SFS_DIR)/*) $(wildcard $(SFS_DIR)/*/*) $(wildcard $(SFS_DIR)/*/*/*) $(wildcard assets/wallpapers/*) $(STUB_STAGED) $(FONTVEC_STAGED) $(DOS_COM_STAGED) tools/sfs_gen.py tools/tex_pack.py $(SKILL_BCS) $(SFS_DIR)/userdemo $(SFS_DIR)/hello.mex $(SFS_DIR)/shell.mex $(SFS_DIR)/hello.nex | $(BUILD)
 	$(PYTHON) tools/tex_pack.py
 	$(PYTHON) tools/sfs_gen.py $(SFS_DIR) $@
 
-$(BUILD)/sfs_uefi.img: $(wildcard $(SFS_DIR)/*) $(wildcard $(SFS_DIR)/*/*) tools/sfs_gen.py $(SFS_IMG) | $(BUILD)
+$(BUILD)/sfs_uefi.img: $(wildcard $(SFS_DIR)/*) $(wildcard $(SFS_DIR)/*/*) $(wildcard $(SFS_DIR)/*/*/*) tools/sfs_gen.py $(SFS_IMG) | $(BUILD)
 	$(PYTHON) tools/sfs_gen.py $(SFS_DIR) $@ --exclude-fonts
 
 # =====================================================================
@@ -748,6 +755,7 @@ SHELL_SRC := csharp/apps/Shell/Shell.cs csharp/apps/Shell/Apps.cs \
              csharp/apps/Shell/NetTools.cs \
              csharp/apps/Shell/NetDefenseApp.cs \
              csharp/apps/Shell/AiLauncher.cs \
+             csharp/apps/Shell/MediaPlayers.cs \
              csharp/NexOS.Forms/Forms.cs csharp/NexOS.Forms/Voice.cs \
              csharp/apps/Shell/Shell.csproj
 $(SFS_DIR)/shell.mex: $(SHELL_SRC) $(CS_CORE) tools/mex_pack.py
@@ -912,7 +920,7 @@ $(LINUX_ROOT)/gnu_dynlink: usr/dynlink_crt.c usr/linux_dynlink.c usr/libc.h \
 
 # =====================================================================
 #  Disk image assembly
-#  boot + stage2 + kernel (32-bit) + SFS at LBA 3488, padded to 4 MiB
+#  boot + stage2 + kernel (32-bit) + kernel64 + SFS at LBA 6144, padded to 4 MiB
 # =====================================================================
 $(IMG): $(BUILD)/boot.bin $(BUILD)/stage2.bin $(BUILD)/kernel.bin $(BUILD)/kernel64.bin $(SFS_IMG) $(LINUX_SFS_IMG) | $(BUILD)
 	cat $(BUILD)/boot.bin $(BUILD)/stage2.bin $(BUILD)/kernel.bin > $@
@@ -926,8 +934,17 @@ $(IMG): $(BUILD)/boot.bin $(BUILD)/stage2.bin $(BUILD)/kernel.bin $(BUILD)/kerne
 	# boot-stack collision, so make it a build error instead of a mystery.
 	@k64sz=$$(stat -c%s $(BUILD)/kernel64.bin); \
 	 secs=$$(sed -n 's/^#define[[:space:]]*KERNEL64_SECTORS[[:space:]]*\([0-9]*\).*/\1/p' kernel.cpp | head -1); \
+	 floor=$$(sed -n 's/^#define[[:space:]]*K64_STAGE_FLOOR[[:space:]]*0x0*\([0-9A-Fa-f]*\)u.*/\1/p' kernel.cpp | head -1); \
+	 [ -n "$$secs" ] && [ -n "$$floor" ] || { \
+	   echo '*** ERROR: cannot read KERNEL64_SECTORS / K64_STAGE_FLOOR from kernel.cpp'; \
+	   echo '***        (renamed, or reformatted away from "#define NAME  <digits>" / "#define NAME  0x...u")'; \
+	   echo '***        Both are fetched BEFORE this check.  $(( )) failure semantics vary by shell'; \
+	   echo '***        AND invocation shape; [ -n ] does not (measured 7-cell matrix).'; \
+	   exit 1; \
+	 }; \
 	 gap=$$(( ($(SFS_LBA) - 2048) * 512 )); \
 	 lim=$$(( $$secs * 512 )); \
+	 dest_lim=$$(( 0x$$floor - 0x100000 )); \
 	 if [ $$k64sz -gt $$(( $$secs * 512 )) ]; then \
 	   echo "*** ERROR: kernel64.bin ($$k64sz bytes) exceeds the KERNEL64_SECTORS window ($$(( $$secs * 512 )) bytes)."; \
 	   echo "***        The 32-bit side can only stage that many sectors, so the image would be"; \
@@ -935,6 +952,16 @@ $(IMG): $(BUILD)/boot.bin $(BUILD)/stage2.bin $(BUILD)/kernel.bin $(BUILD)/kerne
 	   exit 1; \
 	 fi; \
 	 if [ $$lim -gt $$gap ]; then lim=$$gap; fi; \
+	 if [ $$lim -gt $$dest_lim ]; then lim=$$dest_lim; fi; \
+	 if [ $$k64sz -gt $$dest_lim ]; then \
+	   echo "*** ERROR: kernel64.bin is $$k64sz bytes; the 64-bit blit TARGET would end at $$(( 0x100000 + $$k64sz )) bytes and cross K64_STAGE_FLOOR (0x$$floor)."; \
+	   echo "***        The staging buffer is only LOWER-bounded at that floor (kernel.cpp:7641), so a larger"; \
+	   echo "***        target overwrites the very source the blit reads (overlapping copy -> the tail comes"; \
+	   echo "***        back as zero pages -- the failure recorded in switch32to64.asm)."; \
+	   echo "***        TARGET-side ceiling = K64_STAGE_FLOOR - 0x100000 = $$dest_lim bytes."; \
+	   echo "***        Shave $$(( $$k64sz - $$dest_lim )) bytes, or raise K64_STAGE_FLOOR together with the staging floor."; \
+	   exit 1; \
+	 fi; \
 	 if [ $$k64sz -gt $$lim ]; then \
 	   echo "*** ERROR: kernel64.bin is $$k64sz bytes but only $$lim bytes are reachable."; \
 	   echo "***        KERNEL64_SECTORS=$$secs (kernel.cpp) => $$(( $$secs * 512 )) bytes;"; \
@@ -960,7 +987,7 @@ $(IMG): $(BUILD)/boot.bin $(BUILD)/stage2.bin $(BUILD)/kernel.bin $(BUILD)/kerne
 	   exit 1; \
 	 fi; \
 	 echo "    SFS fit:  $$sfsz / $$slot bytes ($$(( ($$slot - $$sfsz) / 1024 )) KiB spare)"
-	# Write SFS image at LBA 3488
+	# Write SFS image at LBA 6144
 	dd if=$(SFS_IMG) of=$@ bs=512 seek=$(SFS_LBA) conv=notrunc 2>/dev/null
 	# Write the independent Linux user-space partition after the main SFS
 	dd if=$(LINUX_SFS_IMG) of=$@ bs=512 seek=$(LINUX_SFS_LBA) conv=notrunc 2>/dev/null
@@ -1075,7 +1102,7 @@ ifdef FB_TEST
 DIAG_CXX += -DFB_TEST=$(FB_TEST)
 endif
 
-$(BUILD)/gui_diag.o: gui.cpp src/gui/gui_legacy.cpp src/gui/gfx_engine.h src/gui/gfx_engine.cpp  src/gui/gfx_graphics.inc | $(BUILD)
+$(BUILD)/gui_diag.o: gui.cpp src/gui/gui_legacy.cpp src/gui/gfx_engine.h src/gui/gfx_engine.cpp  src/gui/gfx_graphics.inc  src/gui/gfx_draw.inc | $(BUILD)
 	$(DIAG_CXX) -I. -c gui.cpp -o $@
 
 $(BUILD)/bootuefi_diag.o: uefi/bootuefi.c | $(BUILD)
@@ -1181,8 +1208,8 @@ TEXTBOOT_IMG := $(BUILD)/os_textboot.img
 $(BUILD)/kernel_textboot.o: kernel.cpp | $(BUILD)
 	$(CC) $(CXXFLAGS) -DTEXT_BOOT -c kernel.cpp -o $@
 
-$(BUILD)/kernel_textboot.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_textboot.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS) linker.ld | $(BUILD)
-	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_textboot.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS)
+$(BUILD)/kernel_textboot.elf: $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_textboot.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(BUILD)/dos_prim_kernel.o $(BUILD)/dos_int21.o $(BUILD)/dos_psp.o $(BUILD)/dos_exec.o $(BUILD)/dos_int21_isr.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS) linker.ld | $(BUILD)
+	$(LD) $(LDFLAGS) -o $@ $(BUILD)/entry.o $(BUILD)/switch32to64.o $(BUILD)/kernel_textboot.o $(BUILD)/divdi3.o $(BUILD)/ai_engine.o $(BUILD)/ai_plugin.o $(BUILD)/kb.o $(BUILD)/skill.o $(BUILD)/gguf.o $(BUILD)/net.o $(BUILD)/distnet.o $(BUILD)/silent_telemetry.o $(BUILD)/gui.o $(BUILD)/gfx_engine.o $(BUILD)/font_vec.o $(BUILD)/addrman.o $(BUILD)/winloader.o $(BUILD)/win32.o $(BUILD)/linux_compat.o $(BUILD)/gdt.o $(BUILD)/syscall.o $(BUILD)/proc.o $(BUILD)/vfs.o $(BUILD)/perm.o $(BUILD)/clr.o $(BUILD)/mforms.o $(BUILD)/bootsplash.o $(BUILD)/intel_cursor.o $(BUILD)/svga.o $(BUILD)/nexos_ai.o $(BUILD)/systemalgo.o $(BUILD)/knowledge_base.o $(BUILD)/dos_prim_kernel.o $(BUILD)/dos_int21.o $(BUILD)/dos_psp.o $(BUILD)/dos_exec.o $(BUILD)/dos_int21_isr.o $(PLUGIN_OBJS) $(DRIVER_FW_OBJS)
 
 $(BUILD)/kernel_textboot.bin: $(BUILD)/kernel_textboot.elf | $(BUILD)
 	$(OBJCOPY) -O binary $< $@
@@ -1556,6 +1583,47 @@ data-vdi: $(BUILD)/data.vdi
 $(BUILD)/data.vdi: tools/make_data_vdi.py
 	$(PYTHON) tools/make_data_vdi.py 8
 
+# ----- Sync the VirtualBox disk containers with the current build -----
+# build/os_v2_vbox.vdi and build/data_vbox.vdi are REAL VirtualBox VDI
+# containers (header "<<< Oracle VirtualBox Disk Image >>>", signature
+# 0xBEDA107F at offset 0x40), NOT copies of the raw images -- so they cannot be
+# refreshed with `cp`, and a plain `make` does not touch them.
+#
+# They used to be regenerated by hand, which is exactly how they drifted:
+# on 2026-11-06 a freshly built build/os_v2.img (13:48) sat beside a 11:31
+# vbox.vdi, the VirtualBox VM booted the stale container, and every fix merged
+# after 11:31 appeared to be missing inside VirtualBox.  Run this after any
+# build whose results you intend to test in VirtualBox.
+#
+# The converter is VBoxManage, which exists only on the Windows host, and it
+# refuses to replace a medium that a running VM has attached.  So this target
+# is a thin, honest wrapper that (a) refuses fast and loud on Linux and
+# (b) on Windows runs tools/vbox_sync.ps1, which detaches, converts to a temp
+# name, swaps, and re-attaches -- restoring the previous container if any step
+# fails, so the VM is never left diskless.
+vbox-sync:
+	@if command -v pwsh >/dev/null 2>&1 && [ -d /mnt/c ]; then \
+	   pwsh -NoProfile -File tools/vbox_sync.ps1; \
+	 elif [ -x "/c/Program Files/Oracle/VBoxManage.exe" ] || [ -x "C:/Program Files/Oracle/VBoxManage.exe" ]; then \
+	   pwsh -NoProfile -File tools/vbox_sync.ps1; \
+	 else \
+	   echo "vbox-sync: this target needs the Windows host (VBoxManage.exe lives there)." >&2; \
+	   echo "  Run it from a Windows shell:" >&2; \
+	   echo '      pwsh -NoProfile -File tools/vbox_sync.ps1' >&2; \
+	   echo "  The raw images and the VDI containers are the same bytes, but the" >&2; \
+	   echo "  container format means \`cp\` cannot refresh them." >&2; \
+	   exit 3; \
+	 fi
+
+# Check whether the VirtualBox containers are stale relative to the build.
+# Read-only and Linux-safe: it compares payload bytes, so it works without
+# VBoxManage and gives a clear answer on any platform.
+# Deliberately NOT depending on $(IMG): this is a read-only report about
+# artefacts that already exist.  Depending on the image made 'make vbox-check'
+# rebuild the whole kernel first, which defeats the point of a quick check.
+vbox-check:
+	@$(PYTHON) tools/vbox_check.py
+
 # ----- ISO + data VHD: run with a persistent user disk (recommended) -----
 iso-run-data: $(ISO) build/data.vhd
 	$(QEMU) -cdrom $(ISO) -boot d -m 2G \
@@ -1644,7 +1712,7 @@ $(BUILD)/switch32to64.o: .attic64/switch32to64.asm $(BUILD)/kernel64.bin | $(BUI
 # -Idrivers: kernel64.cpp includes driver_contract.h for the driver-scan
 # hookup (task-8) and font_vec.h for the vec_* forwarding shims.
 # -DSFS_LBA_FROM_MAKEFILE: the 64-bit kernel has to FIND the SFS volume it
-# was shipped with, and it used to hard-code the offset (SFS_ALT_LBA 3488)
+# was shipped with, and it used to hard-code the offset (SFS_ALT_LBA 3488; HISTORICAL -- now 6144)
 # -- which silently drifted when the image layout moved the SFS to 6144, so
 # the 64-bit kernel reported 'SFS not mounted' and could never load a driver.
 # Passing the Makefile's own SFS_LBA removes the second source of truth.
@@ -1654,6 +1722,30 @@ $(BUILD)/kernel64.o: .attic64/kernel64.cpp drivers/driver_contract.h font_vec.h 
 $(BUILD)/smp64.o: .attic64/smp64.cpp .attic64/smp64.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c .attic64/smp64.cpp -o $@
 
+# Intel HD Audio output driver -- 64-BIT ONLY, on purpose.  The 32-bit kernel's
+# load window is 588,800 bytes and sits at 588,732 (68 bytes spare), so a sound
+# driver physically cannot live there; the 64-bit kernel has ~20 KB of .bss
+# slack and is the kernel that runs the desktop where audio is actually wanted.
+$(BUILD)/hda64.o: .attic64/hda64.cpp | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c .attic64/hda64.cpp -o $@
+
+# ---- AI modules (64-bit only; the 32-bit image has 420 B spare) ----------
+$(BUILD)/ai_config64.o: ai_config.cpp ai_config.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c ai_config.cpp -o $@
+$(BUILD)/ai_tooluse64.o: ai_tooluse.cpp ai_tooluse.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c ai_tooluse.cpp -o $@
+$(BUILD)/ai_context64.o: ai_context.cpp ai_context.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c ai_context.cpp -o $@
+$(BUILD)/ai_usage64.o: ai_usage.cpp ai_usage.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c ai_usage.cpp -o $@
+$(BUILD)/ai_kb64.o: ai_kb.cpp ai_kb.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c ai_kb.cpp -o $@
+$(BUILD)/ai_redact64.o: ai_redact.cpp ai_redact.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c ai_redact.cpp -o $@
+$(BUILD)/ai_coop64.o: ai_coop.cpp ai_coop.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c ai_coop.cpp -o $@
+$(BUILD)/ai_market64.o: ai_market.cpp ai_market.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -c ai_market.cpp -o $@
 # ---- TLS 1.3 client, 64-bit kernel ---------------------------------------
 $(BUILD)/tls_crypto64.o: tls_crypto.cpp tls_crypto.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c tls_crypto.cpp -o $@
@@ -1689,7 +1781,7 @@ $(BUILD)/svga64.o: svga.cpp svga.h | $(BUILD)
 $(BUILD)/nexos_ai64.o: nexos_ai.cpp nexos_ai.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -c nexos_ai.cpp -o $@
 
-$(BUILD)/gui64.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h afont_data.h  src/gui/gfx_graphics.inc | $(BUILD) src/gui/gfx_engine.h src/gui/gfx_engine.cpp
+$(BUILD)/gui64.o: gui.cpp src/gui/gui_legacy.cpp logo.h font_vec.h afont_data.h  src/gui/gfx_graphics.inc  src/gui/gfx_draw.inc  src/gui/gfx_ime.h src/gui/gfx_ime.cpp src/gui/mforms_bridge.h | $(BUILD) src/gui/gfx_engine.h src/gui/gfx_engine.cpp
 	$(CC64) $(CXX64FLAGS) -I plugins -c gui.cpp -o $@
 
 $(BUILD)/ai_engine64.o: ai_engine.cpp | $(BUILD)
@@ -1783,8 +1875,8 @@ $(BUILD)/linux_guest_backend64.o: plugins/linux_guest_backend.cpp | $(BUILD)
 # The 64-bit object list lives in ONE variable: the real link and the
 # strict re-link used by tools/check_k64_undefined.sh must never diverge,
 # otherwise the gate would validate a different binary than we ship.
-KERNEL64_OBJS := $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/net_tls64.o $(BUILD)/tls_crypto64.o $(BUILD)/tls1364.o $(BUILD)/tls_x50964.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o $(BUILD)/systemalgo64.o \
-	$(BUILD)/vmm64.o $(BUILD)/vnc_client64.o $(BUILD)/linux_manager64.o $(BUILD)/linux_guest_backend64.o $(BUILD)/svga64.o $(BUILD)/nexos_ai64.o $(BUILD)/gfx_engine64.o
+KERNEL64_OBJS := $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/net_tls64.o $(BUILD)/tls_crypto64.o $(BUILD)/tls1364.o $(BUILD)/tls_x50964.o $(BUILD)/ai_config64.o $(BUILD)/ai_tooluse64.o $(BUILD)/ai_context64.o $(BUILD)/ai_usage64.o $(BUILD)/ai_kb64.o $(BUILD)/ai_redact64.o $(BUILD)/ai_coop64.o $(BUILD)/ai_market64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o $(BUILD)/systemalgo64.o $(BUILD)/hda64.o \
+	$(BUILD)/vmm64.o $(BUILD)/vnc_client64.o $(BUILD)/linux_manager64.o $(BUILD)/linux_guest_backend64.o $(BUILD)/svga64.o $(BUILD)/nexos_ai64.o $(BUILD)/gfx_engine64.o $(BUILD)/gfx_ime64.o
 
 $(BUILD)/kernel64.elf: $(KERNEL64_OBJS) .attic64/linker64.ld | $(BUILD)
 	$(LD64) $(LDFLAGS64) -o $@ $(KERNEL64_OBJS)
@@ -1820,3 +1912,6 @@ $(BUILD)/smp_impl64.o: smp_impl64.cpp .attic64/smp64.h | $(BUILD)
 OBJCOPY64 ?= $(OBJCOPY)
 $(BUILD)/kernel64.bin: $(BUILD)/kernel64.elf check-k64 | $(BUILD)
 	$(OBJCOPY64) -O binary $< $@
+
+
+

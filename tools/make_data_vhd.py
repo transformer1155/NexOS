@@ -21,10 +21,10 @@ def main():
         size_mb = 8
     total_sectors = size_mb * 1024 * 1024 // 512
     # MKFS layout (must match kernel.cpp)
-    SUPER_LBA = 512
-    TABLE_LBA = 513
+    SUPER_LBA    = 900   # must match MKFS_SUPER_LBA in kernel.cpp
+    TABLE_LBA    = 901   # MKFS_TABLE_LBA
     TABLE_SECT = 16
-    DATA_LBA = 529
+    DATA_LBA     = 917   # MKFS_DATA_LBA
     DATA_SECTORS = 15200
     assert SUPER_LBA + 1 + TABLE_SECT + DATA_SECTORS <= total_sectors, \
         "disk too small for MKFS data area"
@@ -34,7 +34,7 @@ def main():
     # Superblock (struct Superblock in kernel.cpp)
     sb = struct.pack('<4sHHIII',
                      b'MKFS',          # magic
-                     1,                # version
+                     MKFS_VERSION,                # version (must match MKFS_V2)
                      0,                # file_count
                      DATA_LBA,         # data_start
                      DATA_LBA,         # free_lba

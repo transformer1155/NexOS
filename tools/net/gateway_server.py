@@ -9,7 +9,7 @@
 #    POST /package/install   接收 .nexpack 二进制流 → 调用 PackageInstaller
 #    GET  /package/status    查询已安装包列表
 #    POST /quota             AI quota 查询
-#    POST /ai                AI 生成请求
+#    POST /ai                AI 生成请求 (默认走 OpenCode Zen 免费模型, 无需账号)
 #    POST /mcp/<app_id>      MCP tool dispatch
 #
 #  依赖: Python 3.8+ 标准库 (http.server + socket + struct)
@@ -19,8 +19,32 @@ import argparse, hashlib, json, os, socket, sys, threading, time, zipfile
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(HERE)
+# ---- AI backend ---------------------------------------------------------
+# Default: OpenCode Zen free models via the anonymous "public" sentinel key.
+# No account, no API key.  Set NEXOS_AI_BACKEND=echo for the old offline echo,
+# or NEXOS_AI_BACKEND=openai + OPENCODE_ZEN_KEY for a real key.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import opencode_free  # noqa: E402  (same directory)
+
+AI_BACKEND = os.environ.get("NEXOS_AI_BACKEND", "opencode").strip().lower()
+AI_MODEL   = os.environ.get("OPENCODE_ZEN_MODEL", "").strip()
+AI_TIMEOUT = int(os.environ.get("OPENCODE_ZEN_TIMEOUT", "60"))
+
+# 从 __file__ 向上逐层找 "tools/" 目录
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROBE = _HERE
+while True:
+    _p = os.path.dirname(_PROBE)
+    if _p == _PROBE: break
+    if os.path.basename(_PROBE) == "tools": break
+    _PROBE = _p
+if os.path.basename(_PROBE) == "tools":
+    HERE = _PROBE
+    REPO = os.path.dirname(_PROBE)
+else:
+    # 兜底: 退回原始逻辑
+    HERE = _HERE
+    REPO = os.path.dirname(os.path.dirname(_HERE))
 
 # ---- 配置 ---------------------------------------------------------------
 PKG_DIR    = os.environ.get("NEXOS_PKG_DIR",
@@ -160,7 +184,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         sys.stderr.write("[gw] " + (fmt % args) + "\n")
 
     def _send_json(self, code, obj):
-        body = json.dumps(obj).encode("utf-8")
+        # ensure_ascii=False: the kernel JSON decoder takes UTF-8 directly and
+        # Chinese replies stay readable in raw serial logs.
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -217,15 +243,57 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": msg})
 
     def _handle_ai(self):
+        """POST /ai -- answer with OpenCode Zen free models (no account).
+
+        Request:  {"prompt": "...", "mode": 0|1|2, "model": "optional"}
+        Response: {"ok": true, "reply": "...", "model": "...", "mode": n,
+                   "quotaLeft": n}
+        Failures keep the envelope honest: 429 + retry_after when the shared
+        anonymous quota window is exhausted, 502 otherwise.
+        """
+        global quota_left
         body = self._read_body()
         try: payload = json.loads(body.decode("utf-8"))
         except: return self._send_json(400, {"error": "bad json"})
-        prompt = payload.get("prompt", "")
+        prompt = payload.get("prompt", "") or ""
+        mode   = payload.get("mode", 1)
+        model  = (payload.get("model") or AI_MODEL or "").strip()
+
         with quota_lock:
             if quota_left <= 0:
-                return self._send_json(429, {"error": "quota exhausted"})
-            quota_left -= 1
-        return self._send_json(200, {"ok": True, "reply": "(host ai echo) " + prompt[:200]})
+                return self._send_json(429, {"ok": False,
+                                             "error": "quota exhausted"})
+
+        if AI_BACKEND == "echo":
+            ok, reply, meta = True, "(host ai echo) " + prompt[:200], {"model": "echo"}
+        else:
+            ok, reply, meta = opencode_free.chat(
+                prompt, model=model or None, max_tokens=512,
+                timeout=AI_TIMEOUT)
+
+        if ok:
+            with quota_lock:
+                quota_left -= 1
+                left = quota_left
+            return self._send_json(200, {
+                "ok": True, "reply": reply, "model": meta.get("model"),
+                "mode": mode, "quotaLeft": left,
+                "backend": AI_BACKEND,
+            })
+
+        with quota_lock:
+            left = quota_left
+        if meta.get("rate_limited"):
+            return self._send_json(429, {
+                "ok": False, "error": opencode_free.format_failure(meta),
+                "retry_after": meta.get("retry_after"),
+                "backend": AI_BACKEND, "quotaLeft": left,
+            })
+        return self._send_json(502, {
+            "ok": False, "error": opencode_free.format_failure(meta),
+            "backend": AI_BACKEND, "quotaLeft": left,
+            "attempts": meta.get("attempts", []),
+        })
 
     def _handle_quota(self):
         with quota_lock:
@@ -265,22 +333,37 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
 # ---- main ---------------------------------------------------------------
 def main():
+    global AI_BACKEND, AI_MODEL
     ap = argparse.ArgumentParser(description="NexOS host-side HTTP gateway")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=19387)
     ap.add_argument("--pkg-dir", default=PKG_DIR)
+    ap.add_argument("--ai-backend", default=AI_BACKEND,
+                    choices=["opencode", "echo"],
+                    help="AI backend for POST /ai (default: opencode free models)")
+    ap.add_argument("--ai-model", default=AI_MODEL,
+                    help="force an OpenCode Zen model id (default: auto free)")
+    ap.add_argument("--ai-key", default="",
+                    help="override the anonymous 'public' sentinel key")
     args = ap.parse_args()
 
     set_pkg_dir(args.pkg_dir)
     os.makedirs(PKG_DIR, exist_ok=True)
 
+    AI_BACKEND = args.ai_backend
+    AI_MODEL = args.ai_model
+    if args.ai_key:
+        opencode_free.ZEN_KEY = args.ai_key
+
     server = ThreadingHTTPServer((args.host, args.port), GatewayHandler)
     print("[nexos-gateway] listening on %s:%d" % (args.host, args.port))
     print("[nexos-gateway] pkg dir: %s" % PKG_DIR)
+    print("[nexos-gateway] AI backend: %s%s (no account needed)"
+          % (AI_BACKEND, (" model=" + AI_MODEL) if AI_MODEL else ""))
     print("[nexos-gateway] endpoints:")
     print("    POST /package/install   <.nexpack binary>")
     print("    GET  /package/status")
-    print("    POST /ai                 {prompt: ...}")
+    print("    POST /ai                 {prompt: ...}  -> OpenCode Zen free")
     print("    GET  /health")
     try:
         server.serve_forever()

@@ -125,48 +125,149 @@ struct MexStr { uint32_t off, len; };
 // ---------------------------------------------------------------------
 //  runtime state
 // ---------------------------------------------------------------------
+// Maximum .mex image size the CLR will load.
+//
+// This was 192 KiB (196,608 bytes) and shell.mex grew to 201,237 bytes once the
+// media players and the audio status line were added -- 4,629 bytes over.
+// clr_load() then reported "truncated image" (clr.cpp:1069) and the managed
+// DESKTOP WOULD NOT START AT ALL: a black screen with "Fatal Boot Error -
+// Managed shell (shell.mex) failed to load".  Nothing was wrong with the .mex
+// or the SFS; the limit was simply below the file.
+//
+// 256 KiB leaves ~55 KiB of headroom for the next few features.  It is
+// kmalloc'd (clr.cpp:1051), not .bss, so the 64-bit kernel's bss ceiling is
+// not affected -- which is exactly why raising it is safe here.
+// Maximum .mex image size the CLR will load.
+//
+// shell.mex grew to 201,237 bytes once the media players and the audio status
+// line were added, which is 4,629 bytes past the old 192 KiB (196,608) limit.
+// clr_load() then reported "truncated image" (clr.cpp:1069) and the managed
+// DESKTOP WOULD NOT START: a black screen reading "Fatal Boot Error - Managed
+// shell (shell.mex) failed to load".  Nothing was wrong with the .mex or the
+// SFS; the cap was simply below the file.
+//
+// Sized on the 32 BIT build only where there is room.  The 32-bit kernel sits
+// 36 bytes below the EBDA at 0x9FC00, so the extra constant must not enlarge
+// its image; the 64-bit kernel is the one that runs the Win11 desktop and has
+// thousands of bytes spare.
+#if defined(__x86_64__)
+#define CLR_IMAGE_MAX   (256 * 1024)
+#else
+// The 32-bit kernel sits ~36 bytes below the EBDA at 0x9FC00, so it must not
+// grow AT ALL: keep its original 192 KiB cap.  It never runs shell.mex (the
+// Win11 desktop is a 64-bit feature), and clr_load() on that kernel only ever
+// loads the small example images, so the cap is not a practical limit there.
 #define CLR_IMAGE_MAX   (192 * 1024)
+#endif
 #define CLR_HEAP_SIZE   (512 * 1024)
 #define CLR_STACK_SLOTS 32768
 #define CLR_MAX_DEPTH   48
 #define CLR_MAX_STRINGS 1024
+// Maximum number of internal calls a mex image may reference.  This used to
+// be a bare 128 in three places, and the managed shell finally outgrew it:
+// adding Host::WallInvalid/PanX/PanY pushed it to 130 and every boot failed
+// with "[CLR] fault: too many internal calls" (fatal boot error screen).
+// Keep the array, the dispatch bound and the load check in sync via this one
+// constant.
+#define CLR_MAX_ICALLS 192
 #define CLR_MAX_STATICS 1024
 #define CLR_STEP_LIMIT  20000000
 
+// =====================================================================
+//  CLR INSTANCE POOL
+// ---------------------------------------------------------------------
+//  The CLR used to have exactly one set of these variables, so clr_load()
+//  could only ever hold ONE .mex: loading a second image reset g_resident and
+//  overwrote g_image, which is why every "app" had to be a stub that asked
+//  shell.mex to open its window.
+//
+//  Each of these is genuinely per-assembly state -- the loaded image, its
+//  section pointers, its managed heap, its evaluation stack, its static fields
+//  and its icall bindings.  Grouping them into a slot structure lets several
+//  assemblies be resident at once (one slot each) while the ~1400 lines of
+//  interpreter code below keep using the original names: the accessors
+//  immediately after this block redirect every g_* identifier to the CURRENT
+//  slot, so no call site had to change.
+//
+//  What stays GLOBAL on purpose:
+//    g_reader        one file reader for the whole CLR
+//    g_report        a single human-readable status line
+//    g_ext_icalls    host-registered icalls belong to the host, not an image
+//    g_vcache / g_clr_trace / g_current_app_id   diagnostics and identity
+// =====================================================================
+typedef struct ClrVm {
+    uint8_t*    image;
+    MexHeader*  hdr;
+    MexMethod*  methods;
+    MexType*    types;
+    MexStr*     strtab;
+    uint8_t*    code;
+    const char* names;
+    uint8_t*    litdata;
+    uint8_t*    heap;
+    uint32_t    heap_used;
+    int32_t     stack[CLR_STACK_SLOTS];
+    int         sp;
+    int32_t     statics[CLR_MAX_STATICS];
+    int32_t     strobj[CLR_MAX_STRINGS];
+    int16_t     icall_bind[CLR_MAX_ICALLS];
+    int         fault;
+    uint32_t    steps;
+    int         fail_streak;
+    int         resident;
+    char        name[64];        // .mex basename this slot holds
+} ClrVm;
+
+// Four slots: the desktop shell plus up to three independently resident
+// applications.  Sized in memory terms: ~256 KiB image cap + 512 KiB managed
+// heap + ~25 KiB tables per slot, so 4 slots is ~3.2 MB out of the kernel's
+// 16 MiB kmalloc heap (kernel64.cpp HEAP_SIZE).  Raise CLR_MAX_VMS together
+// with that budget, not on its own.
+#define CLR_MAX_VMS 4
+
+static ClrVm  g_vm_pool[CLR_MAX_VMS];
+static ClrVm* g_cur = &g_vm_pool[0];   // slot 0 is the resident desktop shell
+static int    g_vm_count = 0;          // how many slots have ever been loaded
+
 static clr_read_fn  g_reader = 0;
-static uint8_t*     g_image  = 0;
-static MexHeader*   g_hdr    = 0;
-static MexMethod*   g_methods = 0;
-static MexType*     g_types  = 0;
-static MexStr*      g_strtab = 0;
-static uint8_t*     g_code   = 0;
-static const char*  g_names  = 0;
-static uint8_t*     g_litdata = 0;
+static char         g_report[512];
 
-static uint8_t*     g_heap = 0;
-static uint32_t     g_heap_used = 0;
-
-static int32_t      g_stack[CLR_STACK_SLOTS];
-static int          g_sp = 0;
-
-static int32_t      g_statics[CLR_MAX_STATICS];
-static int32_t      g_strobj[CLR_MAX_STRINGS];
-static int16_t      g_icall_bind[128];
+// ---- per-slot state, redirected ------------------------------------
+// Every existing reference to these names now resolves through g_cur, so the
+// interpreter stays byte-for-byte the same code.
+#define g_image      (g_cur->image)
+#define g_hdr        (g_cur->hdr)
+#define g_methods    (g_cur->methods)
+#define g_types      (g_cur->types)
+#define g_strtab     (g_cur->strtab)
+#define g_code       (g_cur->code)
+#define g_names      (g_cur->names)
+#define g_litdata    (g_cur->litdata)
+#define g_heap       (g_cur->heap)
+#define g_heap_used  (g_cur->heap_used)
+#define g_stack      (g_cur->stack)
+#define g_sp         (g_cur->sp)
+#define g_statics    (g_cur->statics)
+#define g_strobj     (g_cur->strobj)
+#define g_icall_bind (g_cur->icall_bind)
+#define g_fault      (g_cur->fault)
+#define g_steps      (g_cur->steps)
+#define g_fail_streak (g_cur->fail_streak)
+#define g_resident   (g_cur->resident)
 
 // DIAG-ONLY: when non-zero, every clr_call / native icall prints its name to
 // the serial log.  Used to pinpoint a triple-fault inside the managed desktop
 // paint (mforms_paint_desktop sets this around its PaintDesktop call).
 int g_clr_trace = 0;
 
-static int          g_fault = 0;
-static char         g_report[512];
-static uint32_t     g_steps = 0;
+// g_fault / g_steps / g_fail_streak live in the slot struct (see the pool
+// above); only g_report stays global because it is the CLR-wide status line.
 
 // Consecutive clr_call failures before the image is declared dead.  A single
 // fault is treated as recoverable (see clr_call): the managed shell is a
 // long-lived resident image and one bad frame must not retire it.
 #define CLR_FAIL_STREAK_MAX 12
-static int          g_fail_streak = 0;
+// (g_fail_streak is per-slot; see the pool)
 
 static const char* mex_name(uint32_t off) { return g_names + off; }
 
@@ -314,7 +415,13 @@ struct IcallEntry { const char* name; IcallFn fn; };
 // Slots for subsystems that layer on top of the CLR (the managed GUI
 // shell registers ~40 of these).  Kept separate from the built-in table
 // so clr.cpp never has to know what they are.
-#define CLR_MAX_EXT_ICALLS 96
+// The host registers one entry per row of mforms.cpp's g_regs[] table
+// (~110 rows today).  At 96 the LAST rows silently failed to register
+// (clr_register_icall returns -1) and any call to them -- Host::SetPixel from
+// Theme.ApplyPixel at startup, SetWindowTransparent, the Linux WebView set --
+// faulted the whole managed shell ("mforms NOT ready").  256 leaves headroom
+// for a while; the table itself is the real limit.
+#define CLR_MAX_EXT_ICALLS 256
 struct ExtIcall { const char* name; IcallFn fn; };
 static ExtIcall g_ext_icalls[CLR_MAX_EXT_ICALLS];
 static int      g_ext_icall_count = 0;
@@ -361,7 +468,7 @@ static int32_t ic_ai_quota(int32_t* a) { (void)a; return (int32_t)quota_remainin
 static int32_t ic_ai_request(int32_t* a) {
     const char* prompt = a[0] ? str_data(a[0]) : "";
     int mode = a[1];
-    static char out[512];
+    static char out[2048];   /* remote answers are longer than the Markov stub */
     ai_request(prompt, mode, out, (int)sizeof(out));
     return ai_mk_cstr(out);
 }
@@ -560,7 +667,7 @@ done:
 static int call_icall(const MexMethod* m, int32_t* args, int32_t* out) {
     if (g_clr_trace) { ser("[icall] "); ser(mex_name(m->name_off)); ser("\n"); }
     uint32_t id = m->icall_id;
-    if (id >= 128 || g_icall_bind[id] == -1) {
+    if (id >= CLR_MAX_ICALLS || g_icall_bind[id] == -1) {
         char buf[128];
         scpy_(buf, "unbound internal call ", sizeof(buf));
         scat_(buf, mex_name(m->name_off), sizeof(buf));
@@ -1093,7 +1200,7 @@ static int load_image(const char* filename) {
 
     if (h->n_statics > CLR_MAX_STATICS) { fault("too many static fields"); return -2; }
     if (h->n_strings > CLR_MAX_STRINGS) { fault("too many string literals"); return -2; }
-    if (h->n_icalls  > 128)             { fault("too many internal calls"); return -2; }
+    if (h->n_icalls  > CLR_MAX_ICALLS)             { fault("too many internal calls"); return -2; }
 
     // ---- bind internal calls by name ---------------------------
     const uint32_t* icoffs = (const uint32_t*)(g_image + h->off_icalls);
@@ -1233,7 +1340,7 @@ extern "C" int clr_run(const char* filename) {
 // =====================================================================
 //  Resident hosting API  -- the managed GUI shell lives here
 // =====================================================================
-static int g_resident = 0;
+// (g_resident is per-slot; see the pool above)
 
 // Record the trusted resident identity for an image path: the basename of the
 // .mex with its extension stripped.  Both loaders (clr_run and clr_load) go

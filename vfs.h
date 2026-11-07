@@ -17,6 +17,14 @@
 #define VFS_PATH_MAX   192
 #define VFS_FILE_CACHE 2048          // per-fd payload cache (SFS files are small)
 
+// ---- writable medium (RAMFS) ----
+// SFS is a read-only boot medium, so writes need a second, writable layer.
+// RAMFS is a small in-memory tree that is consulted FIRST for read/write;
+// anything it does not own falls through to SFS (read-only).
+#define VFS_RAMFS_MAX      16        // concurrent ramfs files
+#define VFS_RAMFS_CAP      4096      // bytes per ramfs file
+#define VFS_RAMFS_NAME_MAX 48        // flat name (mirrors SFS's flat namespace)
+
 // Access intent passed to vfs_check_access().
 #define VFS_ACC_READ   0x1
 #define VFS_ACC_WRITE  0x2
@@ -45,6 +53,15 @@ int  vfs_open(const char* path, int flags);
 int  vfs_read(int fd, void* buf, int count);
 int  vfs_write(int fd, const void* buf, int count);
 int  vfs_close(int fd);
+
+// Create a file and return a writable fd, or -1 on failure.
+// Routes to the writable RAMFS layer, so this succeeds even though the
+// SFS boot medium is read-only.
+int  vfs_create(const char* path, int flags);
+
+// ---- writable-medium introspection (used by tests and vfs_dump) ----
+// Returns 1 when the path currently lives in the writable layer.
+int  vfs_is_writable(const char* path);
 
 // Debug helper: print mount state + the calling process's sandbox root.
 void vfs_dump(void);

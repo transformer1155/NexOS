@@ -32,6 +32,10 @@ extern "C" {
 // the power-on 640x480 blanks the host display even though the guest keeps
 // drawing happily.  The hint is what keeps the two in step.
 void svga_mode_hint(int w, int h, int bpp, int pitch);
+// Same, but ALSO names the buffer the device must scan out (the GUI
+// backbuffer).  Required for the present() fast path: a device scanning a
+// different surface would show a stale image no matter how fast we feed it.
+void svga_mode_hint_fb(int w, int h, int bpp, int pitch, unsigned int fb_phys);
 
 // Whether svga_init() may actually ENABLE the device.  Default ON.
 //
@@ -52,6 +56,17 @@ void svga_mode_hint(int w, int h, int bpp, int pitch);
 int  svga_init(void);
 void svga_allow_enable(int on);
 int  svga_ready(void);
+// True when RECT_FILL may be used against the displayed framebuffer (device
+// enabled and scanning the firmware LFB).  False keeps callers on the CPU path.
+int  svga_lfb_fill_ready(void);
+// 1 when the device's own scanout is pointed at the given buffer, i.e.
+// present() can issue one C_UPDATE instead of copying 3.7 MB per frame.
+int  svga_buffer_is_scanout(unsigned int phys, unsigned int w, unsigned int h);
+// The physical address svga pointed its scanout at (0 when not enabled).  The
+// GUI calls svga_scanout_target() instead of a bare boolean so it can verify
+// the device is scanning THE SAME buffer it draws into; a mismatched buffer
+// would show a frozen or torn screen.
+unsigned int svga_scanout_target(void);
 // 1 once R_ENABLE was actually applied (device owns the scanout).  The hardware
 // cursor overlay and 2D FIFO acceleration are only meaningful when this is set;
 // without it the firmware still scans the linear framebuffer and the CPU paint

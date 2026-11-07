@@ -29,7 +29,6 @@ cd "$(dirname "$0")/.." || exit 1
 OBJS="${K64_OBJS:-}"
 STRICT_FLAGS="${K64_LDFLAGS:-}"
 ALLOW="tools/k64_undefined_allowlist.txt"
-SCRATCH="${K64_STRICT_ELF:-/tmp/nexos_k64_strict.elf}"
 
 if [ -z "$OBJS" ]; then
   echo "check_k64_undefined: K64_OBJS not set (run it through make)" >&2; exit 2
@@ -41,10 +40,36 @@ fi
 RUNDIR=$(mktemp -d)
 trap 'rm -rf "$RUNDIR"' EXIT
 
+# Scratch path: inside our own mktemp dir by default.  A hardcoded /tmp name was
+# shared by every concurrent run AND by any sudo run, so a root-owned leftover
+# made ld fail with 'cannot open output file' -- which this script then reported
+# as a real link problem, sending the team hunting for a kernel bug that did not
+# exist.  Unique-per-run by construction; K64_STRICT_ELF can still override.
+SCRATCH="${K64_STRICT_ELF:-$RUNDIR/strict.elf}"
+if [ -e "$SCRATCH" ] && [ ! -w "$SCRATCH" ]; then
+  echo "check_k64_undefined: scratch $SCRATCH exists and is not writable" >&2
+  echo "  (a sudo or concurrent run may have left it) -- using a private path" >&2
+  SCRATCH="$RUNDIR/strict_fallback.elf"
+fi
+
 # --- 1) strict re-link -------------------------------------------------------
 # shellcheck disable=SC2086
 ld $STRICT_FLAGS -o "$SCRATCH" $OBJS 2> "$RUNDIR/ld.err"
 LD_RC=$?
+
+# --- 1b) separate "cannot verify" from "verification failed" ----------------
+# An IO failure means the link never ran, so it must NOT be reported as a link
+# problem.  Conflating the two is exactly how a stale root-owned scratch file
+# convinced everyone that kernel64 was broken (and glm-53 lost two boot runs).
+if [ "$LD_RC" -ne 0 ] && grep -qiE 'cannot open output file|permission denied|no space left on device' "$RUNDIR/ld.err"; then
+  echo "" >&2
+  echo "*** GATE-IO-ERROR: cannot write the scratch file -- the link never ran." >&2
+  echo "***   scratch: $SCRATCH" >&2
+  sed -n '1,3p' "$RUNDIR/ld.err" | sed 's/^/***   /' >&2
+  echo "***   This is an ENVIRONMENT problem, not a kernel64 problem." >&2
+  echo "***   Check /tmp ownership/permissions (sudo leaves root-owned files), then re-run." >&2
+  exit 2
+fi
 
 # ld quotes symbol names with a backtick; match any leading char to avoid
 # embedding it, then strip the trailing quote.
@@ -86,8 +111,9 @@ fi
 # error when it produced no undefined-symbol diagnostics at all (a real link
 # problem: bad object, missing file, wrong flags ...).
 if [ "$LD_RC" -ne 0 ] && [ "$COUNT" = "0" ]; then
-  echo "*** ERROR: strict kernel64 re-link failed without naming any undefined" >&2
-  echo "***        symbol -- that is a real link problem, not a bind-to-zero one." >&2
+  echo "*** ERROR: strict kernel64 re-link failed: no IO error and no undefined" >&2
+  echo "***        symbols were named -- that is a REAL LINK PROBLEM (bad object," >&2
+  echo "***        missing file, wrong flags), not a bind-to-zero one." >&2
   echo "***        Reproduce with: ld $STRICT_FLAGS -o /tmp/k64.elf $OBJS" >&2
   exit 1
 fi

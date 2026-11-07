@@ -87,26 +87,44 @@ static inline void vmm_wrmsr(uint32_t msr, uint64_t val) {
 #define MSR_EFER               0xC0000080u
 #define EFER_SVME               (1u << 12)
 
-/* ---- VMCB layout (authoritative: Linux arch/x86/include/asm/svm.h) -----
- * Intercept bits are GLOBAL bit numbers: 0-31 = word0 (0x00), 32-63 =
- * word1 (0x04), 64-95 = word2 (0x08), 96-127 = word3 (0x0C), 128-159 =
- * word4 (0x10).  INTERCEPT_VMRUN=128 -> VMCB+0x10 bit0; the APM REQUIRES
- * the VMCB to intercept VMRUN, VMLOAD, VMSAVE, STGI, CLGI or VMRUN exits
- * with #VMFAILVALID.  INTERCEPT_HLT=119 -> 0x0C bit23.  INTERCEPT_IOIO_
- * PROT=127 -> 0x0C bit31. */
+/* ---- VMCB layout of the control area --------------------------------
+ * Intercept bits are GLOBAL bit numbers and the number IS the exit code
+ * (AMD APM Vol 2 App. C): word0 0x00 = 0-31, word1 0x04 = 32-63,
+ * word2 0x08 = 64-95, word3 0x0C = 96-127, word4 0x10 = 128-159.
+ *   VMRUN = 0x80 = global 128 -> word4 bit0   (APM REQUIRES the VMCB to
+ *          intercept VMRUN/VMLOAD/VMSAVE/STGI/CLGI or VMRUN exits with
+ *          #VMFAILVALID)
+ *   HLT   = 0x78 = global 120 -> word3 bit24  (bit 23 is PAUSE)
+ *   IOIO_PROT = 0x7B = global 123 -> word3 bit27 (bit 31 is SHUTDOWN)
+ * The old values here said HLT=119/bit23 and IOIO=127/bit31, which intercept
+ * PAUSE and SHUTDOWN instead -- so HLT and port I/O never trapped.  Fixed
+ * 2026-10-31; the same bug was in svm_driver.c and kernel64.cpp. */
 #define VMCB_CR_INTERCEPT       0x000
 #define VMCB_DR_INTERCEPT       0x004
 #define VMCB_EXC_INTERCEPT      0x008
 #define VMCB_WORD3_INTERCEPT    0x00C
 #define VMCB_WORD4_INTERCEPT    0x010
-#define VMCB_IOPM_BASE_PA       0x030
-#define VMCB_MSRPM_BASE_PA      0x038
-#define VMCB_ASID               0x048
-#define VMCB_TLB_CTL            0x04C
-#define VMCB_INT_CTL            0x050
-#define VMCB_EXITCODE           0x058   /* u64 */
-#define VMCB_EXITINFO1          0x060
-#define VMCB_EXITINFO2          0x068
+/* NOTE (2026-11-01): this group was 0x18 too low, and it poisoned the same
+ * fields in svm_driver.c and .attic64/kernel64.cpp.  Authoritative layout is
+ * QEMU's target/i386/svm.h struct vmcb_control_area (QEMU_PACKED), which is the
+ * AMD APM layout byte-for-byte:
+ *   0x040 iopm_base_pa(u64)  0x048 msrpm_base_pa(u64)  0x050 tsc_offset(u64)
+ *   0x058 asid(u32)          0x05C tlb_ctl(u8)         0x060 int_ctl(u32)
+ *   0x064 int_vector         0x068 int_state          0x070 exit_code(u64)
+ *   0x078 exit_info_1(u64)   0x080 exit_info_2(u64)   0x088 exit_int_info
+ *   0x08C exit_int_info_err  0x090 nested_ctl(u64)    0x0A0 nRIP
+ * The intercept u64 at 0x00C was already right; the SAVE area really starts at
+ * 0x400, so the VMCB_SAVE_* constants below were correct all along.
+ * Proven end-to-end 2026-11-01: with these offsets the guest runs and HLT
+ * traps as exit code 0x078 (exits=1, halted=1, rc=0). */
+#define VMCB_IOPM_BASE_PA       0x040
+#define VMCB_MSRPM_BASE_PA      0x048
+#define VMCB_ASID               0x058
+#define VMCB_TLB_CTL            0x05C
+#define VMCB_INT_CTL            0x060
+#define VMCB_EXITCODE           0x070   /* u64 */
+#define VMCB_EXITINFO1          0x078
+#define VMCB_EXITINFO2          0x080
 #define VMCB_NEXT_RIP           0x0A0
 #define VMCB_EVENT_INJ          0x0A8
 #define VMCB_CLEAN              0x0F8
@@ -487,13 +505,19 @@ static void vm_build_vmcb(VmmGuest* gg) {
     /* zero the whole page first */
     for (uint32_t i = 0; i < 4096u; i++) v[i] = 0;
 
-    /* control area intercepts (global bit numbers):
-     *   word3 (0x0C): bit23 = HLT, bit31 = IOIO_PROT (all port I/O)
-     *   word4 (0x10): bit0  = VMRUN (MANDATORY: VMRUN fails with
-     *                           #VMFAILVALID unless it intercepts itself),
-     *                 bit1..4 = VMMCALL/VMLOAD/VMSAVE/STGI/CLGI (also
-     *                           required per APM nested-SVM rules)      */
-    vm_put32(v, VMCB_WORD3_INTERCEPT, (1u << 23) | (1u << 31));
+    /* control area intercepts.  A bitmap bit number IS its exit code
+     * (AMD APM Vol 2 App. C), so the position inside the word is
+     * (exit_code - 96) for word3:
+     *   word3 (0x0C, global bits 96..127):
+     *     HLT       = 0x78 = global 120 -> bit 24   (bit 23 is PAUSE!)
+     *     IOIO_PROT = 0x7B = global 123 -> bit 27   (bit 31 is SHUTDOWN!)
+     *   word4 (0x10, global bits 128..159):
+     *     VMRUN     = 0x80 = global 128 -> bit 0  (MANDATORY: VMRUN fails
+     *                 with #VMFAILVALID unless it intercepts itself)
+     *     bit1..4 = VMMCALL/VMLOAD/VMSAVE/STGI/CLGI (APM nested-SVM rules)
+     * NOTE: this used to write (1<<23)|(1<<31), i.e. PAUSE and SHUTDOWN,
+     * so neither HLT nor port I/O ever trapped.  Fixed 2026-10-31.  */
+    vm_put32(v, VMCB_WORD3_INTERCEPT, (1u << 24) | (1u << 27));
     vm_put32(v, VMCB_WORD4_INTERCEPT, 0x0000001Fu);
     vm_put32(v, VMCB_IOPM_BASE_PA, gg->iopm_phys);
     vm_put32(v, VMCB_MSRPM_BASE_PA, gg->msrpm_phys);

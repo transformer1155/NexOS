@@ -44,9 +44,68 @@ static GdtTable g_gdt;
 // Per-slot allocation bitmap for the TLS pool (slots 8..23).
 static int g_tls_used[16];
 
-// 64-bit TSS (IA-32e).  We only need rsp0 (ring-3 -> ring-0 stack) and
-// the IST array for critical exceptions.  iomap points past the struct
-// so no I/O permission bitmap is present.
+// =====================================================================
+//  TSS layout -- must match the CPU mode we actually run in
+// ---------------------------------------------------------------------
+//  THIS WAS THE RING-3 HANG.
+//
+//  The BIOS image boots into plain 32-bit protected mode (stage2 sets
+//  CR0.PE only; EFER.LME is never touched).  In that mode a TSS uses the
+//  CLASSIC 32-BIT LAYOUT:
+//
+//        offset 0 : prev_tss (32-bit)
+//        offset 4 : esp0     <-- ring-0 stack the CPU loads on a
+//        offset 8 : ss0          ring3 -> ring0 trap through a gate
+//
+//  gdt.cpp previously declared a 64-bit (IA-32e) Tss64, whose `rsp0`
+//  lives at offset 8 and leaves offset 4 as ALIGNMENT PADDING.  Under a
+//  32-bit TSS the CPU read esp0 from offset 4, got the zero padding, and
+//  on the very first `int 0x80` from ring 3 it tried to switch stacks to
+//  address 0 -- faulting with no usable stack, so nothing could even run
+//  a handler.  Result: a silent hang, exactly what we observed:
+//
+//     * iret into ring 3 SUCCEEDED (a store from the guest landed) -- iret
+//       does not consult the TSS;
+//     * the first int 0x80 HUNG -- the gate does.
+//
+//  Fix: keep BOTH layouts and select the right one at gdt_init() time by
+//  testing EFER.LMA, so the same source is correct for the BIOS path
+//  (32-bit protected mode) and for a future IA-32e/long-mode path.
+// =====================================================================
+
+// Classic 32-bit protected-mode TSS.  esp0 at offset 4 is the field that
+// matters here.
+struct Tss32 {
+    uint32_t prev_tss;      //  0
+    uint32_t esp0;          //  4   <- ring-0 stack pointer
+    uint32_t ss0;           //  8
+    uint32_t esp1;          // 12
+    uint32_t ss1;           // 16
+    uint32_t esp2;          // 20
+    uint32_t ss2;           // 24
+    uint32_t cr3;           // 28
+    uint32_t eip;           // 32
+    uint32_t eflags;        // 36
+    uint32_t eax;           // 40
+    uint32_t ecx;           // 44
+    uint32_t edx;           // 48
+    uint32_t ebx;           // 52
+    uint32_t esp;           // 56
+    uint32_t ebp;           // 60
+    uint32_t esi;           // 64
+    uint32_t edi;           // 68
+    uint32_t es;            // 72
+    uint32_t cs;            // 76
+    uint32_t ss;            // 80
+    uint32_t ds;            // 84
+    uint32_t fs;            // 88
+    uint32_t gs;            // 92
+    uint32_t ldt;           // 96
+    uint16_t trap;          // 100
+    uint16_t iomap_base;    // 102
+};
+
+// IA-32e (long mode) TSS.  rsp0 at offset 8; offset 4 is padding.
 struct Tss64 {
     uint32_t reserved0;
     uint64_t rsp0;
@@ -58,13 +117,51 @@ struct Tss64 {
     uint16_t reserved3;
     uint16_t iomap;
 };
+
+static Tss32   g_tss32;
 static Tss64   g_tss64;
+// Which descriptor is live (1 = the 64-bit form was selected).
+static int     g_tss_is_64 = 0;
+
 // Dedicated ring-0 stack used during ring-3 -> ring-0 transitions.
 static uint8_t g_kstack[16384];
 // Dedicated stack for #DF / #MC (IST[1]).  Long mode REQUIRES these
 // critical exceptions to use a non-zero IST; IST=0 makes the CPU shut
 // down instead of delivering the fault.
 static uint8_t g_crit_stack[8192];
+
+// True when the CPU is executing in IA-32e long mode.
+//
+// NOTE: `rdmsr` of EFER (0xC0000080) is NOT safe here.  On a CPU running
+// in plain 32-bit protected mode without IA-32e support, that MSR does not
+// exist and `rdmsr` raises #GP.  gdt_init() runs BEFORE idt_init(), so a
+// #GP at this point has no handler and hangs the boot instantly (that is
+// exactly what a naive rdmsr probe did).
+//
+// Instead we ask CPUID whether IA-32e is even available, and only then
+// read EFER.  If the extended-function bit is absent or the long-mode bit
+// (EDX bit 29 of leaf 0x80000001) is clear, we are in plain 32-bit mode.
+static int cpu_is_long_mode(){
+    sp("[GDT] probing long mode...\n");
+    uint32_t max_ext;
+    __asm__ __volatile__("cpuid" : "=a"(max_ext) : "a"(0x80000000) : "ebx", "ecx", "edx");
+    sp("[GDT] cpuid 80000000 ok\n");
+    if (max_ext < 0x80000001u) return 0;          // no extended features
+
+    uint32_t edx;
+    __asm__ __volatile__("cpuid"
+                         : "=d"(edx)
+                         : "a"(0x80000001), "c"(0)
+                         : "ebx");
+    sp("[GDT] cpuid 80000001 ok\n");
+    if (!(edx & (1u << 29))) return 0;            // no IA-32e support at all
+
+    // IA-32e exists; EFER is now safe to read.
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000080));
+    sp("[GDT] rdmsr efer ok\n");
+    return (lo & (1u << 10)) ? 1 : 0;
+}
 
 // Build an 8-byte flat 4 GiB segment descriptor (base=0, limit=4GiB-1,
 // G=1, 32-bit operand size).  `access` is the byte written at bits 40..47.
@@ -89,16 +186,50 @@ void gdt_init(){
     // 4: udata 0x23  DPL 3, data
     g_gdt.udata = gdt_flat(0xF2);
 
-    // 5: TSS 0x28  -- 16-byte 64-bit TSS descriptor (type 9, P=1 DPL=0)
-    uint64_t base = (uint64_t)(uintptr_t)&g_tss64;
-    uint32_t lim  = (uint32_t)(sizeof(Tss64) - 1);   // >= 0x67 for IST
+    // 5: TSS 0x28 -- descriptor form depends on the CPU mode we booted in.
+    //
+    //   32-bit protected mode (BIOS image)  -> classic 16-bit-limit 32-bit
+    //                                          TSS, type 0xB (busy 32-bit), 8-byte
+    //   IA-32e long mode (UEFI image)      -> 16-byte 64-bit TSS, type 0x9
+    //
+    //   Getting this wrong is what hung ring-3: a 64-bit TSS loaded while
+    //   the CPU was in 32-bit protected mode leaves offset 4 (32-bit
+    //   TSS.esp0) holding zero, so the first ring3->ring0 trap switched
+    //   stacks to address 0.
+    g_tss_is_64 = cpu_is_long_mode();
+    sp(g_tss_is_64 ? "[GDT] mode=LONG (64-bit TSS)\n"
+                   : "[GDT] mode=32BIT (32-bit TSS)\n");
+    uint64_t base;
+    uint32_t lim;
+    uint8_t  tss_type;
+    if (g_tss_is_64){
+        base = (uint64_t)(uintptr_t)&g_tss64;
+        lim  = (uint32_t)(sizeof(Tss64) - 1);
+        tss_type = 0x89;              // P=1 DPL=0 type=9 available 64-bit TSS
+        // ring-0 stack + critical-exception IST
+        g_tss64.rsp0   = (uint64_t)(uintptr_t)(g_kstack + sizeof(g_kstack));
+        g_tss64.ist[1] = (uint64_t)(uintptr_t)(g_crit_stack + sizeof(g_crit_stack));
+        g_tss64.iomap  = (uint16_t)sizeof(Tss64);
+    } else {
+        base = (uint64_t)(uintptr_t)&g_tss32;
+        lim  = (uint32_t)(sizeof(Tss32) - 1);
+        tss_type = 0x89;              // P=1 DPL=0 type=9 AVAILABLE 32-bit TSS
+        // NOTE: type 0xB is the BUSY form.  `ltr` requires an AVAILABLE
+        // TSS -- loading a busy descriptor raises #GP, and because
+        // gdt_init() runs before idt_init() there is no handler yet, so
+        // the boot hangs with no report.  The CPU flips it to 0xB itself.
+        // THE FIX: esp0 lives at offset 4 in a 32-bit TSS.
+        g_tss32.ss0        = 0x10;    // ring-0 data selector (kdata)
+        g_tss32.esp0       = (uint32_t)(uintptr_t)(g_kstack + sizeof(g_kstack));
+        g_tss32.iomap_base = (uint16_t)sizeof(Tss32);   // past struct: no I/O map
+    }
     uint64_t w0 = ((uint64_t)(lim & 0xFFFF) << 0)
                 | ((uint64_t)(base & 0xFFFF) << 16)
                 | ((uint64_t)((base >> 16) & 0xFF) << 32)
-                | ((uint64_t)0x89 << 40)             // P=1 DPL=0 type=9 (available 64-bit TSS)
+                | ((uint64_t)tss_type << 40)
                 | ((uint64_t)((lim >> 16) & 0x0F) << 48)
                 | ((uint64_t)((base >> 24) & 0xFF) << 56);
-    uint64_t w1 = (uint64_t)(base >> 32) & 0xFFFFFFFFULL;   // base bits 32..63 (0 below 4GB)
+    uint64_t w1 = (uint64_t)(base >> 32) & 0xFFFFFFFFULL;   // base bits 32..63
     g_gdt.tss_lo = w0;
     g_gdt.tss_hi = w1;
 
@@ -109,15 +240,30 @@ void gdt_init(){
     for (int i = 0; i < 16; i++){ g_gdt.tls_pool[i] = 0; g_tls_used[i] = 0; }
 
     // TSS: ring-0 stack for traps coming from ring 3.
-    g_tss64.rsp0 = (uint64_t)(uintptr_t)(g_kstack + sizeof(g_kstack));
-    g_tss64.ist[1] = (uint64_t)(uintptr_t)(g_crit_stack + sizeof(g_crit_stack));
-    g_tss64.iomap = (uint16_t)sizeof(Tss64);   // points past struct => no I/O map
+    if (!g_tss_is_64){
+        g_tss32.ss0        = 0x10;
+        g_tss32.esp0       = (uint32_t)(uintptr_t)(g_kstack + sizeof(g_kstack));
+        g_tss32.iomap_base = (uint16_t)sizeof(Tss32);
+    } else {
+        g_tss64.rsp0   = (uint64_t)(uintptr_t)(g_kstack + sizeof(g_kstack));
+        g_tss64.ist[1] = (uint64_t)(uintptr_t)(g_crit_stack + sizeof(g_crit_stack));
+        g_tss64.iomap  = (uint16_t)sizeof(Tss64);
+    }
 
     g_gdtr.limit = (uint16_t)(sizeof(GdtTable) - 1);
     g_gdtr.base  = (uint32_t)(uintptr_t)&g_gdt;
 
     __asm__ __volatile__("lgdt %0" :: "m"(g_gdtr));
+    sp("[GDT] lgdt ok\n");
     __asm__ __volatile__("ltr %%ax" :: "a"((uint16_t)0x28));
+    sp("[GDT] ltr ok\n");
+
+    // Report which TSS form went live: this is the single most useful clue
+    // when a ring3 -> ring0 transition misbehaves.
+    if (g_tss_is_64)
+        sp("[GDT] TSS: 64-bit (IA-32e), rsp0 set\n");
+    else
+        sp("[GDT] TSS: 32-bit protected mode, esp0 @offset4 set\n");
 
     // Reload data segments to the new kdata selector (CS stays valid: the
     // new kcode descriptor equals the one stage2/enter_kernel installed,

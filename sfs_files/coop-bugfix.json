@@ -1,0 +1,97 @@
+{
+  "schema": 1,
+  "id": "bugfix",
+  "title": "缺陷端到端修复",
+  "version": "1.0.0",
+  "summary": "从构造最小复现，到定位根因、实施修复、独立验证、形成报告的完整缺陷处理流程。每个阶段都必须交出规定的产出物，才能进入下一阶段。",
+  "tags": ["bugfix", "quality"],
+  "skill": { "exposed": true, "tool": "cooperation.run" },
+  "inputs": [
+    { "name": "symptom", "type": "text", "required": true },
+    { "name": "area",    "type": "text", "required": false }
+  ],
+  "roles": [
+    {
+      "role": "reproducer",
+      "capability": ["build", "run-qemu", "read-serial"],
+      "count": 1,
+      "fallback": "kernel-architect"
+    },
+    {
+      "role": "diagnoser",
+      "capability": ["read-source", "read-serial"],
+      "count": 1,
+      "fallback": "kernel-architect"
+    },
+    {
+      "role": "fixer",
+      "capability": ["edit-source", "build"],
+      "count": 1,
+      "fallback": "kernel-architect"
+    },
+    {
+      "role": "verifier",
+      "capability": ["build", "run-qemu", "read-serial"],
+      "count": 1,
+      "fallback": "kernel-architect"
+    },
+    {
+      "role": "reporter",
+      "capability": ["write-doc"],
+      "count": 1,
+      "fallback": "kernel-architect"
+    }
+  ],
+  "phases": [
+    {
+      "phase": "reproduce",
+      "role": "reproducer",
+      "goal": "构造最小复现并留存证据",
+      "action": { "kind": "task", "subject": "复现：{{symptom}}" },
+      "context_in": [],
+      "context_out": ["repro.steps", "repro.evidence"],
+      "handoff": { "requires": ["repro.steps", "repro.evidence"], "to": "diagnose" }
+    },
+    {
+      "phase": "diagnose",
+      "role": "diagnoser",
+      "goal": "基于复现证据定位根因",
+      "action": { "kind": "report" },
+      "context_in": ["repro.evidence"],
+      "context_out": ["diag.rootcause"],
+      "handoff": { "requires": ["diag.rootcause"], "to": "fix" }
+    },
+    {
+      "phase": "fix",
+      "role": "fixer",
+      "goal": "按根因实施修复",
+      "action": { "kind": "task", "subject": "修复：{{diag.rootcause}}" },
+      "context_in": ["diag.rootcause"],
+      "context_out": ["fix.files", "fix.diff"],
+      "handoff": { "requires": ["fix.files", "fix.diff"], "to": "verify" }
+    },
+    {
+      "phase": "verify",
+      "role": "verifier",
+      "goal": "独立验证修复（不得由 fixer 自验）",
+      "action": { "kind": "task", "subject": "验证修复：{{symptom}}" },
+      "context_in": ["fix.files", "repro.steps"],
+      "context_out": ["verify.result"],
+      "handoff": { "requires": ["verify.result"], "to": "report" }
+    },
+    {
+      "phase": "report",
+      "role": "reporter",
+      "goal": "汇总根因、修复与验证结论",
+      "action": { "kind": "report" },
+      "context_in": ["diag.rootcause", "fix.files", "verify.result"],
+      "context_out": ["report.summary"],
+      "handoff": { "requires": ["report.summary"], "to": "" }
+    }
+  ],
+  "guards": {
+    "max_phases": 8,
+    "require_handoff_artifacts": true,
+    "fail_closed": true
+  }
+}

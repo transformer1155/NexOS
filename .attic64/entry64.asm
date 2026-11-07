@@ -59,7 +59,17 @@ _start64:
     ; NOTE: entry64.o links against linker64.ld, which does not define
     ; __lm_stack_top, so this cannot be an extern -- keep it in sync with
     ; linker.ld's __lm_stack_top by hand.
-    mov rsp, 0x1828000
+    ; 64-bit stack.  It used to be 0x1828000, which sits inside the .lmboot region
+; (0x1800000..0x2000000) -- the same region the long-mode page tables live in
+; (CR3 = 0x1810000), so a stack there can be silently overwritten and then even
+; the #PF handler triple-faults with no diagnostic output.  3 MiB is clear of
+; kernel64 (0x100000..~0x1F3000) and of .lmboot.
+; 64-bit stack.  8 MiB keeps it clear of both kernel images (32-bit at
+; 0x10000..0x9FC00, kernel64 at 0x100000..~0x1F3000), of the .lmboot region
+; (0x1800000..0x2000000) and of the ATA bus-master PRDT area (~0x3477B0).
+; The earlier 0x1828000 overlapped .lmboot; 0x300000 sat next to the DMA
+; buffers; 0x90000 (in the switch stub) was inside the 32-bit kernel image.
+mov rsp, 0x800000
 
     ; ---- Enable FPU (x87) + SSE ----
     mov rax, cr0

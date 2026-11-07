@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Two-guest verification of the NexOS distributed compute network.
 
-Boots TWO QEMU guests on a shared L2 UDP socket link (no SLIRP), so we
+Boots TWO QEMU guests on a shared L2 socket link (no SLIRP), so we
 exercise the REAL broadcast discovery path:
 
     guest A (scheduler, 10.0.2.15):  distnet scheduler   (broadcast QUERY)
@@ -39,7 +39,12 @@ if not QEMU:
     sys.exit(2)
 
 IMG = sys.argv[1] if len(sys.argv) > 1 else "build/os_textboot.img"
-SK = "127.0.0.1:1234"          # UDP socket tunnel between the two guests
+SK = "127.0.0.1:1234"          # TCP socket tunnel between the two guests.  NOTE: the
+#                                 QEMU `-net socket,listen=|connect=` backend used here
+#                                 is TCP, NOT UDP (an earlier comment claimed UDP and
+#                                 sent three people down a dead end trying to inject
+#                                 datagrams into it).  It carries one Ethernet frame per
+#                                 write(), with no length prefix.
 MA_PORT, MB_PORT = 4481, 4482
 SA_LOG = "build/serial_2vm_a.log"   # scheduler guest
 SB_LOG = "build/serial_2vm_b.log"   # compute guest

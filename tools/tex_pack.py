@@ -180,6 +180,68 @@ def main():
 
     print("[tex_pack] generating textures into %s" % OUT)
     pack("wall", 0, load_or_gen("wallpaper.png", (960, 540), gen_wallpaper))
+    # ---- user wallpapers: every PNG in assets/wallpapers/ -----------------
+    # Drop any image in there and it is packed into the image automatically;
+    # the host probes tex_wp0.tex, tex_wp1.tex, ... until a load fails, so the
+    # COUNT IS DATA, not code.  Order is the sorted file name, so renaming a
+    # file reorders the menu.
+    wp_dir = os.path.join(ASSETS, "wallpapers")
+    if not os.path.isdir(wp_dir):
+        os.makedirs(wp_dir)
+    wp_files = sorted(f for f in os.listdir(wp_dir)
+                      if f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")))
+
+    # ---- pick a resolution that FITS, instead of one that looks nice -------
+    # The SFS volume gets a fixed slot (SFS_LBA..LINUX_SFS_LBA); when it
+    # overflows, the loader's dd silently overwrites the SFS tail with the
+    # Linux partition, and the files at the end of the volume (the wallpapers)
+    # stop loading -- which looks exactly like "my wallpaper was ignored".
+    # So: budget the wallpapers, shrink to the largest 16:9 step that fits, and
+    # centre-crop first so a non-16:9 photo is not stretched.
+    # Share of the SFS slot the wallpapers may use.  Measured headroom: the SFS
+    # volume ends up ~715 KiB below the slot limit at 2 MiB, so 2.6 MiB keeps a
+    # ~400 KiB margin while letting 8 wallpapers reach 512x288 instead of 384x216
+    # (the slot limit itself is enforced by a Makefile guard, so this is safe).
+    WP_BUDGET_BYTES = 2600 * 1024
+    HEADER = 24
+    # 16:9 sizes, largest first.  The list is dense on purpose: the picker takes
+    # the biggest one that fits the per-wallpaper budget, so adding a step is
+    # how you spend spare SFS room on sharpness.
+    STEPS = [(1280, 720), (960, 540), (854, 480), (800, 450), (720, 405),
+             (640, 360), (576, 324), (512, 288), (480, 270), (426, 240),
+             (384, 216), (320, 180), (256, 144)]
+    n = max(1, len(wp_files))
+    per = (WP_BUDGET_BYTES - 8 * 1024) // n      # keep a little slack
+    wp_size = STEPS[-1]
+    for (w, h) in STEPS:
+        if w * h * 2 + HEADER <= per:
+            wp_size = (w, h)
+            break
+    print("[tex_pack] wallpaper budget: %d B each -> %dx%d" %
+          (per, wp_size[0], wp_size[1]))
+    for i, f in enumerate(wp_files):
+        path = os.path.join(wp_dir, f)
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception as e:
+            print("  WARN wallpaper %s unreadable (%s), skipped" % (f, e))
+            continue
+        # Any source size / aspect is fine: centre-crop to 16:9, then scale.
+        tw, th = wp_size
+        sw, sh = img.size
+        if sw * th > sh * tw:                    # too wide -> crop sides
+            nw = sh * tw // th
+            x = (sw - nw) // 2
+            img = img.crop((x, 0, x + nw, sh))
+        else:                                    # too tall -> crop top/bottom
+            nh = sw * th // tw
+            y = (sh - nh) // 2
+            img = img.crop((0, y, sw, y + nh))
+        img = img.resize((tw, th), Image.LANCZOS)
+        print("  wallpaper %d: %s (%dx%d -> %dx%d)" %
+              (i, f, sw, sh, tw, th))
+        pack("wp%d" % i, 0, img)
+    print("[tex_pack] user wallpapers: %d" % len(wp_files))
     pack("task", 0, load_or_gen("taskbar.png", (256, 48),
                                 lambda: gen_surface(256, 48, (0xF2, 0xF5, 0xFA), (0xE4, 0xEA, 0xF4))))
     pack("menu", 0, load_or_gen("menu.png", (256, 128),

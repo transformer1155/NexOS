@@ -116,6 +116,26 @@ start:
     ;   0x500B: uint16 mode_number
     ;   0x500D: uint8  vbe_ok (1=ok, 0=failed)
     mov byte [0x500D], 0          ; assume failure
+    ; 32-bit default.  64-bit status: the IDT load-offset bug is FIXED and verified
+    ; (a deliberate #PF now prints a full [DIAG-FAULT] dump with CR2/RIP), and the
+    ; boot reaches kmain64/IDT/SMP/ATA reliably.  Under VirtualBox it still dies
+    ; right after the [FBMAP] line of fb_mapping_selfcheck() with NO exception
+    ; record at all (empty LBA1500, no [DIAG-FAULT]) although a deliberate #PF
+    ; at the same point DOES print -- so something between the IDT install and
+    ; that point stops faults from being dispatched at all.  Prime suspect:
+    ; the ATA bus-master DMA set up just before ([ATA] BM-DMA base=0000D000,
+    ; prdt=003477B0), which VBox services differently from QEMU and could be
+    ; writing over low memory (IDT/GDT/stack).  Flip to 1 when that is solved.
+    ; DEFAULT: long mode.  VirtualBox could not run it until the identity map
+    ; stopped relying on 1 GiB pages: CPUID.80000001h:EDX bit 26 (pdpe1gb) is
+    ; advertised by QEMU but NOT by VirtualBox, whose NEM backend rejects PS=1 at
+    ; the PDPT level outright.  Such a rejection is not a guest fault -- no #PF,
+    ; no IDT entry, no fault record -- the VM just died with Guru Meditation 1155
+    ; the instant the first framebuffer store touched the 3-4 GiB page holding
+    ; the VBE LFB.  switch32to64.asm now probes the bit and falls back to 2 MiB
+    ; pages, so the same image runs on both.  32-bit stays reachable with
+    ; `switch64auto off` for one boot.
+    mov byte [0x5021], 1          ; auto-switch to long mode (DEFAULT ON)
 
     ; Serial debug: 'V' = starting VBE setup
     mov dx, 0x3F8

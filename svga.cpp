@@ -190,9 +190,25 @@ static int  sv_hint_w    = 0;
 static int  sv_hint_h    = 0;
 static int  sv_hint_bpp  = 0;
 static int  sv_hint_pitch = 0;
+// Framebuffer the device should scan out.  Set to the GUI backbuffer so the
+// device reads the memory the compositor actually draws into; 0 means "use the
+// VBE LFB the firmware left us" (the old behaviour).
+static u32  sv_hint_fb    = 0;
 
 void svga_mode_hint(int w, int h, int bpp, int pitch) {
     sv_hint_w = w; sv_hint_h = h; sv_hint_bpp = bpp; sv_hint_pitch = pitch;
+}
+
+// Extended hint: also name the exact buffer the device should scan out.
+//
+// Without this the device scans the VBE LFB (0xE0000000) while the compositor
+// draws into its own backbuffer, so every frame still needs a 3.7 MB CPU copy
+// and no amount of 2D acceleration helps -- the device is looking at the wrong
+// memory.  Pointing R_FB_START at the backbuffer makes present() a single
+// C_UPDATE command.
+void svga_mode_hint_fb(int w, int h, int bpp, int pitch, unsigned int fb_phys) {
+    sv_hint_w = w; sv_hint_h = h; sv_hint_bpp = bpp; sv_hint_pitch = pitch;
+    sv_hint_fb = fb_phys;
 }
 
 // See svga_allow_enable() in the header.  ON by default: the driver now
@@ -209,6 +225,7 @@ void svga_allow_enable(int on) { sv_allow_enable = on; }
 // then; without it the firmware still scans the linear framebuffer and the
 // CPU paint path keeps working.
 static int sv_scanout_enabled = 0;
+static u32  sv_scanout_phys_addr = 0;   // what the device is actually scanning out
 int  svga_scanout_enabled(void) { return sv_scanout_enabled; }
 
 // The kernel heap lives in the first 32 MiB and is identity-mapped, so a
@@ -392,8 +409,29 @@ extern "C" int vmm_map_page(unsigned int virt, unsigned int phys, unsigned int f
 // the live linear framebuffer (which the kernel identity-maps at 0xE0000000).
 //   SV_REG_WIN  -- the SVGA-II index/value register window (BAR1/BAR2 on VBox)
 //   SV_FIFO_WIN -- the SVGA-II command FIFO (device-owned or guest-RAM)
-#define SV_REG_WIN  0xFC000000u
-#define SV_FIFO_WIN 0xF8000000u
+// The 32-bit kernel never identity-maps the high 256 MiB, so these windows
+// are free for aliasing a device BAR there.
+//
+// LONG MODE IS DIFFERENT: switch32to64.asm installs ISO 1 GiB pages over 0..8
+// GiB, so 0xFC000000 and 0xF8000000 are REAL PCI/BIOS/APIC address space there.
+// Dereferencing them as a register window writes into whatever lives at those
+// physical addresses.  That is exactly why the un-guarded 64-bit attempt hung
+// with no output: sv_pci_find() succeeded, then sv_device_init() "mapped" the
+// MMIO window at 0xFC000000 with vmm_map_page (which in long mode only
+// accepts virt==phys) and wrote to a pixel/BIOS region instead of the device.
+//
+// In long mode the device's BAR is already reachable at its own physical
+// address, so the driver must use phys==virt and skip the alias entirely.
+// SV_USE_IDENTITY tells the mapping helper to do that.
+#if defined(__x86_64__)
+#define SV_REG_WIN   0x0u          // unused in long mode: phys==virt is used
+#define SV_FIFO_WIN  0x0u
+#define SV_USE_IDENTITY 1
+#else
+#define SV_REG_WIN   0xFC000000u
+#define SV_FIFO_WIN  0xF8000000u
+#define SV_USE_IDENTITY 0
+#endif
 
 // ---------------------------------------------------------------------
 //  Locate the SVGA-II register window.
@@ -453,8 +491,17 @@ static int sv_pci_find(void) {
                     continue;
                 }
                 // Map one page of the BAR uncacheable and probe R_ID.
+#if defined(__x86_64__)
+                // Long mode: the BAR is already mapped at its physical
+                // address, so use it directly.  vmm_map_page() here only
+                // accepts virt==phys (see kernel64.cpp), so an alias request
+                // would be refused anyway.
+                sv_mmio = (volatile u32*)(unsigned long)base;
+                sv_mmio_flat = 1;
+#else
                 if (!vmm_map_page(SV_REG_WIN, base, 0x1Bu)) continue;
                 sv_mmio  = (volatile u32*)SV_REG_WIN;
+#endif
                 sv_io    = 0;
                 sv_reg_write(R_ID, SVGA_ID_2);
                 u32 id2 = sv_reg_read(R_ID);
@@ -463,12 +510,21 @@ static int sv_pci_find(void) {
                 sv_puts(" phys="); sv_puthex(base);
                 sv_puts(" negotiated="); sv_puthex(id2); sv_putc('\n');
                 if ((id2 & 0xFF000000u) == 0x90000000u && id2 >= SVGA_ID_2) {
-                    sv_mmio = (volatile u32*)SV_REG_WIN; // keep this mapping
+#if defined(__x86_64__)
+                    sv_mmio = (volatile u32*)(unsigned long)base;  // identity: phys==virt
+#else
+                    sv_mmio = (volatile u32*)SV_REG_WIN;     // keep this mapping
+#endif
                     sv_io   = 0;
                     sv_mmio_flat = 1;                    // flat register array
                     sv_puts("[SVGA] register window: MMIO @ bar ");
                     sv_putdec(b); sv_puts(" phys="); sv_puthex(base);
-                    sv_puts(" va="); sv_puthex(SV_REG_WIN); sv_putc('\n');
+#if defined(__x86_64__)
+                    sv_puts(" va=identity");
+#else
+                    sv_puts(" va="); sv_puthex(SV_REG_WIN);
+#endif
+                    sv_putc('\n');
                     found = 1;
                 }
             }
@@ -615,11 +671,19 @@ static u8* sv_map_mmio(u32 win, u32 phys, u32 size) {
     if (phys & 0xFFFu) return 0;                       // must be page aligned
     u32 pages = (size + 4095u) >> 12;
     if (pages == 0 || pages > 4096u) return 0;         // sanity: <= 16 MiB
+#if defined(__x86_64__)
+    // Long mode: identity-mapped 0..8 GiB, so the physical address IS the
+    // virtual address and no page-table work is needed.  bss/static device
+    // windows cannot be used here at all (see the SV_REG_WIN comment).
+    (void)win;
+    return (u8*)(unsigned long)phys;
+#else
     for (u32 i = 0; i < pages; i++) {
         if (!vmm_map_page(win + i * 4096u, phys + i * 4096u, 0x1Bu))
             return 0;                                  // present | rw | UC
     }
     return (u8*)win;
+#endif
 }
 static int sv_fifo_init(void) {
     u32 want0     = sv_reg_read(R_MEM_SIZE);   // the device's stated FIFO size
@@ -665,7 +729,11 @@ static int sv_fifo_init(void) {
         sv_fifo_base = win;
         sv_fifo_size = want0;
         sv_puts("[SVGA] fifo MMIO phys="); sv_puthex(dev_start);
+#if defined(__x86_64__)
+        sv_puts(" -> va=identity");
+#else
         sv_puts(" -> va=");  sv_puthex(SV_FIFO_WIN);
+#endif
         sv_puts(" size=");   sv_putdec((int)sv_fifo_size); sv_putc('\n');
     }
 
@@ -697,7 +765,19 @@ static int sv_fifo_init(void) {
     // keeps the proven-clean scanout and the painted arrow remains.  Either way
     // the FIFO is still brought up so a cursor-capable device can be verified.
     int have_cursor = (sv_caps & ((1u << 5) | (1u << 9))) != 0;
-    int intend_enable = sv_allow_enable && have_cursor
+    // ENABLE whenever we have a usable surface, EVEN WITHOUT a hardware cursor.
+    //
+    // The old rule required SVGA_CAP_CURSOR ("ENABLE only earns its keep for the
+    // cursor overlay").  That made the 2D engine permanently unavailable on the
+    // one device this targets: VirtualBox's vmsvga advertises RECT_FILL + TRACES
+    // but NOT cursor capability, so have_cursor was always 0, the FIFO never
+    // got enabled, and the desktop stayed 100% CPU-rendered regardless of
+    // drivers.  C_RECT_FILL / C_UPDATE are the point; the cursor is a bonus.
+    //
+    // The format/framebuffer self-check below is UNCHANGED and still withholds
+    // the enable when the device will not reproduce the kernel's mode, so this
+    // cannot stripe or blank a working display.
+    int intend_enable = sv_allow_enable
                       && (sv_hint_w > 0) && (sv_hint_h > 0) && (sv_lfb_phys() != 0);
     int fmt_ok = 1;
 
@@ -710,7 +790,9 @@ static int sv_fifo_init(void) {
         // so an Enabled device scans the identical bytes and the cursor overlay
         // works without the screen ever switching surfaces.  Write, read back,
         // and verify.
-        u32 lfb = sv_lfb_phys();
+        // Scan the buffer the compositor draws into when the caller named one;
+        // otherwise fall back to the firmware LFB.
+        u32 lfb = sv_hint_fb ? sv_hint_fb : sv_lfb_phys();
         sv_reg_write(R_FB_START, lfb);
         sv_reg_write(R_FB_OFFSET, 0);
         sv_reg_write(R_FB_SIZE, (u32)sv_hint_h * (u32)sv_hint_pitch);
@@ -765,6 +847,7 @@ static int sv_fifo_init(void) {
     sv_reg_write(R_CONFIG_DONE, 1);
     sv_reg_write(R_ENABLE, 1);
     sv_scanout_enabled = 1;
+    sv_scanout_phys_addr = sv_reg_read(R_FB_START);   // what the device scans
     sv_puts("[SVGA] device ENABLED; hardware cursor + 2D FIFO active\n");
     return 1;
 }
@@ -774,9 +857,18 @@ int svga_init(void) {
     sv_probed = 1;
     sv_ok = 0;
 
-    if (!sv_pci_find())     return 0;
-    if (!sv_device_init())  return 0;
-    if (!sv_fifo_init())    return 0;
+    // STEP MARKERS.  This driver was once guarded off on 64-bit because an
+    // un-guarded attempt hung with NO output at all, which made it
+    // indistinguishable from a crash and impossible to attribute.  Every entry
+    // and exit now says so on the serial line, so the next failure names the
+    // step instead of costing another restart-and-guess cycle.
+    sv_puts("[SVGA] init: scanning PCI\n");
+    if (!sv_pci_find())     { sv_puts("[SVGA] init: STOP at pci_find\n");    return 0; }
+    sv_puts("[SVGA] init: device_init\n");
+    if (!sv_device_init())  { sv_puts("[SVGA] init: STOP at device_init\n"); return 0; }
+    sv_puts("[SVGA] init: fifo_init\n");
+    if (!sv_fifo_init())    { sv_puts("[SVGA] init: STOP at fifo_init\n");   return 0; }
+    sv_puts("[SVGA] init: ok\n");
 
     sv_ok = 1;
     if ((sv_caps & 1u) == 0)
@@ -789,6 +881,49 @@ int svga_init(void) {
 }
 
 int svga_ready(void) { return sv_ok; }
+
+// True when the 2D engine can paint into the DISPLAYED framebuffer.
+//
+// This is deliberately stricter than svga_ready(): a working register window is
+// not enough, the device must have actually ENABLED (FIFO running) and must be
+// scanning the firmware LFB -- the only surface its RECT_FILL can address.  When
+// the scanout was pointed at guest RAM instead, the fills went somewhere
+// invisible and the screen went black, so callers must not use the GPU path
+// unless this returns 1.
+int svga_lfb_fill_ready(void) {
+    if (!sv_ok) return 0;
+    if (!sv_scanout_enabled) return 0;
+    if (sv_scanout_phys_addr == 0) return 0;
+    return 1;
+}
+
+// The physical framebuffer the device is scanning out, or 0 when its scanout
+// is not enabled.  Exposed so the GUI can confirm the device is reading the
+// SAME memory it draws into: an enabled device pointed somewhere else would
+// show a frozen or torn image, and that is far harder to diagnose than a
+// straightforward "the fast path is off".
+// (declared above, in the driver state block)
+
+unsigned int svga_scanout_target(void) {
+    if (!sv_ok || !sv_scanout_enabled) return 0;
+    return sv_scanout_phys_addr;
+}
+
+// True when the caller's buffer IS the device's scanout surface.
+//
+// Takes the backbuffer's physical address rather than guessing: the device only
+// scans memory it was told about, and the GUI's backbuffer is a separately
+// allocated block from the LFB.  A mismatch means the fast path MUST be
+// skipped -- issuing C_UPDATE while the device scans a different surface
+// updates the wrong rectangle and leaves the screen stale.
+int svga_buffer_is_scanout(unsigned int phys, unsigned int w, unsigned int h) {
+    if (!sv_ok || !sv_scanout_enabled) return 0;
+    if (sv_scanout_phys_addr == 0) return 0;
+    if ((phys & 0xFFFu) != (sv_scanout_phys_addr & 0xFFFu)) return 0;
+    if (phys != sv_scanout_phys_addr) return 0;
+    if ((int)w != sv_hint_w || (int)h != sv_hint_h) return 0;
+    return 1;
+}
 
 // ---------------------------------------------------------------------
 //  Commands

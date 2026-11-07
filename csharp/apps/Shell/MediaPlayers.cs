@@ -1,0 +1,695 @@
+//  MediaPlayers.cs - Video Player and Audio Player for the NexOS desktop.
+//
+//  HARDWARE REALITY (read this before "fixing" the playback path)
+//  ---------------------------------------------------------------
+//  NexOS has NO audio device driver.  src/gui/gui_legacy.cpp:4648 literally
+//  renders the string "Cannot play audio in NexOS" for audio previews, and a
+//  repo-wide search finds no AC97/HDA/SB driver and no WAV/MP3/OGG decoder.
+//  There is likewise no video decoder -- the only moving-picture surface in the
+//  system is WebView.cs, which blits a VNC framebuffer from a Linux guest.
+//
+//  So these two apps are honest FRONTS, not players:
+//    * they browse the volumes and open a file the way any media player does,
+//    * they parse the CONTAINER HEADER (RIFF/WAVE, RIFF/AVI, MP4 'ftyp',
+//      OggS, FLAC) and report duration / rate / channels / codec where the
+//      header actually carries them,
+//    * the transport buttons drive a real position cursor and draw a real
+//      waveform/timeline from real samples,
+//    * and playback itself is reported as unavailable, naming the missing
+//      driver, INSTEAD of silently doing nothing.
+//
+//  That way, when an audio/video driver is added later, the UI, the file
+//  handling, the position model and the timeline already exist and only the
+//  output call has to be wired in.  Fabricating fake playback now would hide
+//  the gap and make the later work harder.
+
+using NexOS.Forms;
+
+// Same namespace as every other app file here (Apps.cs, Browser.cs, WebView.cs
+// all use plain "NexOS.Forms").  "NexOS.Forms.Shell" collided with the Shell
+// CLASS of the same name in this namespace -- CS0101.
+namespace NexOS.Forms
+{
+    // =================================================================
+    //  Shared media helpers (header probing)
+    // =================================================================
+    static class Media
+    {
+        public const int T_Unknown = 0;
+        public const int T_Wav     = 1;
+        public const int T_Mp3     = 2;
+        public const int T_Ogg     = 3;
+        public const int T_Flac    = 4;
+        public const int T_Avi     = 5;
+        public const int T_Mp4     = 6;
+        public const int T_Mkv     = 7;
+
+        public static bool Has(string s, string p)
+        {
+            if (s == null || p == null) return false;
+            if (p.Length > s.Length) return false;
+            for (int i = 0; i < p.Length; i++) if (s[i] != p[i]) return false;
+            return true;
+        }
+
+        public static bool Contains(string s, string p)
+        {
+            if (s == null || p == null || p.Length == 0) return false;
+            int n = s.Length - p.Length;
+            for (int i = 0; i <= n; i++)
+            {
+                int j = 0;
+                while (j < p.Length && s[i + j] == p[j]) j++;
+                if (j == p.Length) return true;
+            }
+            return false;
+        }
+
+        public static int TypeOf(string hex)
+        {
+            if (hex == null || hex.Length < 8) return T_Unknown;
+            if (Has(hex, "52494646"))                 // "RIFF"
+            {
+                if (Contains(hex, "57415645")) return T_Wav;    // "WAVE"
+                if (Contains(hex, "41564920")) return T_Avi;    // "AVI "
+                return T_Unknown;
+            }
+            if (Has(hex, "4f676753")) return T_Ogg;             // "OggS"
+            if (Has(hex, "664c6143")) return T_Flac;            // "fLaC"
+            if (Has(hex, "664d5034")) return T_Mp3;             // "fMP4" (MP3 ID3v2 'ID3' handled below)
+            if (Has(hex, "494433"))   return T_Mp3;             // "ID3"
+            if (Has(hex, "1a45dfa3")) return T_Mkv;             // Matroska/WebM EBML
+            if (Contains(hex, "66747970")) return T_Mp4;        // "ftyp"
+            return T_Unknown;
+        }
+
+        public static string TypeName(int t)
+        {
+            if (t == T_Wav)  return "WAV audio";
+            if (t == T_Mp3)  return "MP3 audio";
+            if (t == T_Ogg)  return "Ogg audio/video";
+            if (t == T_Flac) return "FLAC audio";
+            if (t == T_Avi)  return "AVI video";
+            if (t == T_Mp4)  return "MP4 video";
+            if (t == T_Mkv)  return "Matroska/WebM";
+            return "unrecognised container";
+        }
+
+        public static bool IsAudio(int t) { return t == T_Wav || t == T_Mp3 || t == T_Ogg || t == T_Flac; }
+        public static bool IsVideo(int t) { return t == T_Avi || t == T_Mp4 || t == T_Mkv; }
+
+        // Hex string from 2 bytes -> a number (no int.Parse in MiniCLR).
+        public static int HexByte(string hex, int off)
+        {
+            int hi = Nib(hex, off), lo = Nib(hex, off + 1);
+            if (hi < 0 || lo < 0) return 0;
+            return (hi << 4) | lo;
+        }
+        public static int Nib(string hex, int i)
+        {
+            if (hex == null || i < 0 || i >= hex.Length) return -1;
+            int c = (int)hex[i];
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        }
+        // Little-endian 16-bit at byte offset.
+        public static int Le16(string hex, int byteOff)
+        {
+            return HexByte(hex, byteOff * 2) | (HexByte(hex, byteOff * 2 + 2) << 8);
+        }
+        public static int Le32(string hex, int byteOff)
+        {
+            return Le16(hex, byteOff) | (Le16(hex, byteOff + 2) << 16);
+        }
+
+        public static string FmtMs(int ms)
+        {
+            if (ms < 0) ms = 0;
+            int total = ms / 1000;
+            int h = total / 3600;
+            int m = (total % 3600) / 60;
+            int s = total % 60;
+            string r = h > 0 ? U.Cat(U.I(h), ":", Pad2(m)) : U.Cat(U.I(m), ":", Pad2(s));
+            return r;
+        }
+        static string Pad2(int v) { return v < 10 ? U.Cat("0", U.I(v)) : U.I(v); }
+
+        // WAV: parse the fmt/data chunks.  Returns 0 on success.
+        public static int WavInfo(string hex, int[] outInfo)
+        {
+            if (hex == null || hex.Length < 88) return -1;
+            int p = 12;                                        // skip RIFF..WAVE
+            for (int guard = 0; guard < 16; guard++)
+            {
+                if (p * 2 + 8 > hex.Length) return -1;
+                int id0 = HexByte(hex, p * 2), id1 = HexByte(hex, (p + 1) * 2),
+                    id2 = HexByte(hex, (p + 2) * 2), id3 = HexByte(hex, (p + 3) * 2);
+                int sz = Le32(hex, p + 4);
+                bool isFmt  = (id0 == 0x66 && id1 == 0x6D && id2 == 0x74 && id3 == 0x20); // "fmt "
+                bool isData = (id0 == 0x64 && id1 == 0x61 && id2 == 0x74 && id3 == 0x61); // "data"
+                if (isFmt && p * 2 + 8 + 32 <= hex.Length)
+                {
+                    outInfo[0] = Le16(hex, p + 8);        // format tag
+                    outInfo[1] = Le16(hex, p + 10);       // channels
+                    outInfo[2] = Le32(hex, p + 12);       // sample rate
+                    outInfo[3] = Le32(hex, p + 16);       // avg bytes/sec
+                    outInfo[4] = Le16(hex, p + 22);       // bits per sample
+                }
+                if (isData) { outInfo[5] = sz; return 0; }
+                p += 8 + sz + (sz & 1);
+            }
+            return -1;
+        }
+    }
+
+    // =================================================================
+    //  Video Player
+    // =================================================================
+    public class VideoPlayerApp : App
+    {
+        // 0 = opening screen, 1 = file chosen (info + transport), 2 = error
+        int    state;
+        string fileName;
+        int    fsType;
+        int    mtype;
+        int    posMs;         // transport position (drives the timeline)
+        int    durMs;         // from the container header when available
+        int    playing;       // transport state (position advances on ticks)
+        int    frameW, frameH;   // reported stream dimensions when known
+
+        public VideoPlayerApp()
+        {
+            state = 0;
+            fileName = "";
+            fsType = 0;
+            mtype = Media.T_Unknown;
+            posMs = 0; durMs = 0; playing = 0;
+            frameW = 0; frameH = 0;
+        }
+
+        public override string GetTitle() { return "Video Player"; }
+
+        void OpenFile(int fs, string nm)
+        {
+            fsType = fs;
+            fileName = nm;
+            string hex = Host.ReadHex(fs, nm);
+            mtype = Media.TypeOf(hex);
+            posMs = 0;
+            durMs = 0;
+            playing = 0;
+            frameW = 0; frameH = 0;
+            // AVI: main header carries microseconds-per-frame and total frames
+            // at fixed offsets, which is enough to compute a real duration.
+            if (mtype == Media.T_Avi && hex != null && hex.Length > 200)
+            {
+                int usPerFrame = Media.Le32(hex, 32);
+                int totalFrames = Media.Le32(hex, 44);
+                if (usPerFrame > 0 && totalFrames > 0)
+                    durMs = (int)((long)usPerFrame / 1000L * (long)totalFrames);
+                frameW = Media.Le32(hex, 64);
+                frameH = Media.Le32(hex, 68);
+            }
+            state = 1;
+        }
+
+        public override void OnPaint()
+        {
+            AdvanceClock();                 // transport position (no OnTick exists)
+            int w = Gfx.Width(), h = Gfx.Height();
+            Gfx.FillRect(0, 0, w, h, Theme.Dark != 0 ? 0xFF121214 : 0xFFF7F7F7);
+            int pad = 10;
+
+            Gfx.FillRect(0, 0, w, 36, Theme.Dark != 0 ? 0xFF1C1C1F : 0xFFFAFAFA);
+            Gfx.Text(pad, 11, "Video Player", C.Text);
+            Gfx.Text(pad + 120, 11, "Formats: AVI, MP4, MKV  -  preview + header info", C.TextFaint);
+
+            if (state == 0) { DrawBrowser(w, h, pad); return; }
+
+            // ---- header / metadata -------------------------------------
+            int y = 46;
+            Gfx.Text(pad, y, U.Cat("File: ", fileName), C.Text); y += 22;
+            Gfx.Text(pad, y, U.Cat("Container: ", Media.TypeName(mtype)), C.TextSub); y += 20;
+            if (frameW > 0 && frameH > 0)
+            { Gfx.Text(pad, y, U.Cat(U.Cat("Resolution: ", U.I(frameW)), U.Cat(" x ", U.I(frameH))), C.TextSub); y += 20; }
+            if (durMs > 0)
+            { Gfx.Text(pad, y, U.Cat("Duration: ", Media.FmtMs(durMs)), C.TextSub); y += 20; }
+
+            // ---- video surface -----------------------------------------
+            int sy = y + 10;
+            int sh = h - sy - 96;
+            if (sh > 40)
+            {
+                Gfx.FillRect(pad, sy, w - 2 * pad, sh, 0xFF000000);
+                Gfx.DrawRect(pad, sy, w - 2 * pad, sh, 0xFF333333);
+                // No decoder exists: say so on the surface itself rather than
+                // leaving a black rectangle that looks like a rendering bug.
+                Gfx.TextCenter(pad, sy + sh / 2 - 20, w - 2 * pad, "No video decoder in NexOS", 0xFF8A8A8A);
+                Gfx.TextCenter(pad, sy + sh / 2 + 2, w - 2 * pad,
+                               "the renderer would draw decoded frames here", 0xFF5A5A5A);
+                if (playing != 0 && durMs > 0)
+                {
+                    int pct = (int)((long)posMs * 100L / (long)durMs);
+                    if (pct > 100) pct = 100;
+                    Gfx.Progress(pad + 20, sy + sh - 26, w - 2 * pad - 40, 8, pct, 0xFF00C8C8);
+                }
+            }
+
+            // ---- transport ----------------------------------------------
+            int ty = h - 78;
+            Gfx.FillRect(0, ty, w, 78, Theme.Dark != 0 ? 0xFF1C1C1F : 0xFFFAFAFA);
+            Gfx.DrawLine(0, ty, w, ty, C.Border);
+            W.Button(pad, ty + 10, 40, 30, "<<");
+            W.Button(pad + 46, ty + 10, 46, 30, playing != 0 ? "||" : ">");
+            W.Button(pad + 98, ty + 10, 40, 30, ">>");
+            Gfx.Text(pad + 154, ty + 18, U.Cat(U.Cat(Media.FmtMs(posMs), " / "), durMs > 0 ? Media.FmtMs(durMs) : "--:--"), C.TextSub);
+            // Timeline.
+            int tx = pad + 260;
+            int tw = w - tx - pad;
+            if (tw > 60)
+            {
+                Gfx.FillRect(tx, ty + 20, tw, 8, C.BorderMid);
+                int fw = durMs > 0 ? (int)((long)tw * (long)posMs / (long)durMs) : 0;
+                if (fw > 0 && fw < tw) Gfx.FillRect(tx, ty + 20, fw, 8, 0xFF00C8C8);
+            }
+            Gfx.Text(pad, ty + 48, "Playback unavailable: NexOS has no video output path yet (no decoder, no audio clock).", C.Warn);
+            W.Button(pad + 560, ty + 44, 84, 26, "Open...");   // W.Button, not Gfx.Button
+            Host.SetAnim(playing);
+        }
+
+        void DrawBrowser(int w, int h, int pad)
+        {
+            Gfx.Text(pad, 50, "Choose a video file:", C.TextSub);
+            int y = 74;
+            int rows = Host.FileCount(1);
+            int shown = 0;
+            for (int i = 0; i < rows && shown < 12; i++)
+            {
+                if (Host.FileIsDir(1, i) != 0) continue;
+                string nm = Host.FileName(1, i);
+                // Show only things that could plausibly be video, plus a
+                // catch-all so an unusual extension is still openable.
+                string hex = Host.ReadHex(1, nm);
+                int t = Media.TypeOf(hex);
+                if (!Media.IsVideo(t)) continue;
+                int ry = y + shown * W.RowH;
+                bool hot = W.Hot(pad, ry, w - 2 * pad, W.RowH - 2);
+                if (hot) Gfx.FillRound(pad, ry, w - 2 * pad, W.RowH - 2, 6, C.Hover);
+                Gfx.Icon(pad + 8, ry + 4, 22, 0xB83A3A, 'V', 0xFFFFFF);
+                Gfx.Text(pad + 40, ry + 8, nm, C.Text);
+                Gfx.Text(pad + 300, ry + 8, Media.TypeName(t), C.TextFaint);
+                shown++;
+            }
+            if (shown == 0)
+            {
+                Gfx.Text(pad, y, "No video files found on the SFS volume.", C.TextFaint);
+                Gfx.Text(pad, y + 20, "Copy an .avi / .mp4 / .mkv into the SFS image to see it listed.", C.TextFaint);
+            }
+        }
+
+        public override void OnClick(int mx, int my)
+        {
+            int w = Gfx.Width(), h = Gfx.Height();
+            int pad = 10;
+            if (state == 0)
+            {
+                int y = 74, shown = 0;
+                int rows = Host.FileCount(1);
+                for (int i = 0; i < rows && shown < 12; i++)
+                {
+                    if (Host.FileIsDir(1, i) != 0) continue;
+                    string nm = Host.FileName(1, i);
+                    int t = Media.TypeOf(Host.ReadHex(1, nm));
+                    if (!Media.IsVideo(t)) continue;
+                    int ry = y + shown * W.RowH;
+                    if (U.In(mx, my, pad, ry, w - 2 * pad, W.RowH - 2)) { OpenFile(1, nm); return; }
+                    shown++;
+                }
+                return;
+            }
+            int ty = h - 78;
+            int step = durMs > 0 ? durMs / 20 : 2000;
+            if (U.In(mx, my, pad, ty + 10, 40, 30)) { posMs -= step; if (posMs < 0) posMs = 0; return; }
+            if (U.In(mx, my, pad + 46, ty + 10, 46, 30)) { playing = playing == 0 ? 1 : 0; return; }
+            if (U.In(mx, my, pad + 98, ty + 10, 40, 30)) { posMs += step; if (durMs > 0 && posMs > durMs) posMs = durMs; return; }
+            if (U.In(mx, my, pad + 560, ty + 44, 84, 26)) { state = 0; return; }
+        }
+
+        public override void OnKey(int ch)
+        {
+            if (state == 0) return;
+            if (ch == -9) { state = 0; return; }                       // Esc -> browser
+            if (ch == ' ') { playing = playing == 0 ? 1 : 0; return; }
+        }
+
+        // App has NO OnTick virtual (see Forms.cs:1184-1206), so the transport
+        // clock is advanced from OnPaint.  OnPaint runs continuously while
+        // Host.SetAnim(1) is armed, which steps on this app mean "playing",
+        // so this yields a ~10 Hz position tick -- enough for a real timeline
+        // and the same model a decoded-frame player would drive.
+        void AdvanceClock()
+        {
+            if (playing == 0 || state != 1) return;
+            posMs += 100;
+            if (durMs > 0 && posMs >= durMs) { posMs = durMs; playing = 0; }
+        }
+    }
+
+    // =================================================================
+    //  Audio Player
+    // =================================================================
+    public class AudioPlayerApp : App
+    {
+        int    state;
+        string fileName;
+        int    mtype;
+        int    posMs, durMs;
+        int    playing;
+        int    channels, rate, bits;   // parsed from the WAV fmt chunk
+        int[]  wave;                   // 96-sample envelope drawn as the waveform
+        int    waveN;
+        // PCM payload carried as a managed string of raw bytes.
+        // Host.AudioPlay takes exactly this: 16-bit little-endian samples packed
+        // in a string (MiniCLR has no array marshalling), so the string IS the
+        // buffer handed to the driver -- no conversion needed at the call site.
+        string pcm;                    // real samples from the data chunk
+        int    pcmBytes;               // length of pcm
+        int    playedBytes;            // how much the device consumed so far
+        int    lastPlay;               // result of the last Host.AudioPlay call
+
+        public AudioPlayerApp()
+        {
+            state = 0; fileName = ""; mtype = Media.T_Unknown;
+            posMs = 0; durMs = 0; playing = 0;
+            channels = 0; rate = 0; bits = 0;
+            wave = new int[96]; waveN = 0;
+            pcm = ""; pcmBytes = 0; playedBytes = 0; lastPlay = 0;
+        }
+
+        public override string GetTitle() { return "Audio Player"; }
+
+        void OpenFile(int fs, string nm)
+        {
+            fileName = nm;
+            string hex = Host.ReadHex(fs, nm);
+            mtype = Media.TypeOf(hex);
+            posMs = 0; durMs = 0; playing = 0;
+            channels = 0; rate = 0; bits = 0; waveN = 0;
+
+            if (mtype == Media.T_Wav)
+            {
+                int[] info = new int[6];
+                if (Media.WavInfo(hex, info) == 0)
+                {
+                    channels = info[1];
+                    rate     = info[2];
+                    bits     = info[4];
+                    int dataBytes = info[5];
+                    int byteRate  = info[3];
+                    if (byteRate > 0 && dataBytes > 0)
+                        durMs = (int)((long)dataBytes * 1000L / (long)byteRate);
+                    BuildWave(hex, dataBytes);
+                    ExtractPcm(hex, dataBytes);
+                }
+            }
+            state = 1;
+        }
+
+        // Pull the PCM payload out of the WAV and keep it as a managed string.
+        //
+        // The driver takes 16-bit LE samples packed in a string, so this is a
+        // straight byte copy of the "data" chunk.  Bytes are rebuilt one at a
+        // time with Host.CharStr because MiniCLR has no StringBuilder and no
+        // byte-array marshalling.
+        //
+        // The buffer is capped deliberately: Host.AudioPlay's kernel-side
+        // scratch is 4 KiB of samples and a single descriptor covers 64 KiB, so
+        // there is no point carrying a whole multi-minute file in the managed
+        // heap.  The first ~32 KB is roughly 0.37 s of 44.1 kHz stereo, which is
+        // plenty to prove the path end to end.
+        void ExtractPcm(string hex, int dataBytes)
+        {
+            pcm = ""; pcmBytes = 0; playedBytes = 0;
+            if (hex == null || bits == 0) return;
+            int p = FindDataOffset(hex);
+            if (p < 0) return;
+            int want = dataBytes;
+            int blockAlign = (channels > 0 ? channels : 1) * (bits / 8);
+            if (blockAlign <= 0) blockAlign = 4;
+            // Round down to a whole frame so the device never gets a partial one.
+            int maxBytes = 32768;
+            if (want > maxBytes) want = maxBytes;
+            want = (want / blockAlign) * blockAlign;
+            if (want <= 0) return;
+            int avail = (hex.Length / 2) - p;
+            if (want > avail) want = (avail / blockAlign) * blockAlign;
+            if (want <= 0) return;
+            string s = "";
+            for (int i = 0; i < want; i++)
+            {
+                int b = Media.HexByte(hex, (p + i) * 2);
+                s = U.Cat(s, Host.CharStr(b));
+            }
+            pcm = s; pcmBytes = want;
+        }
+
+        // Offset (in bytes) of the first PCM sample: just past the "data"
+        // chunk header.
+        int FindDataOffset(string hex)
+        {
+            int n = hex.Length / 2;
+            for (int i = 0; i + 8 <= n; i++)
+            {
+                if (Media.HexByte(hex, i * 2) == 0x64 && Media.HexByte(hex, (i + 1) * 2) == 0x61
+                 && Media.HexByte(hex, (i + 2) * 2) == 0x74 && Media.HexByte(hex, (i + 3) * 2) == 0x61)
+                    return i + 8;
+            }
+            return -1;
+        }
+
+        // Feed the next block to the driver.  This is the ONLY place that
+        // actually produces sound.
+        void PlayChunk()
+        {
+            if (pcmBytes <= 0) { lastPlay = -1; return; }
+            int frames = pcmBytes / 4;          // 16-bit stereo
+            if (frames <= 0) { lastPlay = -1; return; }
+            int got = Host.AudioPlay(pcm, frames);
+            lastPlay = got;
+            if (got > 0) playedBytes += got;
+        }
+
+        // Downsample the first ~1.5 KB of PCM into a 96-bar envelope.  This is
+        // REAL data from the file, not a decorative pseudo-random shape -- it is
+        // the only honest "preview" possible without a playback device.
+        void BuildWave(string hex, int dataBytes)
+        {
+            waveN = 0;
+            if (hex == null || bits == 0) return;
+            // Locate "data" header to find where PCM begins.
+            int p = -1;
+            for (int i = 0; i + 8 < hex.Length / 2; i++)
+            {
+                if (Media.HexByte(hex, i * 2) == 0x64 && Media.HexByte(hex, (i + 1) * 2) == 0x61
+                 && Media.HexByte(hex, (i + 2) * 2) == 0x74 && Media.HexByte(hex, (i + 3) * 2) == 0x61)
+                { p = i + 8; break; }
+            }
+            if (p < 0) return;
+            int step = dataBytes / 96;
+            if (step < 1) step = 1;
+            for (int b = 0; b < 96; b++)
+            {
+                int off = p + b * step;
+                int peak = 0;
+                // Peak of a small window: absolute max of the signed samples.
+                for (int k = 0; k < 8; k++)
+                {
+                    int off2 = off + k * (bits / 8) * (channels > 0 ? channels : 1);
+                    int s = 0;
+                    if (bits == 16) s = (short)Media.Le16(hex, off2);
+                    else if (bits == 8) s = Media.HexByte(hex, off2 * 2) - 128;
+                    int a = s < 0 ? -s : s;
+                    if (a > peak) peak = a;
+                }
+                wave[waveN++] = peak;
+            }
+        }
+
+        public override void OnPaint()
+        {
+            AdvanceClock();                 // transport position (no OnTick exists)
+            int w = Gfx.Width(), h = Gfx.Height();
+            Gfx.FillRect(0, 0, w, h, Theme.Dark != 0 ? 0xFF121214 : 0xFFF7F7F7);
+            int pad = 10;
+
+            Gfx.FillRect(0, 0, w, 36, Theme.Dark != 0 ? 0xFF1C1C1F : 0xFFFAFAFA);
+            Gfx.Text(pad, 11, "Audio Player", C.Text);
+            Gfx.Text(pad + 120, 11, "Formats: WAV (parsed)  -  MP3/OGG/FLAC (header only)", C.TextFaint);
+
+            if (state == 0) { DrawBrowser(w, h, pad); return; }
+
+            int y = 46;
+            Gfx.Text(pad, y, U.Cat("File: ", fileName), C.Text); y += 22;
+            Gfx.Text(pad, y, U.Cat("Container: ", Media.TypeName(mtype)), C.TextSub); y += 20;
+            if (mtype == Media.T_Wav && rate > 0)
+            {
+                Gfx.Text(pad, y, U.Cat(U.Cat(U.Cat(U.Cat(U.Cat(U.I(rate), " Hz / "), U.I(channels)),
+                                  " ch / "), U.I(bits)), " bit"), C.TextSub); y += 20;
+            }
+            if (durMs > 0) { Gfx.Text(pad, y, U.Cat("Duration: ", Media.FmtMs(durMs)), C.TextSub); y += 20; }
+
+            // ---- waveform ------------------------------------------------
+            int sy = y + 10;
+            int sh = 120;
+            Gfx.FillRect(pad, sy, w - 2 * pad, sh, 0xFF0A0A0A);
+            Gfx.DrawRect(pad, sy, w - 2 * pad, sh, 0xFF333333);
+            if (waveN > 0)
+            {
+                int bw = (w - 2 * pad - 20) / waveN;
+                if (bw < 1) bw = 1;
+                int peakMax = 1;
+                for (int i = 0; i < waveN; i++) if (wave[i] > peakMax) peakMax = wave[i];
+                int mid = sy + sh / 2;
+                for (int i = 0; i < waveN; i++)
+                {
+                    int bh = (int)((long)wave[i] * (long)(sh / 2 - 4) / (long)peakMax);
+                    if (bh < 1) bh = 1;
+                    Gfx.FillRect(pad + 10 + i * bw, mid - bh, bw > 2 ? bw - 1 : 1, bh * 2,
+                                 0xFF00C8C8);
+                }
+                Gfx.Text(pad + 10, sy + sh - 16, "PCM envelope (real samples)", 0xFF5A5A5A);
+            }
+            else
+            {
+                Gfx.TextCenter(pad, sy + sh / 2 - 10, w - 2 * pad,
+                               mtype == Media.T_Wav ? "no PCM payload to sample" : "waveform preview needs a WAV payload",
+                               0xFF8A8A8A);
+            }
+
+            // ---- transport ----------------------------------------------
+            int ty = h - 78;
+            Gfx.FillRect(0, ty, w, 78, Theme.Dark != 0 ? 0xFF1C1C1F : 0xFFFAFAFA);
+            Gfx.DrawLine(0, ty, w, ty, C.Border);
+            W.Button(pad, ty + 10, 40, 30, "<<");
+            W.Button(pad + 46, ty + 10, 46, 30, playing != 0 ? "||" : ">");
+            W.Button(pad + 98, ty + 10, 40, 30, ">>");
+            Gfx.Text(pad + 154, ty + 18, U.Cat(U.Cat(Media.FmtMs(posMs), " / "), durMs > 0 ? Media.FmtMs(durMs) : "--:--"), C.TextSub);
+            int tx = pad + 260, tw = w - tx - pad;
+            if (tw > 60)
+            {
+                Gfx.FillRect(tx, ty + 20, tw, 8, C.BorderMid);
+                int fw = durMs > 0 ? (int)((long)tw * (long)posMs / (long)durMs) : 0;
+                if (fw > 0 && fw < tw) Gfx.FillRect(tx, ty + 20, fw, 8, 0xFFC77A11);
+            }
+            // Report the REAL driver state.  The 64-bit kernel has the HD Audio
+            // driver; the 32-bit one cannot (its load window is full), so this
+            // line has to reflect what the running kernel actually reports
+            // rather than assuming a hard-coded answer.
+            if (Host.AudioAvailable() != 0)
+            {
+                // Report what the DRIVER said about the last block, so "no
+                // sound" is distinguishable from "the device refused it".
+                if (lastPlay > 0)
+                    Gfx.Text(pad, ty + 48,
+                             U.Cat(U.Cat("Playing - ", U.I(lastPlay)),
+                                   U.Cat(" bytes accepted, ",
+                                         U.Cat(U.I(playedBytes), " total"))), C.Good);
+                else if (lastPlay < 0)
+                    Gfx.Text(pad, ty + 48, "HD Audio present but the last playback call was refused", C.Warn);
+                else
+                    Gfx.Text(pad, ty + 48, U.Cat("Output ready: ", Host.AudioInfo()), C.Good);
+            }
+            else
+                Gfx.Text(pad, ty + 48, "No audio device: this kernel reports no working HD Audio codec.", C.Warn);
+            W.Button(pad + 700, ty + 44, 84, 26, "Open...");
+            Host.SetAnim(playing);
+        }
+
+        void DrawBrowser(int w, int h, int pad)
+        {
+            Gfx.Text(pad, 50, "Choose an audio file:", C.TextSub);
+            int y = 74, shown = 0;
+            int rows = Host.FileCount(1);
+            for (int i = 0; i < rows && shown < 12; i++)
+            {
+                if (Host.FileIsDir(1, i) != 0) continue;
+                string nm = Host.FileName(1, i);
+                int t = Media.TypeOf(Host.ReadHex(1, nm));
+                if (!Media.IsAudio(t)) continue;
+                int ry = y + shown * W.RowH;
+                bool hot = W.Hot(pad, ry, w - 2 * pad, W.RowH - 2);
+                if (hot) Gfx.FillRound(pad, ry, w - 2 * pad, W.RowH - 2, 6, C.Hover);
+                Gfx.Icon(pad + 8, ry + 4, 22, 0xC77A11, 'M', 0xFFFFFF);
+                Gfx.Text(pad + 40, ry + 8, nm, C.Text);
+                Gfx.Text(pad + 300, ry + 8, Media.TypeName(t), C.TextFaint);
+                shown++;
+            }
+            if (shown == 0)
+            {
+                Gfx.Text(pad, y, "No audio files found on the SFS volume.", C.TextFaint);
+                Gfx.Text(pad, y + 20, "Copy a .wav / .mp3 / .ogg / .flac into the SFS image to see it listed.", C.TextFaint);
+            }
+        }
+
+        public override void OnClick(int mx, int my)
+        {
+            int w = Gfx.Width(), h = Gfx.Height();
+            int pad = 10;
+            if (state == 0)
+            {
+                int y = 74, shown = 0;
+                int rows = Host.FileCount(1);
+                for (int i = 0; i < rows && shown < 12; i++)
+                {
+                    if (Host.FileIsDir(1, i) != 0) continue;
+                    string nm = Host.FileName(1, i);
+                    int t = Media.TypeOf(Host.ReadHex(1, nm));
+                    if (!Media.IsAudio(t)) continue;
+                    int ry = y + shown * W.RowH;
+                    if (U.In(mx, my, pad, ry, w - 2 * pad, W.RowH - 2)) { OpenFile(1, nm); return; }
+                    shown++;
+                }
+                return;
+            }
+            int ty = h - 78;
+            int step = durMs > 0 ? durMs / 20 : 2000;
+            if (U.In(mx, my, pad, ty + 10, 40, 30)) { posMs -= step; if (posMs < 0) posMs = 0; return; }
+            if (U.In(mx, my, pad + 46, ty + 10, 46, 30))
+            {
+                // Pressing play now REALLY plays: the block is handed to the
+                // HD Audio driver, which runs it through the stream descriptor.
+                if (playing == 0) PlayChunk();
+                playing = playing == 0 ? 1 : 0;
+                return;
+            }
+            if (U.In(mx, my, pad + 98, ty + 10, 40, 30)) { posMs += step; if (durMs > 0 && posMs > durMs) posMs = durMs; return; }
+            if (U.In(mx, my, pad + 700, ty + 44, 84, 26)) { state = 0; return; }
+        }
+
+        public override void OnKey(int ch)
+        {
+            if (state == 0) return;
+            if (ch == -9) { state = 0; return; }
+            if (ch == ' ')
+            {
+                if (playing == 0) PlayChunk();
+                playing = playing == 0 ? 1 : 0;
+                return;
+            }
+        }
+
+        // App has NO OnTick virtual (see Forms.cs:1184-1206), so the transport
+        // clock is advanced from OnPaint.  OnPaint runs continuously while
+        // Host.SetAnim(1) is armed, which steps on this app mean "playing",
+        // so this yields a ~10 Hz position tick -- enough for a real timeline
+        // and the same model a decoded-frame player would drive.
+        void AdvanceClock()
+        {
+            if (playing == 0 || state != 1) return;
+            posMs += 100;
+            if (durMs > 0 && posMs >= durMs) { posMs = durMs; playing = 0; }
+        }
+    }
+}

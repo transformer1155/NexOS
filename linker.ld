@@ -175,6 +175,23 @@ SECTIONS
     __lm_pdpt2 = .;   . = . + 0x1000;
     __lm_pt_spare = .; . = . + 0x3000;  /* head-room: 8 pages total */
 
+    /* 2 MiB-page identity map: one PD per GiB, used when the CPU does not
+     * advertise pdpe1gb (CPUID.80000001h:EDX bit 26).  QEMU advertises it,
+     * VirtualBox's NEM does NOT and rejects PS=1 at the PDPT level -- and a
+     * region the hypervisor refuses to translate is not a guest fault at all:
+     * the VM dies with Guru Meditation and NO IDT dispatch, which is why the
+     * first framebuffer touch killed the long-mode boot with an empty fault
+     * record.  32 KiB out of the 8 MiB .lmboot window is free. */
+    . = ALIGN(0x1000);
+    __lm_pd_g0 = .; . = . + 0x1000;
+    __lm_pd_g1 = .; . = . + 0x1000;
+    __lm_pd_g2 = .; . = . + 0x1000;
+    __lm_pd_g3 = .; . = . + 0x1000;
+    __lm_pd_g4 = .; . = . + 0x1000;
+    __lm_pd_g5 = .; . = . + 0x1000;
+    __lm_pd_g6 = .; . = . + 0x1000;
+    __lm_pd_g7 = .; . = . + 0x1000;
+
     /* 64-bit kernel boot stack (grows DOWN from __lm_stack_top).
      * Previously hard-coded 0x1F0000, which sits INSIDE kernel64's .bss
      * (0x19C000..0x3A2C60) -- the 64-bit stack and 64-bit globals were

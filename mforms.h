@@ -57,6 +57,12 @@ struct MFormsHost {
     // ---- texture cache (SFS-backed .tex files, see tools/tex_pack.py) --
     int  (*has_image)   (int id);
     void (*image)       (int id, int x, int y, int w, int h);  // stretch-blit
+    // Stretch-blit clipped to a SCREEN-space box [cx0,cy0,cx1,cy1).  (x,y,w,h)
+    // still describes the FULL destination rect, so the texture is cropped, not
+    // squashed, when it overhangs the box.  The managed window paint uses this
+    // so app content can never bleed over the title bar / other windows.
+    void (*image_clip)  (int id, int x, int y, int w, int h,
+                         int cx0, int cy0, int cx1, int cy1);
     int  screen_w;
     int  screen_h;
 
@@ -84,6 +90,21 @@ struct MFormsHost {
     int  (*mkdir)(int fs, const char* name);
     int  (*remove)(int fs, const char* name);
     int  (*rename)(int fs, const char* old_name, const char* new_name);
+    // Directory navigation for File Explorer.  The filesystem keeps a single
+    // current directory per medium, so the host owns it: enter index -1 to go
+    // to the volume root, idx >= 0 to enter that listing entry (must be a dir).
+    int  (*enter_dir)(int fs, int idx);
+    // Move one level up inside the volume.  Returns 1 when already at the root.
+    int  (*dir_up)(int fs);
+    // Build the current path ("MKFS", "MKFS/Desktop/sub"); returns its length.
+    int  (*cwd_path)(int fs, char* buf, int size);
+    // Move a file into the folder at listing index dst_idx (drag & drop).
+    int  (*move_file)(int fs, const char* name, int dst_idx);
+    int  (*enter_path)(int fs, const char* path);
+    int  (*file_size)(int fs, const char* name);
+    int  (*is_dir_name)(int fs, const char* name);
+    int  (*copy_range)(int src_fs, const char* src_path, const char* name,
+                       int dst_fs, const char* dst_path, int off, int len);
     // Synchronous HTTP GET for the managed Browser control.  Returns the
     // response body (or an empty string on error).  Caller copies it.
     const char* (*http_get)(const char* url);
@@ -103,6 +124,12 @@ struct MFormsHost {
     // Managed code asks the kernel to open (or focus) an application of
     // this managed Kind (e.g. Notepad from the File Explorer).
     void (*open_app)(int kind);
+    // Same as open_app but ALWAYS creates another window of the app, so one
+    // app can have several live instances (two File Explorers, etc.).
+    void (*open_app_new)(int kind);
+    // Focus / restore the window hosting this managed app id (taskbar button
+    // for a specific instance, multi-instance apps).
+    void (*activate_managed)(int mid);
     // Managed code asks the kernel to close every window of a Kind
     // (taskbar right-click "Close window" / "End process").
     void (*close_app)(int kind);
@@ -134,6 +161,21 @@ struct MFormsHost {
     int         (*login_uid)(void);
     int         (*user_count)(void);
     const char* (*user_name)(int idx);
+
+    // ---- audio output (64-bit kernel only) --------------------------
+    //   audio_available  1 when an HD Audio codec was brought up.
+    //   audio_play       feed 16-bit stereo PCM at 44.1 kHz; returns the
+    //                    number of bytes consumed, or -1 when unavailable.
+    //   audio_info       one-line description for the Control Panel.
+    //
+    // These are NULL on the 32-bit kernel, which has no sound driver (its
+    // load window is full), so every caller must check audio_available
+    // rather than assuming a device exists.
+#if defined(__x86_64__)
+    int         (*audio_available)(void);
+    int         (*audio_play)(const int16_t* frames, int nframes);
+    void        (*audio_info)(char* buf, int n);
+#endif
 };
 
 // ---------------------------------------------------------------------
@@ -180,6 +222,13 @@ int  mforms_content_h(void);
 // Deliver a click at screen point (mx,my).  Returns non-zero when the
 // app consumed it.  Client rect is passed so layout matches the paint.
 int  mforms_click(int id, int ox, int oy, int w, int h, int mx, int my);
+// Window drag & drop phases, in SCREEN coordinates:
+//   phase 0 = press on a managed window (arms a drag)
+//   phase 1 = pointer moved while held
+//   phase 2 = released; hit_id/local coords say which window is under the
+//             pointer, so the source can drop onto ANOTHER window (e.g. move a
+//             file from one File Explorer into a second one).
+int  mforms_drag(int id, int phase, int mx, int my, int hit_id, int hx, int hy);
 
 // Deliver a key.  `ch` is an ASCII code, or a negative virtual key
 // (-1 backspace, -2 enter, -3 up, -4 down, -5 left, -6 right, -7 esc).
@@ -218,6 +267,9 @@ void mforms_paint_overlay(int w, int h);
 // to launch, -1 when the shell consumed the click, or -2 when the point
 // belongs to no shell element and the caller should try its windows.
 int  mforms_desktop_click(int mx, int my);
+// Desktop drag phases: 0 = button down (arm), 1 = pointer moved while held,
+// 2 = released.  Returns 1 when the desktop consumed the phase (a drag started).
+int  mforms_desktop_drag(int mx, int my, int phase);
 
 // Deliver a keystroke to the desktop surface when no window is focused
 // (e.g. the desktop inline-rename editor).  Returns non-zero if consumed.

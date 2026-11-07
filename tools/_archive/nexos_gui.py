@@ -2,8 +2,20 @@
 """NexOS Developer Toolkit GUI (WebView2 + pywebview)."""
 import hashlib, http.client, json, os, re, shutil, socket, subprocess, sys, threading, time, zipfile
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOOLS     = os.path.join(REPO_ROOT, "tools")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# 向上逐层找最近的 "tools/" 目录 (支持任意深度子目录)
+_REPO = _HERE
+while True:
+    _parent = os.path.dirname(_REPO)
+    if _parent == _REPO: break  # 到根了
+    if os.path.basename(_REPO) == "tools": break
+    _REPO = _parent
+TOOLS     = _REPO
+REPO_ROOT = os.path.dirname(_REPO)
+# 兜底: 如果没找到 tools/ 则退回原始逻辑
+if os.path.basename(_HERE) != "tools" and os.path.basename(os.path.dirname(_HERE)) != "tools":
+    TOOLS = os.path.join(os.path.dirname(os.path.dirname(_HERE)), "tools")
+    REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 MEX_PACK  = os.path.join(TOOLS, "mex_pack.py")
 NEXPACK   = os.path.join(TOOLS, "nexpack.py")
 MEX_PROPS = os.path.join(REPO_ROOT, "csharp", "apps", "mex.shared.props")
@@ -240,9 +252,12 @@ FRONTEND_HTML = """<!DOCTYPE html>
 <header class="border-b border-slate-700 px-6 py-4 flex items-center justify-between">
   <div class="flex items-center gap-3">
     <div class="w-10 h-10 bg-gradient-to-br from-cyan-400 to-blue-600 rounded-lg flex items-center justify-center font-bold text-lg">N</div>
-    <div><h1 class="text-xl font-bold">NexOS Developer Toolkit</h1><p class="text-xs text-slate-400">WebView2</p></div>
+    <div><h1 class="text-xl font-bold">NexOS Developer Toolkit</h1><p class="text-xs text-slate-400" id="bridge-status">connecting to Python backend...</p></div>
   </div>
-  <span id="gw-indicator" class="warn-badge">checking gateway...</span>
+  <div class="flex items-center gap-3">
+    <button class="btn bg-slate-700 text-sm" onclick="testBridge()">🔌 Test Connection</button>
+    <span id="gw-indicator" class="warn-badge">checking gateway...</span>
+  </div>
 </header>
 <nav class="flex border-b border-slate-700 bg-slate-900">
   <div class="tab tab-active" data-tab="new">New Project</div>
@@ -378,6 +393,9 @@ async function doDeploy() {
   }
 }
 async function refreshGwStatus() {
+  // 先等 Bridge 就绪
+  if (!(await waitPywebview(500))) return;
+
   const st = await bridge('gw_status', []);
   document.getElementById('gw-indicator').textContent = st.running ? 'RUNNING ' + st.host + ':' + st.port : 'STOPPED';
   document.getElementById('gw-indicator').className = st.running ? 'ok-badge' : 'err-badge';
@@ -397,32 +415,148 @@ async function doGwStart() {
 }
 async function doGwStop() { await bridge('gw_stop', []); setTimeout(refreshGwStatus, 500); }
 
+// 等待 pywebview API 就绪 (最多 5 秒)
+async function waitPywebview(maxMs = 5000) {
+  const start = Date.now();
+  const REQUIRED = ['gw_status', 'new_project', 'verify'];
+  while (Date.now() - start < maxMs) {
+    if (window.pywebview && window.pywebview.api) {
+      // 检查关键方法是否已被注入 (api 初始是空对象 {}，注入后才有方法)
+      const hasAll = REQUIRED.every(m => typeof window.pywebview.api[m] === 'function');
+      if (hasAll) return true;
+    }
+    await new Promise(r => setTimeout(r, 30));
+  }
+  return false;
+}
+
 window.addEventListener('pywebviewready', async () => {
+  const ok = await waitPywebview(3000);
+  const bs = document.getElementById('bridge-status');
+  if (ok) {
+    bs.innerHTML = '<span class="ok-badge">Backend connected ✅</span> ' + 
+      '<span class="text-xs text-slate-500">11 Bridge methods ready</span>';
+  } else {
+    bs.innerHTML = '<span class="err-badge">Backend NOT connected ❌</span> ' +
+      '<span class="text-xs text-slate-500">Try clicking "Test Connection"</span>';
+  }
   refreshGwStatus();
 });
+
+// 兜底：3 秒后如果 pywebviewready 没触发，手动检查
+setTimeout(async () => {
+  const bs = document.getElementById('bridge-status');
+  if (!bs.innerHTML.includes('connected') && !bs.innerHTML.includes('NOT')) {
+    const ok = await waitPywebview(1000); if (ok) {
+      bs.innerHTML = '<span class="ok-badge">Backend connected ✅</span>';
+    } else {
+      bs.innerHTML = '<span class="warn-badge">Waiting for backend...</span>';
+    }
+  }
+}, 3000);
+
+async function testBridge() {
+  const bs = document.getElementById('bridge-status');
+  try {
+    const r = await bridge('gw_status', []);
+    bs.innerHTML = '<span class="ok-badge">Backend connected ✅ ping OK</span>';
+    alert('✅ Bridge connection OK!\ngw_status returned:\n' + JSON.stringify(r, null, 2));
+  } catch(e) {
+    bs.innerHTML = '<span class="err-badge">Bridge error: ' + e.message + '</span>';
+    alert('❌ Bridge error: ' + e.message + '\n\nCheck that nexos_gui.py main() is running and has js_api=bridge set.');
+  }
+}
 </script>
 </body>
 </html>
 """
 
 
-def main():
+def _probe_gui_libs():
+    """诊断 pywebview + WebView2 可用性."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(["powershell", "-NoProfile", "-Command",
+            "(Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue).pv"],
+            capture_output=True, text=True, timeout=5)
+        wv2_ver = r.stdout.strip() if r.returncode == 0 else None
+    except: wv2_ver = None
     try:
         import webview
+        return True, getattr(webview, "__version__", "?"), wv2_ver
     except ImportError:
-        print("error: pywebview missing. run: pip install pywebview", file=sys.stderr)
+        return False, None, wv2_ver
+
+
+def main():
+    import traceback, sys, tempfile
+    _TMP = tempfile.gettempdir()
+    log_path = os.path.join(_TMP, "nexos_gui.log")
+    html_path = os.path.join(_TMP, "nexos_gui.html")
+    # 清旧日志
+    if os.path.exists(log_path):
+        try: os.unlink(log_path)
+        except: pass
+
+    def _log(msg):
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except PermissionError:
+            # 目录不可写，用 temp
+            import tempfile as _tf
+            _p = os.path.join(_tf.gettempdir(), "nexos_gui.log")
+            with open(_p, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+            print(f"[log fallback to {_p}]", flush=True)
+        print(msg, flush=True)
+
+    _log("=== nexos_gui.py starting ===")
+    _log(f"TOOLS={TOOLS}")
+    _log(f"REPO_ROOT={REPO_ROOT}")
+    _log(f"cwd={os.getcwd()}")
+
+    pw_ok, pw_ver, wv2_ver = _probe_gui_libs()
+    _log(f"pywebview  : {'OK ' + pw_ver if pw_ok else 'MISSING'}")
+    _log(f"WebView2   : {wv2_ver or 'unknown'}")
+
+    if not pw_ok:
+        _log("FATAL: pywebview not installed. Run: python -m pip install pywebview")
         sys.exit(1)
-    html_path = os.path.join(TOOLS, "_gui.html")
-    open(html_path, "w", encoding="utf-8").write(FRONTEND_HTML)
+
+    try:
+        import webview
+    except Exception as e:
+        _log(f"FATAL import webview: {e}")
+        _log(traceback.format_exc())
+        sys.exit(2)
+
+    # 写前端 HTML
+    html_path = os.path.join(tempfile.gettempdir(), "nexos_gui.html")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(FRONTEND_HTML)
+    _log(f"HTML written to {html_path}")
+
     bridge = Bridge()
-    webview.create_window(
-        "NexOS Developer Toolkit",
-        url="file:///" + html_path.replace("\\", "/"),
-        width=1100, height=720, min_size=(900, 560),
-        resizable=True, text_select=True,
-        js_api=bridge,
-    )
-    webview.start(debug=False)
+    _log("Bridge instance created")
+
+    try:
+        window = webview.create_window(
+            "NexOS Developer Toolkit",
+            url="file:///" + html_path.replace("\\", "/"),
+            width=1100, height=720, min_size=(900, 560),
+            resizable=True, text_select=True,
+            js_api=bridge,
+        )
+        _log("Window created, starting webview...")
+        webview.start(debug=True)
+    except Exception as e:
+        _log(f"FATAL webview: {e}")
+        _log(traceback.format_exc())
+        sys.exit(3)
+
+    _log("webview.start() returned (window closed)")
+
 
 if __name__ == "__main__":
     main()

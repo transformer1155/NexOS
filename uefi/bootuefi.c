@@ -637,6 +637,14 @@ EFI_STATUS efi_main(EFI_HANDLE Image, EFI_SYSTEM_TABLE *SystemTable)
             /* Copy VbeInfo to 0x5000 (if allocated) or save for later */
             if (vbe_at_final) {
                 bs->CopyMem((VOID *)VBE_INFO_ADDR, &vbe_local, sizeof(vbe_local));
+                /* Boolflag: boot straight into the 64-bit (long mode) kernel.
+                 * Written AFTER the VbeInfo copy above, because the struct is
+                 * 32 bytes (0x5000..0x501F) and would otherwise be clobbered.
+                 * 0x5020 is the AI-agent boot flag, so this uses 0x5021.
+                 * The BIOS path sets the same byte in stage2.asm; without it
+                 * here a UEFI-booted disc would come up in the 32-bit desktop
+                 * while the same image on disk came up in 64-bit. */
+                *(volatile UINT8 *)(VBE_INFO_ADDR + 0x21) = 1;
             } else {
                 /* Save in file-scope backup for post-ExitBS copy to 0x5000 */
                 bs->CopyMem(&g_vbe_backup, &vbe_local, sizeof(vbe_local));
@@ -704,6 +712,14 @@ EFI_STATUS efi_main(EFI_HANDLE Image, EFI_SYSTEM_TABLE *SystemTable)
         inline_memcpy((void *)VBE_INFO_ADDR, &g_vbe_backup, sizeof(g_vbe_backup));
         SERIAL_PUTC('V');  /* V = VbeInfo written to 0x5000 */
     }
+
+    /* Same boolflag as the early branch above, for the deferred-copy case:
+     * set it after the VbeInfo image is in place so the 32-byte struct cannot
+     * overwrite it.  Kept outside the `if` because BOTH paths need the flag --
+     * when firmware honours the 0x5000 reservation the early branch runs and
+     * this one does not, and vice versa.  See the comment there for why. */
+    *(volatile UINT8 *)(VBE_INFO_ADDR + 0x21) = 1;
+    SERIAL_PUTC('L');  /* L = long-mode boot flag (0x5021) set */
 
     /* Relocate 64-bit kernel to K64_LOAD_ADDR if it was staged in a temp
      * buffer, then publish the handoff struct at 0x7000 so the 32-bit

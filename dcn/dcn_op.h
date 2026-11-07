@@ -15,7 +15,9 @@ extern "C" {
 #define DCN_OP_XOR  3   /* xor of all input bytes -> 1 byte */
 
 /* Run a built-in op. Returns DCN_OK, or DCN_ERR_PARAM for an unknown op.
-   `out` must hold at least 4 bytes for SUM, inlen for ECHO, 1 for XOR. */
+   `out` must hold at least 4 bytes for SUM, inlen for ECHO, 1 for XOR.
+   ECHO output size == input size, so callers with a fixed buffer must cap the
+   input at DCN_MAX_PAYLOAD (see dcn_common.h); dcn_sched/worker already do. */
 DCN_API int dcn_op_run(uint8_t op, const uint8_t* in, size_t inlen,
                        uint8_t* out, size_t* outlen);
 

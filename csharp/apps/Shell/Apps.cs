@@ -265,6 +265,14 @@ namespace NexOS.Forms
         int dblT;      // TickMs() of the last row click (double-click detect)
         int dblIdx;    // row index of that click
         static string clip;   // last "copied" path
+        // Clipboard now carries WHERE the file came from, so paste works
+        // across folders, volumes and windows (the old code kept a name only).
+        static int    clipFs   = -1;
+        static string clipPath;
+        static string clipName;
+        static bool   clipCut  = false;
+        static string[] clipList;      // multi-selection (batch copy)
+        static int      clipListN = 0;
 
         // Address bar (location box) at the top of the window.
         string addr;     // committed address text, e.g. "C:\"
@@ -274,6 +282,155 @@ namespace NexOS.Forms
         bool   addrErr;  // true while the "invalid address" dialog is up
         bool   openWith; // true while the "open with" chooser is up
         string owFile;   // file being opened by the chooser
+        // This window's own folder.  The medium has a SINGLE current dir, so
+        // every Explorer instance re-asserts its path before touching the FS --
+        // that is what lets two Explorer windows show different folders.
+        string curPath = null;
+
+        void SyncCwd()
+        {
+            if (fs >= 0 && fs != 1 && curPath != null && curPath.Length > 0)
+                Host.EnterPath(fs, curPath);
+        }
+
+        // ---- drag & drop -------------------------------------------------
+        int    dragRow  = -1;      // listing index being dragged (-1 = none)
+        string dragName = null;    // its file name
+        // A plain click must NOT show the drag ghost: it only appears after the
+        // pointer has moved a few pixels away from the press point (see phase 1),
+        // and it is always removed on release.
+        int    dragPx   = 0, dragPy = 0;
+        bool   dragLive = false;
+
+        // ---- file-operation progress (copy / paste / move) -----------------
+        // The copy loops run on the UI thread, so the only way to give feedback
+        // is to paint + present from inside the loop: every chunk updates this
+        // state and calls Host.Repaint(), which runs OnPaint (above) and draws
+        // the bar.  Nothing else would ever reach the screen mid-copy.
+        bool   jobActive = false;
+        string jobLabel  = null;
+        int    jobDone   = 0;      // bytes copied so far
+        int    jobTotal  = 0;      // bytes to copy (0 = unknown, e.g. folders)
+        int    jobItems  = 0;      // items completed / total, for the text
+        int    jobItemTotal = 0;
+        int    jobShownPct = -1;   // last presented percentage (throttle)
+
+        // Height the progress bar occupies at the bottom of the window while an
+        // operation runs.  The list must reserve it, otherwise the bar covers
+        // the last couple of rows for the whole copy.
+        int JobH() { return jobActive ? 46 : 0; }
+        int JobPct()
+        {
+            if (jobTotal <= 0) return jobItemTotal > 0 ? (jobItems * 100) / jobItemTotal : 0;
+            int p = (jobDone * 100) / jobTotal;
+            if (p > 100) p = 100;
+            return p;
+        }
+        string JobDetail()
+        {
+            if (jobTotal > 0)
+                return U.Cat(U.I(jobDone / 1024), " / ", U.Cat(U.I(jobTotal / 1024), " KB"));
+            return U.Cat(U.I(jobItems), " / ", U.I(jobItemTotal));
+        }
+        void JobBegin(string label)
+        {
+            jobActive = true; jobLabel = label; jobDone = 0; jobTotal = 0;
+            jobItems = 0; jobItemTotal = 0; jobShownPct = -1;
+        }
+        // Present at most ~100 times per operation: the loop runs per 64 KB, and
+        // a full window repaint per chunk would make the copy slower than the
+        // disk it is reading from.
+        void JobPump()
+        {
+            int p = JobPct();
+            if (p != jobShownPct) { jobShownPct = p; Host.Repaint(); }
+        }
+        void JobEnd()
+        {
+            jobActive = false; jobLabel = null; jobDone = 0; jobTotal = 0;
+            jobItems = 0; jobItemTotal = 0; jobShownPct = -1;
+        }
+
+        public override void OnDrag(int phase, int mx, int my, int hitId, int hx, int hy)
+        {
+            int ly = ListTop();
+            if (phase == 0)
+            {
+                // Press: remember the file row under the pointer (folders are
+                // drag SOURCES too, but moving a folder is not supported).
+                dragRow = -1; dragName = null;
+                if (mx < ClientX() || mx > ClientX() + ClientW(Gfx.Width())) return;
+                int rowIdx = (my - ly) / W.RowH + scroll;
+                if (rowIdx < 0 || rowIdx >= ListCount()) return;
+                int li = order[rowIdx];
+                if (Host.FileIsDir(fs, li) != 0) return;
+                dragRow = li;
+                dragName = Host.FileName(fs, li);
+                dragPx = mx; dragPy = my;      // remember where the press landed
+                dragLive = false;              // ghost appears only once it moves
+                return;
+            }
+            if (dragRow < 0 || dragName == null) return;
+            if (phase == 1)
+            {
+                // Real drag only: a click that never moves must not show it.
+                int dx = mx - dragPx, dy = my - dragPy;
+                if (!dragLive && (dx > 4 || dx < -4 || dy > 4 || dy < -4))
+                {
+                    dragLive = true;
+                    Host.DragGhost(1, dragName);
+                    Host.Log(U.Cat("[FILES] drag src=", dragName));
+                }
+                return;
+            }
+
+            // ---- release ----
+            string nm = dragName; int row = dragRow;
+            dragRow = -1; dragName = null;
+            Host.DragGhost(0, "");
+            Host.Log(U.Cat(U.Cat("[FILES] drop '", nm, "' hit=", U.I(hitId)), " at ", U.I(mx), ",", U.I(my)));
+
+            // Dropped on ANOTHER window (two Explorers side by side).
+            if (hitId >= 0 && hitId != id)
+            {
+                App tgt = Shell.ById(hitId);
+                if (tgt != null)
+                {
+                    int r = tgt.AcceptDrop(fs, curPath, nm);
+                    Host.Log(U.Cat(r >= 0 ? "[FILES] moved to other window: " : "[FILES] move FAILED: ", nm));
+                    Host.FileRefresh(); RebuildOrder();
+                    return;
+                }
+                return;
+            }
+
+            // Dropped inside our own window, on a folder row -> move into it.
+            int drow = (my - ly) / W.RowH + scroll;
+            if (drow >= 0 && drow < ListCount())
+            {
+                int li = order[drow];
+                if (Host.FileIsDir(fs, li) != 0 && li != row)
+                {
+                    string tgtPath = U.Cat(curPath, "/", Host.FileName(fs, li));
+                    int r = CopyEntry(fs, curPath, nm, fs, tgtPath, 0);
+                    if (r >= 0) { SyncCwd(); Host.FileDelete(fs, nm); }
+                    Host.Log(U.Cat(r >= 0 ? "[FILES] moved into folder: " : "[FILES] move FAILED: ", nm));
+                    Host.FileRefresh(); RebuildOrder();
+                }
+            }
+        }
+
+        // Another window dropped a file on us: move it into this window's folder.
+        public override int AcceptDrop(int srcFs, string srcPath, string name)
+        {
+            if (fs < 0) return -1;
+            SyncCwd();
+            int r = CopyEntry(srcFs, srcPath, name, fs, curPath, 0);
+            if (r >= 0) { Host.EnterPath(srcFs, srcPath); Host.FileDelete(srcFs, name); }   // drag = move
+            Host.FileRefresh(); RebuildOrder();
+            return r;
+        }
+
         string owExt;    // its extension (recorded on pick)
 
         // Navigation history for Back / Forward.
@@ -349,6 +506,12 @@ namespace NexOS.Forms
         // Navigate to a location, recording it in the history (Back/Forward).
         void Go(int loc)
         {
+            // Switching volumes resets the medium's current directory to the
+            // volume root, otherwise the listing would show the folder we last
+            // entered on a DIFFERENT volume (the FS has one shared cwd).
+            if (loc >= 0 && loc != 1) Host.EnterDir(loc, -1);
+            curPath = (loc >= 0 && loc != 1) ? Host.CwdPath(loc) : null;
+            navFs = loc; navN = 0;
             if (histN == 0 || hist[histPos] != loc)
             {
                 if (histPos < histN - 1) histN = histPos + 1;   // drop redo branch
@@ -369,9 +532,22 @@ namespace NexOS.Forms
             RebuildOrder();
         }
         void GoVolume(int nf) { Go(nf); }     // legacy name, volume only
-        void Back()    { if (histPos > 0) { histPos--; ApplyHist(); } }
+        void Back()
+        {
+            // Folders first: the history only records volumes, so walking out
+            // of a sub-folder has to consume the level stack before touching it.
+            if (fs >= 0 && fs != 1 && navN > 0) { GoUp(); return; }
+            if (histPos > 0) { histPos--; ApplyHist(); }
+        }
         void Forward() { if (histPos < histN - 1) { histPos++; ApplyHist(); } }
-        void NavigateUp() { if (fs >= 0) Go(-1); }   // volume -> This PC
+        void NavigateUp()
+        {
+            if (fs < 0) return;
+            // Inside a folder -> go to its parent; at the volume root the Up
+            // button leaves the volume (back to "This PC"), as on Windows.
+            if (fs != 1 && navN > 0) { GoUp(); return; }
+            Go(-1);
+        }
 
         // ---- selection helpers -------------------------------------
         bool IsSelected(int li)
@@ -423,6 +599,40 @@ namespace NexOS.Forms
             if (sortMode == 3) ce = -ce;
             return ce;
         }
+        // ---- folder navigation ---------------------------------------
+        int[] navIdx;      // per-level entry index we entered (for Up/Back)
+        int   navN, navFs;
+
+        // Enter the folder at listing index li.
+        void EnterFolder(int li)
+        {
+            if (fs < 0 || fs == 1) return;
+            if (Host.EnterDir(fs, li) != 0) { Host.Log("[FILES] enter folder failed"); return; }
+            if (navIdx == null) navIdx = new int[16];
+            if (navN < 16) { navIdx[navN] = li; navN++; }
+            navFs = fs;
+            curPath = Host.CwdPath(fs);
+            addr = AddrOf(fs); addrBuf = ""; sel = -1; scroll = 0; anchor = -1; selN = 0;
+            RebuildOrder();
+            Host.Log(U.Cat("[FILES] entered ", addr));
+            Host.SetAnim(1);
+        }
+
+        // Go up one level (toolbar Up button / Backspace).
+        void GoUp()
+        {
+            if (fs < 0 || fs == 1) return;
+            if (Host.DirUp(fs) != 0) return;         // already at the root
+            int back = -1;
+            if (navIdx != null && navN > 0) { navN--; back = navIdx[navN]; }
+            addr = AddrOf(fs); addrBuf = ""; sel = (back >= 0 && back < Host.FileCount(fs)) ? back : -1;
+            scroll = 0; anchor = -1; selN = 0;
+            RebuildOrder();
+            curPath = Host.CwdPath(fs);
+            Host.Log(U.Cat("[FILES] up -> ", addr));
+            Host.SetAnim(1);
+        }
+
         void RebuildOrder()
         {
             int n = ListCount();
@@ -479,6 +689,9 @@ namespace NexOS.Forms
         // =============================================================
         public override void OnPaint()
         {
+            // This window's folder may not be the medium's current dir any more
+            // (another Explorer window switched it): re-assert before listing.
+            SyncCwd();
             W.Clear();
             int w = Gfx.Width(), h = Gfx.Height();
             int ax = ClientX(), aw = ClientW(w);
@@ -514,7 +727,7 @@ namespace NexOS.Forms
             // ---- file list / details area ----
             int ly = ListTop();
             int n = ListCount();
-            int rows = (h - ly - StatusH() - PAD) / W.RowH;
+            int rows = (h - ly - StatusH() - PAD - JobH()) / W.RowH;
 
             if (viewMode == 1)   // Details: column header + aligned rows
             {
@@ -568,13 +781,34 @@ namespace NexOS.Forms
                 Gfx.DrawRound(bx, inputY, bw, ebh, 4, C.Accent);
                 string shown = editBuf;
                 if ((Host.Ticks() / 30) % 2 == 0) shown = U.Cat(shown, "|");
-                Gfx.Text(bx + 6, inputY + 6, shown, C.Text);
+                Gfx.Text(bx + 6, inputY + 6, shown, C.OnLight);   // white input box -> dark ink
                 if (editMode == 1)
                     Gfx.Text(ax + 4, inputY + W.RowH - 4, "Enter 确认 · Esc 取消", C.TextSub);
             }
 
             // ---- status bar ----
-            int sy = h - StatusH();
+            // VIEWPORT-FIXED status bar: add the host's pan offset so it cancels
+            // out and the bar stays pinned to the window bottom while the list
+            // scrolls underneath it (it used to drift upwards with the content).
+            int sy = h - StatusH() + Host.PanY();
+
+            // ---- file-operation progress bar (copy/paste/move) ----
+            // Painted from the SAME state the copy loop updates, so it shows up
+            // on every Host.Repaint() the loop issues between 64 KB chunks.
+            // Without this a large paste just froze the window with no feedback.
+            if (jobActive)
+            {
+                int jh = JobH();
+                int jy = sy - jh;
+                Gfx.FillRect(0, jy, w, jh, C.Card);
+                Gfx.DrawLine(0, jy, w, jy, C.Border);
+                int pct = JobPct();
+                Gfx.Text(PAD, jy + 5, jobLabel, C.Text);
+                Gfx.Text(PAD + Gfx.Measure(jobLabel) + 12, jy + 5,
+                         JobDetail(), C.TextSub);
+                Gfx.Progress(PAD, jy + 27, w - 2 * PAD, 10, pct, C.Accent);
+            }
+
             Gfx.FillRect(0, sy, w, StatusH(), C.CardAlt);
             Gfx.DrawLine(0, sy, w, sy, C.Border);
             string status = U.Cat(U.I(n), " items");
@@ -591,7 +825,7 @@ namespace NexOS.Forms
                 Gfx.FillRound(dx, dy, dw, dh, 8, 0xFFFFFFFF);
                 Gfx.DrawRound(dx, dy, dw, dh, 8, C.Accent);
                 Gfx.DrawLine(dx + 1, dy + 44, dx + dw - 1, dy + 44, C.Border);
-                Gfx.TextCenter(dx, dy + 16, dw, "你输入的地址无效", C.Text);
+                Gfx.TextCenter(dx, dy + 16, dw, "你输入的地址无效", C.OnLight);
                 int dbw = 96, dbh = 30;
                 int dbx = dx + (dw - dbw) / 2, dby = dy + dh - dbh - 16;
                 Gfx.FillRound(dbx, dby, dbw, dbh, 6, C.Accent);
@@ -607,15 +841,15 @@ namespace NexOS.Forms
                 int px = (w - pw) / 2, py = (h - ph) / 2;
                 Gfx.FillRound(px, py, pw, ph, 8, 0xFFFFFFFF);
                 Gfx.DrawRound(px, py, pw, ph, 8, C.Accent);
-                Gfx.Text(px + 12, py + 8, U.Cat("选择打开方式：", owFile), C.TextSub);
+                Gfx.Text(px + 12, py + 8, U.Cat("选择打开方式：", owFile), C.OnLight);
                 for (int i = 0; i < OW_N; i++)
                 {
                     int ry = py + 34 + i * rowH;
                     bool hot = W.Hot(px + 6, ry, pw - 12, rowH - 2);
                     if (hot) Gfx.FillRound(px + 6, ry, pw - 12, rowH - 2, 4, C.Hover);
-                    Gfx.Text(px + 20, ry + 8, OwLabel(i), C.Text);
+                    Gfx.Text(px + 20, ry + 8, OwLabel(i), C.OnLight);
                 }
-                Gfx.Text(px + 12, py + ph - 20, "选择后该后缀以后都用此应用打开（Esc 取消）", C.TextSub);
+                Gfx.Text(px + 12, py + ph - 20, "选择后该后缀以后都用此应用打开（Esc 取消）", C.OnLight);
             }
 
             // ---- semi-blocking tail: paint scrim, flip, then block ----
@@ -650,7 +884,16 @@ namespace NexOS.Forms
 
         // ---- address bar (location box) -----------------------------
         // Canonical address text for a location.
-        static string AddrOf(int f) { return f < 0 ? "This PC" : (f == 1 ? "SFS" : "MKFS"); }
+        static string AddrOf(int f)
+        {
+            if (f < 0) return "This PC";
+            if (f == 1) return "SFS";        // read-only, flat
+            // The medium owns the current directory, so ask it for the real
+            // path -- this is what makes the address bar follow the user
+            // into sub-folders.
+            string p = Host.CwdPath(f);
+            return (p == null || p.Length == 0) ? (f == 3 ? "Desktop" : "MKFS") : p;
+        }
 
         static string TrimLow(string s)
         {
@@ -933,6 +1176,9 @@ namespace NexOS.Forms
         // =============================================================
         public override void OnKey(int ch)
         {
+            // Backspace inside a folder walks up one level (Windows behaviour).
+            if ((ch == -1 || ch == 8) && fs >= 0 && fs != 1 && navN > 0 && editMode == 0 && !addrEdit)
+            { GoUp(); return; }
             if (addrErr) { addrErr = false; return; }
             if (openWith) { openWith = false; return; }
 
@@ -983,7 +1229,7 @@ namespace NexOS.Forms
         {
             dblT = -100000; dblIdx = -1;   // a right-click never starts a double-click
             int ax = ClientX(), ly = ListTop();
-            int rows = (Gfx.Height() - ly - StatusH() - PAD) / W.RowH;
+            int rows = (Gfx.Height() - ly - StatusH() - PAD - JobH()) / W.RowH;
             // Inside the file-list client area (and only on a real volume) ->
             // the file action menu.
             if (fs >= 0 && mx >= ax && my >= ly && my < ly + rows * W.RowH)
@@ -991,6 +1237,8 @@ namespace NexOS.Forms
                 SelectAt(mx, my);
                 if (sel >= 0 && sel < Host.FileCount(fs))
                     Desktop.OpenFileMenu(id, fs, sel, ox + mx, oy + my);
+                else
+                    Desktop.OpenFolderMenu(id, fs, ox + mx, oy + my);   // empty area
                 return;
             }
             base.OnRightClick(mx, my, ox, oy);
@@ -1009,8 +1257,8 @@ namespace NexOS.Forms
             else if (code == Desktop.A_F_PROPS)  ShowProps();
             else if (code == Desktop.A_F_MKDIR)  BeginNewFolder();
             else if (code == Desktop.A_F_NEWFILE) BeginNewFile();
-            else if (code == Desktop.A_F_CUT)   CopySelected();
-            else if (code == Desktop.A_F_PASTE) Host.Log("[FILE] paste (no-op)");
+            else if (code == Desktop.A_F_CUT)   CutSelected();
+            else if (code == Desktop.A_F_PASTE) PasteHere();
             else if (code == Desktop.A_F_SHARE) Host.Log("[FILE] share (no-op)");
         }
 
@@ -1030,7 +1278,7 @@ namespace NexOS.Forms
             Host.Log(U.Cat("[FILES] run queued kind=", U.I(k)));
             if (k == 1)      DoOpenFile(nm);
             else if (k == 2) DoRunExe(nm);
-            else if (k == 3) Shell.OpenNotepad(nm);
+            else if (k == 3) Shell.OpenNotepadFs(fs, nm);
             else if (k == 4) OpenWith(k2, nm);
             Host.SetAnim(0);
         }
@@ -1044,7 +1292,7 @@ namespace NexOS.Forms
                 return;
             }
             if (sel < 0 || sel >= Host.FileCount(fs)) return;
-            if (Host.FileIsDir(fs, sel) != 0) return;     // dirs: no viewer
+            if (Host.FileIsDir(fs, sel) != 0) { EnterFolder(sel); return; }
             string nm = Host.FileName(fs, sel);
             RequestOpen(nm, 1, U.Cat("正在打开 ", nm));
         }
@@ -1070,7 +1318,7 @@ namespace NexOS.Forms
 
         void OpenWith(int kind, string nm)
         {
-            if (kind == Kind.Notepad) { Shell.OpenNotepad(nm); return; }
+            if (kind == Kind.Notepad) { Shell.OpenNotepadFs(fs, nm); return; }
             Host.Log(U.Cat("[FILES] open ", nm, " with ", Desktop.KindName(kind)));
             Host.OpenApp(kind);
         }
@@ -1134,17 +1382,142 @@ namespace NexOS.Forms
         void CopySelected()
         {
             if (fs < 0 || sel < 0 || sel >= Host.FileCount(fs)) return;
-            clip = Host.FileName(fs, sel);
+            clipFs   = fs;
+            clipPath = curPath;
+            clipCut  = false;
+            clipName = Host.FileName(fs, sel);
+            clip     = clipName;
+            // BATCH: remember every selected file so Paste copies them all.
+            if (clipList == null) clipList = new string[256];
+            clipListN = 0;
+            for (int k = 0; k < selN && clipListN < 256; k++)
+            {
+                int li = selSet[k];
+                if (li < 0 || li >= Host.FileCount(fs)) continue;
+                if (Host.FileIsDir(fs, li) != 0) continue;   // folders: not yet
+                clipList[clipListN] = Host.FileName(fs, li);
+                clipListN++;
+            }
+            if (clipListN == 0) { clipList[0] = clipName; clipListN = 1; }
+            Host.Log(U.Cat("[FILES] copied ", U.I(clipListN)));
+            Host.Log(U.Cat("[FILES] copied: ", clipName));
+        }
+
+        void CutSelected()
+        {
+            CopySelected();
+            if (clipName != null) { clipCut = true; Host.Log(U.Cat("[FILES] cut: ", clipName)); }
+        }
+
+        // Paste the clipboard file into THIS window's folder.
+        // ---- recursive / chunked copy ----------------------------------
+        // Copies `name` from (srcFs, srcPath) into (dstFs, dstPath).  Folders
+        // recurse; files stream in 64 KB pieces so big files work and a
+        // progress bar can be painted between chunks.
+        int CopyEntry(int srcFs, string srcPath, string name, int dstFs, string dstPath, int depth)
+        {
+            if (depth > 6) return -1;
+            Host.EnterPath(srcFs, srcPath);
+            int isDir = Host.IsDirByName(srcFs, name);
+            if (isDir < 0) return -1;
+            if (isDir != 0)
+            {
+                Host.EnterPath(dstFs, dstPath);
+                Host.FileMkDir(dstFs, name);
+                string sSub = U.Cat(srcPath, "/", name);
+                string dSub = U.Cat(dstPath, "/", name);
+                Host.EnterPath(srcFs, sSub);
+                int n = Host.FileCount(srcFs);
+                string[] kids = new string[n];
+                for (int i = 0; i < n; i++) kids[i] = Host.FileName(srcFs, i);
+                int ok = 0;
+                for (int i = 0; i < n; i++)
+                    if (CopyEntry(srcFs, sSub, kids[i], dstFs, dSub, depth + 1) >= 0) ok++;
+                Host.Log(U.Cat("[FILES] folder ", name, ": ", U.I(ok), "/", U.I(n)));
+                return 0;
+            }
+            int sz = Host.FileSize(srcFs, name);
+            if (sz < 0) return -1;
+            int off = 0;
+            while (off < sz)
+            {
+                int r = Host.CopyRange(srcFs, srcPath, name, dstFs, dstPath, off, 65536);
+                if (r <= 0) return -1;
+                off += r;
+                // Feedback between chunks: the state is read by OnPaint, and
+                // JobPump() presents it (throttled to one repaint per percent).
+                if (jobActive) { jobDone += r; JobPump(); }
+            }
+            if (sz == 0) Host.CopyRange(srcFs, srcPath, name, dstFs, dstPath, 0, 1);
+            return sz;
+        }
+
+        void PasteHere()
+        {
+            if ((clipName == null && clipListN == 0) || clipPath == null || clipFs < 0)
+            { Host.Log("[FILES] paste: clipboard empty"); return; }
+            SyncCwd();
+
+            // Measure the payload up front so the bar can show a real percentage
+            // (folders report 0 -- their bytes still stream in as they are read).
+            int totBytes = 0, totItems = 0;
+            for (int k = 0; k < clipListN; k++)
+            {
+                string nmM = clipList[k];
+                if (nmM == null) continue;
+                totItems++;
+                Host.EnterPath(clipFs, clipPath);
+                if (Host.IsDirByName(clipFs, nmM) == 0)
+                {
+                    int sM = Host.FileSize(clipFs, nmM);
+                    if (sM > 0) totBytes += sM;
+                }
+            }
+            JobBegin(clipCut ? "正在移动" : "正在复制");
+            jobTotal = totBytes;
+            jobItemTotal = totItems;
+            Host.Repaint();
+
+            int ok = 0, bad = 0;
+            for (int k = 0; k < clipListN; k++)
+            {
+                string nm2 = clipList[k];
+                if (nm2 == null) continue;
+                int r2;
+                r2 = CopyEntry(clipFs, clipPath, nm2, fs, curPath, 0);
+                if (clipCut && r2 >= 0)
+                {
+                    Host.EnterPath(clipFs, clipPath);   // remove the ORIGINAL
+                    Host.FileDelete(clipFs, nm2);
+                }
+                if (r2 >= 0) { ok++; jobItems++; }
+                else { bad++; Host.Log(U.Cat("[FILES] paste FAILED: ", nm2)); }
+                JobPump();
+            }
+            JobEnd();
+            Host.Log(U.Cat(clipCut ? "[FILES] moved " : "[FILES] pasted ", U.I(ok), " item(s), failed ", U.I(bad)));
+            if (clipCut) { clipName = null; clipPath = null; clipFs = -1; clipCut = false; clipListN = 0; }
+            Host.FileRefresh();
+            RebuildOrder();
         }
         void DeleteSelected()
         {
+            SyncCwd();
             if (fs < 0) return;
+            // Batch deletes get the same bar as copy/paste: on a slow disk a
+            // multi-selection delete otherwise looks like a frozen window.
+            JobBegin(selN > 1 ? "正在删除多项" : "正在删除");
+            jobItemTotal = selN;
+            Host.Repaint();
             for (int k = 0; k < selN; k++)
             {
                 int li = selSet[k];
                 if (li >= 0 && li < Host.FileCount(fs))
                     Host.FileDelete(fs, Host.FileName(fs, li));
+                jobItems++;
+                JobPump();
             }
+            JobEnd();
             Host.FileRefresh();
             RebuildOrder();
             ClearSel();
@@ -1158,9 +1531,10 @@ namespace NexOS.Forms
         }
         void BeginNewFolder()
         {
+            SyncCwd();
             if (fs < 0) return;
             // BUG #8: read-only volumes cannot gain a directory.
-            if (fs != 0) { Host.Log("[FILES] new folder refused: read-only volume"); return; }
+            if (fs == 1) { Host.Log("[FILES] new folder refused: SFS is read-only"); return; }
             string baseName = "New Folder";
             string name = baseName;
             int n = Host.FileCount(fs);
@@ -1196,11 +1570,12 @@ namespace NexOS.Forms
         }
         void BeginNewFile()
         {
+            SyncCwd();
             if (fs < 0) return;
             // BUG #8: SFS is read-only.  The context menu already hides the
             // verb, but the toolbar and the keyboard can reach here, so the
             // volume itself is checked before anything is created.
-            if (fs != 0) { Host.Log("[FILES] new file refused: read-only volume"); return; }
+            if (fs == 1) { Host.Log("[FILES] new file refused: SFS is read-only"); return; }
             string baseName = "New File.txt";
             string name = baseName;
             int n = Host.FileCount(fs);
@@ -1239,6 +1614,7 @@ namespace NexOS.Forms
         }
         void CommitEdit()
         {
+            SyncCwd();
             if (editMode == 1 && editBuf.Length > 0 && editBuf != editOld)
             {
                 Host.FileRename(fs, editOld, editBuf);
@@ -1429,7 +1805,23 @@ namespace NexOS.Forms
             W.Slider(pad + 200, qy + 14, 220, 16, pct, 0x12);
             Gfx.Text(pad + 430, qy + 14, U.Cat(U.I(Theme.PixelScale), "x"), C.TextSub);
 
+            // P2 text gamma.  64-bit rasteriser only: the icall is absent from
+            // the 32-bit image, so hide the control there instead of offering a
+            // switch that could not take effect.
+            int tgy = qy + 70;
             int ty = qy + 70;
+            if (Host.Is64Bit() != 0)
+            {
+                Gfx.Text(pad, tgy, "Text gamma", C.Text);
+                for (int tgi = 0; tgi < 4; tgi++)
+                {
+                    int tgrx = pad + 200 + tgi * 130;
+                    W.Radio(tgrx, tgy + 14, 20, Theme.TextGamma == tgi ? 1 : 0, 0x60 + tgi);
+                    string tgl = (tgi == 0) ? "Off" : (tgi == 1) ? "1.15" : (tgi == 2) ? "1.30" : "1.45";
+                    Gfx.Text(tgrx + 28, tgy + 16, tgl, Theme.TextGamma == tgi ? C.Accent : C.TextSub);
+                }
+                ty = tgy + 70;
+            }
             Gfx.Text(pad, ty, "Terminal", C.Text);
             W.Button(pad,      ty + 22, 200, 38, U.Cat("Font: ", U.I(Theme.TermCellH)));
             W.Button(pad + 236, ty + 22, 220, 38, Theme.TermBgMode != 0 ? "Background: Tint" : "Background: Solid");
@@ -1724,7 +2116,18 @@ namespace NexOS.Forms
                         Theme.PixelScale = 1 + (p * 3) / 100; if (Theme.PixelScale > 4) Theme.PixelScale = 4;
                         Theme.ApplyPixel(); Theme.Save(); return;
                     }
+                    int tgy = qy + 70;
                     int ty = qy + 70;
+                    if (Host.Is64Bit() != 0)
+                    {
+                        for (int tgi = 0; tgi < 4; tgi++)
+                        {
+                            int tgrx = pad + 200 + tgi * 130;
+                            if (U.In(mx, my, tgrx, tgy + 10, 110, 28))
+                            { Theme.TextGamma = tgi; Theme.ApplyPixel(); Theme.Save(); return; }
+                        }
+                        ty = tgy + 70;
+                    }
                     if (U.In(mx, my, pad, ty + 22, 200, 38))
                     { Theme.TermCellH = TerminalApp.ZoomStep(Theme.TermCellH, 1); Theme.Save(); return; }
                     if (U.In(mx, my, pad + 236, ty + 22, 220, 38))
@@ -2142,6 +2545,7 @@ namespace NexOS.Forms
         bool saved;    // last action was a successful Ctrl+S (title hint)
         bool binary;   // file is not decodable text -> show a hex view
         string hex;    // raw bytes as hex (only meaningful when binary)
+        int    fs;     // volume this document lives on (0=MKFS root, 3=Desktop)
 
         public NotepadApp()
         {
@@ -2153,9 +2557,15 @@ namespace NexOS.Forms
                 // Probe the RAW bytes first: if the file is not verifiable
                 // text (NULs / control bytes) fall back to a binary view
                 // instead of showing mangled characters.
-                int pfs = 1;
-                string hx = Host.ReadHex(1, pending);
-                if (hx == "") { pfs = 0; hx = Host.ReadHex(0, pending); }
+                // Read from the volume the caller named FIRST; only fall back to the
+                // old probe order when that volume has nothing under this name.
+                int pfs = Shell.TakeNotepadFs();
+                string hx = Host.ReadHex(pfs, pending);
+                if (hx == "") {
+                    int alt = (pfs == 1) ? 0 : 1;
+                    hx = Host.ReadHex(alt, pending);
+                    if (hx != "") pfs = alt;
+                }
                 if (IsBinaryHex(hx))
                 {
                     binary = true; hex = hx; t.text = "";
@@ -2164,6 +2574,7 @@ namespace NexOS.Forms
                 {
                     binary = false; hex = "";
                     t.text = Host.ReadText(pfs, pending);
+                    fs = pfs;
                     if (t.text == "") t.text = "Untitled - type below, or click Open to read a file.";
                 }
             }
@@ -2171,6 +2582,7 @@ namespace NexOS.Forms
             {
                 t.text = "Untitled - type below, or click Open to read a file.";
                 name = "Untitled";
+                fs = 0;
                 binary = false; hex = "";
             }
             picking = false;
@@ -2207,14 +2619,97 @@ namespace NexOS.Forms
             return false;
         }
 
-        // Ctrl+S save: persist the document body to the MKFS data disk.
-        // Mirrors the ReadText(0, name) fallback used when a file is opened,
-        // so a re-open lands on the saved copy.  Silent on purpose -- the
-        // title shows a "(saved)" hint until the next edit.
+        // ---- save targets ------------------------------------------------
+        // Two ways to save:
+        //   * Ctrl+S  -> overwrite the document in place (old behaviour, kept
+        //               because it is the reflex every user has).
+        //   * Save As -> choose the volume FOLDER and a file name first.
+        //
+        // The folder picker exists because the old editor could only rewrite
+        // the exact file it had opened: there was no way to put a new document
+        // anywhere, so "save" meant "you must have opened something first".
+        static readonly string[] VolNames = { "MKFS root", "Desktop folder" };
+        int  saveVol;        // 0 = MKFS root (fs 0), 1 = Desktop (fs 3)
+        bool pickingSave;    // showing the Save-As name/folder dialog
+        string saveNameBuf;  // file name being typed in the dialog
+        int   saveDirWarn;   // 1 = last save failed, show a red hint
+
+        int SaveFs() { return saveVol == 1 ? 3 : 0; }
+
         void Save()
         {
-            Host.WriteText(0, name, t.text);
+            // Write back to the volume the document came from.  Always using fs 0
+            // silently saved desktop / SFS files into the MKFS root, so the file
+            // you opened never changed -- which looked exactly like "data lost".
+            int wr = Host.WriteText(fs, name, t.text);
+            Host.Log(U.Cat(wr >= 0 ? "[EDITOR] saved " : "[EDITOR] SAVE FAILED ", name));
+            saveDirWarn = wr < 0 ? 1 : 0;
             saved = true;
+        }
+
+        // Commit a Save-As: the name may carry no extension; append one that
+        // matches the detected content so the file is recognisable later.
+        void SaveAs()
+        {
+            string nm = saveNameBuf;
+            if (nm == null || nm == "") nm = "Untitled.txt";
+            // Look for a '.' in the LAST path component only, so a folder name
+            // containing a dot cannot be mistaken for an extension.
+            int dot = -1;
+            for (int i = nm.Length - 1; i >= 0; i--) { if (nm[i] == '.') { dot = i; break; } }
+            if (dot <= 0) nm = U.Cat(nm, "." + DetectExt());
+            name = nm;
+            fs   = SaveFs();
+            int wr = Host.WriteText(fs, name, t.text);
+            Host.Log(U.Cat(wr >= 0 ? "[EDITOR] saved-as " : "[EDITOR] SAVE-AS FAILED ", name));
+            saveDirWarn = wr < 0 ? 1 : 0;
+            saved = true;
+            pickingSave = false;
+        }
+
+        // ---- content sniffing --------------------------------------------
+        // The editor used to treat everything as opaque text.  These cheap
+        // probes recognise the plain formats that are actually parseable here
+        // (there is no PDF/ZIP engine in NexOS), and the title bar reports what
+        // was found so "it opened but looks like noise" is explainable.
+        // MiniCLR has no string.StartsWith, and the copies in Browser.cs /
+        // TerminalApp.cs are private to those classes, so Notepad needs its own.
+        static bool StartsWith(string s, string p)
+        {
+            if (s == null || p == null) return false;
+            if (p.Length > s.Length) return false;
+            for (int i = 0; i < p.Length; i++) if (s[i] != p[i]) return false;
+            return true;
+        }
+
+        static string DetectExtStatic(string body)
+        {
+            if (body == null || body.Length == 0) return "txt";
+            if (body.Length >= 12 && StartsWith(body, "{\\rtf")) return "rtf";   // \rtf is RTF's opening
+            if (StartsWith(body, "<?xml")) return "xml";
+            if (StartsWith(body, "<!DOCTYPE html") || StartsWith(body, "<!doctype html")
+                || StartsWith(body, "<html")) return "html";
+            if (StartsWith(body, "{") ) return "json";         // no parser: best effort
+            if (StartsWith(body, ";;") || StartsWith(body, "; ")) return "ini";
+            if (StartsWith(body, "---")) return "md";          // YAML front matter
+            // Markdown heuristics: a leading heading is the strongest single cue.
+            for (int i = 0; i < body.Length && i < 40; i++)
+                if (body[i] == '#') return "md";
+            return "txt";
+        }
+        string DetectExt() { return DetectExtStatic(t.text); }
+
+        // Human-readable description shown next to the file name.
+        string DetectLabel()
+        {
+            string e = DetectExt();
+            if (e == "rtf")  return "Rich Text (RTF source)";
+            if (e == "xml")  return "XML markup";
+            if (e == "html") return "HTML document";
+            if (e == "json") return "JSON data";
+            if (e == "ini")  return "INI / config";
+            if (e == "md")   return "Markdown";
+            return "Plain text";
         }
 
         public override string GetTitle() { return U.Cat("Notepad - ", name); }
@@ -2230,9 +2725,17 @@ namespace NexOS.Forms
             Gfx.DrawLine(0, 40, w, 40, C.Border);
             W.Button(pad, 6, 70, 28, "Open");
             W.Button(pad + 80, 6, 70, 28, "New");
-            Gfx.Text(pad + 170, 12, name, C.TextSub);
-            if (saved) { int sw = Gfx.Measure(name); Gfx.Text(pad + 178 + sw, 12, "(saved)", 0x107C10); }
+            W.Button(pad + 160, 6, 84, 28, "Save As");
+            Gfx.Text(pad + 254, 12, name, C.TextSub);
+            if (saved) { int sw = Gfx.Measure(name); Gfx.Text(pad + 262 + sw, 12, "(saved)", 0x107C10); }
+            // What the editor thinks the document is.  Shown always (not just
+            // for recognised formats) so "plain text" is a positive statement
+            // rather than an unexplained absence.
+            Gfx.Text(pad + 254, 30, DetectLabel(), C.TextFaint);
+            if (saveDirWarn != 0)
+                Gfx.Text(pad + 400, 12, "save failed - choose another folder", C.Danger);
 
+            if (pickingSave) { DrawSaveAs(w, h); return; }
             if (picking) { DrawPicker(w, h); return; }
             if (binary) { DrawBinary(pad, w, h); return; }
 
@@ -2250,6 +2753,63 @@ namespace NexOS.Forms
                 int cyp = 54 + cl * 20;
                 if (cyp < h - pad) Gfx.FillRect(cxp, cyp, 2, 18, 0x1A1A1A);
             }
+        }
+
+        // ---- Save As dialog ---------------------------------------------
+        // Volume + folder chooser.  Host.WriteText(fs, name, text) addresses a
+        // file by (volume, name) with the volume's CURRENT directory implicitly
+        // applied, so "custom save location" here means picking the volume and
+        // navigating its folders -- that is what the kernel API can actually
+        // express.  The current directory is read back through Host.CwdPath so
+        // the dialog shows where the write will really land.
+        void DrawSaveAs(int w, int h)
+        {
+            int pad = 10;
+            // Dim the editor behind the dialog so the mode is unmistakable.
+            Gfx.FillRect(0, 44, w, h - 44, 0xF7F7F7);
+            Gfx.Text(pad + 8, 56, "Save as - choose a location and a file name", C.Text);
+            int y = 84;
+
+            // Volume selector (two rows, radio-style).
+            Gfx.Text(pad + 8, y, "Volume:", C.TextSub);
+            y += 22;
+            for (int i = 0; i < 2; i++)
+            {
+                int ry = y + i * W.RowH;
+                bool hot = W.Hot(pad, ry, w - 2 * pad, W.RowH - 2);
+                if (saveVol == i) Gfx.FillRound(pad, ry, w - 2 * pad, W.RowH - 2, 6, C.Sel);
+                else if (hot)     Gfx.FillRound(pad, ry, w - 2 * pad, W.RowH - 2, 6, C.Hover);
+                Gfx.Text(pad + 12, ry + 7, saveVol == i ? "(o)" : "( )", C.Text);
+                Gfx.Text(pad + 44, ry + 7, VolNames[i], C.Text);
+            }
+            y += 2 * W.RowH + 10;
+
+            // Current directory of the chosen volume.
+            int vfs = SaveFs();
+            Gfx.Text(pad + 8, y, U.Cat("Folder: ", Host.CwdPath(vfs)), C.TextSub);
+            y += 22;
+            Gfx.Text(pad + 8, y, "File name:", C.TextSub);
+            y += 22;
+            // Name field (plain box; typing is routed from OnKey while visible).
+            Gfx.FillRect(pad + 8, y, w - 2 * pad - 16, 30, C.White);
+            Gfx.DrawRect(pad + 8, y, w - 2 * pad - 16, 30, C.BorderMid);
+            Gfx.Text(pad + 14, y + 7, saveNameBuf == null || saveNameBuf == "" ? "Untitled.txt" : saveNameBuf, C.OnLight);
+            // Caret.
+            if ((Host.Ticks() / 30) % 2 == 0)
+            {
+                string shown = saveNameBuf == null || saveNameBuf == "" ? "Untitled.txt" : saveNameBuf;
+                Gfx.FillRect(pad + 15 + Gfx.Measure(shown), y + 8, 2, 16, 0x1A1A1A);
+            }
+            y += 44;
+
+            // Probed format so the user sees what will be written.
+            Gfx.Text(pad + 8, y, U.Cat("Detected content: ", DetectLabel()), C.TextFaint);
+            y += 26;
+
+            W.Button(pad + 8, y, 100, 30, "Save");
+            W.Button(pad + 116, y, 100, 30, "Cancel");
+            if (saveDirWarn != 0)
+                Gfx.Text(pad + 230, y + 8, "last attempt failed (read-only or no such folder)", C.Danger);
         }
 
         void DrawPicker(int w, int h)
@@ -2338,9 +2898,34 @@ namespace NexOS.Forms
         {
             int w = Gfx.Width(), h = Gfx.Height();
             int pad = 10;
-            if (U.In(mx, my, pad, 6, 70, 28)) { picking = !picking; return; }
+            if (U.In(mx, my, pad, 6, 70, 28)) { picking = !picking; pickingSave = false; return; }
             if (U.In(mx, my, pad + 80, 6, 70, 28))
-            { t.text = ""; name = "Untitled"; picking = false; return; }
+            { t.text = ""; name = "Untitled"; picking = false; pickingSave = false; return; }
+            if (U.In(mx, my, pad + 160, 6, 84, 28))
+            {
+                // Open the Save-As dialog, pre-filled with the current name and
+                // the volume this document already belongs to.
+                pickingSave = !pickingSave;
+                picking = false;
+                if (saveNameBuf == null || saveNameBuf == "")
+                    saveNameBuf = (name == null || name == "Untitled") ? "Untitled.txt" : name;
+                saveVol = (fs == 3) ? 1 : 0;
+                return;
+            }
+
+            if (pickingSave)
+            {
+                int y0 = 84 + 22;
+                // Volume rows.
+                for (int i = 0; i < 2; i++)
+                {
+                    int ry = y0 + i * W.RowH;
+                    if (U.In(mx, my, pad, ry, w - 2 * pad, W.RowH - 2)) { saveVol = i; return; }
+                }
+                int yb = y0 + 2 * W.RowH + 10 + 22 + 22 + 44 + 26;
+                if (U.In(mx, my, pad + 8, yb, 100, 30)) { SaveAs(); return; }
+                if (U.In(mx, my, pad + 116, yb, 100, 30)) { pickingSave = false; return; }
+            }
 
             if (picking)
             {
@@ -2362,9 +2947,29 @@ namespace NexOS.Forms
 
         public override void OnKey(int ch)
         {
+            // Save-As dialog: this consumes typing, so the document body must
+            // not also receive the keystrokes (that would edit the file behind
+            // the dialog while the user thinks they are naming it).
+            if (pickingSave)
+            {
+                if (ch == -9) { pickingSave = false; return; }            // Esc
+                if (ch == -2 || ch == -3) { SaveAs(); return; }           // Enter / Ctrl+Enter
+                if (ch == -4)                                             // Backspace
+                {
+                    if (saveNameBuf != null && saveNameBuf.Length > 0)
+                    {
+                        string s2 = "";
+                        for (int i = 0; i < saveNameBuf.Length - 1; i++) s2 = U.Cat(s2, Host.CharStr((int)saveNameBuf[i]));
+                        saveNameBuf = s2;
+                    }
+                    return;
+                }
+                if (ch > 0) saveNameBuf = U.Cat(saveNameBuf == null ? "" : saveNameBuf, Host.CharStr(ch));
+                return;
+            }
             if (picking) { return; }
             if (binary) { return; }                     // binary view is read-only
-            if (ch == -10) { Save(); return; }          // Ctrl+S -> save
+            if (ch == -10) { Save(); return; }          // Ctrl+S -> save in place
             if (ch == -2) { t.Insert("\n"); saved = false; return; }
             t.Key(ch);
             saved = false;

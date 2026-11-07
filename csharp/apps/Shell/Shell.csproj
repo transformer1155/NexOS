@@ -53,6 +53,7 @@
     <Compile Include="Popup.cs" />
     <Compile Include="Toast.cs" />
     <Compile Include="WebView.cs" />
+    <Compile Include="MediaPlayers.cs" />
     <Compile Include="Lang.cs" />
   </ItemGroup>
 

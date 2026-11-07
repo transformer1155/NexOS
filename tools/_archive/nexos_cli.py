@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 import argparse, http.client, json, os, re, shutil, socket, subprocess, sys, zipfile, hashlib
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOOLS     = os.path.join(REPO_ROOT, "tools")
+# 从 __file__ 向上逐层找 "tools/" 目录，找到即视为 TOOLS
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROBE = _HERE
+while True:
+    _parent = os.path.dirname(_PROBE)
+    if _parent == _PROBE: break
+    if os.path.basename(_PROBE) == "tools": break
+    _PROBE = _parent
+TOOLS = _PROBE if os.path.basename(_PROBE) == "tools" else os.path.join(os.path.dirname(_HERE), "tools")
+REPO_ROOT = os.path.dirname(TOOLS)
 MEX_PACK  = os.path.join(TOOLS, "mex_pack.py")
 NEXPACK   = os.path.join(TOOLS, "nexpack.py")
 MEX_PROPS = os.path.join(REPO_ROOT, "csharp", "apps", "mex.shared.props")

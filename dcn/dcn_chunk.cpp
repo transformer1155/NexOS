@@ -92,8 +92,9 @@ void dcn_chunk_run_local(dcn_chunk_plan_t* p, dcn_compute_fn fn, void* u){
     for (int i = 0; i < p->n_blocks; i++){
         dcn_block_t* b = &p->blocks[i];
         if (b->state != DCN_BLOCK_ASSIGNED) continue;
+        if (b->len > DCN_MAX_PAYLOAD) continue;      /* oversized: skip, never overflow out[] */
         size_t outlen = 0;
-        uint8_t out[4096];
+        uint8_t out[DCN_MAX_PAYLOAD];
         fn(p->data + b->offset, b->len, out, &outlen, u);
         dcn_chunk_complete(p, i, out, outlen);
     }

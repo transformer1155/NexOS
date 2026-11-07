@@ -17,6 +17,27 @@
 #include "mforms.h"
 #include "clr.h"
 
+// Keep-repainting flag polled by the GUI main loop.  DEFINED AT FILE SCOPE
+// (outside any anonymous namespace) so both the 32-bit and the 64-bit link see
+// the plain symbol "g_mforms_anim"; inside a namespace it was emitted mangled
+// and the 64-bit kernel bound it to address 0.
+extern "C" int g_mforms_anim = 0;
+
+// Display post-process settings read by gui.cpp (pixelate_framebuffer) and the
+// text rasteriser.  Same rule: FILE scope, never inside the anonymous namespace.
+extern "C" int g_pixel_mode  = 1;
+extern "C" int g_pixel_scale = 1;
+extern "C" int g_pixel_scan  = 0;
+extern "C" int g_dpr         = 1;
+extern "C" int g_text_aa     = 1;
+#if defined(__x86_64__)
+// Text coverage gamma (P2).  The state and the 4x256 LUT live in gfx_draw.inc
+// (inside the anonymous namespace) and are reached through this C-linkage
+// setter: a variable would not survive the namespace/linkage boundary -- the
+// 64-bit link bound it to 0 and check-k64 caught it.  See gfx_draw.inc.
+extern "C" int gui_set_text_gamma(int sel);
+#endif
+
 // ---- Linux guest backend (WebView control) ----
 // linux_manager.h gives us LinuxGuestFB + lifecycle functions.
 // linux_guest_backend.h wraps vnc_client + linux_manager behind an interface.
@@ -118,6 +139,13 @@ void set_context(int ox, int oy, int w, int h) {
         if (g_cbot > g_h.screen_h) g_cbot = g_h.screen_h;
     }
     g_max_cw = w; g_max_ch = h;      // content is at least the client size
+    // Every ordinary paint starts UNSCOLLED.  set_context_pan() sets these
+    // right after, but a plain mforms_paint() used to inherit the pan of
+    // whatever window painted last: after scrolling the File Explorer the next
+    // window's W.Clear() filled at that stale offset -- outside its own client
+    // rect -- so the window came up completely transparent (open a file "with
+    // Notepad" right after scrolling and nothing was drawn at all).
+    g_pan_x = 0; g_pan_y = 0;
 }
 
 // Pan variant: shift the drawing origin by (px,py) but keep the clip at the
@@ -361,9 +389,20 @@ int32_t g_has_image(int32_t* a) {
 int32_t g_image(int32_t* a) {
     if (!g_h.image) return 0;
     track(a[1] + a[3], a[2] + a[4]);
-    // Native draw_image clips to the framebuffer, so draw whenever the
-    // rect intersects the window box (partial overlap included).
-    g_h.image(a[0], g_ox + a[1], g_oy + a[2], a[3], a[4]);
+    // BUG-CLIP: this used to draw with NO clip at all -- only the framebuffer
+    // clipped it.  A managed app whose content overflows its window therefore
+    // painted over the title bar, the caption buttons and neighbouring windows
+    // (reported as "Settings options spill out of the window" and "the title
+    // bar and min/max buttons disappear while scrolling").  Clip to the
+    // context box like every other primitive; image_clip keeps the texture
+    // mapping, so the image is CROPPED rather than squashed.
+    int ix = g_ox + a[1], iy = g_oy + a[2];
+    if (g_h.image_clip) {
+        if (!box_visible(ix, iy, a[3], a[4])) return 0;
+        g_h.image_clip(a[0], ix, iy, a[3], a[4], g_cl, g_ct, g_cr, g_cbot);
+    } else {
+        g_h.image(a[0], ix, iy, a[3], a[4]);
+    }
     return 0;
 }
 
@@ -426,6 +465,25 @@ int32_t h_ticks(int32_t*) {
 // Managed code opens an app (e.g. Notepad from the File Explorer).
 int32_t h_open_app(int32_t* a) {
     if (g_h.open_app) g_h.open_app(a ? a[0] : -1);
+    return 0;
+}
+
+// Always create a new window of the app (multi-instance support).
+// Focus a specific managed instance (taskbar button per window).
+// Show / hide the drag ghost (the dragged item follows the pointer).
+extern "C" void gui_drag_ghost(int on, const char* name);
+int32_t h_drag_ghost(int32_t* a) {
+    gui_drag_ghost(a && a[0] ? 1 : 0, a ? clr_str(a[1]) : "");
+    return 0;
+}
+
+int32_t h_activate_managed(int32_t* a) {
+    if (g_h.activate_managed) g_h.activate_managed(a ? a[0] : -1);
+    return 0;
+}
+
+int32_t h_open_app_new(int32_t* a) {
+    if (g_h.open_app_new) g_h.open_app_new(a ? a[0] : -1);
     return 0;
 }
 
@@ -508,7 +566,10 @@ extern "C" int mforms_paint_failed(int id) {
 extern "C" void vec_set_dpr(int factor);
 extern "C" void gui_font_cache_clear(void);
 extern "C" void gui_set_text_aa(int on);
-extern "C" { int g_dpr = 1; int g_text_aa = 1; }
+// Definitions hoisted to FILE scope (see the block after the includes): inside
+// this anonymous namespace they got internal linkage and mangled names, so
+// gui64.o's extern references never resolved and the 64-bit kernel bound them
+// to address 0.  check-k64 now fails the build on exactly that.
 // One icall covers both halves of the BUG-3 fix: the supersampling factor AND
 // the AA-preserving switch.  They are meaningless apart (a 2x rasterisation is
 // wasted if the retro pass then quantises the coverage away), so the shell sets
@@ -610,6 +671,61 @@ int32_t h_file_name(int32_t* a) {
 
 // Invalidate the listing so the next query re-reads the medium.
 int32_t h_file_refresh(int32_t*) { g_flist_fs = -1; return 0; }
+// File Explorer folder navigation.  The medium keeps one current directory,
+// so entering a folder invalidates the cached listing.
+int32_t h_enter_dir(int32_t* a) {
+    if (!g_h.enter_dir) return -1;
+    g_flist_fs = -1;
+    return g_h.enter_dir(a[0], a[1]);
+}
+int32_t h_dir_up(int32_t* a) {
+    if (!g_h.dir_up) return -1;
+    g_flist_fs = -1;
+    return g_h.dir_up(a[0]);
+}
+// Move a file into a folder of the current directory (File Explorer drag).
+// Restore a window's own directory before it touches the filesystem.
+// Cross-window file move: source fs/path, file name, destination fs/path.
+// Copy a file between two windows' directories (copy & paste).
+// Size / type of a named file in the medium's current directory.
+int32_t h_file_size(int32_t* a) {
+    if (!g_h.file_size) return -1;
+    return g_h.file_size(a[0], clr_str(a[1]));
+}
+int32_t h_is_dir_name(int32_t* a) {
+    if (!g_h.is_dir_name) return -1;
+    return g_h.is_dir_name(a[0], clr_str(a[1]));
+}
+// Copy a byte range of a file into another directory (chunked copy / progress).
+int32_t h_copy_range(int32_t* a) {
+    if (!g_h.copy_range) return -1;
+    int r = g_h.copy_range(a[0], clr_str(a[1]), clr_str(a[2]),
+                           a[3], clr_str(a[4]), a[5], a[6]);
+    if (r >= 0) g_flist_fs = -1;
+    return r;
+}
+
+
+int32_t h_enter_path(int32_t* a) {
+    if (!g_h.enter_path) return -1;
+    g_flist_fs = -1;
+    return g_h.enter_path(a[0], clr_str(a[1]));
+}
+
+int32_t h_move_file(int32_t* a) {
+    if (!g_h.move_file) return -1;
+    int r = g_h.move_file(a[0], clr_str(a[1]), a[2]);
+    g_flist_fs = -1;                 // both listings changed
+    return r;
+}
+
+int32_t h_cwd_path(int32_t* a) {
+    static char pbuf[256];
+    pbuf[0] = 0;
+    if (g_h.cwd_path) g_h.cwd_path(a[0], pbuf, (int)sizeof(pbuf) - 1);
+    pbuf[sizeof(pbuf) - 1] = 0;
+    return clr_new_str(pbuf);
+}
 
 // File-system mutations, backed by the kernel SFS (mkfs).  These let the
 // kernel-native context menus create / delete / rename files the same
@@ -775,8 +891,31 @@ int32_t h_clip_get(int32_t*) {
 // its animations (AI desktop thinking dots, typewriter reveal) can progress.
 // The GUI main loop polls g_mforms_anim and throttles render_all() to ~30 fps
 // while set, because between input events nothing else triggers a repaint.
-extern "C" { int g_mforms_anim = 0; }
+// NOTE: the definition moved to file scope below -- inside this anonymous
+// namespace it was emitted as _ZN12_GLOBAL__N_1..g_mforms_animE, so
+// gui64.o's extern reference never resolved and check-k64 rejected the link.
 int32_t h_set_anim(int32_t* a) { g_mforms_anim = (a && a[0]) ? 1 : 0; return 0; }
+
+// Host.WallInvalid(): the managed shell changed what the wallpaper/desktop layer
+// looks like (desktop switch, animated AI desktop).  Drop the host's cached
+// copy so the next desktop repaint re-runs the managed paint instead of
+// re-blitting a stale snapshot.  Throttled inside the host.
+extern "C" void gui_wall_invalid(void);
+int32_t h_wall_invalid(int32_t*) { gui_wall_invalid(); return 0; }
+
+// Host.PanX()/PanY(): the content scroll offset the host is currently applying
+// to this paint.  Managed apps that own viewport-fixed chrome (a status bar, a
+// pinned header) must offset it by this amount so it cancels out -- the host
+// shifts EVERY primitive by (-panX,-panY) to implement scrolling.
+int32_t h_pan_x(int32_t*) { return g_pan_x; }
+int32_t h_pan_y(int32_t*) { return g_pan_y; }
+
+// Host.WallpaperCount(): how many user wallpapers were packed from
+// assets/wallpapers/ and loaded at boot.  The managed shell cycles through
+// 1 + count wallpapers (index 0 is the built-in one), so dropping another PNG
+// in that folder is all it takes to add one.
+extern "C" int gui_wallpaper_count(void);
+int32_t h_wallpaper_count(int32_t*) { return gui_wallpaper_count(); }
 
 // Host.Repaint(): repaint the whole GUI synchronously, before a long blocking
 // host call.  The managed shell paints its "busy" placeholder, calls this, and
@@ -800,13 +939,26 @@ int32_t h_win_action(int32_t* a) {
 //   mode  : 0 off, 1 on
 //   scale : block size in pixels (1 = full detail, >1 = chunkier pixels)
 //   scan  : 0 off, 1 on (CRT scanline darkening)
-extern "C" { int g_pixel_mode = 1; int g_pixel_scale = 1; int g_pixel_scan = 0; }
+// g_pixel_mode / g_pixel_scale / g_pixel_scan are DEFINED at FILE scope (see
+// the block after the includes) for the same reason as g_mforms_anim.
 int32_t h_set_pixel(int32_t* a) {
     g_pixel_mode  = (a && a[0]) ? 1 : 0;
     g_pixel_scale = (a && a[1] > 1) ? a[1] : 1;
     g_pixel_scan  = (a && a[2]) ? 1 : 0;
     return 0;
 }
+
+#if defined(__x86_64__)
+// Host.SetTextGamma(sel): the managed shell pushes Theme.TextGamma here.
+// Unknown values fall back to the 1.30 default instead of leaving the
+// rasteriser with a selector it does not understand.  Returns the value
+// actually stored so the shell can confirm what took effect.
+int32_t h_set_text_gamma(int32_t* a) {
+    /* Clamping lives in gui_set_text_gamma() so there is exactly one place that
+     * decides what an out-of-range value means.  It returns what took effect. */
+    return (int32_t)gui_set_text_gamma(a ? a[0] : 2);
+}
+#endif
 
 // Force the compositor to repaint its cached managed layers on the next
 // frame (see gui.cpp).  Defined in gui.cpp; the 64-bit stub lives there too.
@@ -910,6 +1062,56 @@ int32_t h_linux_fbw(int32_t* a)   { (void)a; return g_webview_fbw;   }
 int32_t h_linux_fbh(int32_t* a)   { (void)a; return g_webview_fbh;   }
 int32_t h_linux_fbcap(int32_t* a) { (void)a; return g_webview_fbcap; }
 
+// ---- Audio output (64-BIT ONLY) ---------------------------------------
+// Guarded because mforms.cpp is compiled into BOTH kernels, and the 32-bit
+// kernel's linked image sits 68 bytes below the EBDA at 0x9FC00.  These
+// handlers plus their three icall table entries cost enough to push it over
+// ("kernel.bin grew into the EBDA -- shrink the image").  The 32-bit kernel
+// has no sound driver at all, so it has nothing to expose; leaving the
+// entries out is the honest arrangement, not a limitation.
+#if defined(__x86_64__)
+// Host.AudioAvailable() -> 1 when an HD Audio codec is up.
+int32_t h_audio_available(int32_t* a) {
+    (void)a;
+    if (!g_h.audio_available) return 0;
+    return g_h.audio_available();
+}
+
+// Host.AudioInfo() -> one-line driver status for the Control Panel.
+int32_t h_audio_info(int32_t* a) {
+    (void)a;
+    static char abuf[128];
+    abuf[0] = 0;
+    if (g_h.audio_info) g_h.audio_info(abuf, (int)sizeof(abuf) - 1);
+    abuf[sizeof(abuf) - 1] = 0;
+    return clr_new_str(abuf);
+}
+
+// Host.AudioPlay(pcmPtr, nframes) -> bytes consumed, or -1.
+// The managed side cannot hand over a raw buffer, so this takes PCM packed
+// into a managed STRING of little-endian 16-bit samples.  MiniCLR has no
+// arrays-across-the-boundary, but clr_str gives us the bytes directly, and
+// the Audio Player builds that string from the data chunk it already parsed.
+int32_t h_audio_play(int32_t* a) {
+    if (!g_h.audio_play) return -1;
+    const char* s = clr_str(a[0]);              // PCM bytes, 16-bit LE pairs
+    int want = (int)a[1];                       // how many frames were offered
+    if (!s || want <= 0) return -1;
+    int have = 0; while (s[have] && have < (want * 4)) have++;
+    if (have < 4) return -1;
+    // Re-interpret the string bytes as int16_t samples.  Alignment is not
+    // guaranteed, so copy into an aligned scratch buffer first.
+    static int16_t pcm[4096];
+    int n = have / 2;
+    if (n > 4096) n = 4096;
+    const unsigned char* src = (const unsigned char*)s;
+    for (int i = 0; i < n; i++) {
+        pcm[i] = (int16_t)((uint16_t)src[i * 2] | ((uint16_t)src[i * 2 + 1] << 8));
+    }
+    return g_h.audio_play(pcm, n / 2);          // n/2 = stereo frames
+}
+#endif  // __x86_64__ : audio output exists only on the 64-bit kernel
+
 // Host.LinuxInput(mx,my,buttons,key): forward a mouse/key event to VNC.
 extern "C" { int gui_linux_input(int mx, int my, int buttons, int key); }
 int32_t h_linux_input(int32_t* a) {
@@ -1002,6 +1204,10 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::Ticks",        h_ticks       },
     { "NexOS.Forms.Host::TickMs",       h_tick_ms     },
     { "NexOS.Forms.Host::SetAnim",      h_set_anim    },
+    { "NexOS.Forms.Host::WallInvalid",  h_wall_invalid },
+    { "NexOS.Forms.Host::PanX",         h_pan_x       },
+    { "NexOS.Forms.Host::PanY",         h_pan_y       },
+    { "NexOS.Forms.Host::WallpaperCount", h_wallpaper_count },
     { "NexOS.Forms.Host::Repaint",      h_repaint     },
     { "NexOS.Forms.Host::RunningMask",  h_run_mask    },
     { "NexOS.Forms.Host::ImeMode",     h_ime_mode    },
@@ -1010,6 +1216,13 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::FileName",     h_file_name   },
     { "NexOS.Forms.Host::FileIsDir",    h_file_is_dir },
     { "NexOS.Forms.Host::FileRefresh",  h_file_refresh},
+    { "NexOS.Forms.Host::EnterDir",     h_enter_dir   },
+    { "NexOS.Forms.Host::DirUp",        h_dir_up      },
+    { "NexOS.Forms.Host::CwdPath",      h_cwd_path    },
+    { "NexOS.Forms.Host::EnterPath",     h_enter_path  },
+    { "NexOS.Forms.Host::FileSize",       h_file_size   },
+    { "NexOS.Forms.Host::IsDirByName",    h_is_dir_name },
+    { "NexOS.Forms.Host::CopyRange",      h_copy_range  },
     { "NexOS.Forms.Host::FileMkDir",    h_file_mkdir  },
     { "NexOS.Forms.Host::FileDelete",   h_file_delete },
     { "NexOS.Forms.Host::FileRename",   h_file_rename },
@@ -1030,6 +1243,9 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::GetClipboard", h_clip_get    },
     { "NexOS.Forms.Host::SetClipboard", h_clip_set    },
     { "NexOS.Forms.Host::OpenApp",      h_open_app    },
+    { "NexOS.Forms.Host::OpenAppNew",   h_open_app_new },
+    { "NexOS.Forms.Host::ActivateManaged", h_activate_managed },
+    { "NexOS.Forms.Host::DragGhost",     h_drag_ghost  },
     { "NexOS.Forms.Host::CloseApp",     h_close_app   },
     { "NexOS.Forms.Host::ExitGui",      h_exit_gui    },
     { "NexOS.Forms.Host::LoginCheck",   h_login_check },
@@ -1038,6 +1254,9 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::UserName",     h_user_name   },
     { "NexOS.Forms.Host::WinAction",     h_win_action  },
     { "NexOS.Forms.Host::SetPixel",     h_set_pixel   },
+#if defined(__x86_64__)
+    { "NexOS.Forms.Host::SetTextGamma", h_set_text_gamma },
+#endif
     { "NexOS.Forms.Host::SetPerf",      h_set_perf    },
     { "NexOS.Forms.Host::SetWindowTransparent", h_set_window_transparent },
     // ---- Linux guest / VNC framebuffer ----
@@ -1050,6 +1269,12 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::LinuxFbW",       h_linux_fbw      },
     { "NexOS.Forms.Host::LinuxFbH",       h_linux_fbh      },
     { "NexOS.Forms.Host::LinuxFbCap",     h_linux_fbcap    },
+#if defined(__x86_64__)
+    // ---- audio output (64-bit kernel only; absent on the 32-bit build) ----
+    { "NexOS.Forms.Host::AudioAvailable", h_audio_available },
+    { "NexOS.Forms.Host::AudioInfo",      h_audio_info      },
+    { "NexOS.Forms.Host::AudioPlay",      h_audio_play      },
+#endif
 };
 const int G_REG_COUNT = (int)(sizeof(g_regs) / sizeof(g_regs[0]));
 
@@ -1268,6 +1493,26 @@ extern "C" int mforms_click(int id, int ox, int oy, int w, int h,
     return (int)r;
 }
 
+extern "C" int mforms_drag(int id, int phase, int mx, int my,
+                           int hit_id, int hx, int hy) {
+    if (!mforms_ready() || id < 0) return 0;
+    gui_invalidate_managed();
+    set_context(0, 0, g_h.screen_w, g_h.screen_h);
+    g_msx = mx; g_msy = my;
+    g_flist_fs = -1;
+    int32_t a[7] = { id, phase, mx, my, hit_id, hx, hy }, r = 0;
+    if (clr_call("NexOS.Forms.Shell::WindowDrag", a, 7, &r) != 0) { heap_recover(); return 0; }
+    rebaseline();
+    if (phase != 1) {            // one line per press / release, not per sample
+        serial_puts("[DRAGW] phase="); serial_putdec(phase);
+        serial_puts(" id="); serial_putdec(id);
+        serial_puts(" local="); serial_putdec(mx); serial_puts(","); serial_putdec(my);
+        serial_puts(" hit="); serial_putdec(hit_id);
+        serial_puts(" -> "); serial_putdec((int)r); serial_puts("\n");
+    }
+    return (int)r;
+}
+
 extern "C" int mforms_key(int id, int ch) {
     if (!mforms_ready() || id < 0) return 0;
     int32_t a[2] = { id, ch }, r = 0;
@@ -1400,6 +1645,27 @@ extern "C" void mforms_paint_overlay(int w, int h) {
 // -2 == "not mine, hit-test your windows".  Note the failure path also
 // returns -2: 0 is a valid Kind (ControlPanel) and must never be
 // synthesised by an error.
+// Desktop drag: forwards down/move/up so the managed desktop can move an icon
+// (and pin it when released over the taskbar).  Only called while a drag is
+// armed, so ordinary pointer motion never enters the CLR.
+extern "C" int mforms_desktop_drag(int mx, int my, int phase) {
+    if (!mforms_ready()) return 0;
+    gui_invalidate_managed();   // the icon moves, so the desk layer is stale
+    set_context(0, 0, g_h.screen_w, g_h.screen_h);
+    g_msx = mx; g_msy = my;
+    int32_t a[3] = { mx, my, phase }, r = 0;
+    if (clr_call("NexOS.Forms.Shell::DesktopDrag", a, 3, &r) != 0) { heap_recover(); return 0; }
+    rebaseline();
+    if (phase != 1) {       // one line per press / release, not per motion sample
+        serial_puts("[DRAG] phase="); serial_putdec(phase);
+        serial_puts(" at "); serial_putdec(mx); serial_puts(","); serial_putdec(my);
+        serial_puts(" -> "); serial_putdec((int)r); serial_puts("\n");
+    }
+    return (int)r;
+}
+
+// Implemented in gui.cpp / gui_legacy.cpp.
+
 extern "C" int mforms_desktop_click(int mx, int my) {
     if (!mforms_ready()) return -2;
     // A click on the desktop/taskbar surface can change managed UI state that

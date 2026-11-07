@@ -40,9 +40,25 @@ struct AiPlugin g_plugins[] = {
 
 int g_plugin_count = (int)(sizeof(g_plugins) / sizeof(g_plugins[0]));
 
+#if defined(__x86_64__)
+/* File scope on purpose: a linkage specification (extern "C") is only legal
+ * at namespace scope, and the name needs C linkage because ai_coop.h declares
+ * it inside extern "C".  Declaring it inside the function is ill-formed. */
+extern "C" void ai_coop_install(void);
+#endif
+
 void ai_plugin_init(void) {
     for (int i = 0; i < g_plugin_count; i++)
         g_plugins[i].loaded = (g_plugins[i].state >= 1) ? 1 : 0;
+
+#if defined(__x86_64__)
+    /* Install the cooperation-template machinery (SFS reader + local tool
+       dispatcher).  GUARDED ON PURPOSE: ai_coop64.o is only in the 64-bit
+       link, so an unguarded call would leave the 32-bit image with an
+       undefined symbol and break its link -- the same cross-architecture
+       trap that bit us with the mforms_key stub. */
+    ai_coop_install();
+#endif
 }
 
 int ai_plugin_find(const char* id) {

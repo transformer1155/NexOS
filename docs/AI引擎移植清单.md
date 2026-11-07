@@ -115,6 +115,23 @@
 | 6.2 | 实现任务级崩溃隔离（不拖垮主系统） | — | — | 6.1 | [ ] |
 | 6.3 | 验证：人为触发推理崩溃，GUI/Shell 不受影响 | — | — | 6.2 | [ ] |
 
+## 宿主侧 AI 通路（OpenCode 免费额度，无需账号）
+
+> 2026-10-31 接入。详见 [opencode-free-ai.md](opencode-free-ai.md)。
+
+内核只有明文 HTTP、没有 TLS，所以 HTTPS 上游由宿主 Python 桥接终结；但**请求本身从 guest 自己的网卡发出**（QEMU SLIRP 把宿主映射为 10.0.2.2）。
+这些桥接已默认切到 **OpenCode Zen 免费模型**：用匿名哨兵 key `public`，不需要注册或 API Key。
+
+| 通路 | 宿主脚本 | guest 侧调用方 | 端点 |
+| :--- | :--- | :--- | :--- |
+| 内核 AI（`ai ask` / NexOS.AI） | `tools/net/gateway_server.py` | `ai_ask_text()` / `ai_request()` → `net_http_post()`（guest 网卡） | `POST /ai` (10.0.2.2:19387) |
+| AI 面板（WinHost C#） | `tools/net/gateway_server.py` | `NexOS.Forms.Backend.AIRequestAsync` | `POST /ai` (127.0.0.1:19387) |
+| `agent run` 问答 | `tools/net/llm_bridge.py` | `net_ask_host()` | `GET /ask` (10.0.2.2:18080) |
+| agent ReAct / 远程模型 | `tools/net/deepseek_proxy.py --preset opencode-free` | `net_agent_remote()` | `POST /v1/chat/completions` (10.0.2.2:18999) |
+
+注意事项：匿名额度按 IP 限流，耗尽时上游返回 429 + `Retry-After`；桥接会原样上报而不是假装成功。
+免费模型集合会轮换，必要时用 `OPENCODE_ZEN_MODEL` 固定。涉及敏感数据的 prompt 不要走免费匿名通道。
+
 ## 进度总览
 
 | 阶段 | 总任务数 | 已完成 | 进度 |

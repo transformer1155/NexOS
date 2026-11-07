@@ -767,8 +767,15 @@ static int elf64_load_image(unsigned char* raw, uint32_t size, const char* path,
         }
         alloc_sections++;
         if (sh->sh_addr) continue;                 /* honour explicit address */
+        /* Honour the section's own alignment (min 16): the image base is
+         * page-aligned, so a section-relative offset that satisfies
+         * sh_addralign also satisfies it at its final address.  Hard-coding 16
+         * would break a future driver with 32/64-byte (AVX) constants. */
+        uint64_t al = sh->sh_addralign;
+        if (al < 16u) al = 16u;
+        cursor = (cursor + al - 1u) & ~(al - 1u);
         sh->sh_addr = cursor;
-        cursor += (sh->sh_size + 15u) & ~(uint64_t)15u;
+        cursor += (sh->sh_size + al - 1u) & ~(al - 1u);
     }
     if (!alloc_sections) {
         serial_puts("[ELF64] no SHF_ALLOC sections\n");
@@ -781,13 +788,26 @@ static int elf64_load_image(unsigned char* raw, uint32_t size, const char* path,
     uint64_t span = cursor;
 
     /* ---- allocate + rewrite section addresses ------------------------ */
-    void* base = kmalloc((unsigned int)span);
-    if (!base) {
+    /* kmalloc makes NO alignment promise, and an ELF image may contain sections
+     * that REQUIRE 16/32/64-byte alignment (fontvec.drv ships .rodata.cst16).
+     * With a mis-aligned base every section address is skewed by the same
+     * amount, so an aligned SSE access inside the rasteriser takes #GP with
+     * cr2=0 - which is exactly the 64-bit CJK crash.  Over-allocate by one page
+     * and align the base to 4096: that satisfies any sh_addralign <= 4096 and
+     * wastes under 4 KiB.
+     *
+     * img_raw (the kmalloc result) is what the teardown path frees, so the
+     * handle keeps THE RAW POINTER in image_base; base_addr is used only here,
+     * for the memset, the sh_addr rewrite and the bounds checks.  Callers never
+     * compute image_base + offset - they use the absolute addresses already
+     * written into the section headers - so this split is safe. */
+    void* img_raw = kmalloc((unsigned int)span + 0x1000u);
+    if (!img_raw) {
         serial_puts("[ELF64] OOM for image span\n");
         kfree(raw); return DRIVER_ERR_NO_MEMORY;
     }
-    e_memset(base, 0, (unsigned int)span);
-    uintptr_t base_addr = (uintptr_t)base;
+    uintptr_t base_addr = ((uintptr_t)img_raw + 0xFFFu) & ~(uintptr_t)0xFFFu;
+    e_memset((void*)base_addr, 0, (unsigned int)span);
 
     for (uint32_t i = 0; i < eh->e_shnum; ++i) {
         Elf64_Shdr* sh = (Elf64_Shdr*)(raw + eh->e_shoff + (uint64_t)i * eh->e_shentsize);
@@ -809,7 +829,7 @@ static int elf64_load_image(unsigned char* raw, uint32_t size, const char* path,
         uintptr_t dst = (uintptr_t)sh->sh_addr;
         if (dst < base_addr || dst + sh->sh_size > base_addr + span) {
             serial_puts("[ELF64] section overflows image\n");
-            kfree(base); kfree(raw); return DRIVER_ERR_IO;
+            kfree(img_raw); kfree(raw); return DRIVER_ERR_IO;
         }
         if (sh->sh_type != SHT_NOBITS)
             e_memcpy((void*)dst, raw + sh->sh_offset, (unsigned int)sh->sh_size);
@@ -842,15 +862,15 @@ static int elf64_load_image(unsigned char* raw, uint32_t size, const char* path,
         if (sh->sh_type != SHT_REL && sh->sh_type != SHT_RELA) continue;
         if (!symtab || !strtab) {
             serial_puts("[ELF64] relocs but no symtab/strtab\n");
-            kfree(base); kfree(raw); return DRIVER_ERR_IO;
+            kfree(img_raw); kfree(raw); return DRIVER_ERR_IO;
         }
         if (sh->sh_offset + sh->sh_size > (uint64_t)size) {
-            kfree(base); kfree(raw); return DRIVER_ERR_IO;
+            kfree(img_raw); kfree(raw); return DRIVER_ERR_IO;
         }
         uint64_t entsz = (sh->sh_type == SHT_RELA) ? sizeof(Elf64_Rela)
                                                    : sizeof(Elf64_Rel);
         if (sh->sh_entsize && sh->sh_entsize != entsz) {
-            kfree(base); kfree(raw); return DRIVER_ERR_IO;
+            kfree(img_raw); kfree(raw); return DRIVER_ERR_IO;
         }
         uint64_t count = sh->sh_size / entsz;
 
@@ -947,7 +967,7 @@ serial_puts("[ELF64] unresolved import: ");
     serial_puts("\n");
     if (failed) {
         serial_puts("[ELF64] relocation failure - refusing image\n");
-        kfree(base); kfree(raw);
+        kfree(img_raw); kfree(raw);
         return DRIVER_ERR_SYMBOL_NOT_FOUND;
     }
 
@@ -987,20 +1007,20 @@ serial_puts("[ELF64] unresolved import: ");
     }
 
     if (!hdr) {
-        kfree(base); kfree(raw);
+        kfree(img_raw); kfree(raw);
         return DRIVER_ERR_IO;
     }
 
     ElfDriverImage* img = (ElfDriverImage*)kmalloc(sizeof(ElfDriverImage));
     if (!img) {
         serial_puts("[ELF64] OOM for image record\n");
-        kfree(base); kfree(raw);
+        kfree(img_raw); kfree(raw);
         return DRIVER_ERR_NO_MEMORY;
     }
     e_memset(img, 0, sizeof(*img));
     img->name       = path;
     img->header     = hdr;
-    img->image_base = base;
+    img->image_base = img_raw;   /* RAW ptr: this is what driver_elf_free() frees */
     img->image_size = (uint32_t)span;
     img->load_span  = (uint32_t)span;
     img->entry      = 0;                      /* ET_REL has no entry point */

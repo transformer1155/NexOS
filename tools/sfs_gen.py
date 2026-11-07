@@ -22,6 +22,52 @@ SFS layout:
 """
 import sys, os, struct
 
+# --- known long names, PER VOLUME --------------------------------------------
+# The same relative path means different things in each volume, so the tolerance
+# list must be selected by WHICH volume is being packed -- never by guessing at a
+# path prefix.
+#
+# sfs_files volume: the kernel reads these, and the 32-bit kernel already adapts by
+# truncating its lookup name too (kernel.cpp cmd_skill caps at FS_NAME_LEN-1).  So
+# they are REACHABLE and their names are load-bearing -- renaming would break
+# `skill view app_calculator`.
+KNOWN_TRUNCATED_SFS_FILES = {
+    'msyh_regular_backup.ttf',
+    'src_app_browser.skill',
+    'src_app_calculator.skill',
+    'src_app_control_panel.skill',
+    'src_app_file_explorer.skill',
+    'src_app_task_manager.skill',
+    'src_app_terminal.skill',
+    'src_font_bitmap.skill',
+    'src_font_vector.skill',
+    'src_input_keyboard.skill',
+    'src_input_mouse.skill',
+    'src_theme_default.skill',
+}
+
+# linux_root volume: a DIFFERENT category, kept separate so the two cannot be
+# confused.  No by-name reader exists anywhere in the tree for these (grep for
+# alpine-initramfs / minirootfs / mkinitramfs: 0 hits outside linux_root), so they
+# are UNRESOLVED rather than 'compensated by a reader'.  Whether to clean them up or
+# keep them stays an open decision, because a rename could break a launcher or
+# external script we never scanned.
+KNOWN_TRUNCATED_LINUX = {
+    'initrd/alpine-initramfs.cpio.gz',
+    'initrd/minirootfs.tar.gz',
+    'initrd/mkinitramfs.py',
+}
+
+
+def _is_linux_volume(src_dir):
+    """True when packing the Linux user-space volume.
+
+    Decided by the volume's own name rather than by matching a path substring: a
+    prefix guess would silently pick the wrong set if the layout ever moves.
+    """
+    return os.path.basename(os.path.abspath(src_dir)) == 'linux_root'
+
+
 def main():
     if len(sys.argv) < 3 or sys.argv[1].startswith('-'):
         print(f"Usage: {sys.argv[0]} <source_dir> <output_img> [--exclude-tex] [--exclude-fonts]")
@@ -65,7 +111,36 @@ def main():
                     continue
                 data = open(fpath, 'rb').read()
                 if len(rel) >= 20:
-                    print(f"Warning: path '{rel}' too long for the 20-byte SFS name field; truncating")
+                    # The SFS name field is 20 bytes (19 chars + NUL, see
+                    # kernel64.cpp FS_NAME_LEN).  The READER compares full names
+                    # exactly, so a truncated name can never be opened by its
+                    # real path -- it is silently unaddressable.
+                    #
+                    # KNOWN_TRUNCATED lists the entries that were already over
+                    # the limit before this check existed.  They CANNOT simply be
+                    # renamed: the 32-bit kernel already adapts by truncating its
+                    # lookup name too (kernel.cpp cmd_skill caps at FS_NAME_LEN-1),
+                    # so those files are reachable and their names are load-bearing.
+                    # Renaming them would break `skill view app_calculator`.  They
+                    # are reported explicitly, not as a vague warning.
+                    #
+                    # Anything NEW that exceeds the limit is a hard error: that is
+                    # the whole point -- it turns a silent failure into a build-time
+                    # one.  Do NOT widen this set to silence a real problem; instead
+                    # shorten the name (e.g. coop-bugfix.json rather than
+                    # ai/cooperation/bugfix-end-to-end.json).
+                    # Tolerance list chosen by the volume being packed (see the
+                    # KNOWN_TRUNCATED_* sets at module scope).
+                    allow = (KNOWN_TRUNCATED_LINUX if _is_linux_volume(src_dir)
+                             else KNOWN_TRUNCATED_SFS_FILES)
+                    if rel not in allow:
+                        sys.exit(f"ERROR: SFS name field is 20 bytes (19 chars); "
+                                 f"'{rel}' ({len(rel)} chars) would be silently truncated "
+                                 "and could never be opened by its full name. "
+                                 "Shorten it, or add a justified entry to the right "
+                                 "volume's known-long-name set.")
+                    print(f"note: '{rel}' is a known long name in this volume "
+                          f"(tolerated -- see the set for why)")
                     rel = rel[:19]
                 files.append((rel, data))
 
