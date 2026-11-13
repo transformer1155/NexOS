@@ -1,0 +1,89 @@
+.encoding = "UTF-8"
+config.version = "8"
+virtualHW.version = "22"
+displayName = "NexOS"
+guestOS = "other-64"
+firmware = "bios"
+memsize = "1024"
+numvcpus = "2"
+cpuid.coresPerSocket = "2"
+powerType.powerOff = "soft"
+powerType.powerOn = "soft"
+powerType.suspend = "soft"
+powerType.reset = "soft"
+tools.syncTime = "FALSE"
+nvram = "NexOS.nvram"
+extendedConfigFile = "NexOS.vmxf"
+floppy0.present = "FALSE"
+sound.present = "FALSE"
+hpet0.present = "TRUE"
+vmci0.present = "TRUE"
+
+# --- IDE: primary master = boot disk, secondary master = MKFS user-data disk.
+#     Mirrors the VirtualBox layout (IDE-0-0 boot, IDE-1-0 data); the 64-bit
+#     kernel probes BOTH channels for the "MKFS" superblock at LBA 900.
+ide0:0.present = "TRUE"
+ide0:0.fileName = "NexOS.vmdk"
+ide0:0.deviceType = "disk"
+ide0:1.present = "FALSE"
+ide1:0.present = "TRUE"
+ide1:0.fileName = "NexOS-data.vmdk"
+ide1:0.deviceType = "disk"
+ide1:1.present = "FALSE"
+
+# --- serial port 1 -> file, matching VirtualBox uartmode1=file ---
+serial0.present = "TRUE"
+serial0.fileType = "file"
+serial0.fileName = "vmware_serial.log"
+serial0.tryNoRxLoss = "FALSE"
+serial0.yieldOnMsrRead = "TRUE"
+
+# --- display: force 32 MB SVGA framebuffer (VirtualBox used vram=32) ---
+svga.autodetect = "FALSE"
+svga.vramSize = "33554432"
+
+# --- NESTED VIRTUALIZATION -------------------------------------------------
+# Pass the host VT-x/AMD-V extensions through to the guest, and hide the
+# hypervisor CPUID bit so the guest sees bare metal (a nested hypervisor in
+# the guest refuses to start while the hypervisor bit is set).
+# NOTE: this only takes effect when the host is NOT running in Host VBS Mode
+# (Hyper-V / VBS active).  See the notes next to this file.
+vhv.enable = "TRUE"
+hypervisor.cpuid.v0 = "FALSE"
+
+# --- PCIe root ports (Workstation 17+ defaults) ---
+pciBridge0.present = "TRUE"
+pciBridge4.present = "TRUE"
+pciBridge4.virtualDev = "pcieRootPort"
+pciBridge4.functions = "8"
+pciBridge5.present = "TRUE"
+pciBridge5.virtualDev = "pcieRootPort"
+pciBridge5.functions = "8"
+pciBridge6.present = "TRUE"
+pciBridge6.virtualDev = "pcieRootPort"
+pciBridge6.functions = "8"
+pciBridge7.present = "TRUE"
+pciBridge7.virtualDev = "pcieRootPort"
+pciBridge7.functions = "8"
+
+# --- no network (mirrors the VirtualBox VM) ---
+ethernet0.present = "FALSE"
+virtualHW.productCompatibility = "hosted"
+vmxstats.filename = "NexOS.scoreboard"
+numa.autosize.cookie = "20022"
+numa.autosize.vcpu.maxPerVirtualNode = "2"
+uuid.bios = "56 4d db fb 99 e4 05 e6-23 fd 23 81 16 ab 64 20"
+uuid.location = "56 4d db fb 99 e4 05 e6-23 fd 23 81 16 ab 64 20"
+pciBridge0.pciSlotNumber = "17"
+pciBridge4.pciSlotNumber = "21"
+pciBridge5.pciSlotNumber = "22"
+pciBridge6.pciSlotNumber = "23"
+pciBridge7.pciSlotNumber = "24"
+ide1:0.redo = ""
+ide0:0.redo = ""
+vmotion.checkpointFBSize = "33554432"
+vmotion.checkpointSVGAPrimarySize = "33554432"
+vmotion.svga.mobMaxSize = "33554432"
+vmotion.svga.graphicsMemoryKB = "32768"
+vmci0.id = "380331040"
+monitor.phys_bits_used = "45"

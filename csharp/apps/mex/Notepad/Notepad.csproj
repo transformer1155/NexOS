@@ -1,10 +1,67 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
-  <Import Project="D:\MyOS\bootloader\csharp\apps\mex.shared.props" />
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- ================================================================
+       Notepad.csproj - a STANDALONE NexOS application.
+
+       This is a real application assembly, not a stub: it contains the
+       editor implementation and exposes App.Main::{Init, Paint, Click,
+       Key, Title}, which mforms.cpp calls for any window this CLR slot
+       owns (see slot_symbol() in mforms.cpp).
+
+       It links ONLY NexOS.Forms + NexOS.Core, never Apps.cs / Desktop.cs,
+       so it can be loaded, replaced or closed without touching the
+       desktop shell.
+
+       The previous version imported
+         <Import Project="D:\MyOS\bootloader\csharp\apps\mex.shared.props" />
+       an absolute path outside this repository, which is why these app
+       .mex files were checked-in binaries with no working build rule.
+       ================================================================ -->
+
   <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <OutputType>Library</OutputType>
     <AssemblyName>Notepad</AssemblyName>
     <RootNamespace>App</RootNamespace>
+
+    <!-- Same freestanding settings as the other .mex targets: MiniCLR has no
+         corelib, so nothing implicit may be referenced. -->
+    <NoStdLib>true</NoStdLib>
+    <DisableImplicitFrameworkReferences>true</DisableImplicitFrameworkReferences>
+    <RuntimeMetadataVersion>v4.0.30319</RuntimeMetadataVersion>
+
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+
+    <DebugType>none</DebugType>
+    <Optimize>true</Optimize>
+    <Deterministic>true</Deterministic>
+    <NoWarn>CS0626;CS0649;CS8021;CS1591;CS0169;CS0414</NoWarn>
+
+    <!-- Compiled WITHOUT the desktop shell.  Forms.cs uses this to drop its few
+         references to Shell.cs / Desktop.cs / Voice.cs, which are shell-side
+         code.  Without it, NexOS.Forms cannot be compiled on its own at all:
+         the three files are mutually dependent, which is precisely why every
+         application previously had to live inside shell.mex. -->
+    <DefineConstants>$(DefineConstants);STANDALONE_APP</DefineConstants>
   </PropertyGroup>
+
   <ItemGroup>
+    <!-- From csharp/apps/mex/Notepad/ the shared sources are three levels up
+         (mex -> apps -> csharp). -->
+    <Compile Include="../../../NexOS.Core/Corelib.cs" />
+    <Compile Include="../../../NexOS.Core/Sys.cs" />
+    <Compile Include="../../../NexOS.Forms/Forms.cs" />
+    <!-- Anim.cs is genuinely self-contained (no Shell/Desktop references), so a
+         standalone application gets the same animation primitives the shell
+         uses - hover/press interpolation is part of the control API, not of
+         the desktop. -->
+    <Compile Include="../../../NexOS.Forms/Anim.cs" />
     <Compile Include="Program.cs" />
   </ItemGroup>
+
 </Project>

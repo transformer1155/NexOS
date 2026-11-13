@@ -40,21 +40,13 @@
     <Compile Include="../../NexOS.Forms/Voice.cs" />
     <Compile Include="Shell.cs" />
     <Compile Include="Login.cs" />
-    <Compile Include="Apps.cs" />
-    <Compile Include="TerminalApp.cs" />
     <Compile Include="Desktop.cs" />
-    <Compile Include="Browser.cs" />
-    <Compile Include="AiSetup.cs" />
-    <Compile Include="AiAgent.cs" />
-    <Compile Include="Demo.cs" />
-    <Compile Include="NetTools.cs" />
-    <Compile Include="NetDefenseApp.cs" />
-    <Compile Include="AiLauncher.cs" />
     <Compile Include="Popup.cs" />
     <Compile Include="Toast.cs" />
-    <Compile Include="WebView.cs" />
-    <Compile Include="MediaPlayers.cs" />
     <Compile Include="Lang.cs" />
+    <!-- NO application sources.  Every app is now an independent .mex built
+         by tools/gen_standalone_apps.py from sfs_files/apps.man.  The shell
+         only owns the desktop, Start menu, taskbar and window surface. -->
   </ItemGroup>
 
   <ItemGroup>

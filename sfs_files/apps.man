@@ -1,0 +1,38 @@
+# =====================================================================
+#  NexOS standalone application manifest -- SINGLE SOURCE OF TRUTH
+# ---------------------------------------------------------------------
+#  The 64-bit kernel parses this file from the SFS volume at boot.  There
+#  is NO compiled-in application list any more: the desktop, Start menu,
+#  taskbar and the native launcher all ask the kernel for this table.
+#
+#  Format (one app per line, '|' separated, no escaping):
+#      kind | display name | mex file | icon colour (RGB hex) | letter | description
+#
+#  Rules:
+#    * "kind" is the stable numeric id used by .lnk shortcuts and AppType
+#      mapping.  Never renumber an existing kind.
+#    * "mex file" must exist in sfs_files/ and be <= 19 characters.
+#    * Lines starting with '#' or blank lines are ignored.
+#    * UTF-8 is allowed in names/descriptions; keep them short.
+# =====================================================================
+0|Settings|ControlPanel.mex|0F6CBD|S|System settings and personalisation
+1|This PC|FileExplorer.mex|FFC83D|P|Browse files on all volumes
+2|Task Mgr|TaskManager.mex|2B7A3D|T|Process and window manager
+3|Terminal|Terminal.mex|2F3A45|>|GUI terminal with IME
+4|Calculator|Calculator.mex|00A3A3|=|Basic calculator
+5|About|About.mex|6060C0|i|NexOS version and system information
+6|Optimizer|MemOptimizer.mex|8A4FBF|O|Memory optimiser
+7|Notepad|Notepad.mex|4A6FA5|N|Text editor (reference standalone app)
+8|Browser|Browser.mex|2D7FF9|B|Browser / WinPE executable host
+9|AI Setup|AiSetup.mex|2E9E6B|A|One-tap AI setup wizard
+10|AI Agent|AiAgent.mex|7B61FF|A|Planner / Actor / Critic agent runner
+11|Demo|Demo.mex|D07A3C|D|Button demo window
+12|Net Tools|NetTools.mex|1F7A8C|N|Network diagnostics console
+13|AI 命令台|AiLauncher.mex|00A3A3|>|Natural-language command console
+14|NetDefense|NetDefense.mex|B03A3A|D|Network attack / defence simulation
+15|WebView|WebView.mex|3C6DB5|W|Linux guest VNC framebuffer viewer
+16|Video Player|VideoPlayer.mex|C0407A|V|Video file preview
+17|Audio Player|AudioPlayer.mex|9B4FBF|M|Audio file preview
+18|AI 对话|AiChat.mex|9B6BFF|C|Local GGUF model chat
+19|Bug 上报|BugReport.mex|E0603A|B|APMS bug report with screenshot
+20|AI 工作台|AiWorkbench.mex|5B3FD6|W|Local AI agent workspace (sessions, tools, docs)

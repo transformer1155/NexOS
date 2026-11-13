@@ -1,0 +1,50 @@
+Host Information:
+
+Host time: 2026-11-11T02:52:44.094000000Z
+Processor online count: 16
+Processor count: 16
+Processor online core count: 8
+Processor core count: 8
+Processor supports HW virtualization: yes
+Processor supports PAE: yes
+Processor supports long mode: yes
+Processor supports nested paging: yes
+Processor supports unrestricted guest: no
+Processor supports nested HW virtualization: no
+Processor supports virt. vmsave/vmload: no
+Processor#0 speed: unknown
+Processor#0 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Processor#1 speed: unknown
+Processor#1 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Processor#2 speed: unknown
+Processor#2 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Processor#3 speed: unknown
+Processor#3 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Processor#4 speed: unknown
+Processor#4 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Processor#5 speed: unknown
+Processor#5 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Processor#6 speed: unknown
+Processor#6 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Processor#7 speed: unknown
+Processor#7 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Processor#8 speed: unknown
+Processor#8 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Processor#9 speed: unknown
+Processor#9 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Processor#10 speed: unknown
+Processor#10 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Processor#11 speed: unknown
+Processor#11 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Processor#12 speed: unknown
+Processor#12 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Processor#13 speed: unknown
+Processor#13 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Processor#14 speed: unknown
+Processor#14 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Processor#15 speed: unknown
+Processor#15 description: AMD Ryzen 7 H 255 w/ Radeon 780M
+Memory size: 15499 MByte
+Memory available: 3328 MByte
+Operating system: Windows 11
+Operating system version: 10.0.26300.9818

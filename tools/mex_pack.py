@@ -359,6 +359,64 @@ def parse_local_sig(sig):
     return n
 
 
+# ---------------------------------------------------------------------
+#  Generic instantiation (TypeSpec) decoding
+# ---------------------------------------------------------------------
+#  A generic INSTANTIATION is a TypeSpec whose signature is
+#      ELEMENT_TYPE_GENERICINST (0x15) <TypeDefOrRef> <arg count> <args...>
+#  The MiniCLR is fully dynamic -- every value on the evaluation stack is a
+#  4-byte slot, and a reference is just a 32-bit heap pointer -- so generic
+#  types are ERASED: Box<int> and Box<string> both map onto the open
+#  generic definition Box.  Nothing in the interpreter can tell them apart
+#  anyway (there is no runtime type identity for a reference type beyond
+#  "is it null"), so erasure costs nothing and buys the whole generic
+#  language surface.
+ELEMENT_TYPE_GENERICINST = 0x15
+ELEMENT_TYPE_VALUETYPE   = 0x11
+ELEMENT_TYPE_CLASS       = 0x12
+ELEMENT_TYPE_SZARRAY     = 0x1D
+
+
+def typespec_base(sig):
+    """TypeSpec signature -> the TypeDefOrRef it is built on.
+
+    Returns (tag, row) where tag 0 = TypeDef, 1 = TypeRef, 2 = TypeSpec,
+    matching the TypeDefOrRef coded index.  Returns None when the blob
+    does not name a type we can chase (an array of a generic, a byref, ...).
+
+    Roslyn encodes a constructed generic type as
+
+        15 12 <coded base> <arg count> <arg>...
+
+    i.e. ELEMENT_TYPE_GENERICINST, then CLASS (or VALUETYPE for a struct),
+    then the coded index of the generic DEFINITION, then the type
+    arguments.  A non-generic type is just
+
+        12 <coded base>
+
+    Verified against Roslyn output for Box<int>, Box<string>, Box<!0>,
+    Pair<int,string> and Pair<!0,!1>.
+    """
+    o = 0
+    if o < len(sig) and sig[o] == ELEMENT_TYPE_GENERICINST:
+        o += 1
+        # CLASS / VALUETYPE marker before the coded index
+        if o < len(sig) and sig[o] in (ELEMENT_TYPE_CLASS,
+                                        ELEMENT_TYPE_VALUETYPE):
+            o += 1
+            if o >= len(sig):
+                return None
+            coded, o = decompress_uint(sig, o)
+            return (coded & 3, coded >> 2)
+        if o < len(sig) and sig[o] in (ELEMENT_TYPE_VALUETYPE, ELEMENT_TYPE_CLASS):
+            o += 1
+            if o >= len(sig):
+                return None
+            coded, o = decompress_uint(sig, o)
+            return (coded & 3, coded >> 2)
+    return None
+
+
 # =====================================================================
 #  Packer
 # =====================================================================
@@ -576,28 +634,94 @@ class Packer:
         raise ValueError('unknown method header byte 0x%02X' % b0)
 
     # ---- token resolution -----------------------------------------
+    def memberref_parent_name(self, mr):
+        """MemberRef -> the fully-qualified name of its parent type.
+
+        The parent is a MemberRefParent coded index: tag 0 = TypeDef,
+        1 = TypeRef, 2 = ModuleRef, 3 = MethodDef, 4 = TypeSpec.  Tag 4 is
+        the generic case: Roslyn routes a call to Box<int>::Get through a
+        MemberRef whose parent is the TypeSpec for Box<int>.  The TypeSpec
+        is chased back to the generic DEFINITION (TypeDef Box) so the
+        method is found under the name the interpreter knows.
+        """
+        tag = mr['Class'] & 7
+        pidx = mr['Class'] >> 3
+        if tag == 0:                       # TypeDef
+            return self.type_info[pidx - 1]['name']
+        if tag == 1:                       # TypeRef
+            tr = self.md.table('TypeRef')[pidx - 1]
+            ns = self.md.get_string(tr['Namespace'])
+            nm = self.md.get_string(tr['Name'])
+            return (ns + '.' + nm) if ns else nm
+        if tag == 4:                       # TypeSpec -> generic instance
+            return self.typespec_name(pidx)
+        return None
+
+    def typespec_name(self, row):
+        """TypeSpec row -> the name of the type it is an instance of."""
+        ts = self.md.table('TypeSpec')
+        if row < 1 or row > len(ts):
+            return None
+        sig = self.md.get_blob(ts[row - 1]['Signature'])
+        base = typespec_base(sig)
+        if base is None:
+            return None
+        tag, r = base
+        if tag == 0:                       # TypeDef: the open generic
+            if r < 1 or r > len(self.type_info):
+                return None
+            return self.type_info[r - 1]['name']
+        if tag == 1:                       # TypeRef: external generic
+            tr = self.md.table('TypeRef')
+            if r < 1 or r > len(tr):
+                return None
+            ns = self.md.get_string(tr[r - 1]['Namespace'])
+            nm = self.md.get_string(tr[r - 1]['Name'])
+            return (ns + '.' + nm) if ns else nm
+        return None
+
+    def typespec_type_index(self, row):
+        """TypeSpec row -> the interpreter's type index for it.
+
+        Generic instances are erased onto their definition, so Box<int>
+        reports the SAME type id as Box.  The interpreter uses that id for
+        the object header, the virtual-dispatch walk and the field layout,
+        and all three are identical for the erased form.
+        """
+        ts = self.md.table('TypeSpec')
+        if row < 1 or row > len(ts):
+            return -1
+        sig = self.md.get_blob(ts[row - 1]['Signature'])
+        base = typespec_base(sig)
+        if base is None:
+            return -1
+        tag, r = base
+        if tag == 0:
+            return r - 1
+        return -1
+
     def resolve_method_token(self, tok):
         table = tok >> 24
         row = tok & 0xFFFFFF
         if table == 0x06:                      # MethodDef
             return row - 1
+        if table == 0x2B:                      # MethodSpec (generic method)
+            ms = self.md.table('MethodSpec')
+            if row < 1 or row > len(ms):
+                raise ValueError('bad MethodSpec row')
+            # MethodSpec.Method is a MethodDefOrRef coded index.
+            coded = ms[row - 1]['Method']
+            tag = coded & 1
+            r = coded >> 1
+            if tag == 0:
+                return r - 1                   # MethodDef
+            return self.resolve_method_token(0x0A000000 | r)
         if table == 0x0A:                      # MemberRef -> match locally
             mr = self.md.table('MemberRef')[row - 1]
             name = self.md.get_string(mr['Name'])
             sig = self.md.get_blob(mr['Signature'])
             _, npar, _ = parse_method_sig(sig)
-            # MemberRefParent coded index: tag in low 3 bits
-            tag = mr['Class'] & 7
-            pidx = mr['Class'] >> 3
-            tname = None
-            if tag == 0:                       # TypeDef
-                t = self.type_info[pidx - 1]
-                tname = t['name']
-            elif tag == 1:                     # TypeRef
-                tr = self.md.table('TypeRef')[pidx - 1]
-                ns = self.md.get_string(tr['Namespace'])
-                nm = self.md.get_string(tr['Name'])
-                tname = (ns + '.' + nm) if ns else nm
+            tname = self.memberref_parent_name(mr)
             if tname is not None:
                 want = tname + '::' + name
                 for i, mi in enumerate(self.method_info):
@@ -624,6 +748,11 @@ class Packer:
                 if t['name'] == full:
                     return i
             raise ValueError('unresolved TypeRef ' + full)
+        if table == 0x1B:                      # TypeSpec (generic instance)
+            idx = self.typespec_type_index(row)
+            if idx < 0:
+                raise ValueError('unresolved TypeSpec row %d' % row)
+            return idx
         if table == 0x04:                      # ldtoken of a field
             return 0
         raise ValueError('unsupported type token 0x%08X' % tok)
@@ -636,10 +765,41 @@ class Packer:
                 return self.static_slot[row]
             return self.field_offset[row]
         if table == 0x0A:
+            # A field reached through a MemberRef.  This happens for exactly
+            # one reason in practice: the field belongs to a GENERIC type, so
+            # the declaring type in the reference is the instantiation
+            # (Box<int>) rather than the definition (Box).  The name is the
+            # only stable handle, so look the field up by name in the
+            # definition.
             mr = self.md.table('MemberRef')[row - 1]
             name = self.md.get_string(mr['Name'])
-            raise ValueError('field MemberRef not supported: ' + name)
+            tname = self.memberref_parent_name(mr)
+            if tname is None:
+                raise ValueError('field MemberRef has no parent type: ' + name)
+            slot = self.find_field_slot(tname, name, static)
+            if slot is None:
+                raise ValueError('field MemberRef not found: %s::%s' % (tname, name))
+            return slot
         raise ValueError('unsupported field token 0x%08X' % tok)
+
+    def find_field_slot(self, tname, fname, static):
+        """-> static slot index or instance byte offset for a named field.
+
+        Returns None when the type or the field does not exist.  The lookup
+        walks the type's own field list first and then its base types, so a
+        field declared on a base class is found from a derived type too.
+        """
+        for i, t in enumerate(self.type_info):
+            if t['name'] != tname:
+                continue
+            for fr in range(t['fstart'], t['fend']):
+                if self.md.get_string(self.md.table('Field')[fr - 1]['Name']) != fname:
+                    continue
+                if static:
+                    return self.static_slot.get(fr)
+                return self.field_offset.get(fr)
+            return None
+        return None
 
     def intern_us(self, tok):
         off = tok & 0xFFFFFF

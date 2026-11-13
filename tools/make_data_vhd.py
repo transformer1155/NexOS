@@ -20,12 +20,14 @@ def main():
         print("size too small, using 8 MiB minimum")
         size_mb = 8
     total_sectors = size_mb * 1024 * 1024 // 512
-    # MKFS layout (must match kernel.cpp)
-    SUPER_LBA    = 900   # must match MKFS_SUPER_LBA in kernel.cpp
+    # MKFS layout (must match kernel.cpp -- the 32-bit kernel the Makefile
+    # compiles uses SUPER=900/DATA=917; LBA 512 would sit inside kernel32.bin)
+    SUPER_LBA    = 900   # MKFS_SUPER_LBA in kernel.cpp
     TABLE_LBA    = 901   # MKFS_TABLE_LBA
     TABLE_SECT = 16
     DATA_LBA     = 917   # MKFS_DATA_LBA
-    DATA_SECTORS = 15200
+    DATA_SECTORS = 15200 # DATA_DISK_SECTORS in kernel.cpp (dedicated data disk)
+    MKFS_VERSION = 2     # must match MKFS_V2 in kernel.cpp
     assert SUPER_LBA + 1 + TABLE_SECT + DATA_SECTORS <= total_sectors, \
         "disk too small for MKFS data area"
 
@@ -34,7 +36,7 @@ def main():
     # Superblock (struct Superblock in kernel.cpp)
     sb = struct.pack('<4sHHIII',
                      b'MKFS',          # magic
-                     MKFS_VERSION,                # version (must match MKFS_V2)
+                     MKFS_VERSION,                # version (must match kernel format)
                      0,                # file_count
                      DATA_LBA,         # data_start
                      DATA_LBA,         # free_lba

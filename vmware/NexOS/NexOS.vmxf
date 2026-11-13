@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<Foundry>
+<VM>
+<VMId type="string">52 5d 04 51 60 11 8d 37-0a 30 99 86 69 65 08 03</VMId>
+<ClientMetaData>
+<clientMetaDataAttributes/>
+<HistoryEventList/></ClientMetaData>
+<vmxPathName type="string">NexOS.vmx</vmxPathName></VM></Foundry>

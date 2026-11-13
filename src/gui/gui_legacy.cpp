@@ -1,4 +1,24 @@
 
+// ---------------------------------------------------------------------
+//  Standalone application entry points (defined in mforms.cpp).
+//
+//  These are declared at the very top of the file, outside every
+//  conditional block, because launch_app_impl() lives inside a
+//  __x86_64__-guarded region and the 64-bit variant of that region still
+//  references them.  Declaring them once, unconditionally, is the only
+//  placement both variants can see.
+//
+//  The 64-bit kernel has no MiniCLR, so the standalone path is never taken
+//  there; the symbols resolve to the stub in mforms.cpp only where it is
+//  linked, and the 64-bit link check lists them explicitly.
+extern "C" int  mforms_open_standalone(const char* mex, int slot);
+extern "C" const char* mforms_standalone_mex(int app);
+extern "C" int  mforms_standalone_slot_for(int app);
+extern "C" void mforms_set_window_slot(int win, int slot);
+
+
+extern "C" void gui_build_marker(void);
+
 #if defined(__x86_64__)
 #  define SERIAL_LINKAGE   /* external: gfx_ime.cpp (64-bit) calls these */
 #else
@@ -39,6 +59,13 @@ typedef int (*svc_fn)(void* args, void* out, int outcap);
 extern "C" svc_fn svc_lookup(const char* name);
 #include "font_vec.h"       // runtime vector font rasterizer (stb_truetype)
 
+#if defined(__x86_64__)
+// Background GGUF decode job (owned by kernel64.cpp).  The managed AiChat
+// window arms it and polls the text; the overlay pass advances a few layers
+// per frame.  This status query keeps the frame pump alive.
+extern "C" int ai_async_status(void);
+#endif
+
 // ---- rendering data tables (extracted from this file, step 2a-1) ----
 #include "gfx_engine.h"
 
@@ -58,11 +85,20 @@ extern "C" svc_fn svc_lookup(const char* name);
 // ---------------------------------------------------------------------
 #if defined(__i386__) || defined(NexOS_HAVE_MFORMS)
 #  include "mforms.h"     // NexOS.Forms host: managed (C#) GUI shell bridge
+//
+// Standalone-app entry points (defined in mforms.cpp).  These are plain C
+// linkage functions, so they must be declared at FILE scope: a static member
+// declaration would instead produce a mangled class-scope symbol that nobody
+// defines, and the 64-bit link check would flag it.
 #  ifndef NexOS_HAVE_MFORMS
 #    define NexOS_HAVE_MFORMS 1
 #  endif
 #else
 #  define NexOS_HAVE_MFORMS 0
+//
+// The 64-bit kernel has no MiniCLR, so the standalone path is never taken --
+// but launch_app_impl still references these symbols, so they must be declared
+// here as well or the 64-bit link fails with an undefined symbol.
 static inline int         mforms_ready(void) { return 0; }
 static inline int         mforms_open(int) { return -1; }
 static inline void        mforms_close(int) {}
@@ -87,6 +123,7 @@ static inline int         mforms_desktop_key(int) { return 0; }
 static inline int         mforms_desktop_menu(int) { return -1; }
 static inline void        mforms_set_running(uint32_t) {}
 static inline void        mforms_set_ime(int) {}
+static inline int         mforms_ime_anchor(int, int*, int*) { return 0; }
 static inline int         mforms_paint_failed(int) { return 0; }
 #endif
 #endif  // __x86_64__ bridge selection (original block kept for 32-bit)
@@ -496,7 +533,44 @@ extern "C" void boot_beacon(uint8_t r, uint8_t g, uint8_t b) {
     // so a "RED" stage showed blue and "YELLOW" showed magenta -- fatal for a
     // colour-based boot diagnostic.  Corrected so the logical (r,g,b) appears
     // correctly on both pixel formats.
+    //
+    // SURFACE-FORMAT SAFETY (2026-11-12): the OLD fill below ALWAYS wrote 32
+    // bits per pixel with a stride of pitch/4.  On a 16bpp surface (pitch
+    // 2048 for 1024px) that is 4096 bytes written into a 2048-byte row, so
+    // every row spilled into the next two rows and the screen came up as the
+    // classic "purple vertical stripes".  The root cause was an old stage2
+    // that picked a 16bpp mode and never recorded the pixel format, but the
+    // KERNEL must not depend on the bootloader's bookkeeping: it now derives
+    // the real surface format from bpp and writes accordingly.
+    uint8_t  bpp = *(volatile uint8_t*)(vb + 0x08);
     uint32_t px;
+    if (bpp == 16) {
+        // RGB565 -- 5/6/5 bits, value already in the 16-bit layout.
+        px = (uint32_t)((((uint16_t)r >> 3) << 11) |
+                        (((uint16_t)g >> 2) << 5)  |
+                         ((uint16_t)b >> 3));
+        uint32_t pstride16 = (pitch != 0) ? (pitch / 2u) : (uint32_t)w;
+        volatile uint16_t* fb16 = (volatile uint16_t*)fbva;
+        for (uint32_t y = 0; y < h; y++) {
+            volatile uint16_t* row = fb16 + (uint32_t)y * pstride16;
+            for (uint32_t x = 0; x < pstride16; x++) row[x] = (uint16_t)px;
+        }
+        return;
+    }
+    if (bpp == 24) {
+        // 24-bit packed BGR.
+        volatile uint8_t* fb24 = (volatile uint8_t*)fbva;
+        uint32_t pstride24 = (pitch != 0) ? (pitch / 3u) : (uint32_t)w * 3u;
+        for (uint32_t y = 0; y < h; y++) {
+            volatile uint8_t* row = fb24 + (uint32_t)y * pstride24;
+            for (uint32_t x = 0; x < w; x++) {
+                row[x*3]   = (uint8_t)b;
+                row[x*3+1] = (uint8_t)g;
+                row[x*3+2] = (uint8_t)r;
+            }
+        }
+        return;
+    }
     if (fmt == 1)      px = ((uint32_t)b << 16) | ((uint32_t)g << 8) | r;   // RGBX32
     else if (fmt == 0) px = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;   // BGRX32
     else if (fmt == 3) px = (uint32_t)((((uint16_t)r>>3)<<11)|(((uint16_t)g>>2)<<5)|((uint16_t)b>>3)); // RGB565
@@ -583,6 +657,11 @@ static bool g_bga_available = false;  // true if Bochs VBE ports detected
 //  Global state bound to the active Terminal window. Typing a-z composes
 //  pinyin; digits pick a candidate; space picks #1; ESC cancels.
 // =====================================================================
+// Last rect occupied by the floating IME candidate bar.  The bar now moves
+// with the caret, so the previous position must be invalidated as well or
+// the partial-repaint compositor leaves a ghost of the old bar behind.
+static int g_ime_bar_px = -1, g_ime_bar_py = -1, g_ime_bar_pw = 0;
+
 // ---- Pinyin IME: 32-bit keeps it here; 64-bit uses src/gui/gfx_ime.cpp
 #if !defined(__x86_64__)
 static char   g_ime_py[16];         // composing pinyin
@@ -611,10 +690,18 @@ static void serial_putdec(int v);
 // selects where the glyph lands:
 //   0 = native buffer (term_input / browser_url) passed via out_buf
 //   1 = managed (C#) app, delivered through mforms_key(codepoint)
+//   2 = desktop surface, delivered through mforms_desktop_key(codepoint)
 static int ime_commit(uint32_t cp, int target_kind, int app_id,
                       char* out_buf, int* out_len, int out_max){
     char u8[4];
     utf8_encode(cp, u8);
+    if (target_kind == 2) {
+        mforms_desktop_key((int)cp);
+        serial_puts("[IME] commit U+");
+        serial_putdec((int)cp);
+        serial_puts(" -> desktop\n");
+        return 1;
+    }
     if (target_kind == 1) {
         // Managed (C#) app: deliver the FULL Unicode codepoint as a single
         // key event.  Sending the raw UTF-8 bytes would split one glyph into
@@ -634,6 +721,7 @@ static int ime_commit(uint32_t cp, int target_kind, int app_id,
     serial_puts("[IME] commit U+");
     serial_putdec((int)cp);
     serial_puts(" -> native\n");
+    if (!out_buf || !out_len) return 0;
     int n = 0;
     for (int i = 0; u8[i] && *out_len < out_max - 1; i++)
         out_buf[(*out_len)++] = u8[i], n++;
@@ -1891,12 +1979,30 @@ enum AppType {
     APP_LINUX_GUEST,     // WSL2-style seamless Linux desktop (VNC viewer window)
     APP_START_MENU,      // Start menu: loaded into the window DB so it is
                          // composited & dirty-tracked like any other window
+    // ---- managed apps added after Kind 13 (AiLauncher) ----
+    // Each needs its own AppType so launch_app_impl() can size a window and
+    // managed_kind_for() can route it back to the C# Kind index.  Kinds 14-18
+    // (NetDefense/WebView/VideoPlayer/AudioPlayer/AiChat) were missing here,
+    // so app_for_managed_kind() fell through to APP_NONE and their desktop /
+    // Start-menu icons silently did nothing -- AiChat in particular was a
+    // seeded desktop icon that could never open.  (2026-11-12)
+    APP_NETDEFENSE,
+    APP_WEBVIEW,
+    APP_VIDEOPLAYER,
+    APP_AUDIOPLAYER,
+    APP_AICHAT,
+    APP_BUGREPORT,      // APMS bug-report application (standalone .mex)
+    APP_AIWORKBENCH     // AI workbench: sessions + workspace tools (standalone .mex)
 };
 
 // TEMP UNBLOCK: used by the window painter below but defined further down.
 static int  managed_kind_for(AppType app);
 
-constexpr int MAX_WINDOWS = 12;   // +headroom: slot 0 is permanently the Start menu
+// 12 -> 16.  The .bss ASSERT in linker.ld caps __bss_end at 0x9C0000 and the
+// real value was already 0x9A6098, so 24 windows overflowed the heap floor.
+// Concurrent standalone apps are bounded by CLR_MAX_VMS-1 (7), not by this
+// table; 16 leaves room for those plus the Start menu and shell windows.
+constexpr int MAX_WINDOWS = 16;
 constexpr int TITLE_BAR_H = 32;
 constexpr int MAX_ICONS = 9;
 constexpr int MAX_START_ITEMS = 9;
@@ -5186,12 +5292,21 @@ struct Win11Desktop {
         browser::draw(gfx, id, windows[id], x, y, w, h, mouse_x, mouse_y);
     }
 
-    // ---- Shared IME candidate bar (browser / managed text boxes) ----
-    // Drawn at a fixed screen position because the C# text box caret
-    // location is not known to the native layer.
-    void draw_ime_bar(int bx, int by) {
+    // ---- Shared IME candidate / pre-edit bar -------------------------
+    // Managed text controls publish their caret position through
+    // Host.SetImeAnchor(), so the bar can sit directly above the focused
+    // field.  Its width now fits the actual pinyin + candidates instead of
+    // spanning the whole screen, which is what makes left-alignment with an
+    // input box possible.
+    int ime_bar_width() const {
+        int bw = 16 + g_ime_len * 8 + 14 + g_ime_cand_count * 34 + 12;
+        if (bw < 120) bw = 120;
+        if (bw > gfx.width - 16) bw = gfx.width - 16;
+        return bw;
+    }
+
+    void draw_ime_bar(int bx, int by, int bw) {
         if (!g_ime_active || g_ime_cand_count <= 0) return;
-        const int bw = gfx.width - 16;
         gfx.fill_rounded_rect(bx, by, bw, 28, 6, 0x1E1E1E);
         gfx.draw_rounded_rect(bx, by, bw, 28, 6, 0x3A3A3A);
         // [pinyin]
@@ -6721,14 +6836,75 @@ struct Win11Desktop {
         fe_info_paint();
         if (fe_info) { int iw = 360, ih = 168; int ix = (gfx.width - iw) / 2, iy = (gfx.height - ih) / 2 - 40; dirty_add(ix, iy, iw, ih); }
 
-        // Screen-level IME candidate bar for browser URL / managed text boxes
-        // (the terminal draws its own bar inside its window).
-        if (g_ime_active && g_ime_cand_count > 0 && active_window >= 0 &&
-            active_window < window_count) {
-            int ak = windows[active_window].app;
-            if (ak == APP_BROWSER || ak == APP_MANAGED) {
-                draw_ime_bar(8, TOPBAR_H + 4);
-                dirty_add(8, TOPBAR_H + 4, gfx.width - 16, 28);
+        // Floating IME candidate bar for every input surface except the
+        // terminal (which draws its own bar inside its window).
+        // active_window < 0 is the desktop surface (lock screen / inline
+        // rename).  The bar is anchored to the focused field rather than
+        // pinned to the top of the screen:
+        //   * managed apps publish their caret via Host.SetImeAnchor();
+        //   * native / desktop surfaces fall back to a window-relative spot
+        //     (or the pointer on the desktop), never the screen topbar.
+        if (g_ime_active && g_ime_cand_count > 0 &&
+            (active_window < 0 ||
+             (active_window < window_count &&
+              windows[active_window].app != APP_TERMINAL))) {
+            const int bh = 28;
+            int bw = ime_bar_width();
+            int bx = 8, by = TOPBAR_H + 4;
+            int ax = -1, ay = -1;
+            bool anchored = false;
+            if (active_window >= 0 && active_window < window_count) {
+                Win11Window& w = windows[active_window];
+                if (mforms_ime_anchor(w.managed_app, &ax, &ay)) {
+                    anchored = true;
+                    bx = ax;                    // left-align with the field
+                    by = ay - bh - 4;          // directly above the caret
+                    // Not enough room above (title bar): flip below the line.
+                    if (by < w.content_y() + 2) by = ay + g_font_h + 4;
+                } else if (g_ime_bar_px >= 0) {
+                    // Anchor publish missed a frame (the app only reports it
+                    // while it paints).  Keep the last placed position instead
+                    // of jumping to a fallback: a mid-composition reposition
+                    // looked like the bar "following the mouse".
+                    bx = g_ime_bar_px;
+                    by = g_ime_bar_py;
+                } else {
+                    bx = w.x + 9;
+                    by = w.content_y() + 44;   // inside the window, near inputs
+                }
+            } else {
+                // Desktop surface.  Anchor ONCE at composition start; do not
+                // re-read the pointer every frame, otherwise the bar glides
+                // after the mouse for as long as the composition is open.
+                if (g_ime_bar_px < 0) {
+                    bx = mouse_x;
+                    by = mouse_y - bh - 4;
+                } else {
+                    bx = g_ime_bar_px;
+                    by = g_ime_bar_py;
+                }
+            }
+            if (bx < 4) bx = 4;
+            if (bx + bw > gfx.width - 4) bx = gfx.width - 4 - bw;
+            if (by < TOPBAR_H + 2) by = TOPBAR_H + 2;
+            if (by + bh > gfx.height - 4) by = gfx.height - 4 - bh;
+            // Erase the bar's previous position before drawing the new one.
+            if (g_ime_bar_px >= 0 &&
+                (g_ime_bar_px != bx || g_ime_bar_py != by))
+                dirty_add(g_ime_bar_px, g_ime_bar_py, g_ime_bar_pw, bh);
+            draw_ime_bar(bx, by, bw);
+            dirty_add(bx, by, bw, bh);
+            g_ime_bar_px = bx; g_ime_bar_py = by; g_ime_bar_pw = bw;
+            serial_puts("[IME] bar anchored=");
+            serial_putdec(anchored ? 1 : 0);
+            serial_puts(" at ");
+            serial_putdec(bx); serial_puts(","); serial_putdec(by);
+            serial_puts("\n");
+        } else {
+            // Composition ended: the last bar must be erased from the cache.
+            if (g_ime_bar_px >= 0) {
+                dirty_add(g_ime_bar_px, g_ime_bar_py, g_ime_bar_pw, 28);
+                g_ime_bar_px = -1;
             }
         }
 
@@ -8398,6 +8574,13 @@ struct Win11Desktop {
             case APP_DEMO:          return 11;  // Kind.Demo
             case APP_NETTOOLS:      return 12;  // Kind.NetTools
             case APP_AILAUNCHER:    return 13;  // Kind.AiLauncher
+            case APP_NETDEFENSE:    return 14;  // Kind.NetDefense
+            case APP_WEBVIEW:       return 15;  // Kind.WebView
+            case APP_VIDEOPLAYER:   return 16;  // Kind.VideoPlayer
+            case APP_AUDIOPLAYER:   return 17;  // Kind.AudioPlayer
+            case APP_AICHAT:        return 18;  // Kind.AiChat
+            case APP_BUGREPORT:     return 19;  // Kind.BugReport
+            case APP_AIWORKBENCH:   return 20;  // Kind.AiWorkbench
             default:                return -1;   // Win32 stay native
         }
     }
@@ -8420,6 +8603,13 @@ struct Win11Desktop {
             case 11: return APP_DEMO;
             case 12: return APP_NETTOOLS;
             case 13: return APP_AILAUNCHER;
+            case 14: return APP_NETDEFENSE;
+            case 15: return APP_WEBVIEW;
+            case 16: return APP_VIDEOPLAYER;
+            case 17: return APP_AUDIOPLAYER;
+            case 18: return APP_AICHAT;
+            case 19: return APP_BUGREPORT;
+            case 20: return APP_AIWORKBENCH;
             default: return APP_NONE;
         }
     }
@@ -8523,6 +8713,20 @@ struct Win11Desktop {
                 ww = 640; wh = 560; title = "Net Tools"; break;
             case APP_AILAUNCHER:
                 ww = 640; wh = 480; title = "AI Launcher"; break;
+            case APP_NETDEFENSE:
+                ww = 640; wh = 520; title = "Net Defense"; break;
+            case APP_WEBVIEW:
+                ww = 720; wh = 560; title = "WebView (Linux VNC)"; break;
+            case APP_VIDEOPLAYER:
+                ww = 560; wh = 420; title = "Video Player"; break;
+            case APP_AUDIOPLAYER:
+                ww = 420; wh = 320; title = "Audio Player"; break;
+            case APP_AICHAT:
+                ww = 520; wh = 440; title = "AI 对话"; break;
+            case APP_BUGREPORT:
+                ww = 640; wh = 520; title = "Bug 上报"; break;
+            case APP_AIWORKBENCH:
+                ww = 760; wh = 540; title = "AI 工作台"; break;
             case APP_LINUX_GUEST:
                 // WSL2-style seamless Linux desktop: a large window so the
                 // nested Linux GUI has room to breathe.
@@ -8558,7 +8762,52 @@ struct Win11Desktop {
         // form faults inside the CLR (Shell::Open(10)), and a CLR fault there
         // takes the whole managed desktop paint down with it -> black screen.
         // The native draw_agent renderer is complete (trace / buttons / input).
-        int mkind = (app == APP_AIAGENT || app == APP_LINUX_GUEST) ? -1 : managed_kind_for(app);
+        // ---- standalone applications ------------------------------------
+        // Notepad is a REAL standalone assembly (csharp/apps/mex/Notepad,
+        // loaded into its own CLR slot).  Opening it through Shell::Open
+        // instantiated the shell-side COPY instead, so the window kept the old
+        // appearance even though Notepad.mex was loaded and its entry point had
+        // run.  -2 marks "standalone slot app" and routes to the branch below.
+        // APP_AIAGENT is no longer forced onto the native draw_agent: the
+        // old CLR fault was an in-shell-app problem, and AiAgent now lives
+        // in its own .mex / own CLR slot.  Only the Linux VNC guest stays
+        // native (it has no managed equivalent).
+        int mkind = (app == APP_LINUX_GUEST) ? -1
+                  : (app == APP_NOTEPAD) ? -2
+                  : managed_kind_for(app);
+        if (mkind == -2 && NexOS_HAVE_MFORMS) {
+            serial_puts("[gui] opening standalone app ");
+            serial_putdec((int)app);
+            serial_puts("\n");
+            int slot = mforms_standalone_slot_for((int)app);
+            int mid  = mforms_open_standalone(mforms_standalone_mex((int)app), slot);
+            if (mid >= 0) {
+                int wid = create_window(wx, wy, ww, wh, title, APP_MANAGED);
+                if (wid >= 0) {
+                    windows[wid].managed_app = mid;
+                    windows[wid].launch_kind = app;
+                    // mforms_open_standalone() already bound this handle to
+                    // its own CLR slot.  Re-binding it with the hint slot here
+                    // would point every event at the wrong assembly.
+                    const char* mt = mforms_title(mid);
+                    if (mt && mt[0]) {
+                        int tl = strlen_(mt); if (tl > 39) tl = 39;
+                        memcpy_(windows[wid].title, mt, tl);
+                        windows[wid].title[tl] = 0;
+                    }
+                    for (int j = 0; j < window_count; j++) windows[j].active = false;
+                    windows[wid].active = true;
+                    active_window = wid;
+                    render_all();
+                }
+                return;
+            }
+            serial_puts("[gui] standalone open failed; falling back to the shell\n");
+            // mkind=-1 used to skip the managed block below AND then hit
+            // "if (app == APP_NOTEPAD) return", so a failed standalone launch
+            // produced NO window at all.  Fall back to the shell-managed copy.
+            mkind = managed_kind_for(app);
+        }
         if (mkind >= 0 && mforms_ready()) {
             int mid = mforms_open(mkind);
             // BUG-9: mforms_open now refuses (returns -1, with the reason in
@@ -8784,22 +9033,28 @@ struct Win11Desktop {
         return made;
     }
 
-    // ---- Shared pinyin IME router (all text input boxes) ----
-    // Returns true if the key was consumed by the composer.  Active only in
-    // Chinese mode (g_ime_cn).  Routes a-z/space/digit/backspace/enter for
-    // whichever input box currently has focus:
-    //   - Terminal input line
-    //   - Browser URL bar (when focused)
-    //   - Managed (C#) text box (committed glyphs delivered via mforms_key)
+    // ---- Shared pinyin IME router (ALL text input boxes) ----
+    // target_kind: 0 = native buffer, 1 = managed window (mforms_key),
+    //              2 = desktop surface (mforms_desktop_key: lock screen /
+    //                  inline rename).  force_target >= 0 overrides the
+    //                  per-window default.
     // `out_buf`/`out_len`/`out_max` are only used for the native buffers.
-    bool ime_route(char ch, char* out_buf, int* out_len, int out_max) {
+    bool ime_route(char ch, char* out_buf, int* out_len, int out_max,
+                   int force_target = -1) {
         if (!g_ime_cn) return false;
-        if (active_window < 0 || active_window >= window_count) return false;
-        Win11Window& w = windows[active_window];
-        bool text_box = (w.app == APP_TERMINAL)
-                     || (w.app == APP_BROWSER && w.browser_url_focused)
-                     || (w.app == APP_MANAGED);
+        bool desk = (active_window < 0);
+        if (desk && force_target != 2) return false;
+        if (!desk && active_window >= window_count) return false;
+        Win11Window& w = windows[desk ? 0 : active_window];
+        bool text_box = desk
+                     || (w.app == APP_TERMINAL)
+                     || (w.app == APP_BROWSER)
+                     || (w.app == APP_MANAGED)
+                     || (w.app == APP_AIAGENT);
         if (!text_box) return false;
+        int target = (force_target >= 0) ? force_target
+                   : ((!desk && w.app == APP_MANAGED) ? 1 : 0);
+        int app_id = desk ? 0 : w.managed_app;
 
         if (ch >= 'a' && ch <= 'z') {
             if (g_ime_len < 15) {
@@ -8822,11 +9077,10 @@ struct Win11Desktop {
         if (ch == ' ') {   // Space -> candidate #1 (or flush if none)
             if (g_ime_active) {
                 if (g_ime_cand_count > 0)
-                    ime_commit((uint32_t)g_ime_cands[0],
-                               w.app == APP_MANAGED ? 1 : 0, w.managed_app,
+                    ime_commit((uint32_t)g_ime_cands[0], target, app_id,
                                out_buf, out_len, out_max);
                 else
-                    ime_flush_raw(w, out_buf, out_len, out_max);
+                    ime_flush_raw(w, out_buf, out_len, out_max, target);
                 ime_reset();
             }
             return true;
@@ -8834,36 +9088,59 @@ struct Win11Desktop {
         if (ch >= '1' && ch <= '9' && g_ime_active && g_ime_cand_count > 0) {
             int idx = ch - '1';
             if (idx < g_ime_cand_count)
-                ime_commit((uint32_t)g_ime_cands[idx],
-                           w.app == APP_MANAGED ? 1 : 0, w.managed_app,
+                ime_commit((uint32_t)g_ime_cands[idx], target, app_id,
                            out_buf, out_len, out_max);
             ime_reset();
             return true;
         }
         if (ch == '\n' || ch == 0x0D) { // Enter flushes raw pinyin as text
-            if (g_ime_active) ime_flush_raw(w, out_buf, out_len, out_max);
+            if (g_ime_active) ime_flush_raw(w, out_buf, out_len, out_max, target);
             return false; // let the window run its own Enter action
         }
         // Any other printable char while composing: drop the syllable and let
         // the character through as normal English input.
         if (g_ime_active && ch >= 32 && ch < 127) {
-            ime_flush_raw(w, out_buf, out_len, out_max);
+            ime_flush_raw(w, out_buf, out_len, out_max, target);
             return false;
         }
         return false;
     }
 
     // Flush the raw (un-committed) pinyin as literal ASCII into the active box.
-    void ime_flush_raw(Win11Window& w, char* out_buf, int* out_len, int out_max) {
-        if (w.app == APP_MANAGED) {
+    void ime_flush_raw(Win11Window& w, char* out_buf, int* out_len,
+                       int out_max, int target) {
+        if (target == 1) {
             for (int i = 0; i < g_ime_len; i++)
                 mforms_key(w.managed_app, (int)g_ime_py[i]);
+        } else if (target == 2) {
+            for (int i = 0; i < g_ime_len; i++)
+                mforms_desktop_key((int)g_ime_py[i]);
         } else if (out_buf && out_len) {
             for (int i = 0; i < g_ime_len && *out_len < out_max - 1; i++)
                 out_buf[(*out_len)++] = g_ime_py[i];
             if (out_buf) out_buf[*out_len] = 0;
         }
         ime_reset();
+    }
+
+    // Route ONE key through the composer for every focused input surface.
+    // Called once at the top of handle_key(), before app-specific dispatch,
+    // so no text control can be skipped.  ime_route() used to be called from
+    // four separate app branches, which left the lock screen, inline rename
+    // and every future input control with no Chinese input at all.
+    bool ime_route_global(char ch) {
+        if (!g_ime_cn) return false;
+        if (active_window < 0)
+            return ime_route(ch, nullptr, nullptr, 0, 2);
+        if (active_window >= window_count) return false;
+        Win11Window& w = windows[active_window];
+        if (w.app == APP_MANAGED)
+            return ime_route(ch, nullptr, nullptr, 0, 1);
+        if (w.app == APP_TERMINAL || w.app == APP_AIAGENT)
+            return ime_route(ch, w.term_input, &w.term_input_len, 127, 0);
+        if (w.app == APP_BROWSER)
+            return ime_route(ch, w.browser_url, &w.browser_url_len, 255, 0);
+        return false;
     }
 
     // Flip Chinese/English input mode (bound to Shift).  Resets any
@@ -8917,6 +9194,22 @@ struct Win11Desktop {
 
     // Keyboard navigation from the arrow keys / Tab.
     //   code 1=up 2=down 3=left 4=right 5=tab
+    // The managed window that currently has keyboard focus, or -1.
+    //
+    // A window is "managed" when its app is APP_MANAGED and it is backed by a
+    // live NexOS.Forms instance.  Only such a window can receive a special
+    // key -- forwarding to anything else would send the code to an app id
+    // that does not exist.
+    int focused_managed_window() {
+        if (!gui_mode) return -1;
+        if (active_window < 0 || active_window >= MAX_WINDOWS) return -1;
+        Win11Window& w = windows[active_window];
+        if (!w.visible || w.minimized) return -1;
+        if (w.app != APP_MANAGED) return -1;
+        if (w.managed_app < 0) return -1;
+        return w.managed_app;
+    }
+
     void desktop_nav(int code) {
         if (!gui_mode) return;
         if (mforms_desktop_menu_open()) {           // Start menu is modal: navigate it
@@ -8944,7 +9237,18 @@ struct Win11Desktop {
         }
 
         // Start menu is modal and keyboard-navigable: Esc closes, Enter activates.
+        {
+            int _mo = mforms_desktop_menu_open();
+            serial_puts("[gui] menuopen=");
+            serial_putdec(_mo);
+            serial_puts(" ch=");
+            serial_putdec((int)ch);
+            serial_puts(" ");
+        }
         if (mforms_desktop_menu_open()) {
+            serial_puts("[gui] start menu open");
+            serial_putdec((int)ch);
+            serial_puts(" ");
             gui_invalidate_managed();
             int kind = -1;
             if (ch == 27)                     kind = mforms_desktop_menu(4);  // esc  -> close
@@ -8966,6 +9270,18 @@ struct Win11Desktop {
             // through the Start menu / desktop "Terminal" shortcut, which
             // calls gui_exit() deliberately.
             serial_puts("[GUI] ESC ignored (desktop stays up)\n");
+            return true;
+        }
+
+        // ---- Chinese IME for EVERY focused input surface ----
+        // One router for windows AND the desktop surface.  Running it here,
+        // before the per-app dispatch below, is what lets the lock screen,
+        // inline rename and every C# text box receive Chinese.  Previously
+        // four app branches called ime_route() individually and everything
+        // else was silently left in English-only mode.
+        if (ime_route_global(ch)) {
+            g_desk_needs_full = true;
+            render_all();
             return true;
         }
 
@@ -9010,12 +9326,7 @@ struct Win11Desktop {
         // codes into mforms' negative virtual keys (-1 bksp, -2 enter).
         if (active_window >= 0 && windows[active_window].app == APP_MANAGED) {
             Win11Window& wa = windows[active_window];
-            // Chinese IME composer: pinyin is composed here and committed
-            // glyphs are delivered to the focused C# text box via mforms_key.
-            if (ime_route(ch, nullptr, nullptr, 0)) {
-                render_all();
-                return true;
-            }
+            // Chinese IME is routed once, above, by ime_route_global().
             int k = 0;
             if (ch == 0x08)                        k = -1;   // backspace
             else if (ch == '\n' || ch == 0x0D)     k = -2;   // enter
@@ -9031,11 +9342,7 @@ struct Win11Desktop {
         // Handle terminal input
         if (active_window >= 0 && windows[active_window].app == APP_TERMINAL) {
             Win11Window& win = windows[active_window];
-            // Chinese IME composer consumes letters/space/digit/backspace.
-            if (ime_route(ch, win.term_input, &win.term_input_len, 127)) {
-                render_all();
-                return true;
-            }
+            // Chinese IME is routed once, above, by ime_route_global().
             if (ch == '\n' || ch == 0x0D) { // Enter
                 if (win.term_input_len > 0) {
                     // Echo the command line into the scrollback buffer.
@@ -9094,10 +9401,6 @@ struct Win11Desktop {
         // Handle AI Agent panel input (reuses the window's term_input field).
         else if (active_window >= 0 && windows[active_window].app == APP_AIAGENT) {
             Win11Window& win = windows[active_window];
-            if (ime_route(ch, win.term_input, &win.term_input_len, 127)) {
-                render_all();
-                return true;
-            }
             if (ch == '\n' || ch == 0x0D) { // Enter -> submit goal / command
                 gui_agent_submit(win);
                 render_all();
@@ -9124,12 +9427,6 @@ struct Win11Desktop {
         else if (active_window >= 0 && windows[active_window].app == APP_BROWSER) {
             Win11Window& win = windows[active_window];
             browser::ensure_init();
-            // Chinese IME composer for the address bar.
-            if (ime_route(ch, win.browser_url, &win.browser_url_len, 255)) {
-                serial_puts("[browser] addr="); serial_puts(win.browser_url); serial_puts("\n");
-                render_all();
-                return true;
-            }
             if (win.browser_url_focused) {
                 if (ch == '\n' || ch == 0x0D) { // Enter = navigate
                     if (win.browser_url_len > 0) {
@@ -9821,6 +10118,7 @@ void gui_set_callbacks(const GuiCallbacks* cb) {
 }
 
 int gui_init(void) {
+    gui_build_marker();
     // Allocate the framebuffer backbuffer FIRST: it is the single largest GUI
     // allocation (width*height*4).  On a hi-res real machine it must win the
     // ~11 MiB heap over the optional bitmap/vector fonts, which degrade
@@ -9962,6 +10260,10 @@ extern "C" int gui_app_id_by_name(const char* n) {
         { "notepad",  APP_NOTEPAD },       { "text",   APP_NOTEPAD },
         { "editor",   APP_NOTEPAD },
         { "agent",    APP_AIAGENT },
+        { "aichat",   APP_AICHAT },      { "ai",     APP_AICHAT },
+        { "chat",     APP_AICHAT },
+        { "bugreport", APP_BUGREPORT },  { "bug",   APP_BUGREPORT },
+        { "apms",     APP_BUGREPORT },
     };
     for (unsigned i = 0; i < sizeof(map)/sizeof(map[0]); i++) {
         const char* a = n; const char* b = map[i].k;
@@ -10547,7 +10849,18 @@ void gui_mouse_down_right(void) {
     g_wm.handle_mouse_down_right();
 }
 
+// BUILD MARKER: if this appears in the serial log, the running image is the
+// one built from this source tree.
+extern "C" void gui_build_marker(void) {
+    serial_puts("[MARK] gui_legacy standalone build");
+    serial_puts(" ");
+}
+
 int gui_handle_key(char ch) {
+
+    serial_puts("[HK] ");
+    serial_putdec((int)ch);
+    serial_puts(" ");
     return g_wm.handle_key(ch) ? 1 : 0;
 }
 
@@ -10555,10 +10868,38 @@ void gui_handle_ctrl(int code) {
     g_wm.handle_ctrl(code);
 }
 
+// ---- special-key forwarding to a managed (C#) window ---------------
+//
+// THE GAP THIS CLOSES: every shortcut an editor needs -- arrows, Home,
+// End, PageUp/PageDown, Delete -- arrives as a distinct non-character
+// key, but the desktop consumed all of them itself and only CHARACTER
+// codepoints were ever handed to a managed app via mforms_key().  A C#
+// TextBox therefore could never move its caret: the key never reached
+// it.
+//
+// The rules, in order:
+//   1. If a managed window has focus, the key belongs to that app.
+//      Returns 1.
+//   2. Otherwise the key falls through to desktop navigation.  Returns 0.
+//
+// Codes are the negative values TBox::Key() understands (Forms.cs):
+//   -7 Left  -8 Right  -11 Up  -12 Down  -13 Home  -14 End
+//   -15 PageUp  -16 PageDown
+int gui_special_key_to_managed(int code) {
+    if (!g_wm.gui_mode) return 0;
+    int id = g_wm.focused_managed_window();
+    if (id < 0) return 0;                 // no managed window: desktop keeps it
+    mforms_key(id, code);
+    g_wm.render_all();                    // the caret moved; repaint
+    return 1;
+}
+
 // Keyboard-driven UI control: Win key toggles the Start menu; the arrow keys /
 // Tab move the keyboard focus (or navigate an open Start menu).
 void gui_toggle_start_menu(void) {
-    serial_puts("[GUI] key: Win -> toggle Start menu\n");
+    // Reached only on a clean Win key-UP (the keyboard driver suppresses
+    // Win+<key> chords), so this serial mark doubles as the key-up proof.
+    serial_puts("[GUI] key: Win RELEASED -> toggle Start menu\n");
     g_wm.toggle_start_menu();
 }
 void gui_desktop_nav(int code) {
@@ -10613,6 +10954,14 @@ void gui_tick(void) {
             g_wm.render_all();
         }
     }
+    // Keep the frame pump alive while a background GGUF decode is running.
+    // The overlay pass (mforms_paint_overlay) advances the job a few layers
+    // per frame, and AiChat.cs re-arms SetAnim(1) on each paint.  This extra
+    // re-arm is a safety net against the stale-animation watchdog clearing
+    // the flag between two managed paints and stalling the decode.
+#if defined(__x86_64__)
+    if (ai_async_status() == 1) g_mforms_anim = 1;
+#endif
     // Repaint ONLY when something actually needs a new frame:
     //  - the managed shell is running an animation (AI thinking dots /
     //    typewriter reveal) and asked for continuous frames via SetAnim(1)

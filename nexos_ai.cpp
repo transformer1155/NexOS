@@ -951,6 +951,75 @@ int ai_request(const char* prompt, int mode, char* out, int outsize){
     return 0;
 }
 
+/* ---- OpenAI-compatible protocol --------------------------------------
+ * The MiniCLR C# surface (NexOS.AI::OpenAIChat/ListModels/GetQuota/AddModel)
+ * lands here.  We deliberately do NOT parse or re-format the JSON: the
+ * kernel has no JSON builder, and the host gateway is the single place that
+ * knows about providers, hosted keys and quota ledgers.
+ * -------------------------------------------------------------------- */
+static int ai_gateway_post_raw(const char* path, const char* body,
+                               char* out, int outsize){
+    if(!out || outsize <= 0) return 0;
+    out[0] = 0;
+    static char url[128];
+    my_snprintf(url, (int)sizeof(url), "http://%s:%d%s",
+                g_ai_gateway.gateway_host ? g_ai_gateway.gateway_host : "10.0.2.2",
+                g_ai_gateway.gateway_port, path);
+    int n = net_http_post(url, body, out, outsize - 1);
+    if(n <= 0) return 0;
+    out[outsize - 1] = 0;
+    return 1;
+}
+
+static void ai_proto_error(char* out, int outsize, const char* msg){
+    my_snprintf(out, outsize, "{\"error\":{\"message\":\"%s\"}}", msg);
+}
+
+int ai_openai_chat(const char* request_json, char* out, int outsize){
+    if(!out || outsize <= 0) return 0;
+    out[0] = 0;
+    if(!g_ai_gateway.initialized) ai_gateway_init();
+    if(!request_json || !request_json[0]){
+        ai_proto_error(out, outsize, "empty request"); return 0;
+    }
+    if(!ai_gateway_post_raw("/v1/chat/completions", request_json, out, outsize))
+        ai_proto_error(out, outsize, "gateway unreachable");
+    return my_strlen(out);
+}
+
+int ai_list_models(char* out, int outsize){
+    if(!out || outsize <= 0) return 0;
+    out[0] = 0;
+    if(!g_ai_gateway.initialized) ai_gateway_init();
+    if(!ai_gateway_post_raw("/v1/models", "{}", out, outsize))
+        ai_proto_error(out, outsize, "gateway unreachable");
+    return my_strlen(out);
+}
+
+int ai_platform_quota(const char* platform_id, char* out, int outsize){
+    if(!out || outsize <= 0) return 0;
+    out[0] = 0;
+    if(!g_ai_gateway.initialized) ai_gateway_init();
+    static char body[128];
+    my_snprintf(body, (int)sizeof(body), "{\"platform\":\"%s\"}",
+                platform_id ? platform_id : "");
+    if(!ai_gateway_post_raw("/quota", body, out, outsize))
+        ai_proto_error(out, outsize, "gateway unreachable");
+    return my_strlen(out);
+}
+
+int ai_add_model(const char* spec_json, char* out, int outsize){
+    if(!out || outsize <= 0) return 0;
+    out[0] = 0;
+    if(!g_ai_gateway.initialized) ai_gateway_init();
+    if(!spec_json || !spec_json[0]){
+        ai_proto_error(out, outsize, "empty spec"); return 0;
+    }
+    if(!ai_gateway_post_raw("/models/register", spec_json, out, outsize))
+        ai_proto_error(out, outsize, "gateway unreachable");
+    return my_strlen(out);
+}
+
 /* Wrap a tool result in the bus reply envelope.  Escapes inner_json directly
  * into g_env after the prefix, so no third buffer is needed. */
 static const char* build_mcp_result(int code, const char* inner_json){

@@ -57,12 +57,23 @@ int ime_commit(uint32_t cp, int target_kind, int app_id,
         serial_puts(" -> managed\n");
         return 1;
     }
+    if (target_kind == 2) {
+        // Desktop surface (lock screen / inline rename): these fields belong
+        // to the managed desktop, not to a window in the window table, so the
+        // codepoint must go through mforms_desktop_key rather than mforms_key.
+        mforms_desktop_key((int)cp);
+        serial_puts("[IME] commit U+");
+        serial_putdec((int)cp);
+        serial_puts(" -> desktop\n");
+        return 1;
+    }
     // Native buffer (terminal input line / browser URL): append the UTF-8
     // bytes directly.  Log once so a headless test can prove the CJK glyph
     // actually reached a native input box.
     serial_puts("[IME] commit U+");
     serial_putdec((int)cp);
     serial_puts(" -> native\n");
+    if (!out_buf || !out_len) return 0;
     int n = 0;
     for (int i = 0; u8[i] && *out_len < out_max - 1; i++)
         out_buf[(*out_len)++] = u8[i], n++;

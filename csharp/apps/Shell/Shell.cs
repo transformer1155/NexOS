@@ -38,6 +38,9 @@ namespace NexOS.Forms
         // them; both iterate KINDS, so "excluded" means "no explicit Put()".
         public const int VideoPlayer    = 16;  // video file previewer/player
         public const int AudioPlayer    = 17;  // audio file previewer/player
+        public const int AiChat         = 18;  // local GGUF model chat window
+        public const int BugReport      = 19;  // APMS bug report (standalone)
+        public const int AiWorkbench    = 20;  // AI workbench: sessions + ws_ tools + docs
     }
 
     public static class Shell
@@ -95,6 +98,226 @@ namespace NexOS.Forms
             NexOS.Sys.PrintInt(Theme.TextGamma);
             Theme.ApplyPixel();      // push pixel-mode settings to the kernel
 
+            // ---- OS API layer 0+1 managed self-test (one serial line) ----
+            // Exercises the error channel, ABI probes and the Perm facade.
+            // NOTE: the shell runs on the default token (no prefixes), so
+            // FsCanPath allows everything; denial paths are covered by the
+            // kernel-side osapi self-test (serial: "fails=0").
+            {
+                int ok = 1;
+                Host.ClearError();
+                Host.SetLastError(Err.Busy);
+                if (Host.LastError() != Err.Busy) ok = 0;
+                if (Host.ApiVersion() < 1) ok = 0;
+                if (!Host.HasCap(Cap.Err) || !Host.HasCap(Cap.Perm)) ok = 0;
+                if (Perm.Uid() < 0) ok = 0;
+                if (Perm.FsCanPath("/data/calc/x", 1) == 0) ok = 0;
+                int h = Host.HandleAlloc(1 /*HK_HEAP*/, 3, 1);
+                if (h == 0) ok = 0;
+                if (Host.HandleClose(h) != 1) ok = 0;
+                if (Host.HandleClose(h) == 1) ok = 0;   // double close must fail
+                if (Host.LastError() != Err.BadHandle) ok = 0;
+                // ---- L2: mutex + event + job ----
+                int mu = Sync.MutexNew();
+                if (mu == 0 || Sync.Lock(mu) != 1) ok = 0;
+                else if (Sync.Lock(mu) == 1) ok = 0;             // double lock must fail (Deadlk)
+                else if (Sync.Unlock(mu) != 1) ok = 0;
+                int ev = Sync.EventNew();
+                Sync.EventSet(ev);
+                if (Sync.EventWait(ev, 5, 1) != 1) ok = 0;
+                if (Sync.EventWait(ev, 2, 1) == 1) ok = 0;       // cleared -> Timeout
+                int jb = Job.Start(0, 10);
+                if (jb == 0 || Job.Status(jb) != Job.Run) ok = 0;
+                Job.Tick(10);                                     // complete it
+                if (Job.Status(jb) != Job.Done || Job.Progress(jb) != 10) ok = 0;                // ---- L3: vfs resolve + atomic create ----
+                string rp = Fs.Resolve("/a/b/../c");
+                if (rp == null || !(rp == "/a/c")) ok = 0;
+                string esc = Fs.Resolve("/../x");
+                if (esc != null) ok = 0;                          // must refuse root escape
+                int fo = File.Open("/osapi_t.txt", FileFlags.Creat | FileFlags.Excl | FileFlags.WR);
+                if (fo != 0) {
+                    int[] wb = new int[4];
+                    wb[0] = 'N'; wb[1] = 'E'; wb[2] = 'X'; wb[3] = 'O';
+                    if (File.Write(fo, wb, 4) != 4) ok = 0;
+                    if (File.Close(fo) != 1) ok = 0;
+                    int fo2 = File.Open("/osapi_t.txt", FileFlags.Creat | FileFlags.Excl | FileFlags.WR);
+                    if (fo2 != 0 || Host.LastError() != Err.NameExists) ok = 0;   // hard: O_EXCL
+                    int frd = File.Open("/osapi_t.txt", FileFlags.RD);
+                    if (frd != 0) {
+                        int[] rb = new int[4];
+                        if (File.Read(frd, rb, 4) != 4) ok = 0;
+                        if (rb[0] != 'N' || rb[3] != 'O') ok = 0;
+                        File.Close(frd);
+                    } else ok = 0;
+                    File.Unlink("/osapi_t.txt");
+                } else ok = 0;
+                NexOS.Sys.Print("[SHELL] osapi l0l1 ok=");
+                NexOS.Sys.PrintInt(ok);
+                NexOS.Sys.Print(" abi=");
+                NexOS.Sys.PrintInt(Host.ApiVersion());
+                NexOS.Sys.Print("\n");
+            }
+
+            // ---- OS API L2 process + L3 glob managed self-test ----
+            {
+                int ok2 = 1;
+                // create a real file, then glob for it (listing content is
+                // cwd-dependent, so a static name would be flaky)
+                int fh = File.Open("/mgt1.txt", FileFlags.Creat | FileFlags.Excl | FileFlags.WR);
+                if (fh != 0){
+                    int[] wb = new int[4]; wb[0]='t'; wb[1]='e'; wb[2]='s'; wb[3]='t';
+                    File.Write(fh, wb, 4);
+                    File.Close(fh);
+                }
+                string g = Fs.Glob("/", "*.txt");
+                if (g == null || NexOS.Sys.StrLen(g) == 0) ok2 = 0;
+                File.Unlink("/mgt1.txt");
+                // wait/kill of a bad pid must report BadPid
+                if (Proc.Wait(0) != Proc.BadPid) ok2 = 0;
+                if (Proc.Kill(0) != 0) ok2 = 0;
+                NexOS.Sys.Print("[SHELL] osapi proc glob ok=");
+                NexOS.Sys.PrintInt(ok2);
+                NexOS.Sys.Print("\n");
+            }
+
+            // ---- OS API L12: migrate legacy in-memory state into Cfg ----
+            // Old state is only a DEFAULT source: any key already persisted
+            // in Cfg wins.  Theme.Save()/Host.WriteText("assoc.cfg") keep
+            // working unchanged; this is the first read of the new store.
+            {
+                int cs = Cfg.Open("shell");
+                if (cs != 0)
+                {
+                    CfgSeedInt(cs, "dark",        Theme.Dark);
+                    CfgSeedInt(cs, "pixelmode",   Theme.PixelMode);
+                    CfgSeedInt(cs, "textgamma",   Theme.TextGamma);
+                    CfgSeedInt(cs, "widgetson",   Theme.WidgetsOn);
+                    CfgSeedInt(cs, "taskbarleft", Theme.TaskbarLeft);
+                    Cfg.Flush(cs);
+                    Cfg.Close(cs);
+                }
+                int ca = Cfg.Open("assoc");
+                if (ca != 0)
+                {
+                    string old = Host.ReadText(0, "assoc.cfg");
+                    if (old != null)
+                    {
+                        int i = 0, n = NexOS.Sys.StrLen(old);
+                        while (i < n)
+                        {
+                            int j = i;
+                            while (j < n && NexOS.Sys.StrCharAt(old, j) != '\n') j++;
+                            int eq = -1;
+                            for (int k = i; k < j; k++)
+                                if (NexOS.Sys.StrCharAt(old, k) == '=') { eq = k; break; }
+                            if (eq > i && eq + 1 < j)
+                            {
+                                string kk = NexOS.Sys.StrSub(old, i, eq - i);
+                                string vv = NexOS.Sys.StrSub(old, eq + 1, j - eq - 1);
+                                if (Cfg.Get(ca, kk) == null) Cfg.Set(ca, kk, vv);
+                            }
+                            i = j + 1;
+                        }
+                    }
+                    Cfg.Flush(ca);
+                    Cfg.Close(ca);
+                }
+            }
+
+            // ---- OS API L12 managed self-test: Set -> Flush -> reopen -> Get ----
+            {
+                int ok3 = 1;
+                int c = Cfg.Open("cfgt");
+                if (c == 0) ok3 = 0;
+                else
+                {
+                    if (Cfg.Set(c, "k", "v") != 1) ok3 = 0;
+                    if (Cfg.Dirty(c) != 1) ok3 = 0;
+                    if (Cfg.Flush(c) != 1) ok3 = 0;
+                    if (Cfg.Dirty(c) != 0) ok3 = 0;
+                    int d = Cfg.Open("cfgt");
+                    if (d == 0) ok3 = 0;
+                    else
+                    {
+                        string gv = Cfg.Get(d, "k");
+                        if (gv == null || !(gv == "v")) ok3 = 0;
+                        if (Cfg.Count(d) < 1) ok3 = 0;
+                        Cfg.Close(d);
+                    }
+                    Cfg.Close(c);
+                }
+                if (!Host.HasCap(Cap.Cfg)) ok3 = 0;
+                NexOS.Sys.Print("[SHELL] osapi L12 cfg ok=");
+                NexOS.Sys.PrintInt(ok3);
+                NexOS.Sys.Print("\n");
+            }
+
+            // ---- OS API L4 managed self-test ----------------------------
+            // The kernel-side pure-C self-test asserts the numeric gen++
+            // already; this one proves the managed icall path sees the same
+            // stale-handle behaviour (no pointers ever cross the boundary).
+            {
+                int ok4 = 1;
+                int h = Mem.HeapAlloc(64);
+                if (h == 0) ok4 = 0;
+                else
+                {
+                    if (Mem.HeapSize(h) != 64) ok4 = 0;
+                    if (Mem.HeapPoke(h, 0, 90) != 1) ok4 = 0;
+                    if (Mem.HeapPeek(h, 0) != 90) ok4 = 0;
+                    int h2 = Mem.HeapRealloc(h, 128);
+                    if (h2 == 0) { ok4 = 0; Mem.HeapFree(h); }
+                    else
+                    {
+                        if (Mem.HeapSize(h2) != 128) ok4 = 0;
+                        if (Mem.HeapPeek(h2, 0) != 90) ok4 = 0;   // data kept
+                        if (Mem.HeapSize(h) != 0) ok4 = 0;          // old h dead
+                        if (Mem.HeapFree(h2) != 1) ok4 = 0;
+                        if (Mem.HeapFree(h2) != 0) ok4 = 0;         // double free
+                        int e = Host.LastError();
+                        if (!(e == Err.BadHandle || e == Err.Stale)) ok4 = 0;
+                    }
+                }
+                int ar = Mem.ArenaNew(256);
+                if (ar == 0) ok4 = 0;
+                else
+                {
+                    if (Mem.ArenaAlloc(ar, 32) != 0) ok4 = 0;
+                    int m = Mem.ArenaMark(ar);
+                    if (m != 32) ok4 = 0;
+                    if (Mem.ArenaAlloc(ar, 64) != 32) ok4 = 0;
+                    if (Mem.ArenaRelease(ar, m) != 1) ok4 = 0;
+                    if (Mem.ArenaUsed(ar) != 32) ok4 = 0;
+                    if (Mem.ArenaFree(ar) != 1) ok4 = 0;
+                }
+                int sh = Mem.ShmCreate("sh4t", 64);
+                if (sh == 0) ok4 = 0;
+                else
+                {
+                    int sh2 = Mem.ShmOpen("sh4t");
+                    if (sh2 == 0) ok4 = 0;
+                    if (Mem.ShmSize(sh) != 64) ok4 = 0;
+                    if (Mem.ShmClose(sh) != 1) ok4 = 0;
+                    if (sh2 != 0)
+                    {
+                        if (Mem.ShmSize(sh2) != 64) ok4 = 0;       // alias lives
+                        if (Mem.ShmClose(sh2) != 1) ok4 = 0;
+                    }
+                }
+                int mp = Mem.Mmap(Mem.WhatFb, 4096, 4096);
+                if (mp <= 0) ok4 = 0;
+                else
+                {
+                    if (Mem.Unmap(mp) != 1) ok4 = 0;
+                    if (Mem.Mappings() != 0) ok4 = 0;
+                }
+                if (Mem.Live() != 0) ok4 = 0;                      // no leaks
+                if (!Host.HasCap(Cap.Mem)) ok4 = 0;
+                NexOS.Sys.Print("[SHELL] osapi L4 mem ok=");
+                NexOS.Sys.PrintInt(ok4);
+                NexOS.Sys.Print("\n");
+            }
+
             apps = new App[MAX];   // heap_alloc zeroes -> all null
             count = 0;
             Voice.Init();           // allocate the voice registry / queue
@@ -110,6 +333,26 @@ namespace NexOS.Forms
             Host.Log("NexOS.Forms.Shell initialised");
         }
 
+        // L12 migration helper: seed a key only when the persistent store
+        // has no value yet.  Legacy in-memory state is a default, not an
+        // override, so a saved choice always wins on the next boot.
+        static void CfgSeedInt(int h, string key, int val)
+        {
+            if (Cfg.Get(h, key) == null) Cfg.Set(h, key, U.I(val));
+        }
+
+        // ALL applications are independent .mex images now.  The shell does
+        // NOT instantiate app classes any more: mforms_open(kind) resolves
+        // the kind through sfs_files/apps.man and loads that .mex into its
+        // own MiniCLR slot.  Shell.Open() remains as a managed-side shortcut
+        // for the few places that used to call it directly.
+        //
+        // The Windows preview harness (winhost) is the one exception: it has
+        // no MiniCLR slot allocator and no apps.man, so it keeps embedding
+        // the application classes in-process.  Without this split,
+        // Shell.Open -> Host.OpenApp -> LaunchOrFocus -> Shell.Open would
+        // recurse forever in that harness.
+#if WINHOST
         // Instantiate an app and return its window id, or -1 on overflow.
         public static int Open(int kind)
         {
@@ -142,12 +385,29 @@ namespace NexOS.Forms
             if (kind == Kind.Demo)         return new DemoApp();
             if (kind == Kind.NetTools)     return new NetToolsApp();
             if (kind == Kind.AiLauncher)   return new AiLauncherApp();
+            if (kind == Kind.AiChat)       return new AiChatApp();
             if (kind == Kind.NetDefense)   return new NetDefenseApp();
             if (kind == Kind.WebView)      return new WebViewApp();
             if (kind == Kind.VideoPlayer)  return new VideoPlayerApp();
             if (kind == Kind.AudioPlayer)  return new AudioPlayerApp();
             return null;
         }
+#else
+        // On NexOS the kernel owns launching: it resolves the kind through
+        // apps.man and loads that .mex into a fresh MiniCLR slot.
+        public static int Open(int kind)
+        {
+            Host.OpenApp(kind);
+            return -1;
+        }
+
+        // No in-shell app classes exist.  Kept as an explicit null factory so
+        // a future caller cannot accidentally reintroduce embedded apps.
+        static App Make(int kind)
+        {
+            return null;
+        }
+#endif
 
         public static void Close(int id)
         {

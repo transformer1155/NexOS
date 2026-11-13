@@ -58,6 +58,17 @@ namespace NexOS.Forms
         static int[] Ez  = null;   // easing: 0=Cubic, 1=Back(overshoot)
         static int   Inited = 0;
 
+        // Must be called from an application's Init() entry point.
+        // mforms_paint() marks the managed heap on entry and resets it to that
+        // mark after every frame.  If the tween pool is first created lazily
+        // from inside Paint(), the arrays are freed at the end of that frame
+        // while the static references survive: the next Anim.ToOf() reads a
+        // recycled array header and faults with "array index out of range".
+        // After 12 consecutive faults MiniCLR unloads the whole .mex image,
+        // which is what makes a standalone app window go blank/transparent.
+        // Allocating the pool during Init() puts it BELOW the per-frame mark.
+        public static void Init() { Ensure(); }
+
         static void Ensure()
         {
             if (Inited == 1) return;

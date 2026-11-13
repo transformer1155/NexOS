@@ -124,15 +124,52 @@ mov rsp, 0x800000
 ;  Contains both 64-bit and 32-bit compat segments (for switch back)
 ; =====================================================================
 section .data
-align 8
+align 16
 
+; ---------------------------------------------------------------------
+;  64-bit TSS
+;  Layout (IA-32e):  reserved(8) rsp0 rsp1 rsp2 reserved(8) ist[7]
+;  reserved(8) reserved(2) iomap(2).  Total 108 bytes.
+;
+;  ist[0] is the stack the CPU uses for exception vector 1 (IST=1).  The
+;  kernel patches it at boot with the address of a dedicated fault stack,
+;  so a fault taken while a PE's own stack is exhausted still lands on a
+;  known-good stack instead of double-faulting.
+; ---------------------------------------------------------------------
+align 16
+gdt64_tss:
+    dq 0                   ; reserved0
+    dq 0                   ; rsp0
+    dq 0                   ; rsp1
+    dq 0                   ; rsp2
+    dq 0                   ; reserved1
+    dq 0                   ; ist[0]  <- fault stack (patched by the kernel)
+    dq 0, 0, 0, 0, 0, 0    ; ist[1..6]
+    dq 0                   ; reserved2
+    dw 0                   ; reserved3
+    dw 0                   ; iomap base
+gdt64_tss_end:
+global gdt64_tss
+global gdt64_tss_end
+
+align 8
 gdt64:
     dq 0x0000000000000000       ; 0x00: Null descriptor
     dq 0x00AF9A000000FFFF       ; 0x08: 64-bit code (L=1, D=0, G=1)
     dq 0x00CF92000000FFFF       ; 0x10: 64-bit data (flat, G=1, D=1)
     dq 0x00CF9A000000FFFF       ; 0x18: 32-bit compat code (L=0, D=1)
     dq 0x00CF92000000FFFF       ; 0x20: 32-bit data (flat)
+    ; 0x28: 64-bit TSS descriptor (16 bytes).  Needed for IST.  The bytes
+    ;       are a zero placeholder; kernel64.cpp::gdt_install_tss() fills
+    ;       them at boot because NASM cannot encode the TSS base relocation
+    ;       (which spans the whole 16-byte descriptor).
+gdt64_tss_desc:
+    dq 0
+    dq 0
 gdt64_end:
+global gdt64
+global gdt64_tss_desc
+global gdt64_end
 
 ; 64-bit GDT descriptor (10 bytes: 2 limit + 8 base)
 gdt64_desc:
@@ -212,3 +249,72 @@ isr_stub_table:
 %endrep
 
 extern fault_common
+
+; =====================================================================
+;  V2.1 headless: IRQ0 (PIT) stub + preemptive context switch
+; ---------------------------------------------------------------------
+;  The 256 generic stubs above all funnel into fault_common(), which halts.
+;  A hardware interrupt must NEVER take that path: it has to return with
+;  iretq so the hlt loop (or the next thread) can resume.
+;
+;  On an interrupt gate with no CPL change the CPU pushes only
+;      [rsp+0]=rip  [rsp+8]=cs  [rsp+16]=rflags
+;  and clears IF.  We save the 15 GP registers below that frame, then hand
+;  the frame pointer to a C scheduler.  Calling C on the interrupted stack
+;  would overwrite the CPU's iret frame, so the stub first switches to a
+;  dedicated 8 KiB IRQ stack (symbol exported by kernel64.cpp).
+;
+;  headless_irq0_c(uint64_t frame_rsp) returns the frame pointer of the
+;  context to run next -- the SAME one for stage 2 (no switch), or another
+;  thread's for stage 3.  Restoring rsp, popping the registers and issuing
+;  iretq then lands in the selected context.
+; =====================================================================
+section .text
+global irq0_stub
+extern headless_irq0_c
+
+section .bss
+align 16
+hs_irq_stack:     resb 8192
+hs_irq_stack_top:
+
+section .text
+irq0_stub:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rdi, rsp
+    mov rsp, hs_irq_stack_top
+    cld
+    call headless_irq0_c
+    mov rsp, rax
+    mov al, 0x20
+    out 0x20, al             ; master PIC EOI (only IRQ0 is unmasked)
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    iretq

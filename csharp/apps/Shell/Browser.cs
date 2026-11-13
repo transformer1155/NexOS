@@ -10,7 +10,6 @@
 //  use for the address bar, navigation and the text fallback.
 // =====================================================================
 using NexOS.Forms;
-
 namespace NexOS.Forms
 {
     public class BrowserApp : App

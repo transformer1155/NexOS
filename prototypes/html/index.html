@@ -1,0 +1,2150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NexOS 独立 .mex 应用交互原型</title>
+<style>
+  :root{
+    --bg:#eef2f8; --panel:#fff; --line:#e1e7f0; --text:#1c2532; --sub:#6b7688;
+    --accent:#2563eb; --accent-soft:#e8f0ff; --glass:rgba(255,255,255,.78);
+    --real:#0f9d58; --stub:#e08b18; --missing:#8792a3;
+    --shadow:0 18px 48px rgba(30,50,90,.16),0 2px 8px rgba(30,50,90,.08);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:13px/1.5 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+       color:var(--text);background:var(--bg);height:100vh;overflow:hidden}
+  button,input{font:inherit}
+  .shell{display:flex;flex-direction:column;height:100vh}
+
+  header{display:flex;align-items:center;gap:14px;padding:10px 18px;background:var(--panel);
+         border-bottom:1px solid var(--line);flex:none}
+  header h1{margin:0;font-size:15px;font-weight:650;letter-spacing:.2px}
+  header .hint{color:var(--sub);font-size:12px}
+  .spacer{flex:1}
+  .pill{padding:4px 10px;border-radius:999px;background:var(--accent-soft);color:var(--accent);
+        font-size:11px;font-weight:600}
+  .btn{border:1px solid var(--line);background:#fff;border-radius:7px;padding:6px 12px;
+       cursor:pointer;color:var(--text);transition:.15s}
+  .btn:hover{border-color:var(--accent);color:var(--accent);background:#f7faff}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn.primary:hover{background:#1d55d0;color:#fff}
+
+  .main{display:grid;grid-template-columns:236px minmax(0,1fr) 296px;flex:1;min-height:0}
+  aside{background:var(--panel);min-height:0;display:flex;flex-direction:column}
+  aside.left{border-right:1px solid var(--line)}
+  aside.right{border-left:1px solid var(--line)}
+  .sec{padding:10px 12px;border-bottom:1px solid var(--line);flex:none}
+  .sec h2{margin:0 0 8px;font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--sub)}
+  .search{width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:7px;outline:none}
+  .search:focus{border-color:var(--accent)}
+  .filters{display:flex;gap:5px;margin-top:8px;flex-wrap:wrap}
+  .chip{border:1px solid var(--line);background:#fff;border-radius:999px;padding:3px 9px;
+        font-size:11px;cursor:pointer;color:var(--sub)}
+  .chip.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  .applist{overflow:auto;flex:1;padding:6px}
+  .item{display:flex;align-items:center;gap:8px;padding:8px 9px;border-radius:8px;cursor:pointer;
+        border:1px solid transparent;margin-bottom:2px}
+  .item:hover{background:#f5f8fd}
+  .item.on{background:var(--accent-soft);border-color:#cfe0ff}
+  .item .k{width:24px;height:24px;border-radius:6px;background:#f0f4fa;color:var(--sub);
+           display:grid;place-items:center;font-size:11px;font-weight:700;flex:none}
+  .item.on .k{background:var(--accent);color:#fff}
+  .item .nm{flex:1;min-width:0}
+  .item .nm b{display:block;font-weight:600;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .item .nm small{color:var(--sub);font-size:10.5px}
+  .dot{width:7px;height:7px;border-radius:50%;flex:none}
+  .dot.real{background:var(--real)} .dot.stub{background:var(--stub)} .dot.missing{background:var(--missing)}
+
+  .stage{position:relative;overflow:auto;background:
+    radial-gradient(1100px 600px at 70% -10%,#d9e7ff 0%,transparent 60%),
+    linear-gradient(160deg,#eaf1fb,#dfe8f6 60%,#e9eef8)}
+  .stage-bar{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:10px;
+             padding:8px 14px;background:rgba(255,255,255,.72);backdrop-filter:blur(12px);
+             border-bottom:1px solid rgba(255,255,255,.7);font-size:12px}
+  .stage-bar b{font-weight:650}
+  .stage-bar .sub{color:var(--sub)}
+  #desk{position:relative;min-height:calc(100% - 38px);padding:22px}
+  .win{position:absolute;border-radius:11px;background:var(--glass);backdrop-filter:blur(18px);
+       box-shadow:var(--shadow);border:1px solid rgba(255,255,255,.85);overflow:hidden}
+  .win.active{outline:2px solid rgba(37,99,235,.35)}
+  .titlebar{height:34px;display:flex;align-items:center;gap:8px;padding:0 8px 0 12px;
+            background:rgba(255,255,255,.62);border-bottom:1px solid rgba(255,255,255,.8);
+            font-size:12px;font-weight:600;user-select:none}
+  .titlebar .h{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tb{width:26px;height:22px;border:none;background:transparent;border-radius:5px;cursor:pointer;
+      color:var(--sub);font-size:13px;line-height:1}
+  .tb:hover{background:#e8eef8;color:var(--text)}
+  .tb.close:hover{background:#e81123;color:#fff}
+  .client{position:relative;background:rgba(255,255,255,.55)}
+  .ctl{position:absolute;border-radius:6px;overflow:hidden}
+  .ctl[data-t="button"],.ctl[data-t="toolbar"],.ctl[data-t="tabs"],.ctl[data-t="stepper"]{
+    display:flex;align-items:center;justify-content:center;gap:4px;background:#fff;
+    border:1px solid var(--line);color:var(--text);cursor:pointer;font-size:11.5px;
+    box-shadow:0 1px 2px rgba(30,50,90,.06)}
+  .ctl[data-t="button"]:hover,.ctl .mini:hover{border-color:var(--accent);color:var(--accent)}
+  .ctl.pressed{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+  .ctl[data-t="toolbar"],.ctl[data-t="tabs"],.ctl[data-t="stepper"]{background:transparent;border:none;
+    box-shadow:none;gap:5px;justify-content:flex-start;padding:0}
+  .ctl .mini{height:100%;min-width:52px;padding:0 10px;display:grid;place-items:center;
+    background:#fff;border:1px solid var(--line);border-radius:6px;cursor:pointer;font-size:11px;white-space:nowrap}
+  .ctl .mini.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  .ctl[data-t="display"]{background:#f8fbff;border:1px solid var(--line);display:flex;
+    align-items:flex-end;justify-content:flex-end;padding:10px 14px;font-size:26px;font-weight:300;color:var(--text)}
+  .ctl[data-t="input"] input{width:100%;height:100%;border:1px solid var(--line);border-radius:6px;
+    padding:0 10px;background:#fff;outline:none;color:var(--text);font-size:12px}
+  .ctl[data-t="input"] input:focus{border-color:var(--accent)}
+  .ctl[data-t="label"],.ctl[data-t="statusbar"]{display:flex;align-items:center;padding:0 8px;
+    color:var(--sub);font-size:11px;background:rgba(255,255,255,.5)}
+  .ctl[data-t="statusbar"]{border-top:1px solid var(--line);background:rgba(240,245,252,.8)}
+  .ctl[data-t="panel"],.ctl[data-t="canvas"]{background:#fff;border:1px solid var(--line);
+    padding:8px 10px;font-size:11px;color:var(--sub)}
+  .ctl[data-t="canvas"]{background:linear-gradient(135deg,#f7faff,#eef4ff);
+    display:grid;place-items:center;color:#9aa8bd;font-size:12px}
+  .ctl[data-t="list"],.ctl[data-t="grid"],.ctl[data-t="log"]{background:#fff;border:1px solid var(--line);
+    padding:6px;font-size:11px;color:var(--sub);overflow:hidden}
+  .ctl .row{padding:3px 6px;border-radius:4px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ctl .row:hover{background:var(--accent-soft)}
+  .ctl[data-t="progress"],.ctl[data-t="slider"]{background:#e8edf5;border:1px solid var(--line);
+    border-radius:999px;cursor:pointer}
+  .ctl .fill{height:100%;width:35%;background:linear-gradient(90deg,#4f8bff,var(--accent));border-radius:999px}
+  .ctl[data-t="chart"]{background:#fff;border:1px solid var(--line);position:relative;overflow:hidden}
+  .ctl[data-t="chart"]::after{content:"";position:absolute;left:0;right:0;bottom:0;height:52%;
+    background:linear-gradient(180deg,rgba(37,99,235,.22),rgba(37,99,235,.02));
+    clip-path:polygon(0 70%,12% 48%,26% 62%,40% 30%,55% 52%,70% 24%,85% 44%,100% 18%,100% 100%,0 100%)}
+  .ctl[data-t="toggle"]{background:#fff;border:1px solid var(--line);display:flex;align-items:center;
+    justify-content:space-between;padding:0 8px;cursor:pointer;font-size:11px}
+  .ctl[data-t="toggle"] .sw{width:30px;height:16px;border-radius:999px;background:#cfd8e6;position:relative;transition:.18s}
+  .ctl[data-t="toggle"] .sw::after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;
+    border-radius:50%;background:#fff;transition:.18s}
+  .ctl[data-t="toggle"].on{border-color:var(--accent)}
+  .ctl[data-t="toggle"].on .sw{background:var(--accent)}
+  .ctl[data-t="toggle"].on .sw::after{left:16px}
+  .ctl.flash{animation:flash .5s ease}
+  @keyframes flash{0%{box-shadow:0 0 0 0 rgba(37,99,235,.55)}100%{box-shadow:0 0 0 12px rgba(37,99,235,0)}}
+
+  .inspect{overflow:auto;flex:1;padding:12px}
+  .inspect h3{margin:14px 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--sub)}
+  .inspect h3:first-child{margin-top:0}
+  .kv{display:flex;gap:8px;padding:3px 0;font-size:11.5px}
+  .kv span:first-child{color:var(--sub);min-width:64px;flex:none}
+  .tag{display:inline-block;padding:2px 7px;border:1px solid var(--line);border-radius:5px;
+       margin:2px 3px 2px 0;font-size:10.5px;background:#f8fafd}
+  ul.tight{margin:0;padding-left:16px;font-size:11.5px;color:var(--sub)}
+  ul.tight li{margin:3px 0}
+  #log{font:11px/1.55 ui-monospace,Consolas,monospace;background:#0f1726;color:#c8d6ea;
+       border-radius:8px;padding:9px;height:210px;overflow:auto;flex:none}
+  #log div{margin:2px 0;white-space:pre-wrap;word-break:break-all}
+  #log .t{color:#6f86a8}
+  #log .launch{color:#7ee2a8} #log .click{color:#9ec5ff} #log .key{color:#ffd48a}
+  #log .close{color:#ff9c9c} #log .menu{color:#c9a7ff} #log .sys{color:#8fa2bd}
+  .ctx{position:fixed;z-index:50;background:#fff;border:1px solid var(--line);border-radius:8px;
+       box-shadow:var(--shadow);padding:5px;min-width:158px;display:none}
+  .ctx div{padding:6px 11px;border-radius:5px;cursor:pointer;font-size:12px}
+  .ctx div:hover{background:var(--accent-soft);color:var(--accent)}
+  .ctx hr{border:none;border-top:1px solid var(--line);margin:4px 0}
+  .empty{color:var(--sub);font-size:12px;padding:30px;text-align:center}
+  .legend{display:flex;gap:10px;font-size:10.5px;color:var(--sub);align-items:center}
+</style>
+</head>
+<body>
+<div class="shell">
+  <header>
+    <h1>NexOS · 独立 .mex 应用交互原型</h1>
+    <span class="pill" id="count">18 apps</span>
+    <span class="hint">数据来自 <code>prototypes/specs.json</code> · 改完跑 <code>python3 prototypes/gen.py</code></span>
+    <span class="spacer"></span>
+    <span class="legend"><i class="dot real"></i>real <i class="dot stub"></i>stub <i class="dot missing"></i>missing</span>
+    <button class="btn" id="btnNew">新建窗口</button>
+    <button class="btn" id="btnClear">清空日志</button>
+  </header>
+
+  <div class="main">
+    <aside class="left">
+      <div class="sec">
+        <input class="search" id="search" placeholder="搜索应用 / Kind…">
+        <div class="filters" id="filters">
+          <span class="chip on" data-f="all">全部</span>
+          <span class="chip" data-f="real">real</span>
+          <span class="chip" data-f="stub">stub</span>
+          <span class="chip" data-f="missing">missing</span>
+        </div>
+      </div>
+      <div class="applist" id="applist"></div>
+    </aside>
+
+    <section class="stage" id="stage">
+      <div class="stage-bar">
+        <b id="stageTitle">桌面</b>
+        <span class="sub" id="stageSub">双击左侧应用打开窗口 · 控件可点击 · 右键弹出菜单 · 键盘有反馈</span>
+        <span class="spacer"></span>
+        <button class="btn primary" id="btnOpen">打开窗口</button>
+      </div>
+      <div id="desk"></div>
+    </section>
+
+    <aside class="right">
+      <div class="sec">
+        <h2>事件日志（模拟串口）</h2>
+        <div id="log"></div>
+      </div>
+      <div class="inspect" id="inspector"></div>
+    </aside>
+  </div>
+</div>
+
+<div class="ctx" id="ctx"></div>
+
+<!-- NEX_DATA_START -->
+<script id="nex-data">
+/* GENERATED by prototypes/gen.py -- edit prototypes/specs.json instead */
+window.NEX_META = {
+  "title": "NexOS 独立 .mex 应用交互原型规格",
+  "source": "唯一真源。改这里，然后运行 python3 prototypes/gen.py 重新生成 html/apps.js 与 mex/*/Program.cs",
+  "kinds": "Kind 0-17，来自 csharp/apps/Shell/Shell.cs:15-41",
+  "status": "real = 已有真实 mex；stub = 115KB 无构建规则占位；missing = 连源码目录都没有",
+  "contract": "App.Main::Init / Paint(id,w,h) / Click(id,x,y) / Key(id,ch) / Title(id)",
+  "limits": "MiniCLR: 无 System.Collections、无字符串 +、无静态初始化器、无浮点/泛型/try-catch；Paint 内不得持久持有新分配对象"
+};
+window.NEX_APPS = [
+  {
+    "id": 0,
+    "key": "ControlPanel",
+    "zh": "控制面板",
+    "title": "Control Panel",
+    "status": "stub",
+    "win": [
+      520,
+      400,
+      320,
+      240
+    ],
+    "layout": [
+      {
+        "t": "tabs",
+        "x": 8,
+        "y": 8,
+        "w": 120,
+        "h": 360,
+        "id": "nav",
+        "text": "分类",
+        "items": [
+          "显示",
+          "网络",
+          "账户",
+          "系统"
+        ]
+      },
+      {
+        "t": "panel",
+        "x": 136,
+        "y": 8,
+        "w": 376,
+        "h": 330,
+        "id": "body",
+        "text": "设置区"
+      },
+      {
+        "t": "toggle",
+        "x": 152,
+        "y": 40,
+        "w": 200,
+        "h": 24,
+        "id": "dark",
+        "text": "深色模式"
+      },
+      {
+        "t": "toggle",
+        "x": 152,
+        "y": 76,
+        "w": 200,
+        "h": 24,
+        "id": "anim",
+        "text": "窗口动画"
+      },
+      {
+        "t": "slider",
+        "x": 152,
+        "y": 112,
+        "w": 260,
+        "h": 20,
+        "id": "scale",
+        "text": "缩放"
+      },
+      {
+        "t": "button",
+        "x": 152,
+        "y": 296,
+        "w": 90,
+        "h": 28,
+        "id": "apply",
+        "text": "应用"
+      },
+      {
+        "t": "button",
+        "x": 252,
+        "y": 296,
+        "w": 90,
+        "h": 28,
+        "id": "reset",
+        "text": "恢复默认"
+      }
+    ],
+    "menu": [
+      "刷新",
+      "重置为默认",
+      "属性"
+    ],
+    "keys": {
+      "Esc": "关闭窗口",
+      "Tab": "切换焦点",
+      "Enter": "应用当前设置"
+    },
+    "state": [
+      "int tab",
+      "bool dark",
+      "bool anim",
+      "int scale",
+      "int focus"
+    ],
+    "events": [
+      "Init 显式初始化全部字段（MiniCLR 不跑 .cctor）",
+      "Click 命中 nav 切换分组",
+      "Click 命中 toggle 立即置脏并重绘",
+      "Click 命中 apply 持久化设置"
+    ],
+    "accept": [
+      "能从桌面打开且窗口有内容",
+      "切换分类后内容变化",
+      "关闭后无残留状态"
+    ]
+  },
+  {
+    "id": 1,
+    "key": "FileExplorer",
+    "zh": "文件资源管理器",
+    "title": "File Explorer",
+    "status": "stub",
+    "win": [
+      600,
+      420,
+      360,
+      260
+    ],
+    "layout": [
+      {
+        "t": "toolbar",
+        "x": 8,
+        "y": 8,
+        "w": 584,
+        "h": 32,
+        "id": "tools",
+        "text": "工具栏",
+        "items": [
+          "后退",
+          "向上",
+          "新建",
+          "刷新"
+        ]
+      },
+      {
+        "t": "input",
+        "x": 8,
+        "y": 44,
+        "w": 584,
+        "h": 26,
+        "id": "path",
+        "text": "路径"
+      },
+      {
+        "t": "tabs",
+        "x": 8,
+        "y": 76,
+        "w": 160,
+        "h": 300,
+        "id": "vol",
+        "text": "卷",
+        "items": [
+          "MKFS root",
+          "SFS",
+          "Desktop"
+        ]
+      },
+      {
+        "t": "list",
+        "x": 176,
+        "y": 76,
+        "w": 416,
+        "h": 300,
+        "id": "files",
+        "text": "文件列表"
+      },
+      {
+        "t": "statusbar",
+        "x": 8,
+        "y": 382,
+        "w": 584,
+        "h": 22,
+        "id": "status",
+        "text": "状态栏"
+      }
+    ],
+    "menu": [
+      "打开",
+      "新建文件夹",
+      "重命名",
+      "删除",
+      "属性"
+    ],
+    "keys": {
+      "Enter": "打开选中项",
+      "Backspace": "返回上级",
+      "F5": "刷新",
+      "Esc": "关闭菜单"
+    },
+    "state": [
+      "int vol",
+      "int sel",
+      "int count",
+      "int scroll",
+      "int menu"
+    ],
+    "events": [
+      "Init 载入默认卷列表",
+      "Click 命中 vol 调用 Host.FileCount/FileName 重建列表",
+      "双击列表项进入目录或 Host.OpenApp",
+      "右键弹菜单并按状态灰化"
+    ],
+    "accept": [
+      "三个卷可切换",
+      "SFS 只读时条目灰化",
+      "列表可滚动且不越界"
+    ]
+  },
+  {
+    "id": 2,
+    "key": "TaskManager",
+    "zh": "任务管理器",
+    "title": "Task Manager",
+    "status": "stub",
+    "win": [
+      560,
+      420,
+      360,
+      260
+    ],
+    "layout": [
+      {
+        "t": "tabs",
+        "x": 8,
+        "y": 8,
+        "w": 544,
+        "h": 28,
+        "id": "tabs",
+        "text": "页签",
+        "items": [
+          "进程",
+          "性能",
+          "详情"
+        ]
+      },
+      {
+        "t": "chart",
+        "x": 8,
+        "y": 44,
+        "w": 260,
+        "h": 100,
+        "id": "cpu",
+        "text": "CPU"
+      },
+      {
+        "t": "chart",
+        "x": 276,
+        "y": 44,
+        "w": 276,
+        "h": 100,
+        "id": "mem",
+        "text": "内存"
+      },
+      {
+        "t": "grid",
+        "x": 8,
+        "y": 152,
+        "w": 544,
+        "h": 220,
+        "id": "procs",
+        "text": "进程表"
+      },
+      {
+        "t": "button",
+        "x": 452,
+        "y": 380,
+        "w": 100,
+        "h": 28,
+        "id": "kill",
+        "text": "结束任务"
+      }
+    ],
+    "menu": [
+      "结束任务",
+      "切换到",
+      "属性"
+    ],
+    "keys": {
+      "Delete": "结束选中进程",
+      "Up": "上一行",
+      "Down": "下一行",
+      "F5": "刷新"
+    },
+    "state": [
+      "int tab",
+      "int sel",
+      "int count",
+      "int tick"
+    ],
+    "events": [
+      "Init 定长数组存进程行",
+      "Paint 每帧只读取不分配",
+      "Click 表头排序 / 行选中",
+      "Click kill 触发结束确认"
+    ],
+    "accept": [
+      "进程表可选中",
+      "图表随 tick 变化",
+      "Paint 不泄漏堆"
+    ]
+  },
+  {
+    "id": 3,
+    "key": "Terminal",
+    "zh": "终端",
+    "title": "Terminal",
+    "status": "stub",
+    "win": [
+      640,
+      400,
+      360,
+      220
+    ],
+    "layout": [
+      {
+        "t": "log",
+        "x": 8,
+        "y": 8,
+        "w": 624,
+        "h": 330,
+        "id": "out",
+        "text": "输出"
+      },
+      {
+        "t": "input",
+        "x": 8,
+        "y": 346,
+        "w": 624,
+        "h": 28,
+        "id": "cmd",
+        "text": "命令行"
+      },
+      {
+        "t": "statusbar",
+        "x": 8,
+        "y": 378,
+        "w": 624,
+        "h": 20,
+        "id": "status",
+        "text": "cwd"
+      }
+    ],
+    "menu": [
+      "复制",
+      "粘贴",
+      "清屏",
+      "新建窗口"
+    ],
+    "keys": {
+      "Enter": "执行当前行",
+      "Up": "历史上一条",
+      "Down": "历史下一条",
+      "Tab": "补全",
+      "Ctrl+C": "中断"
+    },
+    "state": [
+      "string cmd",
+      "int histIdx",
+      "int scroll",
+      "int len"
+    ],
+    "events": [
+      "Init 初始化定长历史数组",
+      "Key Enter 提交命令并清空输入",
+      "Key Up/Down 回填历史",
+      "Key Tab 补全并消费事件（返回非零）"
+    ],
+    "accept": [
+      "可输入并回显",
+      "历史可上下翻",
+      "Tab 不切走焦点"
+    ]
+  },
+  {
+    "id": 4,
+    "key": "Calculator",
+    "zh": "计算器",
+    "title": "Calculator",
+    "status": "stub",
+    "win": [
+      340,
+      440,
+      260,
+      340
+    ],
+    "layout": [
+      {
+        "t": "display",
+        "x": 10,
+        "y": 10,
+        "w": 320,
+        "h": 72,
+        "id": "disp",
+        "text": "0"
+      },
+      {
+        "t": "button",
+        "x": 10,
+        "y": 94,
+        "w": 74,
+        "h": 56,
+        "id": "b7",
+        "text": "7"
+      },
+      {
+        "t": "button",
+        "x": 92,
+        "y": 94,
+        "w": 74,
+        "h": 56,
+        "id": "b8",
+        "text": "8"
+      },
+      {
+        "t": "button",
+        "x": 174,
+        "y": 94,
+        "w": 74,
+        "h": 56,
+        "id": "b9",
+        "text": "9"
+      },
+      {
+        "t": "button",
+        "x": 256,
+        "y": 94,
+        "w": 74,
+        "h": 56,
+        "id": "div",
+        "text": "/"
+      },
+      {
+        "t": "button",
+        "x": 10,
+        "y": 158,
+        "w": 74,
+        "h": 56,
+        "id": "b4",
+        "text": "4"
+      },
+      {
+        "t": "button",
+        "x": 92,
+        "y": 158,
+        "w": 74,
+        "h": 56,
+        "id": "b5",
+        "text": "5"
+      },
+      {
+        "t": "button",
+        "x": 174,
+        "y": 158,
+        "w": 74,
+        "h": 56,
+        "id": "b6",
+        "text": "6"
+      },
+      {
+        "t": "button",
+        "x": 256,
+        "y": 158,
+        "w": 74,
+        "h": 56,
+        "id": "mul",
+        "text": "*"
+      },
+      {
+        "t": "button",
+        "x": 10,
+        "y": 222,
+        "w": 74,
+        "h": 56,
+        "id": "b1",
+        "text": "1"
+      },
+      {
+        "t": "button",
+        "x": 92,
+        "y": 222,
+        "w": 74,
+        "h": 56,
+        "id": "b2",
+        "text": "2"
+      },
+      {
+        "t": "button",
+        "x": 174,
+        "y": 222,
+        "w": 74,
+        "h": 56,
+        "id": "b3",
+        "text": "3"
+      },
+      {
+        "t": "button",
+        "x": 256,
+        "y": 222,
+        "w": 74,
+        "h": 56,
+        "id": "sub",
+        "text": "-"
+      },
+      {
+        "t": "button",
+        "x": 10,
+        "y": 286,
+        "w": 74,
+        "h": 56,
+        "id": "b0",
+        "text": "0"
+      },
+      {
+        "t": "button",
+        "x": 92,
+        "y": 286,
+        "w": 74,
+        "h": 56,
+        "id": "clr",
+        "text": "C"
+      },
+      {
+        "t": "button",
+        "x": 174,
+        "y": 286,
+        "w": 74,
+        "h": 56,
+        "id": "eq",
+        "text": "="
+      },
+      {
+        "t": "button",
+        "x": 256,
+        "y": 286,
+        "w": 74,
+        "h": 56,
+        "id": "add",
+        "text": "+"
+      }
+    ],
+    "menu": [
+      "复制结果",
+      "清空"
+    ],
+    "keys": {
+      "0-9": "输入数字",
+      "+ - * /": "运算符",
+      "Enter": "等于",
+      "Backspace": "退格",
+      "Esc": "清空"
+    },
+    "state": [
+      "int acc",
+      "int pendingOp",
+      "string disp",
+      "bool fresh"
+    ],
+    "events": [
+      "Init 显式清零 acc/pendingOp",
+      "Click 命中数字键追加到 disp",
+      "Click 命中运算符保存 pendingOp",
+      "Key 返回非零表示已消费"
+    ],
+    "accept": [
+      "1+2=3",
+      "C 清零",
+      "键盘与鼠标结果一致"
+    ]
+  },
+  {
+    "id": 5,
+    "key": "About",
+    "zh": "关于",
+    "title": "About NexOS",
+    "status": "stub",
+    "win": [
+      420,
+      300,
+      320,
+      240
+    ],
+    "layout": [
+      {
+        "t": "panel",
+        "x": 8,
+        "y": 8,
+        "w": 404,
+        "h": 180,
+        "id": "info",
+        "text": "NexOS / 版本 / 内核 / 构建时间"
+      },
+      {
+        "t": "label",
+        "x": 20,
+        "y": 200,
+        "w": 380,
+        "h": 22,
+        "id": "lic",
+        "text": "MIT License"
+      },
+      {
+        "t": "button",
+        "x": 230,
+        "y": 250,
+        "w": 88,
+        "h": 28,
+        "id": "copy",
+        "text": "复制信息"
+      },
+      {
+        "t": "button",
+        "x": 326,
+        "y": 250,
+        "w": 86,
+        "h": 28,
+        "id": "close",
+        "text": "关闭"
+      }
+    ],
+    "menu": [
+      "复制系统信息"
+    ],
+    "keys": {
+      "Esc": "关闭窗口",
+      "Enter": "复制信息"
+    },
+    "state": [
+      "int built"
+    ],
+    "events": [
+      "Init 读取 Host 信息",
+      "Click copy 调 Host.Log",
+      "Click close 调 Host.WinAction"
+    ],
+    "accept": [
+      "窗口能打开",
+      "信息非空",
+      "关闭能释放槽"
+    ]
+  },
+  {
+    "id": 6,
+    "key": "MemOptimizer",
+    "zh": "内存优化",
+    "title": "Memory Optimizer",
+    "status": "stub",
+    "win": [
+      440,
+      320,
+      320,
+      240
+    ],
+    "layout": [
+      {
+        "t": "chart",
+        "x": 8,
+        "y": 8,
+        "w": 424,
+        "h": 110,
+        "id": "chart",
+        "text": "内存占用"
+      },
+      {
+        "t": "progress",
+        "x": 8,
+        "y": 130,
+        "w": 424,
+        "h": 24,
+        "id": "bar",
+        "text": "扫描进度"
+      },
+      {
+        "t": "label",
+        "x": 8,
+        "y": 166,
+        "w": 424,
+        "h": 22,
+        "id": "tip",
+        "text": "可回收: -- KiB"
+      },
+      {
+        "t": "button",
+        "x": 238,
+        "y": 264,
+        "w": 94,
+        "h": 28,
+        "id": "scan",
+        "text": "扫描"
+      },
+      {
+        "t": "button",
+        "x": 340,
+        "y": 264,
+        "w": 92,
+        "h": 28,
+        "id": "free",
+        "text": "清理"
+      }
+    ],
+    "menu": [
+      "重新扫描",
+      "查看明细"
+    ],
+    "keys": {
+      "F5": "重新扫描",
+      "Enter": "执行清理",
+      "Esc": "关闭"
+    },
+    "state": [
+      "int total",
+      "int used",
+      "int reclaim",
+      "int phase"
+    ],
+    "events": [
+      "Init 读取内存计数",
+      "Click scan 进入 phase=1 并逐帧推进",
+      "Click free 仅在 phase=2 可用",
+      "Paint 按 phase 更新进度条"
+    ],
+    "accept": [
+      "扫描可完成",
+      "清理按钮按阶段灰化",
+      "不误报已释放内存"
+    ]
+  },
+  {
+    "id": 7,
+    "key": "Notepad",
+    "zh": "记事本",
+    "title": "Notepad - Untitled",
+    "status": "real",
+    "win": [
+      640,
+      480,
+      320,
+      200
+    ],
+    "layout": [
+      {
+        "t": "toolbar",
+        "x": 8,
+        "y": 8,
+        "w": 624,
+        "h": 36,
+        "id": "tools",
+        "text": "工具栏",
+        "items": [
+          "Open",
+          "New",
+          "Save As"
+        ]
+      },
+      {
+        "t": "label",
+        "x": 8,
+        "y": 46,
+        "w": 624,
+        "h": 20,
+        "id": "fmt",
+        "text": "格式: Plain Text"
+      },
+      {
+        "t": "canvas",
+        "x": 8,
+        "y": 68,
+        "w": 608,
+        "h": 366,
+        "id": "editor",
+        "text": "文本编辑区"
+      },
+      {
+        "t": "statusbar",
+        "x": 8,
+        "y": 436,
+        "w": 624,
+        "h": 22,
+        "id": "status",
+        "text": "Ln 1, Col 1 | 0 chars | Target: -"
+      }
+    ],
+    "menu": [
+      "撤销",
+      "重做",
+      "剪切",
+      "复制",
+      "粘贴",
+      "删除",
+      "全选",
+      "自动换行"
+    ],
+    "keys": {
+      "Ctrl+O": "打开",
+      "Ctrl+S": "原地保存",
+      "Ctrl+Shift+S": "另存为",
+      "Ctrl+Z/Y": "撤销/重做",
+      "Tab": "插入 4 空格并消费",
+      "Esc": "只关对话框",
+      "Alt+F4": "关闭拦截"
+    },
+    "state": [
+      "string text",
+      "int caret",
+      "int sel",
+      "bool dirty",
+      "bool wrap",
+      "int dialog",
+      "Doc[] docs"
+    ],
+    "events": [
+      "Init 建 Doc[] 定长数组（按 id 隔离，禁止跨窗口共享 static app）",
+      "Click 工具栏进入 Open/Save As 模态",
+      "Key 编辑统一走 MarkDirty",
+      "Alt+F4 且 dirty 时弹【保存/不保存/取消】",
+      "保存前先查同名，冲突弹确认"
+    ],
+    "accept": [
+      "双击图标走独立槽",
+      "两个窗口文本与撤销栈互不干扰",
+      "含 NUL 的二进制文件拒绝打开",
+      "关闭未保存文档有三选项"
+    ]
+  },
+  {
+    "id": 8,
+    "key": "Browser",
+    "zh": "浏览器",
+    "title": "Browser",
+    "status": "stub",
+    "win": [
+      720,
+      480,
+      400,
+      300
+    ],
+    "layout": [
+      {
+        "t": "tabs",
+        "x": 8,
+        "y": 8,
+        "w": 704,
+        "h": 28,
+        "id": "tabs",
+        "text": "标签页",
+        "items": [
+          "新标签页"
+        ]
+      },
+      {
+        "t": "toolbar",
+        "x": 8,
+        "y": 40,
+        "w": 704,
+        "h": 32,
+        "id": "nav",
+        "text": "导航",
+        "items": [
+          "后退",
+          "前进",
+          "刷新"
+        ]
+      },
+      {
+        "t": "input",
+        "x": 8,
+        "y": 76,
+        "w": 704,
+        "h": 26,
+        "id": "url",
+        "text": "地址栏"
+      },
+      {
+        "t": "canvas",
+        "x": 8,
+        "y": 108,
+        "w": 704,
+        "h": 350,
+        "id": "page",
+        "text": "页面画布"
+      },
+      {
+        "t": "statusbar",
+        "x": 8,
+        "y": 460,
+        "w": 704,
+        "h": 18,
+        "id": "status",
+        "text": "状态"
+      }
+    ],
+    "menu": [
+      "后退",
+      "前进",
+      "重新加载",
+      "查看源码"
+    ],
+    "keys": {
+      "Enter": "导航到地址",
+      "Alt+Left": "后退",
+      "Alt+Right": "前进",
+      "F5": "刷新",
+      "Esc": "停止加载"
+    },
+    "state": [
+      "string url",
+      "int histIdx",
+      "int scroll",
+      "int loading"
+    ],
+    "events": [
+      "Init 初始化历史定长数组",
+      "Key Enter 触发加载",
+      "Click 画布命中链接",
+      "Paint 按 loading 显示进度"
+    ],
+    "accept": [
+      "地址栏可输入",
+      "后退/前进状态正确",
+      "离线页面有明确提示不白屏"
+    ]
+  },
+  {
+    "id": 9,
+    "key": "AiSetup",
+    "zh": "AI 设置向导",
+    "title": "AI Setup",
+    "status": "stub",
+    "win": [
+      520,
+      380,
+      360,
+      280
+    ],
+    "layout": [
+      {
+        "t": "stepper",
+        "x": 8,
+        "y": 8,
+        "w": 504,
+        "h": 44,
+        "id": "steps",
+        "text": "步骤",
+        "items": [
+          "检测",
+          "选择模型",
+          "启用",
+          "完成"
+        ]
+      },
+      {
+        "t": "panel",
+        "x": 8,
+        "y": 60,
+        "w": 504,
+        "h": 250,
+        "id": "body",
+        "text": "当前步骤内容"
+      },
+      {
+        "t": "list",
+        "x": 20,
+        "y": 84,
+        "w": 480,
+        "h": 180,
+        "id": "models",
+        "text": "可用模型"
+      },
+      {
+        "t": "button",
+        "x": 322,
+        "y": 330,
+        "w": 90,
+        "h": 28,
+        "id": "prev",
+        "text": "上一步"
+      },
+      {
+        "t": "button",
+        "x": 422,
+        "y": 330,
+        "w": 90,
+        "h": 28,
+        "id": "next",
+        "text": "下一步"
+      }
+    ],
+    "menu": [
+      "跳过向导",
+      "重新检测"
+    ],
+    "keys": {
+      "Enter": "下一步",
+      "Esc": "取消向导",
+      "Up/Down": "选择模型"
+    },
+    "state": [
+      "int step",
+      "int model",
+      "bool enabled",
+      "int detected"
+    ],
+    "events": [
+      "Init 置 step=0",
+      "Click next 校验当前步再前进",
+      "最后一步写配置并调 Host.Log",
+      "Esc 直接取消不写盘"
+    ],
+    "accept": [
+      "四步可前进/后退",
+      "未选模型时 next 不可用",
+      "完成后状态可查询"
+    ]
+  },
+  {
+    "id": 10,
+    "key": "AiAgent",
+    "zh": "AI Agent",
+    "title": "AI Agent",
+    "status": "stub",
+    "win": [
+      680,
+      460,
+      420,
+      300
+    ],
+    "layout": [
+      {
+        "t": "input",
+        "x": 8,
+        "y": 8,
+        "w": 560,
+        "h": 30,
+        "id": "goal",
+        "text": "目标"
+      },
+      {
+        "t": "button",
+        "x": 576,
+        "y": 8,
+        "w": 96,
+        "h": 30,
+        "id": "run",
+        "text": "运行"
+      },
+      {
+        "t": "panel",
+        "x": 8,
+        "y": 46,
+        "w": 220,
+        "h": 380,
+        "id": "plan",
+        "text": "Planner"
+      },
+      {
+        "t": "panel",
+        "x": 236,
+        "y": 46,
+        "w": 220,
+        "h": 380,
+        "id": "actor",
+        "text": "Actor"
+      },
+      {
+        "t": "panel",
+        "x": 464,
+        "y": 46,
+        "w": 208,
+        "h": 380,
+        "id": "critic",
+        "text": "Critic"
+      },
+      {
+        "t": "statusbar",
+        "x": 8,
+        "y": 430,
+        "w": 664,
+        "h": 22,
+        "id": "status",
+        "text": "idle / running / done"
+      }
+    ],
+    "menu": [
+      "清空目标",
+      "停止",
+      "导出轨迹"
+    ],
+    "keys": {
+      "Enter": "启动",
+      "Esc": "停止",
+      "Ctrl+L": "清空输出"
+    },
+    "state": [
+      "string goal",
+      "int phase",
+      "int step",
+      "bool running"
+    ],
+    "events": [
+      "Init 三面板状态清零",
+      "Click run 切换 running 并推进 phase",
+      "Esc 中止并保留轨迹",
+      "Paint 按 phase 绘制高亮"
+    ],
+    "accept": [
+      "目标可输入",
+      "三面板随运行更新",
+      "停止后能重新运行"
+    ]
+  },
+  {
+    "id": 11,
+    "key": "Demo",
+    "zh": "演示窗口",
+    "title": "Demo",
+    "status": "stub",
+    "win": [
+      400,
+      280,
+      280,
+      200
+    ],
+    "layout": [
+      {
+        "t": "label",
+        "x": 12,
+        "y": 12,
+        "w": 376,
+        "h": 24,
+        "id": "hint",
+        "text": "点击按钮观察收缩动画"
+      },
+      {
+        "t": "button",
+        "x": 150,
+        "y": 80,
+        "w": 100,
+        "h": 48,
+        "id": "push",
+        "text": "点我"
+      },
+      {
+        "t": "label",
+        "x": 12,
+        "y": 150,
+        "w": 376,
+        "h": 28,
+        "id": "reply",
+        "text": "回复: -"
+      },
+      {
+        "t": "progress",
+        "x": 12,
+        "y": 200,
+        "w": 376,
+        "h": 18,
+        "id": "anim",
+        "text": "动画帧"
+      }
+    ],
+    "menu": [
+      "重置",
+      "连续点击 x10"
+    ],
+    "keys": {
+      "Enter": "触发按钮",
+      "Esc": "重置",
+      "Space": "触发按钮"
+    },
+    "state": [
+      "int frame",
+      "int clicks",
+      "bool pressed"
+    ],
+    "events": [
+      "Init 置 frame=0",
+      "Click push 置 pressed 并启动帧计数",
+      "Paint 按 frame 收缩按钮",
+      "回复固定文本"
+    ],
+    "accept": [
+      "按钮有按下反馈",
+      "动画能回到静止",
+      "连点不崩"
+    ]
+  },
+  {
+    "id": 12,
+    "key": "NetTools",
+    "zh": "网络诊断",
+    "title": "Network Tools",
+    "status": "missing",
+    "win": [
+      600,
+      400,
+      380,
+      260
+    ],
+    "layout": [
+      {
+        "t": "toolbar",
+        "x": 8,
+        "y": 8,
+        "w": 584,
+        "h": 32,
+        "id": "cmds",
+        "text": "命令",
+        "items": [
+          "ipconfig",
+          "netstat",
+          "ping"
+        ]
+      },
+      {
+        "t": "input",
+        "x": 8,
+        "y": 46,
+        "w": 584,
+        "h": 26,
+        "id": "arg",
+        "text": "参数"
+      },
+      {
+        "t": "log",
+        "x": 8,
+        "y": 80,
+        "w": 584,
+        "h": 280,
+        "id": "out",
+        "text": "输出"
+      },
+      {
+        "t": "button",
+        "x": 502,
+        "y": 366,
+        "w": 90,
+        "h": 26,
+        "id": "clear",
+        "text": "清空"
+      }
+    ],
+    "menu": [
+      "复制全部",
+      "保存日志",
+      "重新执行"
+    ],
+    "keys": {
+      "Enter": "执行当前命令",
+      "F5": "重新执行",
+      "Ctrl+L": "清空",
+      "Esc": "关闭"
+    },
+    "state": [
+      "int cmd",
+      "string arg",
+      "int lines"
+    ],
+    "events": [
+      "Init 选中默认命令",
+      "Click 命令按钮填充输出区",
+      "Enter 带参数重跑",
+      "输出超过可视区可滚动"
+    ],
+    "accept": [
+      "三个命令都能出结果",
+      "参数可传",
+      "输出不截断崩溃"
+    ]
+  },
+  {
+    "id": 13,
+    "key": "AiLauncher",
+    "zh": "AI 命令台",
+    "title": "AI Launcher",
+    "status": "missing",
+    "win": [
+      560,
+      360,
+      360,
+      240
+    ],
+    "layout": [
+      {
+        "t": "input",
+        "x": 8,
+        "y": 8,
+        "w": 544,
+        "h": 34,
+        "id": "ask",
+        "text": "用一句话描述要做什么"
+      },
+      {
+        "t": "list",
+        "x": 8,
+        "y": 50,
+        "w": 544,
+        "h": 180,
+        "id": "suggest",
+        "text": "建议命令"
+      },
+      {
+        "t": "log",
+        "x": 8,
+        "y": 238,
+        "w": 544,
+        "h": 80,
+        "id": "history",
+        "text": "历史"
+      },
+      {
+        "t": "button",
+        "x": 462,
+        "y": 324,
+        "w": 90,
+        "h": 26,
+        "id": "go",
+        "text": "执行"
+      }
+    ],
+    "menu": [
+      "清空历史",
+      "复制命令",
+      "固定到任务栏"
+    ],
+    "keys": {
+      "Enter": "执行",
+      "Up/Down": "浏览建议",
+      "Tab": "补全建议",
+      "Esc": "清空输入"
+    },
+    "state": [
+      "string input",
+      "int sel",
+      "int histIdx"
+    ],
+    "events": [
+      "Init 载入定长建议表",
+      "Key 输入时过滤建议",
+      "Key Tab 补全并消费",
+      "Click go 调 Host.OpenApp"
+    ],
+    "accept": [
+      "输入即过滤",
+      "Tab 不切走焦点",
+      "执行能打开目标应用"
+    ]
+  },
+  {
+    "id": 14,
+    "key": "NetDefense",
+    "zh": "网络攻防模拟",
+    "title": "Network Defense",
+    "status": "missing",
+    "win": [
+      660,
+      440,
+      420,
+      300
+    ],
+    "layout": [
+      {
+        "t": "canvas",
+        "x": 8,
+        "y": 8,
+        "w": 424,
+        "h": 340,
+        "id": "topo",
+        "text": "拓扑画布"
+      },
+      {
+        "t": "panel",
+        "x": 440,
+        "y": 8,
+        "w": 212,
+        "h": 180,
+        "id": "attack",
+        "text": "攻击面板"
+      },
+      {
+        "t": "panel",
+        "x": 440,
+        "y": 196,
+        "w": 212,
+        "h": 152,
+        "id": "defend",
+        "text": "防御面板"
+      },
+      {
+        "t": "log",
+        "x": 8,
+        "y": 356,
+        "w": 644,
+        "h": 52,
+        "id": "events",
+        "text": "事件日志"
+      },
+      {
+        "t": "button",
+        "x": 556,
+        "y": 412,
+        "w": 96,
+        "h": 24,
+        "id": "start",
+        "text": "开始模拟"
+      }
+    ],
+    "menu": [
+      "重置拓扑",
+      "导出日志",
+      "切换视角"
+    ],
+    "keys": {
+      "Space": "开始/暂停",
+      "R": "重置",
+      "Esc": "关闭"
+    },
+    "state": [
+      "int tick",
+      "int nodes",
+      "bool running",
+      "int score"
+    ],
+    "events": [
+      "Init 建定长节点数组",
+      "Click start 启动 tick",
+      "Paint 按 tick 绘制链路",
+      "日志只保留最近 N 行"
+    ],
+    "accept": [
+      "拓扑可见",
+      "模拟可暂停/重置",
+      "日志不无限增长撑爆堆"
+    ]
+  },
+  {
+    "id": 15,
+    "key": "WebView",
+    "zh": "Linux 桌面查看器",
+    "title": "Linux Guest (VNC)",
+    "status": "missing",
+    "win": [
+      800,
+      520,
+      480,
+      320
+    ],
+    "layout": [
+      {
+        "t": "toolbar",
+        "x": 8,
+        "y": 8,
+        "w": 784,
+        "h": 30,
+        "id": "bar",
+        "text": "连接栏",
+        "items": [
+          "连接",
+          "断开",
+          "全屏"
+        ]
+      },
+      {
+        "t": "canvas",
+        "x": 8,
+        "y": 44,
+        "w": 784,
+        "h": 440,
+        "id": "fb",
+        "text": "远程帧缓冲"
+      },
+      {
+        "t": "statusbar",
+        "x": 8,
+        "y": 490,
+        "w": 784,
+        "h": 22,
+        "id": "status",
+        "text": "disconnected | 0x0"
+      }
+    ],
+    "menu": [
+      "重新连接",
+      "缩放适配",
+      "发送 Ctrl+Alt+Del"
+    ],
+    "keys": {
+      "Esc": "退出全屏",
+      "Ctrl+Enter": "连接",
+      "F11": "全屏"
+    },
+    "state": [
+      "int connected",
+      "int fbw",
+      "int fbh",
+      "int scale"
+    ],
+    "events": [
+      "Init 置 disconnected",
+      "Click 连接更新状态与分辨率",
+      "Click 画布转发鼠标坐标",
+      "断开后清空帧缓冲显示占位"
+    ],
+    "accept": [
+      "未连接时显示占位而非黑屏",
+      "连接状态可见",
+      "断开不残留画面"
+    ]
+  },
+  {
+    "id": 16,
+    "key": "VideoPlayer",
+    "zh": "视频播放器",
+    "title": "Video Player",
+    "status": "missing",
+    "win": [
+      640,
+      440,
+      400,
+      280
+    ],
+    "layout": [
+      {
+        "t": "canvas",
+        "x": 8,
+        "y": 8,
+        "w": 624,
+        "h": 340,
+        "id": "video",
+        "text": "画面"
+      },
+      {
+        "t": "progress",
+        "x": 8,
+        "y": 356,
+        "w": 624,
+        "h": 18,
+        "id": "seek",
+        "text": "进度"
+      },
+      {
+        "t": "toolbar",
+        "x": 8,
+        "y": 382,
+        "w": 420,
+        "h": 32,
+        "id": "ctrl",
+        "text": "控制",
+        "items": [
+          "播放",
+          "暂停",
+          "停止",
+          "上一个",
+          "下一个"
+        ]
+      },
+      {
+        "t": "slider",
+        "x": 440,
+        "y": 382,
+        "w": 192,
+        "h": 32,
+        "id": "vol",
+        "text": "音量"
+      }
+    ],
+    "menu": [
+      "打开文件",
+      "全屏",
+      "循环",
+      "属性"
+    ],
+    "keys": {
+      "Space": "播放/暂停",
+      "Left": "后退 5s",
+      "Right": "前进 5s",
+      "Esc": "退出全屏",
+      "M": "静音"
+    },
+    "state": [
+      "int playing",
+      "int pos",
+      "int duration",
+      "int volume"
+    ],
+    "events": [
+      "Init 置 pos=0",
+      "Click 控制项切换 playing",
+      "Click 进度条换算 pos",
+      "Paint 未加载文件时显示占位"
+    ],
+    "accept": [
+      "播放/暂停状态可切换",
+      "进度条可拖动",
+      "无文件时明确提示"
+    ]
+  },
+  {
+    "id": 17,
+    "key": "AudioPlayer",
+    "zh": "音频播放器",
+    "title": "Audio Player",
+    "status": "missing",
+    "win": [
+      480,
+      380,
+      320,
+      260
+    ],
+    "layout": [
+      {
+        "t": "panel",
+        "x": 8,
+        "y": 8,
+        "w": 464,
+        "h": 110,
+        "id": "track",
+        "text": "曲目信息 / 封面"
+      },
+      {
+        "t": "progress",
+        "x": 8,
+        "y": 126,
+        "w": 464,
+        "h": 18,
+        "id": "seek",
+        "text": "进度"
+      },
+      {
+        "t": "toolbar",
+        "x": 8,
+        "y": 152,
+        "w": 464,
+        "h": 36,
+        "id": "ctrl",
+        "text": "控制",
+        "items": [
+          "上一首",
+          "播放",
+          "暂停",
+          "下一首"
+        ]
+      },
+      {
+        "t": "list",
+        "x": 8,
+        "y": 196,
+        "w": 464,
+        "h": 150,
+        "id": "playlist",
+        "text": "播放列表"
+      },
+      {
+        "t": "statusbar",
+        "x": 8,
+        "y": 352,
+        "w": 464,
+        "h": 22,
+        "id": "status",
+        "text": "stopped"
+      }
+    ],
+    "menu": [
+      "添加到列表",
+      "移除",
+      "循环模式",
+      "属性"
+    ],
+    "keys": {
+      "Space": "播放/暂停",
+      "Left": "上一首",
+      "Right": "下一首",
+      "Up/Down": "选曲",
+      "M": "静音"
+    },
+    "state": [
+      "int idx",
+      "int playing",
+      "int pos",
+      "int count",
+      "bool loop"
+    ],
+    "events": [
+      "Init 载入定长播放列表",
+      "Click 列表项切换 idx",
+      "Click 控制项切换 playing",
+      "播放结束按 loop 决定下一首"
+    ],
+    "accept": [
+      "列表可选曲",
+      "播放状态可见",
+      "空列表不崩"
+    ]
+  }
+];
+</script>
+<!-- NEX_DATA_END -->
+<script>
+(function(){
+  "use strict";
+  var APPS = window.NEX_APPS || [], META = window.NEX_META || {};
+  var $ = function(s){ return document.querySelector(s); };
+  var esc = function(s){ return String(s==null?"":s).replace(/[&<>"']/g,function(c){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]; }); };
+
+  var state = { filter:"all", q:"", current:null, handle:64, wins:[], active:null };
+  state.current = APPS.filter(function(a){return a.key==="Notepad";})[0] || APPS[0];
+
+  function clock(){
+    var d = new Date();
+    return ("0"+d.getHours()).slice(-2)+":"+("0"+d.getMinutes()).slice(-2)+":"+("0"+d.getSeconds()).slice(-2);
+  }
+  function log(kind, text){
+    var box = $("#log");
+    var d = document.createElement("div");
+    d.className = kind;
+    d.innerHTML = '<span class="t">'+clock()+'</span> '+esc(text);
+    box.appendChild(d);
+    box.scrollTop = box.scrollHeight;
+    while(box.children.length > 220) box.removeChild(box.firstChild);
+  }
+
+  // ---- left list -------------------------------------------------
+  function renderList(){
+    var box = $("#applist"); box.innerHTML = "";
+    var n = 0;
+    APPS.forEach(function(a){
+      if(state.filter!=="all" && a.status!==state.filter) return;
+      if(state.q && (a.key+a.zh+a.id).toLowerCase().indexOf(state.q)<0) return;
+      n++;
+      var d = document.createElement("div");
+      d.className = "item"+(state.current && state.current.key===a.key?" on":"");
+      d.innerHTML = '<span class="k">'+a.id+'</span><span class="nm"><b>'+esc(a.zh)+
+                    '</b><small>'+esc(a.key)+' · '+esc(a.title)+'</small></span>'+
+                    '<i class="dot '+a.status+'"></i>';
+      d.onclick = function(){ state.current=a; renderList(); renderInspector(); openWindow(a); };
+      box.appendChild(d);
+    });
+    if(!n) box.innerHTML = '<div class="empty">没有匹配的应用</div>';
+    $("#count").textContent = APPS.length+" apps";
+  }
+
+  // ---- inspector -------------------------------------------------
+  function renderInspector(){
+    var a = state.current, box = $("#inspector");
+    if(!a){ box.innerHTML='<div class="empty">请选择一个应用</div>'; return; }
+    var h = "";
+    h += "<h3>基本信息</h3>";
+    h += '<div class="kv"><span>Kind</span><b>'+a.id+'</b></div>';
+    h += '<div class="kv"><span>程序集</span><b>'+esc(a.key)+'.mex</b></div>';
+    h += '<div class="kv"><span>状态</span><b>'+esc(a.status)+'</b></div>';
+    h += '<div class="kv"><span>窗口</span><span>'+a.win[0]+'×'+a.win[1]+' (min '+a.win[2]+'×'+a.win[3]+')</span></div>';
+    h += '<div class="kv"><span>控件</span><span>'+a.layout.length+' 个</span></div>';
+    h += "<h3>键位</h3>";
+    Object.keys(a.keys).forEach(function(k){
+      h += '<div class="kv"><span>'+esc(k)+'</span><span>'+esc(a.keys[k])+'</span></div>';
+    });
+    h += "<h3>状态字段（建议）</h3><div>";
+    a.state.forEach(function(s){ h += '<span class="tag">'+esc(s)+'</span>'; });
+    h += "</div><h3>事件序列</h3><ul class=\"tight\">";
+    a.events.forEach(function(e){ h += "<li>"+esc(e)+"</li>"; });
+    h += "</ul><h3>验收点</h3><ul class=\"tight\">";
+    a.accept.forEach(function(e){ h += "<li>"+esc(e)+"</li>"; });
+    h += "</ul><h3>右键菜单</h3><div>";
+    a.menu.forEach(function(m){ h += '<span class="tag">'+esc(m)+'</span>'; });
+    h += "</div><h3>契约</h3><div class=\"kv\"><span>入口</span><span style=\"font:10.5px ui-monospace,monospace\">"+
+         esc(META.contract||"")+"</span></div>";
+    box.innerHTML = h;
+  }
+
+  // ---- control rendering -----------------------------------------
+  function controlHtml(c){
+    var st = 'left:'+c.x+'px;top:'+c.y+'px;width:'+c.w+'px;height:'+c.h+'px';
+    var inner = "", t = c.t, txt = esc(c.text||"");
+    if(t==="button") inner = txt;
+    else if(t==="toolbar"||t==="tabs"||t==="stepper"){
+      inner = (c.items||[txt]).map(function(it,i){
+        return '<span class="mini'+(i===0?" on":"")+'" data-item="'+esc(it)+'">'+esc(it)+'</span>';
+      }).join("");
+    }
+    else if(t==="input") inner = '<input placeholder="'+txt+'" data-cid="'+esc(c.id)+'">';
+    else if(t==="display") inner = txt;
+    else if(t==="label"||t==="statusbar"||t==="panel"||t==="canvas") inner = txt;
+    else if(t==="list"||t==="grid"||t==="log"){
+      var rows = t==="log" ? ["[init] app ready", "[hint] 右键查看菜单", "[hint] 点击控件看事件日志"]
+                           : ["项目 A", "项目 B", "项目 C", "项目 D"];
+      inner = rows.map(function(r){return '<div class="row">'+esc(r)+'</div>';}).join("");
+    }
+    else if(t==="progress"||t==="slider") inner = '<div class="fill"></div>';
+    else if(t==="toggle") inner = '<span>'+txt+'</span><span class="sw"></span>';
+    else if(t==="chart") inner = '<span style="position:absolute;top:6px;left:9px;z-index:1">'+txt+'</span>';
+    else inner = txt;
+    return '<div class="ctl" data-t="'+t+'" data-cid="'+esc(c.id||"c")+'" style="'+st+'">'+inner+'</div>';
+  }
+
+  // ---- windows ----------------------------------------------------
+  function bringFront(win){
+    state.wins.forEach(function(w){ w.el.classList.remove("active"); });
+    win.el.classList.add("active");
+    win.el.style.zIndex = ++state.z;
+    state.active = win;
+  }
+  state.z = 10;
+
+  function openWindow(app){
+    app = app || state.current;
+    if(!app) return;
+    var uid = state.handle++;
+    var slot = 1 + (state.wins.length % 7);
+    var off = (state.wins.length % 4) * 26;
+    var el = document.createElement("div");
+    el.className = "win active";
+    el.style.width = (app.win[0]+2)+"px";
+    el.style.left = (24+off)+"px";
+    el.style.top = (18+off)+"px";
+    el.style.zIndex = ++state.z;
+    var body = app.layout.map(controlHtml).join("");
+    el.innerHTML =
+      '<div class="titlebar"><span class="h">'+esc(app.title)+'</span>'+
+      '<button class="tb" data-act="min" title="最小化">—</button>'+
+      '<button class="tb" data-act="max" title="最大化">□</button>'+
+      '<button class="tb close" data-act="close" title="关闭">×</button></div>'+
+      '<div class="client" style="width:'+app.win[0]+'px;height:'+app.win[1]+'px">'+body+'</div>';
+    $("#desk").appendChild(el);
+    var win = { uid:uid, slot:slot, app:app, el:el };
+    state.wins.push(win);
+    bringFront(win);
+    $("#stageTitle").textContent = app.zh + " · " + app.key + ".mex";
+    $("#stageSub").textContent = "handle "+uid+" → CLR slot "+slot+" · 每个窗口独立映像";
+    log("launch", "[gui] opening standalone app "+app.id+" (Kind "+app.id+")");
+    log("launch", "[MFORMS] standalone app live in slot "+slot+" handle "+uid);
+    renderInspector();
+    wireWindow(win);
+    return win;
+  }
+
+  function closeWindow(win){
+    if(!win) return;
+    log("close", "[MFORMS] standalone slot "+win.slot+" released  (handle "+win.uid+")");
+    win.el.remove();
+    state.wins = state.wins.filter(function(w){ return w!==win; });
+    if(state.active===win){ state.active = state.wins[state.wins.length-1]||null;
+      if(state.active) bringFront(state.active); }
+  }
+
+  function flash(el){ el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash"); }
+
+  function wireWindow(win){
+    var el = win.el, app = win.app;
+    el.addEventListener("mousedown", function(){ bringFront(win); });
+    el.querySelector(".titlebar").addEventListener("click", function(e){
+      var b = e.target.closest("[data-act]"); if(!b) return;
+      var act = b.getAttribute("data-act");
+      if(act==="close") closeWindow(win);
+      else if(act==="min"){ el.style.display="none"; log("sys","[win] minimise handle "+win.uid); }
+      else { log("sys","[win] maximise/restore handle "+win.uid); }
+    });
+    el.querySelector(".client").addEventListener("click", function(e){
+      var mini = e.target.closest("[data-item]");
+      var ctl = e.target.closest(".ctl");
+      if(!ctl) return;
+      var cid = ctl.getAttribute("data-cid"), t = ctl.getAttribute("data-t");
+      if(mini){
+        ctl.querySelectorAll(".mini").forEach(function(m){m.classList.remove("on");});
+        mini.classList.add("on");
+        log("click", "Click("+win.uid+") → "+cid+" / "+mini.getAttribute("data-item"));
+      } else {
+        log("click", "Click("+win.uid+") → "+cid+" ["+t+"] "+(ctl.getAttribute("data-text")||""));
+      }
+      if(t==="toggle") ctl.classList.toggle("on");
+      if(t==="progress"||t==="slider"){
+        var r = ctl.getBoundingClientRect();
+        var pct = Math.max(5, Math.min(100, Math.round((e.clientX-r.left)/r.width*100)));
+        var fill = ctl.querySelector(".fill"); if(fill) fill.style.width = pct+"%";
+      }
+      flash(ctl);
+    });
+    el.querySelector(".client").addEventListener("contextmenu", function(e){
+      e.preventDefault(); showMenu(app, win, e.clientX, e.clientY);
+    });
+    el.querySelectorAll("input").forEach(function(inp){
+      inp.addEventListener("keydown", function(e){
+        log("key", "Key("+win.uid+", '"+e.key+"') → "+inp.getAttribute("data-cid"));
+      });
+    });
+  }
+
+  // ---- context menu ----------------------------------------------
+  function showMenu(app, win, x, y){
+    var m = $("#ctx");
+    m.innerHTML = app.menu.map(function(s){return "<div>"+esc(s)+"</div>";}).join("")+
+                  "<hr><div style=\"color:var(--sub)\">Esc 关闭</div>";
+    m.style.left = Math.min(x, window.innerWidth-180)+"px";
+    m.style.top = Math.min(y, window.innerHeight-app.menu.length*30-60)+"px";
+    m.style.display = "block";
+    log("menu", "RightClick("+win.uid+") → menu: "+app.menu.join(" / "));
+    m.querySelectorAll("div").forEach(function(d){
+      d.onclick = function(){ log("menu","Menu("+win.uid+") → "+d.textContent); hideMenu(); };
+    });
+  }
+  function hideMenu(){ $("#ctx").style.display="none"; }
+  document.addEventListener("click", function(e){ if(!e.target.closest("#ctx")) hideMenu(); });
+
+  // ---- keyboard ---------------------------------------------------
+  document.addEventListener("keydown", function(e){
+    if(e.key==="Escape"){ hideMenu(); return; }
+    if(e.target.tagName==="INPUT") return;
+    var win = state.active; if(!win) return;
+    var a = win.app, k = e.key;
+    var hit = Object.keys(a.keys).filter(function(x){
+      return x.toLowerCase()===k.toLowerCase() || x==="Enter" && k==="Enter"; })[0];
+    if(hit) log("key","Key("+win.uid+", "+k+") → "+a.keys[hit]);
+    else if(k.length===1) log("key","Key("+win.uid+", '"+k+"')");
+    if(k==="Tab"){ e.preventDefault(); log("key","Key("+win.uid+", Tab) → 已消费（焦点保留）"); }
+  });
+
+  // ---- toolbar / filters -----------------------------------------
+  $("#search").addEventListener("input", function(e){ state.q=e.target.value.toLowerCase().trim(); renderList(); });
+  $("#filters").addEventListener("click", function(e){
+    var c = e.target.closest(".chip"); if(!c) return;
+    $("#filters").querySelectorAll(".chip").forEach(function(x){x.classList.remove("on");});
+    c.classList.add("on"); state.filter=c.getAttribute("data-f"); renderList();
+  });
+  $("#btnOpen").onclick = function(){ openWindow(state.current); };
+  $("#btnNew").onclick = function(){ openWindow(state.current); log("sys","[win] new window → 独立 CLR 槽 / 独立静态状态"); };
+  $("#btnClear").onclick = function(){ $("#log").innerHTML=""; log("sys","log cleared"); };
+
+  // ---- boot -------------------------------------------------------
+  renderList();
+  renderInspector();
+  log("sys", "NexOS interactive prototype ready · "+APPS.length+" apps");
+  log("sys", META.contract||"");
+  openWindow(state.current);
+})();
+</script>
+</body>
+</html>

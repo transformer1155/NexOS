@@ -27,7 +27,11 @@ param(
     [switch]$WhatIf
 )
 
-$ErrorActionPreference = 'Stop'
+# VBoxManage writes its conversion progress to STDERR.  Under Windows
+# PowerShell 5.1 a native command's stderr becomes an ErrorRecord, and with
+# 'Stop' that aborts the script at convertfromraw (leaving the VM on the old
+# disk).  Every VBoxManage call below checks $LASTEXITCODE explicitly instead.
+$ErrorActionPreference = 'Continue'
 
 function Find-VBoxManage {
     $candidates = @(
@@ -62,15 +66,22 @@ if ($running -match [regex]::Escape('"' + $VmName + '"')) {
 }
 
 # --- 1) detach so VBoxManage will let us replace the file ---------------------
-$attached = $false
+$attachedPath = $null
 $info = & $VBoxManage showvminfo $VmName --machinereadable
 foreach ($line in $info) {
     if ($line -match '^"IDE-0-0"="(.+)"') {
-        $attachedPath = $Matches[1]
-        if ($attachedPath -eq $vdi) { $attached = $true }
+        # --machinereadable escapes backslashes as "\\".  Keep the last
+        # non-"none" value: some VirtualBox versions also emit a stale
+        # "none" line for the same port.
+        $candidate = $Matches[1].Replace('\\', '\').Trim()
+        if ($candidate -ne 'none') { $attachedPath = $candidate }
     }
 }
-Write-Host "[vbox] attached as IDE-0-0: $attached"
+# Whether a disk is attached at all -- NOT whether the path string matched.
+# VirtualBox can also drop the attachment when the file under a registered
+# medium is replaced, so the final step re-attaches unconditionally anyway.
+$attached = ($attachedPath -and $attachedPath -ne 'none')
+Write-Host "[vbox] attached as IDE-0-0: $attached ($attachedPath)"
 if ($WhatIf) {
     Write-Host '[vbox] -WhatIf: would detach, convert and re-attach'
     return
@@ -100,27 +111,28 @@ Write-Host "[vbox] keeping medium UUID: $oldUuid"
 
 $tmp = "$vdi.new.vdi"
 if (Test-Path $tmp) { Remove-Item $tmp -Force }
-& $VBoxManage convertfromraw $raw $tmp --format VDI
+& $VBoxManage convertfromraw $raw $tmp --format VDI 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "convertfromraw failed rc=$LASTEXITCODE" }
 if (-not (Test-Path $tmp)) { throw 'convertfromraw produced no file' }
-& $VBoxManage internalcommands sethduuid $tmp $oldUuid
+& $VBoxManage internalcommands sethduuid $tmp $oldUuid 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "sethduuid failed rc=$LASTEXITCODE (the VM would report the disk inaccessible)" }
 
-# --- 3) swap in the new container and re-attach -----------------------------
+# --- 3) swap in the new container and ALWAYS re-attach -------------------
+# Do not gate this on the probe above: a replaced file can make VirtualBox
+# report the medium as detached, and leaving the VM diskless is worse than
+# re-attaching a disk that was already attached.
 $backup = "$vdi.prev"
 if (Test-Path $backup) { Remove-Item $backup -Force }
 Move-Item -Path $vdi -Destination $backup -Force
 Move-Item -Path $tmp -Destination $vdi -Force
 Write-Host ("[vbox] vdi rebuilt: {0:N0} bytes (previous kept as {1})" -f (Get-Item $vdi).Length, $backup)
 
-if ($attached) {
+& $VBoxManage storageattach $VmName --storagectl IDE --port 0 --device 0 --type hdd --medium $vdi
+if ($LASTEXITCODE -ne 0) {
+    # never leave the VM diskless: put the old container back
+    Move-Item -Path $vdi -Destination "$vdi.failed" -Force
+    Move-Item -Path $backup -Destination $vdi -Force
     & $VBoxManage storageattach $VmName --storagectl IDE --port 0 --device 0 --type hdd --medium $vdi
-    if ($LASTEXITCODE -ne 0) {
-        # never leave the VM diskless: put the old container back
-        Move-Item -Path $vdi -Destination "$vdi.failed" -Force
-        Move-Item -Path $backup -Destination $vdi -Force
-        & $VBoxManage storageattach $VmName --storagectl IDE --port 0 --device 0 --type hdd --medium $vdi
-        throw "storageattach (re-attach) failed rc=$LASTEXITCODE -- restored the previous container"
-    }
+    throw "storageattach (re-attach) failed rc=$LASTEXITCODE -- restored the previous container"
 }
 Write-Host '[vbox] done: VM disk now contains the current build'

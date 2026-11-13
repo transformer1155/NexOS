@@ -167,12 +167,16 @@ start:
     test word [0x5300], 0x0080
     jz .vbe_enum_skip
 
-    ; Check BitsPerPixel: accept 32, 24, or 16 (broader hardware support)
+    ; Check BitsPerPixel: PREFER 32bpp (required for the enumerated candidate)
+    ; The whole GUI (backbuffer, present(), boot beacons, the managed shell)
+    ; is built around a 32-bit-per-pixel framebuffer.  Accepting 16bpp here
+    ; made stage2 pick 1024x768x16 on VirtualBox, and every 32-bit store
+    ; into that surface then landed half a row off -- the classic "purple
+    ; vertical stripes" desktop.  32bpp is therefore REQUIRED for an
+    ; enumerated candidate; vbe_query_only still accepts 24/16 as a last
+    ; resort for hardware that offers nothing else, and it then records the
+    ; matching pixel_format so the kernel can convert correctly.
     cmp byte [0x5300 + 25], 32
-    je .vbe_bpp_ok
-    cmp byte [0x5300 + 25], 24
-    je .vbe_bpp_ok
-    cmp byte [0x5300 + 25], 16
     je .vbe_bpp_ok
     jmp .vbe_enum_skip
 .vbe_bpp_ok:
@@ -396,26 +400,43 @@ start:
 .vbe_set_failed:
     ; INT 10h 0x4F02 failed (QEMU SeaBIOS may reject repeated mode set).
     ; Try direct Bochs VBE ports (0x1CE/0x1CF) which QEMU always honours.
+    ; NOTE: the DISPI register indices are
+    ;   0=ID  1=XRES  2=YRES  3=BPP  4=ENABLE
+    ; The previous code used 4/5/1 (XRES/YRES/ENABLE), i.e. it was writing the
+    ; resolution into the ENABLE register and the mode was never actually
+    ; applied.  Also always force 32bpp, because the whole GUI is a 32-bit
+    ; backbuffer.
     mov dx, 0x1CE                 ; VBE_DISPI_IOPORT_INDEX
-    mov ax, 0x0004                ; VBE_DISPI_INDEX_XRES
+    mov ax, 0x0001                ; VBE_DISPI_INDEX_XRES
     out dx, ax
     mov dx, 0x1CF
     mov ax, [0x5300 + 18]         ; width from VBE info block
     out dx, ax
     mov dx, 0x1CE
-    mov ax, 0x0005                ; VBE_DISPI_INDEX_YRES
+    mov ax, 0x0002                ; VBE_DISPI_INDEX_YRES
     out dx, ax
     mov dx, 0x1CF
     mov ax, [0x5300 + 20]         ; height
     out dx, ax
     mov dx, 0x1CE
-    mov ax, 0x0001                ; VBE_DISPI_INDEX_ENABLE
+    mov ax, 0x0003                ; VBE_DISPI_INDEX_BPP
+    out dx, ax
+    mov dx, 0x1CF
+    mov ax, 32                    ; force 32bpp
+    out dx, ax
+    mov dx, 0x1CE
+    mov ax, 0x0004                ; VBE_DISPI_INDEX_ENABLE
     out dx, ax
     mov dx, 0x1CF
     mov ax, 0x0041                ; ENABLE | LFB_ENABLED (0x40 + 0x01)
     out dx, ax
 
     mov byte [0x500E], 1          ; vbe_mode_set = 1 (via BGA ports)
+    mov byte [0x5008], 32         ; bpp = 32
+    mov ax, [0x5300 + 18]
+    shl ax, 2
+    mov [0x5009], ax              ; pitch = width * 4
+    mov byte [0x500F], 0          ; pixel_format = BGRX32
 
     mov dx, 0x3F8
     mov al, 'B'                   ; 'B' = BGA fallback succeeded
@@ -442,28 +463,36 @@ start:
     jb .vbe_skip                  ; not a BGA adapter, give up
 
     ; Set a default 1024x768x32 mode via BGA ports (works in 32-bit PM).
+    ; DISPI indices: 0=ID 1=XRES 2=YRES 3=BPP 4=ENABLE
     mov dx, 0x1CE
-    mov ax, 0x0004                ; XRES
+    mov ax, 0x0001                ; XRES
     out dx, ax
     mov dx, 0x1CF
     mov ax, 1024
     out dx, ax
     mov dx, 0x1CE
-    mov ax, 0x0005                ; YRES
+    mov ax, 0x0002                ; YRES
     out dx, ax
     mov dx, 0x1CF
     mov ax, 768
     out dx, ax
     mov dx, 0x1CE
-    mov ax, 0x0001                ; ENABLE
+    mov ax, 0x0003                ; BPP
+    out dx, ax
+    mov dx, 0x1CF
+    mov ax, 32
+    out dx, ax
+    mov dx, 0x1CE
+    mov ax, 0x0004                ; ENABLE
     out dx, ax
     mov dx, 0x1CF
     mov ax, 0x0041                ; ENABLE | LFB_ENABLED
     out dx, ax
 
-    ; Tell the kernel about this mode (Bochs Cirrus LFB is typically
-    ; at 0xFE000000; 0xFD000000 is the legacy Bochs VBE LFB address).
-    mov dword [0x5000], 0xFE000000   ; framebuffer_phys (32-bit, kernel can read it)
+    ; Tell the kernel about this mode.  Bochs/QEMU expose the VBE LFB at
+    ; 0xE0000000 (that is what the real BIOS path reports and what the
+    ; kernel's low-framebuffer map expects), so use that address here.
+    mov dword [0x5000], 0xE0000000   ; framebuffer_phys (32-bit, kernel can read it)
     mov word  [0x5004], 1024         ; width
     mov word  [0x5006], 768          ; height
     mov byte  [0x5008], 32           ; bpp
@@ -471,6 +500,7 @@ start:
     mov word  [0x500B], 0x144        ; mode number (1024x768x32)
     mov byte  [0x500D], 1            ; vbe_ok
     mov byte  [0x500E], 1            ; vbe_mode_set (BGA ports succeeded)
+    mov byte  [0x500F], 0            ; pixel_format = BGRX32
 
     mov dx, 0x3F8
     mov al, 'G'                   ; 'G' = BGA fallback mode set
@@ -594,6 +624,27 @@ vbe_query_only:
     mov [0x5008], al
     mov ax, [0x5300 + 16]
     mov [0x5009], ax
+
+    ; Store the PIXEL FORMAT at 0x500F so the kernel knows how to convert
+    ; from its 32-bit backbuffer into this surface.  Without this field the
+    ; kernel always assumed BGRX32 and, on a 16bpp surface, every row landed
+    ; half a line off -- the classic "purple vertical stripes" desktop.
+    ;   32bpp -> 0 (BGRX32, kernel default)
+    ;   24bpp -> 2 (RGB24, 3 bytes/pixel)
+    ;   16bpp -> 3 (RGB565, 2 bytes/pixel)
+    mov al, [0x5300 + 25]
+    cmp al, 32
+    je .vqo_fmt_ok32
+    cmp al, 24
+    je .vqo_fmt_ok24
+    mov byte [0x500F], 3            ; 16bpp -> RGB565
+    jmp .vqo_fmt_done
+.vqo_fmt_ok24:
+    mov byte [0x500F], 2            ; 24bpp -> RGB24
+    jmp .vqo_fmt_done
+.vqo_fmt_ok32:
+    mov byte [0x500F], 0            ; 32bpp -> BGRX32
+.vqo_fmt_done:
 
     popa
     clc                            ; success

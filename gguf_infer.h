@@ -39,6 +39,28 @@ const float* qwen_forward(int32_t token, int32_t pos);
 int32_t qwen_sample(const float* logits, float temp, float top_p);
 void qwen_reset(void);       // clear KV cache / position
 
+// Quantisation control.  mode 1 (default) uses int8-quantised activations
+// (W4A8/W8A8 integer dot products); mode 0 falls back to float dots.
+void qwen_set_quant_mode(int mode);
+int  qwen_quant_mode(void);
+
+// ---- resumable / asynchronous generation -----------------------------
+// qwen_gen_begin() tokenises the prompt and arms the first forward.
+// qwen_gen_slice(layers, piece, cap) then runs AT MOST `layers` transformer
+// layers per call and returns 1 (still running), 0 (finished) or -1 (error).
+// `piece` receives any text produced by that slice.  The host GUI calls
+// qwen_gen_slice() a few layers at a time from its frame loop so the mouse
+// keeps moving while the model decodes.
+#define QWEN_GEN_IDLE   0
+#define QWEN_GEN_RUN    1
+#define QWEN_GEN_DONE   2
+#define QWEN_GEN_ERROR  3
+int  qwen_gen_begin(const char* prompt, int max_new, float temp);
+int  qwen_gen_slice(int layers, char* piece, int piece_cap);
+int  qwen_gen_status(void);
+int  qwen_gen_produced(void);
+void qwen_gen_abort(void);
+
 // Full prompt -> streamed completion.  emit() receives UTF-8 pieces.
 typedef void (*QwenEmitFn)(const char* piece);
 int  qwen_generate(const char* prompt, int max_new, float temp, QwenEmitFn emit);

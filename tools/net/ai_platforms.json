@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "description": "Host-side AI platform registry. API keys are NEVER stored here in plaintext for real accounts: set the environment variable named by key_env on the host, or put secrets in ai_platforms.local.json (gitignored). Models listed here plus apps.json 'models' plus app-registered models form the shared catalogue.",
+  "default_platform": "opencode",
+  "quota": {
+    "reset": "daily",
+    "per_app_default": { "daily_requests": 100 },
+    "per_app": {}
+  },
+  "platforms": [
+    {
+      "id": "opencode",
+      "type": "openai-compatible",
+      "base_url": "https://opencode.ai/zen/v1",
+      "key_env": "OPENCODE_ZEN_KEY",
+      "key": "public",
+      "timeout": 60,
+      "models": ["nexos-auto"],
+      "quota": { "enabled": true, "daily_requests": 200, "daily_tokens": 200000 }
+    },
+    {
+      "id": "openai",
+      "type": "openai-compatible",
+      "base_url": "https://api.openai.com/v1",
+      "key_env": "OPENAI_API_KEY",
+      "key": "",
+      "timeout": 60,
+      "models": ["gpt-4o-mini"],
+      "quota": { "enabled": true, "daily_requests": 100, "daily_tokens": 100000 }
+    },
+    {
+      "id": "deepseek",
+      "type": "openai-compatible",
+      "base_url": "https://api.deepseek.com/v1",
+      "key_env": "DEEPSEEK_API_KEY",
+      "key": "",
+      "timeout": 60,
+      "models": ["deepseek-chat"],
+      "quota": { "enabled": true, "daily_requests": 100, "daily_tokens": 100000 }
+    },
+    {
+      "id": "claude",
+      "type": "openai-compatible",
+      "base_url": "https://api.anthropic.com/v1",
+      "key_env": "ANTHROPIC_API_KEY",
+      "key": "",
+      "timeout": 60,
+      "models": ["claude-3-5-sonnet"],
+      "quota": { "enabled": false, "daily_requests": 50, "daily_tokens": 50000 }
+    },
+    {
+      "id": "tongyi",
+      "type": "openai-compatible",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "key_env": "DASHSCOPE_API_KEY",
+      "key": "",
+      "timeout": 60,
+      "models": ["qwen-plus"],
+      "quota": { "enabled": true, "daily_requests": 100, "daily_tokens": 100000 }
+    },
+    {
+      "id": "local-gguf",
+      "type": "local-gguf",
+      "base_url": "",
+      "key_env": "",
+      "key": "",
+      "timeout": 30,
+      "models": ["qwen2-0.5b-instruct-q4_k_m"],
+      "quota": { "enabled": true, "daily_requests": 0, "daily_tokens": 0 }
+    }
+  ],
+  "apps": {}
+}
+{
+  "schema_version": 1,
+  "description": "Host-side AI platform registry. API keys are NEVER stored here in plaintext for real accounts: set the environment variable named by key_env on the host, or put secrets in ai_platforms.local.json (gitignored). Models listed here plus apps.json 'models' plus app-registered models form the shared catalogue.",
+  "default_platform": "opencode",
+  "quota": {
+    "reset": "daily",
+    "per_app_default": { "daily_requests": 100 },
+    "per_app": {}
+  },
+  "platforms": [
+    {
+      "id": "opencode",
+      "type": "openai-compatible",
+      "base_url": "https://opencode.ai/zen/v1",
+      "key_env": "OPENCODE_ZEN_KEY",
+      "key": "public",
+      "timeout": 60,
+      "models": ["nexos-auto"],
+      "quota": { "enabled": true, "daily_requests": 200, "daily_tokens": 200000 }
+    },
+    {
+      "id": "openai",
+      "type": "openai-compatible",
+      "base_url": "https://api.openai.com/v1",
+      "key_env": "OPENAI_API_KEY",
+      "key": "",
+      "timeout": 60,
+      "models": ["gpt-4o-mini"],
+      "quota": { "enabled": true, "daily_requests": 100, "daily_tokens": 100000 }
+    },
+    {
+      "id": "deepseek",
+      "type": "openai-compatible",
+      "base_url": "https://api.deepseek.com/v1",
+      "key_env": "DEEPSEEK_API_KEY",
+      "key": "",
+      "timeout": 60,
+      "models": ["deepseek-chat"],
+      "quota": { "enabled": true, "daily_requests": 100, "daily_tokens": 100000 }
+    },
+    {
+      "id": "claude",
+      "type": "openai-compatible",
+      "base_url": "https://api.anthropic.com/v1",
+      "key_env": "ANTHROPIC_API_KEY",
+      "key": "",
+      "timeout": 60,
+      "models": ["claude-3-5-sonnet"],
+      "quota": { "enabled": false, "daily_requests": 50, "daily_tokens": 50000 }
+    },
+    {
+      "id": "tongyi",
+      "type": "openai-compatible",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "key_env": "DASHSCOPE_API_KEY",
+      "key": "",
+      "timeout": 60,
+      "models": ["qwen-plus"],
+      "quota": { "enabled": true, "daily_requests": 100, "daily_tokens": 100000 }
+    },
+    {
+      "id": "local-gguf",
+      "type": "local-gguf",
+      "base_url": "",
+      "key_env": "",
+      "key": "",
+      "timeout": 30,
+      "models": ["qwen2-0.5b-instruct-q4_k_m"],
+      "quota": { "enabled": true, "daily_requests": 0, "daily_tokens": 0 }
+    }
+  ],
+  "apps": {}
+}
+{
+  "schema_version": 1,
+  "description": "Host-side AI platform registry. API keys are NEVER stored here in plaintext for real accounts: set the environment variable named by key_env on the host, or put secrets in ai_platforms.local.json (gitignored). Models listed here plus apps.json 'models' plus app-registered models form the shared catalogue.",
+  "default_platform": "opencode",
+  "quota": {
+    "reset": "daily",
+    "per_app_default": { "daily_requests": 100 },
+    "per_app": {}
+  },
+  "platforms": [
+    {
+      "id": "opencode",
+      "type": "openai-compatible",
+      "base_url": "https://opencode.ai/zen/v1",
+      "key_env": "OPENCODE_ZEN_KEY",
+      "key": "public",
+      "timeout": 60,
+      "models": ["nexos-auto"],
+      "quota": { "enabled": true, "daily_requests": 200, "daily_tokens": 200000 }
+    },
+    {
+      "id": "openai",
+      "type": "openai-compatible",
+      "base_url": "https://api.openai.com/v1",
+      "key_env": "OPENAI_API_KEY",
+      "key": "",
+      "timeout": 60,
+      "models": ["gpt-4o-mini"],
+      "quota": { "enabled": true, "daily_requests": 100, "daily_tokens": 100000 }
+    },
+    {
+      "id": "deepseek",
+      "type": "openai-compatible",
+      "base_url": "https://api.deepseek.com/v1",
+      "key_env": "DEEPSEEK_API_KEY",
+      "key": "",
+      "timeout": 60,
+      "models": ["deepseek-chat"],
+      "quota": { "enabled": true, "daily_requests": 100, "daily_tokens": 100000 }
+    },
+    {
+      "id": "claude",
+      "type": "openai-compatible",
+      "base_url": "https://api.anthropic.com/v1",
+      "key_env": "ANTHROPIC_API_KEY",
+      "key": "",
+      "timeout": 60,
+      "models": ["claude-3-5-sonnet"],
+      "quota": { "enabled": false, "daily_requests": 50, "daily_tokens": 50000 }
+    },
+    {
+      "id": "tongyi",
+      "type": "openai-compatible",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "key_env": "DASHSCOPE_API_KEY",
+      "key": "",
+      "timeout": 60,
+      "models": ["qwen-plus"],
+      "quota": { "enabled": true, "daily_requests": 100, "daily_tokens": 100000 }
+    },
+    {
+      "id": "local-gguf",
+      "type": "local-gguf",
+      "base_url": "",
+      "key_env": "",
+      "key": "",
+      "timeout": 30,
+      "models": ["qwen2-0.5b-instruct-q4_k_m"],
+      "quota": { "enabled": true, "daily_requests": 0, "daily_tokens": 0 }
+    }
+  ],
+  "apps": {}
+}

@@ -147,6 +147,7 @@ namespace NexOS.Forms
             if (Has(l, "about") != 0      || Has(l, "关于") != 0) return Kind.About;
             if (Has(l, "net") != 0        || Has(l, "网络") != 0 || Has(l, "诊断") != 0) return Kind.NetTools;
             if (Has(l, "agent") != 0      || Has(l, "ai") != 0 || Has(l, "助手") != 0) return Kind.AiAgent;
+            if (Has(l, "chat") != 0       || Has(l, "聊天") != 0 || Has(l, "对话") != 0) return Kind.AiChat;
             if (Has(l, "memory") != 0     || Has(l, "内存") != 0 || Has(l, "optim") != 0 || Has(l, "优化") != 0) return Kind.MemOptimizer;
             if (Has(l, "demo") != 0) return Kind.Demo;
             return -1;

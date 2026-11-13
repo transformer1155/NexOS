@@ -46,6 +46,7 @@ static inline int         mforms_desktop_key(int) { return 0; }
 static inline int         mforms_desktop_menu(int) { return -1; }
 static inline void        mforms_set_running(uint32_t) {}
 static inline void        mforms_set_ime(int) {}
+static inline int         mforms_ime_anchor(int, int*, int*) { return 0; }
 static inline int         mforms_paint_failed(int) { return 0; }
 #endif
 

@@ -138,6 +138,12 @@ namespace NexOS.Forms
         // CN / EN indicator (previously the indicator was native-only and
         // gated off the managed desktop, so it never showed).
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ImeMode();
+        // IME candidate / pre-edit popup anchor.  A focused text control
+        // publishes its caret (or input-box) origin in CLIENT coordinates
+        // while painting; the native compositor converts it to screen space
+        // and places the candidate bar directly above that field instead of
+        // pinning it to the top of the screen.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void SetImeAnchor(int x, int y);
         // BUG-3: device pixel ratio for the font rasteriser.  1 = 1:1, 2 = each
         // glyph is rendered at 2x and box-filtered down (the fix for the blurry
         // pre-rendered font).  The kernel mirrors this into g_dpr and calls
@@ -170,6 +176,15 @@ namespace NexOS.Forms
         // volume (0=mkfs).
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int WriteText(int fs, string name, string text);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern string Exec(string cmd);
+
+        // ---- asynchronous local-model inference ------------------------
+        // AiStart arms a background, frame-driven decode job and returns at
+        // once; AiPoll returns the text produced since the last poll;
+        // AiStatus: 0 idle, 1 running, 2 done, 3 error; AiCancel aborts.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int AiStart(string prompt);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern string AiPoll();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int AiStatus();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void AiCancel();
         // Execute a native Windows PE image (.exe) through the kernel's
         // win32 / win64 PE loader and surface the windows it creates on the
         // desktop -- the same path as `winapp foo.exe` at the prompt.  This
@@ -181,6 +196,18 @@ namespace NexOS.Forms
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void Reboot();
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern void Log(string s);
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern string CharStr(int ch);
+
+        // ---- OS API layer 0: error channel / ABI / handles --------------
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void SetLastError(int code);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int  LastError();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern void ClearError();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int  ApiVersion();
+        // Bit n set = capability n present.  Gate every optional icall on it.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int  CapsMask();
+        public static bool HasCap(int cap) { return (CapsMask() & (1 << cap)) != 0; }
+        // Handles: kind/slot/rights in, packed h_t out (0 = failure).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int  HandleAlloc(int kind, int slot, int rights);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int  HandleClose(int h);
         // Shared clipboard (mirrors the kernel terminal clipboard) so copy in
         // one app can be pasted in another and in the text terminal.
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern string GetClipboard();
@@ -295,6 +322,34 @@ namespace NexOS.Forms
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int AudioAvailable();
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern string AudioInfo();
         [MethodImpl(MethodImplOptions.InternalCall)] public static extern int AudioPlay(string pcm, int nframes);
+
+        // ---- standalone application registry (sfs_files/apps.man) --------
+        // The 64-bit kernel parses the manifest at boot; the shell has NO
+        // compiled-in app list.  These icalls are the only way managed code
+        // learns which applications exist.  32-bit builds return 0 / "".
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int AppCount();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int AppKind(int idx);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern string AppName(int idx);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern string AppMex(int idx);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int AppColor(int idx);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int AppLetter(int idx);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern string AppDesc(int idx);
+        // Reverse lookup used by .lnk shortcuts whose body is a .mex name.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int AppKindByMex(string mex);
+
+        // ---- APMS (Application Problem / Performance Management) ----------
+        // Kernel-side operations service: event ring, serial-log tail,
+        // framebuffer screenshot and the Markdown bug report on the data
+        // disk.  ApmsCapture(scale) writes apms_shot.ppm and returns its
+        // byte count.  ApmsReport(text) combines the user's description
+        // with telemetry/events/log and writes apms_report.md.
+        // ApmsStatus() returns the number of recorded events.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ApmsStatus();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern string ApmsEvent(int idx);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern string ApmsLogTail();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ApmsCapture(int scale);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ApmsReport(string text);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ApmsClear();
     }
 #endif // !WINHOST
 
@@ -346,6 +401,11 @@ namespace NexOS.Forms
     // =================================================================
     public class TBox
     {
+        // Newline as a named constant: char literals with an escape are
+        // mangled by the MiniCLR compiler, and a silent zero would make
+        // every line-lookup return 0.
+        const char NL = (char)10;
+
         public string text = "";
         public int cursor = 0;            // caret index (0..len)
         public int selA = 0, selB = 0;    // selection [selA, selB); equal => none
@@ -367,6 +427,20 @@ namespace NexOS.Forms
                 undoSp++;
             }
         }
+        // Redo restores the state captured by the most recent Undo.  Full undo/
+        // redo stacks are more machinery than this editor needs, and MiniCLR has
+        // no generics to build them with.
+        int    redoLen = -1;
+        string redoText;
+        int    redoCursor;
+        public void Redo()
+        {
+            if (redoLen < 0) return;
+            text = redoText;
+            cursor = redoCursor;
+            selA = selB = cursor;
+            redoLen = -1;
+        }
         public void Undo() {
             if (undoSp > 0) {
                 undoSp--;
@@ -376,15 +450,19 @@ namespace NexOS.Forms
             }
         }
         // Insert s at the caret, replacing any active selection.
+        // A MiniCLR string is a UTF-8 BYTE array, so rebuilding the text by
+        // per-byte Host.CharStr(text[i]) loops -- as Insert/Backspace/Delete
+        // once did -- re-UTF-8-encoded every byte of an existing CJK char
+        // (E4 -> C3 A4 ...), corrupting the whole buffer on every edit made
+        // after the first Chinese character.  Rebuild with byte-based StrSub
+        // slices instead: they pass the raw UTF-8 through untouched, and are
+        // O(n) with one allocation rather than the O(n^2) Cat loop.
         public void Insert(string s) {
             int a = selA, b = selB; if (a > b) { int t = a; a = b; b = t; }
             PushUndo();
-            string r = "";
-            int i = 0;
-            for (i = 0; i < a; i++) r = U.Cat(r, Host.CharStr((int)text[i]));
-            r = U.Cat(r, s);
-            for (i = b; i < text.Length; i++) r = U.Cat(r, Host.CharStr((int)text[i]));
-            text = r;
+            string head = NexOS.Sys.StrSub(text, 0, a);
+            string tail = NexOS.Sys.StrSub(text, b, text.Length - b);
+            text = U.Cat(U.Cat(head, s), tail);
             cursor = a + s.Length;
             selA = selB = cursor;
         }
@@ -392,12 +470,16 @@ namespace NexOS.Forms
             if (selA != selB) { Insert(""); return; }
             if (cursor > 0) {
                 PushUndo();
-                string r = "";
-                int i = 0;
-                for (i = 0; i < cursor - 1; i++) r = U.Cat(r, Host.CharStr((int)text[i]));
-                for (i = cursor; i < text.Length; i++) r = U.Cat(r, Host.CharStr((int)text[i]));
-                text = r;
-                cursor = cursor - 1;
+                // Remove one CODEPOINT: back over UTF-8 continuation bytes so
+                // a CJK char (3 bytes) goes away whole instead of leaving a
+                // broken sequence behind.
+                int k = cursor;
+                while (k > 0 && ((int)text[k - 1] & 0xC0) == 0x80) k--;
+                if (k > 0) k--;
+                string head = NexOS.Sys.StrSub(text, 0, k);
+                string tail = NexOS.Sys.StrSub(text, cursor, text.Length - cursor);
+                text = U.Cat(head, tail);
+                cursor = k;
                 selA = selB = cursor;
             }
         }
@@ -405,20 +487,21 @@ namespace NexOS.Forms
             if (selA != selB) { Insert(""); return; }
             if (cursor < text.Length) {
                 PushUndo();
-                string r = "";
-                int i = 0;
-                for (i = 0; i < cursor; i++) r = U.Cat(r, Host.CharStr((int)text[i]));
-                for (i = cursor + 1; i < text.Length; i++) r = U.Cat(r, Host.CharStr((int)text[i]));
-                text = r;
+                // Remove the whole codepoint after the caret (1 ASCII byte or
+                // one multi-byte UTF-8 sequence).
+                int k = cursor + 1;
+                while (k < text.Length && ((int)text[k] & 0xC0) == 0x80) k++;
+                string head = NexOS.Sys.StrSub(text, 0, cursor);
+                string tail = NexOS.Sys.StrSub(text, k, text.Length - k);
+                text = U.Cat(head, tail);
                 selA = selB = cursor;
             }
         }
         public string GetSelection() {
             if (selA == selB) return "";
             int a = selA, b = selB; if (a > b) { int t = a; a = b; b = t; }
-            string r = "";
-            for (int i = a; i < b; i++) r = U.Cat(r, Host.CharStr((int)text[i]));
-            return r;
+            // Raw UTF-8 bytes of the selection (byte-safe for CJK).
+            return NexOS.Sys.StrSub(text, a, b - a);
         }
         public void SelectAll() { selA = 0; selB = text.Length; }
         public void MoveLeft()  { if (cursor > 0) cursor--; selA = selB = cursor; }
@@ -428,12 +511,111 @@ namespace NexOS.Forms
 
         // Route a keystroke.  ch is a codepoint (>=32), a negative virtual
         // key, or -1/-8 (backspace).  Returns true if consumed.
+        // ---- line / column helpers ---------------------------------------
+        // A caret is an offset into the text, so "current line" and "column"
+        // are a single scan.  These live on TBox rather than in one app so every
+        // editor shares one definition of where the caret is.
+        public int LineOf(int pos)
+        {
+            if (pos < 0) pos = 0;
+            if (pos > text.Length) pos = text.Length;
+            int line = 0;
+            for (int i = 0; i < pos; i++) if (text[i] == NL) line++;
+            return line;
+        }
+        public int ColOf(int pos)
+        {
+            if (pos < 0) pos = 0;
+            if (pos > text.Length) pos = text.Length;
+            int col = 0;
+            for (int i = 0; i < pos; i++) { if (text[i] == NL) col = 0; else col++; }
+            return col;
+        }
+        public int LineCount()
+        {
+            int n = 1;
+            for (int i = 0; i < text.Length; i++) if (text[i] == NL) n++;
+            return n;
+        }
+        public int LineStart(int want)
+        {
+            int line = 0, i = 0;
+            while (i < text.Length)
+            {
+                if (line == want) return i;
+                if (text[i] == NL) line++;
+                i++;
+            }
+            return text.Length;
+        }
+        // Move the caret to the SAME COLUMN on another line, clamped to that
+        // line's length.  Snapping to the line start would make Up/Down feel
+        // broken on any line shorter than the one the caret left.
+        public void MoveVertical(int delta)
+        {
+            int line = LineOf(cursor);
+            int col  = ColOf(cursor);
+            int want = line + delta;
+            if (want < 0) want = 0;
+            int last = LineCount() - 1;
+            if (want > last) want = last;
+            int start = LineStart(want);
+            int len = 0;
+            while (start + len < text.Length && text[start + len] != NL) len++;
+            int target = start + (col < len ? col : len);
+            if (target > text.Length) target = text.Length;
+            cursor = target;
+            selA = selB = cursor;
+        }
+        public void MoveHome() { cursor = LineStart(LineOf(cursor)); selA = selB = cursor; }
+        public void MoveEnd()
+        {
+            int start = LineStart(LineOf(cursor));
+            int p = start;
+            while (p < text.Length && text[p] != NL) p++;
+            cursor = p; selA = selB = cursor;
+        }
+        // Shift+arrow: keep the anchor, move the caret, selection follows.
+        public void ExtendVertical(int delta)
+        {
+            int anchor = selA;
+            MoveVertical(delta);
+            selA = anchor; selB = cursor;
+            if (selA > selB) { int t = selA; selA = selB; selB = t; }
+        }
+
+        // Character constants instead of '\n' literals: MiniCLR's char handling
+        // is fragile and an escape inside a char literal was silently dropped.
         public bool Key(int ch) {
             if (ch == -1 || ch == 8)  { Backspace(); return true; }                              // backspace
             if (ch == -3) { string s = GetSelection(); if (s == "") s = text; Host.SetClipboard(s); return true; } // Ctrl+C
             if (ch == -4) { Insert(Host.GetClipboard()); return true; }                          // Ctrl+V
             if (ch == -5) { Undo(); return true; }                                                // Ctrl+Z
             if (ch == -6) { SelectAll(); return true; }                                           // Ctrl+A
+            // Caret movement.  These codes come from Program.cs's key mapping
+            // (the kernel forwards -1..-17 for the non-character keys).
+            if (ch == -7)  { MoveLeft();      return true; }                                      // Left
+            if (ch == -8)  { MoveRight();     return true; }                                      // Right
+            if (ch == -11) { MoveVertical(-1);  return true; }                                    // Up
+            if (ch == -12) { MoveVertical(1);   return true; }                                    // Down
+            if (ch == -13) { MoveHome();      return true; }                                      // Home
+            if (ch == -14) { MoveEnd();       return true; }                                      // End
+            if (ch == -15) { MoveVertical(-10); return true; }                                    // PageUp
+            if (ch == -16) { MoveVertical(10);  return true; }                                    // PageDown
+            if (ch == -17) { Delete();        return true; }                                      // Delete
+            // Ctrl+X (cut).  MiniCLR has neither Substring nor Remove, so the
+            // removal is rebuilt here: prefix via StrSub + suffix via StrSub.
+            if (ch == -18) {
+                int a = selA, b = selB;
+                if (a > b) { int t = a; a = b; b = t; }
+                string cut = NexOS.Sys.StrSub(text, a, b - a);
+                Host.SetClipboard(cut);
+                string head2 = NexOS.Sys.StrSub(text, 0, a);
+                string tail2 = NexOS.Sys.StrSub(text, b, text.Length - b);
+                text = U.Cat(head2, tail2);
+                cursor = a; selA = selB = a;
+                return true;
+            }
             if ((ch >= 32 && ch < 127) || (ch >= 0x80 && ch <= 0xFFFF)) { Insert(Host.CharStr(ch)); return true; }
             return false;
         }
@@ -1052,7 +1234,15 @@ namespace NexOS.Forms
         {
             if (cmd == null) return;
             if (NexOS.Sys.StrLen(cmd) == 0) return;
+#if !STANDALONE_APP
+            // Voice.cs is shell-side code (it drives synthetic clicks through
+            // Desktop/Shell).  A standalone application still compiles against
+            // the same control API, it just registers no voice binding: the
+            // menu/button renders and responds to the mouse exactly as before,
+            // only voice activation is unavailable until the voice engine is
+            // made a Host service rather than a shell module.
             NexOS.Forms.Voice.Register(cmd, x, y, w, h);
+#endif
         }
 
         // -----------------------------------------------------------------
@@ -1231,7 +1421,13 @@ namespace NexOS.Forms
         // File Explorer shows a file-action menu on its rows).
         public virtual void OnRightClick(int mx, int my, int ox, int oy)
         {
+#if !STANDALONE_APP
+            // The desktop owns the shared window menu.  A standalone application
+            // has no Desktop class (that is shell code), so it simply does not
+            // offer this menu; the button is not a dead zone either way because
+            // the app's own handler still ran.
             if (HitControl(mx, my) >= 0) Desktop.OpenWinMenu(id, ox + mx, oy + my);
+#endif
         }
         // Perform a file-action code from the file context menu.
         public virtual void DoFileAction(int code) { }
@@ -1246,7 +1442,15 @@ namespace NexOS.Forms
         public virtual void DoWinAction(int code)
         {
             if (code == WAct.Refresh)      OnCtxRefresh();
-            else if (code == WAct.Close)   Shell.Close(id);
+            // WAct.Close goes through the Host, not through Shell.Close().
+            //
+            // Shell.Close() lives in Shell.cs, and Forms.cs must be compilable
+            // WITHOUT the shell so a application can be built as its own
+            // assembly (NexOS.Forms + corelib only).  Host.WinAction already
+            // carries the same request to the kernel, and the comment below
+            // states that unsupported actions are no-ops, so this is the same
+            // behaviour with one less link-time dependency.
+            else if (code == WAct.Close)   Host.WinAction(id, WAct.Close);
             else if (code == WAct.Minimize) Host.WinAction(id, WAct.Minimize);
             else if (code == WAct.Maximize) Host.WinAction(id, WAct.Maximize);
             else if (code == WAct.Restore)  Host.WinAction(id, WAct.Restore);
@@ -1288,6 +1492,27 @@ namespace NexOS.Forms
     // bar right-click).  Mirrors the Win11 window menu: Restore / Move /
     // Size / Minimize / Maximize / Close - with the greyed states the OS
     // shows for the current window state.
+    // Small pure helpers shared by more than one application.  They live in
+    // the toolkit rather than in a sibling application's class so that no
+    // app has to link another app's source just to reach a function.
+    public static class AppUtil
+    {
+        // Terminal font size steps, shared by the Terminal (its own
+        // Ctrl+Plus / Ctrl+Minus) and the Control Panel (terminal settings).
+        public static int TermZoomStep(int cur, int dir)
+        {
+            int[] steps = new int[6];
+            steps[0] = 14; steps[1] = 16; steps[2] = 18;
+            steps[3] = 20; steps[4] = 22; steps[5] = 24;
+            int idx = 2;
+            for (int i = 0; i < 6; i++) if (steps[i] == cur) { idx = i; break; }
+            idx += dir; if (idx < 0) idx = 0; if (idx > 5) idx = 5;
+            return steps[idx];
+        }
+    }
+
+    // WAct: the host gesture codes the shell understands.  The desktop
+    // shows for the current window state.
     public static class WAct
     {
         public const int Restore  = 10;   // un-maximise / un-minimise
@@ -1297,5 +1522,262 @@ namespace NexOS.Forms
         public const int Maximize = 14;   // maximise to fill
         public const int Refresh  = 15;   // re-run OnCtxRefresh()
         public const int Close    = 17;   // Shell.Close(id)
+    }
+
+    // =================================================================
+    //  OS API layer 0+1 (ABI v1): error codes, capabilities, handles,
+    //  read-only permission facade.  All icalls are name+signature bound;
+    //  changing any signature requires NEX_ABI_VERSION++.
+    // =================================================================
+    public static class Err
+    {
+        public const int OK          = 0;
+        public const int NoEntry     = 1;
+        public const int BadArg      = 2;
+        public const int BadHandle   = 3;
+        public const int PermDenied  = 4;
+        public const int NameExists  = 5;
+        public const int NotFound    = 6;
+        public const int NoSpace     = 7;
+        public const int Busy        = 8;
+        public const int Broken      = 9;
+        public const int Timeout     = 10;
+        public const int TooBig      = 11;
+        public const int NoMem       = 12;
+        public const int NotSupported= 13;
+        public const int IoError     = 14;
+        public const int WouldBlock  = 15;
+        public const int CrossDev    = 16;
+        public const int NotDir      = 17;
+        public const int IsDir       = 18;
+        public const int Quota       = 19;
+        public const int Deadlk      = 20;
+        public const int Stale       = 21;
+        public const int ClrFault    = 22;
+    }
+
+    public static class Cap
+    {
+        public const int Err = 0, Handle = 1, Perm = 2, Proc = 3, Thread = 4;
+        public const int Sync = 5, Job = 6, Fs = 7, Mem = 8, Ipc = 9;
+        public const int Net = 10, Dev = 11, Clock = 12, Gfx = 13, Pkg = 14;
+        public const int Log = 15, Cfg = 16, Clr = 17, Dbg = 18;
+    }
+
+    // Read-only handle value; only ever obtained from an alloc icall.
+    // kind:8 | slot:16 | gen:8  packed into a 32-bit int.
+    public struct Handle
+    {
+        public int Raw;
+        public int Kind() { return Raw & 0xFF; }
+        public int Gen()  { return (Raw >> 24) & 0xFF; }
+        public bool Valid() { return Raw != 0; }
+        public static Handle None() { Handle h; h.Raw = 0; return h; }
+    }
+
+    // Perm: strictly read-only security facade.  There is deliberately NO
+    // SetBound*/SetToken/SetCaps here -- boundaries change only from ring 0.
+    public static class Perm
+    {
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Uid();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int FsVolMask();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int FsPrefixCount();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int FsPrefixVol(int i);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int FsPrefixMode(int i);
+        // Active check: can the current token access `path` with `mode`
+        // (FSB_RO=1 read, FSB_RW=2 write)?  Segment-boundary prefix match.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int FsCanPath(string path, int mode);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int DevAllowed(int devClass, int devId);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int NetPortAllowed(int port);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int NetAddrAllowed(int ipBe);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int SyscallAllowed(int cls);
+        public static bool CanRead(string path)  { return FsCanPath(path, 1) != 0; }
+        public static bool CanWrite(string path) { return FsCanPath(path, 2) != 0; }
+    }
+
+    // =================================================================
+    //  OS API layer 2: sync primitives, async jobs, timers.
+    //  The kernel is cooperative (no preemption), so blocking waits are
+    //  bounded: Mutex/Sem/Cond fail fast (Busy/WouldBlock) instead of
+    //  deadlocking; Event supports a bounded busy wait.
+    // =================================================================
+    public static class Sync
+    {
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int MutexNew();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Lock(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Unlock(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int SemNew(int init, int max);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int SemWait(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int SemPost(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int EventNew();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int EventWait(int h, int ms, int clear);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int EventSet(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int EventClear(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int CondNew();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int CondWait(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int CondSignal(int h, int all);
+    }
+
+    public static class Job
+    {
+        public const int Run = 0, Done = 1, Err = 2, Cancel = 3;
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Start(int kind, int goal);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Status(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Progress(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ProgressTotal(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int CancelJob(int h);
+        // driven automatically each frame by the host paint overlay
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Tick(int budget);
+    }
+
+    public static class Timer
+    {
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int New(int ms, int periodic);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Poll(int h);
+    }
+
+    // =================================================================
+    //  OS API layer 3: VFS resolve, atomic file layer, directories.
+    //  Paths are canonical absolute ("/data/..."-style); ".." never
+    //  escapes the root.  All icalls set LastError on failure.
+    // =================================================================
+    public static class Fs
+    {
+        // Resolve ".."/"." segments; returns canonical path or null (err set).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern string Resolve(string path);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int DirOpen(string path);
+        // One entry per call; null at end of listing.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern string DirNext(int h);
+        // Glob: newline-joined matches of `pattern` over the listing; null on error.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern string Glob(string dir, string pattern);
+    }
+
+    public static class FileFlags
+    {
+        public const int RD = 1, WR = 2, Append = 4, Trunc = 8;
+        public const int Creat = 16, Excl = 32;
+    }
+
+    public static class File
+    {
+        // Atomic open.  O_CREAT|O_EXCL on an existing name fails with
+        // Err.NameExists.  Returns handle 0 on failure (see LastError).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Open(string path, int flags);
+        // Read/Write use int[] buffers (MiniCLR has no byte[]); each element
+        // carries one byte value.  Returns bytes moved, 0 at EOF.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Read(int h, int[] buf, int len);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Write(int h, int[] buf, int len);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Seek(int h, int off, int whence);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Size(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Flush(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Close(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Lock(int h, int op);  // 1=SH 2=EX 0=UN
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Rename(string a, string b);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Unlink(string path);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int MkDir(string path);
+    }
+
+    // ---- L2 processes: cooperative CLR-slot processes -------------------
+    // One .mex image per process, loaded into its own CLR slot.  Wait is a
+    // poll (this kernel has no preemption): -1 while running, >=0 exit code.
+    public static class Proc
+    {
+        public const int Running = -1;
+        public const int BadPid  = -2;
+        public const int Failed  = -3;
+        public const int Killed  = -4;
+
+        public const int StateRunning = 0;
+        public const int StateExited  = 1;
+
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Spawn(string mex);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Wait(int pid);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Kill(int pid);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Exit(int code); // from inside own process
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Count();
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int PidAt(int i);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int StateAt(int pid);
+    }
+
+    // =================================================================
+    //  OS API layer 12: persistent configuration store.
+    //  Logical name "t" maps to the canonical /data/cfg/t.cfg (boundary
+    //  checked); the flat MKFS stores "t.cfg".  Open() caches the whole
+    //  file, Set/Del mutate the cache, Flush() writes t.cfg.tmp and
+    //  renames it to t.cfg so a torn write cannot corrupt the old copy.
+    //
+    //  ABI note: MiniCLR is a 32-bit stack machine (icall args are int32
+    //  slots), so handles are the packed 32-bit h_t here, exactly as in
+    //  File/Sync.  Wrap() gives callers the read-only Handle view.
+    //  Every failing call sets Host.LastError(); 0 is the invalid handle.
+    // =================================================================
+    public static class Cfg
+    {
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Open(string name);
+        // null => no such key / end of keys (Host.LastError == Err.NoEntry)
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern string Get(int h, string key);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Set(int h, string key, string val);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Del(int h, string key);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern string KeyAt(int h, int i);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Flush(int h);
+        // Close flushes first, then invalidates the handle (gen++).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Close(int h);
+        // ---- read-only accessors over the cached CfgEntry[] ----
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Count(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Dirty(int h);
+
+        public static Handle Wrap(int h) { Handle x; x.Raw = h; return x; }
+    }
+
+    // =================================================================
+    //  OS API layer 4: memory.
+    //  Managed code NEVER sees a pointer -- only packed int handles.
+    //  Bytes are reached through HeapPoke/HeapPeek (offset + bounds check),
+    //  arena allocations return a byte offset, shm segments are named,
+    //  and Mmap only records a mapping (the kernel is identity-mapped).
+    //
+    //  Free/Close ALWAYS bumps the generation: a recycled slot can never
+    //  make an old handle resolve again (Host.LastError == Err.Stale).
+    //  This is a separate real heap (kernel kmalloc), NOT the CLR bump
+    //  heap that Paint() uses -- the two tracks never mix.
+    //  ABI: int handles for the same 32-bit-stack-machine reason as Cfg.
+    // =================================================================
+    public static class Mem
+    {
+        public const int WhatFb   = 1;
+        public const int WhatMmio = 2;
+
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int HeapAlloc(int sz);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int HeapFree(int h);
+        // Returns a NEW handle; the old one is invalidated even if the
+        // allocation stayed in the same slot.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int HeapRealloc(int h, int sz);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int HeapSize(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int HeapPoke(int h, int off, int val);
+        // 0..255 on success, -1 on a bad/stale handle (check LastError).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int HeapPeek(int h, int off);
+
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ArenaNew(int cap);
+        // 0 is a VALID offset; -1 means failure (check LastError).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ArenaAlloc(int h, int sz);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ArenaMark(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ArenaRelease(int h, int mark);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ArenaUsed(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ArenaFree(int h);
+
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ShmCreate(string name, int sz);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ShmOpen(string name);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ShmSize(int h);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int ShmClose(int h);
+
+        // Returns a positive mapping id, or 0 on failure (dev_class GUARD,
+        // overlap, out of range).  Unmap invalidates just that id.
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Mmap(int what, int addr, int len);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Unmap(int id);
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Mappings();
+        // Read-only: number of live L4 blocks (leak sentinel).
+        [MethodImpl(MethodImplOptions.InternalCall)] public static extern int Live();
+
+        public static Handle Wrap(int h) { Handle x; x.Raw = h; return x; }
     }
 }

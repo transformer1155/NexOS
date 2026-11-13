@@ -878,15 +878,10 @@ namespace NexOS.Forms
                 line++;
             }
         }
-        public static int ZoomStep(int cur, int dir)
-        {
-            int[] steps = new int[6];
-            steps[0] = 14; steps[1] = 16; steps[2] = 18; steps[3] = 20; steps[4] = 22; steps[5] = 24;
-            int idx = 2;
-            for (int i = 0; i < 6; i++) if (steps[i] == cur) { idx = i; break; }
-            idx += dir; if (idx < 0) idx = 0; if (idx > 5) idx = 5;
-            return steps[idx];
-        }
+        // The zoom ladder lives in AppUtil (NexOS.Forms) so the Control
+        // Panel can change the terminal font size without linking the whole
+        // Terminal application.
+        public static int ZoomStep(int cur, int dir) { return AppUtil.TermZoomStep(cur, dir); }
 
         // ---- tabs ----------------------------------------------------
         void NewTab()

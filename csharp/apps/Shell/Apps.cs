@@ -2129,7 +2129,7 @@ namespace NexOS.Forms
                         ty = tgy + 70;
                     }
                     if (U.In(mx, my, pad, ty + 22, 200, 38))
-                    { Theme.TermCellH = TerminalApp.ZoomStep(Theme.TermCellH, 1); Theme.Save(); return; }
+                    { Theme.TermCellH = AppUtil.TermZoomStep(Theme.TermCellH, 1); Theme.Save(); return; }
                     if (U.In(mx, my, pad + 236, ty + 22, 220, 38))
                     { Theme.TermBgMode = Theme.TermBgMode != 0 ? 0 : 1; Theme.Save(); return; }
                     return;
@@ -2552,32 +2552,7 @@ namespace NexOS.Forms
             t = new TBox();
             string pending = Shell.TakeNotepadFile();
             if (pending != null && pending != "")
-            {
-                name = pending;
-                // Probe the RAW bytes first: if the file is not verifiable
-                // text (NULs / control bytes) fall back to a binary view
-                // instead of showing mangled characters.
-                // Read from the volume the caller named FIRST; only fall back to the
-                // old probe order when that volume has nothing under this name.
-                int pfs = Shell.TakeNotepadFs();
-                string hx = Host.ReadHex(pfs, pending);
-                if (hx == "") {
-                    int alt = (pfs == 1) ? 0 : 1;
-                    hx = Host.ReadHex(alt, pending);
-                    if (hx != "") pfs = alt;
-                }
-                if (IsBinaryHex(hx))
-                {
-                    binary = true; hex = hx; t.text = "";
-                }
-                else
-                {
-                    binary = false; hex = "";
-                    t.text = Host.ReadText(pfs, pending);
-                    fs = pfs;
-                    if (t.text == "") t.text = "Untitled - type below, or click Open to read a file.";
-                }
-            }
+                LoadFile(Shell.TakeNotepadFs(), pending);
             else
             {
                 t.text = "Untitled - type below, or click Open to read a file.";
@@ -2587,6 +2562,41 @@ namespace NexOS.Forms
             }
             picking = false;
             saved = false;
+        }
+
+        // ---- the ONE file-open path ------------------------------------
+        // The in-app Open picker used to call Host.ReadText() directly and
+        // skip the raw-byte probe entirely.  A .mex is a binary "MEX1"
+        // image: ReadText scrubs its NULs / control bytes into spaces and
+        // dots, so the editor received a blank page and the file looked
+        // unopenable.  Going through the same loader as the shell handoff
+        // sends binary files to the existing hex view and leaves text files
+        // (txt / md / json / html ...) exactly as they were.
+        void LoadFile(int pfs, string fname)
+        {
+            name = fname;
+            fs = pfs;
+            string hx = Host.ReadHex(pfs, fname);
+            if (hx == "")
+            {
+                int alt = (pfs == 1) ? 0 : 1;
+                string altHex = Host.ReadHex(alt, fname);
+                if (altHex != "") { hx = altHex; fs = alt; }
+            }
+            if (IsBinaryHex(hx))
+            {
+                binary = true; hex = hx; t.text = "";
+            }
+            else
+            {
+                binary = false; hex = "";
+                t.text = Host.ReadText(fs, fname);
+                if (t.text == "") t.text = "Untitled - type below, or click Open to read a file.";
+            }
+            t.cursor = 0;
+            t.selA = t.selB = 0;
+            saved = false;
+            Host.Log(U.Cat(U.Cat("[EDITOR] ", U.I(binary ? 1 : 0)), fname));
         }
 
         // ---- binary detection / hex formatting --------------------------
@@ -2714,6 +2724,30 @@ namespace NexOS.Forms
 
         public override string GetTitle() { return U.Cat("Notepad - ", name); }
 
+        // Width-aware glyph model (matches the kernel's mh_measure / Gfx.Measure
+        // and the draw_text_utf8 advances used to paint the body): 8px ASCII,
+        // 16px CJK.  A MiniCLR string is a UTF-8 BYTE array, so decode the
+        // sequence at i: one 3-byte CJK char is ONE 16px glyph, not three.
+        // Counting per byte made the caret and IME popup drift 3x right past
+        // every Chinese character.
+        static int NpAdv(string s, int i) { return ((int)s[i] < 0x80) ? 8 : 16; }
+        static int NpBytes(string s, int i) {
+            int b = (int)s[i];
+            if (b < 0x80) return 1;
+            if ((b & 0xE0) == 0xC0) return 2;
+            if ((b & 0xF0) == 0xE0) return 3;
+            if ((b & 0xF8) == 0xF0) return 4;
+            return 1;
+        }
+        static int NpWidth(string s, int start, int n) {
+            if (s == null) return 0;
+            if (start < 0) start = 0;
+            if (n > s.Length - start) n = s.Length - start;
+            int w = 0, i = start, end = start + n;
+            while (i < end) { w += NpAdv(s, i); i += NpBytes(s, i); }
+            return w;
+        }
+
         public override void OnPaint()
         {
             W.Clear();
@@ -2745,14 +2779,22 @@ namespace NexOS.Forms
             if (t.selA == 0 && t.selB == t.text.Length && t.text.Length > 0)
                 Gfx.FillRect(pad + 8, 54, w - 2 * pad - 16, h - 48 - pad, 0xCDE6FF);
             DrawLines(pad + 8, 54, t.text, C.Text, h - pad, false);
-            // caret (on top)
-            int cl = 0, cc = 0;
-            for (int i = 0; i < t.cursor; i++) { if (t.text[i] == '\n') { cl++; cc = 0; } else cc++; }
+            // caret (on top) - width-aware so it tracks Chinese (16px) text
+            int cl = 0, lineStart = 0;
+            for (int i = 0; i < t.cursor; i++) { if (t.text[i] == '\n') { cl++; lineStart = i + 1; } }
+            int colInLine = t.cursor - lineStart;
             if ((Host.Ticks() / 30) % 2 == 0) {
-                int cxp = pad + 8 + cc * 8;
+                int cxp = pad + 8 + NpWidth(t.text, lineStart, colInLine);
                 int cyp = 54 + cl * 20;
                 if (cyp < h - pad) Gfx.FillRect(cxp, cyp, 2, 18, 0x1A1A1A);
             }
+            // Publish the caret origin so the native pinyin candidate /
+            // pre-edit popup sits just above this line, aligned with it.
+            int anchorY = 54 + cl * 20;
+            if (anchorY > h - 30) anchorY = h - 30;
+#if !WINHOST
+            Host.SetImeAnchor(pad + 8 + NpWidth(t.text, lineStart, colInLine), anchorY);
+#endif
         }
 
         // ---- Save As dialog ---------------------------------------------
@@ -2800,6 +2842,11 @@ namespace NexOS.Forms
                 string shown = saveNameBuf == null || saveNameBuf == "" ? "Untitled.txt" : saveNameBuf;
                 Gfx.FillRect(pad + 15 + Gfx.Measure(shown), y + 8, 2, 16, 0x1A1A1A);
             }
+#if !WINHOST
+            // The Save-As name field is an input box too: anchor the IME
+            // popup above it while the dialog owns the keyboard.
+            Host.SetImeAnchor(pad + 14, y + 7);
+#endif
             y += 44;
 
             // Probed format so the user sees what will be written.
@@ -2884,8 +2931,12 @@ namespace NexOS.Forms
             {
                 if (i == n || s[i] == '\n')
                 {
-                    string line = "";
-                    for (int j = start; j < i; j++) line = U.Cat(line, Host.CharStr(s[j]));
+                    // s[start..i) is already the correct UTF-8 bytes for this
+                    // line: pass the substring straight to Gfx.Text so CJK
+                    // renders.  The old per-byte Host.CharStr(s[j]) loop
+                    // re-encoded each UTF-8 byte, and draw_text_utf8 then hit
+                    // its "2-byte -> skip" branch -- Chinese vanished.
+                    string line = U.Sub(s, start, i - start);
                     if (i == n && caret && (Host.Ticks() / 30) % 2 == 0)
                         line = U.Cat(line, "|");
                     if (y < maxY) Gfx.Text(x, y, line, col);
@@ -2936,8 +2987,9 @@ namespace NexOS.Forms
                     int ry = y + i * W.RowH;
                     if (U.In(mx, my, pad, ry, w - 2 * pad, W.RowH - 2))
                     {
-                        name = Host.FileName(1, i);
-                        t.text = Host.ReadText(1, name);
+                        // Same loader as the shell handoff: binary .mex files
+                        // open in the hex view instead of as scrubbed text.
+                        LoadFile(1, Host.FileName(1, i));
                         picking = false;
                         return;
                     }
@@ -2958,9 +3010,13 @@ namespace NexOS.Forms
                 {
                     if (saveNameBuf != null && saveNameBuf.Length > 0)
                     {
-                        string s2 = "";
-                        for (int i = 0; i < saveNameBuf.Length - 1; i++) s2 = U.Cat(s2, Host.CharStr((int)saveNameBuf[i]));
-                        saveNameBuf = s2;
+                        // Drop the last CODEPOINT, not the last byte: a CJK
+                        // file-name char is 3 UTF-8 bytes and chopping one byte
+                        // would leave a broken sequence on screen.
+                        int k = saveNameBuf.Length;
+                        while (k > 0 && ((int)saveNameBuf[k - 1] & 0xC0) == 0x80) k--;
+                        if (k > 0) k--;
+                        saveNameBuf = k > 0 ? U.Sub(saveNameBuf, 0, k) : "";
                     }
                     return;
                 }

@@ -22,6 +22,10 @@
 #include "systemalgo.h"
 
 extern "C" void* kmalloc(uint32_t size);
+// Paired release, needed now that a slot can be reused or closed: without it
+// every reload leaked one 256 KiB image and one 512 KiB managed heap out of the
+// kernel's 16 MiB pool, which only 4 slots can afford a few times.
+extern "C" void  kfree(void* ptr);
 
 // ---------------------------------------------------------------------
 //  freestanding helpers (this translation unit has no libc)
@@ -169,7 +173,7 @@ struct MexStr { uint32_t off, len; };
 // with "[CLR] fault: too many internal calls" (fatal boot error screen).
 // Keep the array, the dispatch bound and the load check in sync via this one
 // constant.
-#define CLR_MAX_ICALLS 192
+#define CLR_MAX_ICALLS 384   // OS API L0-L3 added ~45 InternalCall methods
 #define CLR_MAX_STATICS 1024
 #define CLR_STEP_LIMIT  20000000
 
@@ -218,16 +222,48 @@ typedef struct ClrVm {
     char        name[64];        // .mex basename this slot holds
 } ClrVm;
 
-// Four slots: the desktop shell plus up to three independently resident
-// applications.  Sized in memory terms: ~256 KiB image cap + 512 KiB managed
-// heap + ~25 KiB tables per slot, so 4 slots is ~3.2 MB out of the kernel's
-// 16 MiB kmalloc heap (kernel64.cpp HEAP_SIZE).  Raise CLR_MAX_VMS together
-// with that budget, not on its own.
-#define CLR_MAX_VMS 4
+// Slot capacity is defined in clr.h so mforms.cpp, the GUI window table and
+// app_registry.h all share one number.  It used to be 4 (shell + 3 apps);
+// raising it to 8 gives 7 concurrently resident application images.
+//
+// Budget (32-bit kernel HEAP_SIZE 128 MiB): ~840 KiB per loaded slot, so 8
+// fully loaded slots are ~6.7 MiB.  The 64-bit kernel has a 16 MiB heap, so
+// this value must not be raised further without re-checking that budget.
+// The old comment claimed ~25 KiB of tables per slot; CLR_STACK_SLOTS is
+// 32768 int32 slots (128 KiB), so ClrVm is in fact ~136 KiB.
 
-static ClrVm  g_vm_pool[CLR_MAX_VMS];
-static ClrVm* g_cur = &g_vm_pool[0];   // slot 0 is the resident desktop shell
-static int    g_vm_count = 0;          // how many slots have ever been loaded
+// The pool MUST NOT live in .bss.
+//
+// Each ClrVm is ~25 KiB of tables (16 KiB stack + 4 KiB statics + 4 KiB string
+// objects + 384 B bindings), so four of them is ~100 KiB of .bss -- and the
+// 64-bit kernel's .bss has to end below HEAP_START (0x500000).  Declaring the
+// pool as an array pushed the image over: the linker refused with
+// "kernel64 .bss overruns HEAP_START".
+//
+// Allocated on first use instead.  The cost is one kmalloc of ~100 KiB at
+// startup, which the 16 MiB kernel heap can trivially afford, and every slot's
+// own image/heap was already kmalloc'd anyway.
+static ClrVm* g_vm_pool = 0;           // kmalloc'd CLR_MAX_VMS slots
+static ClrVm* g_cur     = 0;           // slot 0 once the pool exists
+static int    g_vm_count = 0;
+
+// Returns the pool, allocating it on first use.  0 means "out of memory", which
+// every caller must treat as a hard CLR failure rather than dereferencing NULL.
+static ClrVm* vm_pool_ensure(void) {
+    if (g_vm_pool) return g_vm_pool;
+    ClrVm* p = (ClrVm*)kmalloc((uint32_t)(sizeof(ClrVm) * CLR_MAX_VMS));
+    if (!p) return 0;
+    for (int i = 0; i < CLR_MAX_VMS; i++) {
+        ClrVm* v = &p[i];
+        v->image = 0; v->hdr = 0; v->methods = 0; v->types = 0; v->strtab = 0;
+        v->code = 0; v->names = 0; v->litdata = 0; v->heap = 0;
+        v->heap_used = 0; v->sp = 0; v->fault = 0; v->steps = 0;
+        v->fail_streak = 0; v->resident = 0; v->name[0] = 0;
+    }
+    g_vm_pool = p;
+    g_cur = &p[0];
+    return p;
+}
 
 static clr_read_fn  g_reader = 0;
 static char         g_report[512];
@@ -260,6 +296,11 @@ static char         g_report[512];
 // paint (mforms_paint_desktop sets this around its PaintDesktop call).
 int g_clr_trace = 0;
 
+// DIAG: last method index + IL offset at the moment of a fault, for pinning
+// down "array index out of range" style crashes inside the managed shell.
+static uint32_t g_dbg_mi = 0;
+static uint32_t g_dbg_pc = 0;
+
 // g_fault / g_steps / g_fail_streak live in the slot struct (see the pool
 // above); only g_report stays global because it is the CLR-wide status line.
 
@@ -271,12 +312,24 @@ int g_clr_trace = 0;
 
 static const char* mex_name(uint32_t off) { return g_names + off; }
 
+// APMS lives in the 64-bit kernel (kernel64.cpp / .attic64/apms.inc).  The
+// 32-bit kernel has no APMS, so the hook is compiled in only for the 64-bit
+// CLR object; the linker resolves it against kernel64.o.
+#if defined(__x86_64__)
+extern "C" void apms_on_clr_fault(const char* msg);
+#endif
+
 static void fault(const char* msg) {
     if (g_fault) return;
     g_fault = 1;
     scpy_(g_report, "CLR fault: ", sizeof(g_report));
     scat_(g_report, msg, sizeof(g_report));
     ser("[CLR] fault: "); ser(msg); ser("\n");
+#if defined(__x86_64__)
+    // clr.cpp writes straight to the UART (ser()), so hooking serial_puts()
+    // alone would miss every managed-layer exception.  Record it explicitly.
+    apms_on_clr_fault(msg);
+#endif
 }
 
 // ---------------------------------------------------------------------
@@ -473,6 +526,39 @@ static int32_t ic_ai_request(int32_t* a) {
     return ai_mk_cstr(out);
 }
 
+/* ---- OpenAI-compatible protocol: raw JSON in, raw JSON out ----
+ * Keys, provider routing and quota all live in the host gateway.  These
+ * icalls are pure transport so the MiniCLR interpreter needs no JSON,
+ * socket or crypto support of its own.  Buffers are static because the
+ * freestanding kernel has no per-call heap for managed strings. */
+static int32_t ic_ai_openai_chat(int32_t* a) {
+    const char* req = a[0] ? str_data(a[0]) : "";
+    static char out[4096];
+    ai_openai_chat(req, out, (int)sizeof(out));
+    return ai_mk_cstr(out);
+}
+
+static int32_t ic_ai_list_models(int32_t* a) {
+    (void)a;
+    static char out[4096];
+    ai_list_models(out, (int)sizeof(out));
+    return ai_mk_cstr(out);
+}
+
+static int32_t ic_ai_get_quota(int32_t* a) {
+    const char* p = a[0] ? str_data(a[0]) : "";
+    static char out[2048];
+    ai_platform_quota(p, out, (int)sizeof(out));
+    return ai_mk_cstr(out);
+}
+
+static int32_t ic_ai_add_model(int32_t* a) {
+    const char* spec = a[0] ? str_data(a[0]) : "";
+    static char out[1024];
+    ai_add_model(spec, out, (int)sizeof(out));
+    return ai_mk_cstr(out);
+}
+
 static int32_t ic_mcp_myid(int32_t* a) { (void)a; return ai_mk_cstr(g_current_app_id); }
 
 static int32_t ic_mcp_call(int32_t* a) {
@@ -497,6 +583,10 @@ static inline int32_t arr_len(int32_t obj) {
 static inline int32_t* arr_data(int32_t obj) {
     return (int32_t*)((uint32_t)obj + 12);
 }
+
+// ---- exported for osapi.cpp (L3 file layer) --------------------------
+int clr_arr_len(int32_t obj)      { return arr_len(obj); }
+int32_t* clr_arr_data(int32_t obj){ return arr_data(obj); }
 
 static int32_t ic_sa_spatial_create(int32_t* a) {
     return sa_spatial_create(a[0], a[1]);
@@ -566,6 +656,10 @@ static const IcallEntry g_icalls[] = {
     { "NexOS.AI::SetMode",           ic_ai_set_mode      },
     { "NexOS.AI::Request",           ic_ai_request       },
     { "NexOS.AI::GetRemainingQuota", ic_ai_quota         },
+    { "NexOS.AI::OpenAIChat",        ic_ai_openai_chat   },
+    { "NexOS.AI::ListModels",        ic_ai_list_models   },
+    { "NexOS.AI::GetQuota",          ic_ai_get_quota     },
+    { "NexOS.AI::AddModel",          ic_ai_add_model     },
     { "NexOS.MCP::MyAppId",          ic_mcp_myid         },
     { "NexOS.MCP::CallTool",         ic_mcp_call         },
     { "NexOS.SystemAlgo::SpatialCreate",   ic_sa_spatial_create },
@@ -685,6 +779,7 @@ static int exec_method(uint32_t midx, int depth) {
     if (midx >= g_hdr->n_methods) { fault("bad method index"); return -1; }
 
     const MexMethod* m = &g_methods[midx];
+    g_dbg_mi = midx;
     const int nargs = m->n_args;
     // n_args comes from metadata, and call/callvirt/newobj never verified the
     // caller actually pushed that many values.  Without this, g_sp - nargs can
@@ -752,6 +847,7 @@ static int exec_method(uint32_t midx, int depth) {
                           : (fault("evaluation stack underflow"), (int32_t)0))
 
     while (pc < n) {
+        g_dbg_pc = pc;
         if (g_fault) return -1;
         if (++g_steps > CLR_STEP_LIMIT) { fault("step limit exceeded"); return -1; }
 
@@ -1264,6 +1360,20 @@ static int load_image(const char* filename) {
 // =====================================================================
 extern "C" void clr_init(clr_read_fn reader) {
     g_reader = reader;
+
+    // THE POOL MUST EXIST BEFORE ANY g_* ACCESSOR IS TOUCHED.
+    //
+    // g_image / g_heap / g_sp and the rest are macros that dereference g_cur
+    // (see the pool section above).  If the pool were still NULL the next
+    // statement would fault -- and clr_init runs early enough that this would
+    // present as a boot crash rather than a CLR failure.  Allocating here makes
+    // g_cur valid for every later caller.
+    if (!vm_pool_ensure()) {
+        scpy_(g_report, "MiniCLR: cannot allocate the instance pool", sizeof(g_report));
+        ser("[CLR] FATAL: no memory for the instance pool\n");
+        return;                     // clr_ready() stays false; callers refuse
+    }
+
     g_image = 0;
     g_heap = 0;
     g_heap_used = 0;
@@ -1358,12 +1468,43 @@ static void note_resident_identity(const char* filename) {
     app_registry_note_resident(g_current_app_id);
 }
 
-extern "C" int clr_load(const char* filename) {
-    g_fault = 0;
-    g_steps = 0;
-    g_sp = 0;
-    g_resident = 0;
-    g_fail_streak = 0;
+// ---- slot management -------------------------------------------------
+// Load an image into a SPECIFIC slot and switch the interpreter to it.  Returns
+// the slot index (>= 0), or the same negative codes clr_load always produced.
+//
+// Slot 0 is the desktop shell; the others are free for independently resident
+// applications.  Loading INTO an occupied slot replaces its image, which is
+// what "the app restarted" should mean.
+//
+// g_cur is switched BEFORE load_image runs, because every accessor in this file
+// (g_image, g_hdr, g_heap, ...) resolves through it.  Switching back is the
+// caller's job via clr_use().
+extern "C" int clr_load_slot(int slot, const char* filename) {
+    if (!vm_pool_ensure()) {
+        scpy_(g_report, "CLR: no memory for the instance pool", sizeof(g_report));
+        return -3;
+    }
+    if (slot < 0 || slot >= CLR_MAX_VMS) {
+        scpy_(g_report, "CLR: slot out of range", sizeof(g_report));
+        return -4;
+    }
+    ClrVm* v = &g_vm_pool[slot];
+    g_cur = v;
+
+    // A slot reuse must release the previous image, otherwise every reload
+    // leaks one CLR_IMAGE_MAX block (~256 KiB) from the kernel heap.
+    if (v->image) { kfree(v->image); v->image = 0; }
+    v->hdr = 0; v->methods = 0; v->types = 0; v->strtab = 0;
+    v->code = 0; v->names = 0; v->litdata = 0;
+    v->heap_used = 0;
+    v->sp = 0;
+    v->fault = 0;
+    v->steps = 0;
+    v->resident = 0;
+    v->fail_streak = 0;
+    int i = 0; while (filename[i] && i < 63) { v->name[i] = filename[i]; i++; }
+    v->name[i] = 0;
+    if (slot + 1 > g_vm_count) g_vm_count = slot + 1;
     scpy_(g_report, "", sizeof(g_report));
 
     int rc = load_image(filename);
@@ -1371,19 +1512,69 @@ extern "C" int clr_load(const char* filename) {
         if (!g_report[0]) scpy_(g_report, "CLR: load failed", sizeof(g_report));
         return rc;
     }
-    g_resident = 1;
-    // A resident image becomes a first-class MCP citizen: its .mex basename is
-    // the identity the bus will check its outbound ACL against.
+    v->resident = 1;
     note_resident_identity(filename);
     scpy_(g_report, "CLR: ", sizeof(g_report));
     scat_(g_report, filename, sizeof(g_report));
-    scat_(g_report, " resident", sizeof(g_report));
+    scat_(g_report, " -> slot ", sizeof(g_report));
+    return slot;
+}
+
+// Switch the interpreter to another already-loaded slot.  Returns the previous
+// slot so a caller can restore it, or -1 when the slot is empty.
+extern "C" int clr_use(int slot) {
+    if (!vm_pool_ensure()) return -1;
+    int prev = (int)(g_cur - g_vm_pool);
+    if (slot < 0 || slot >= CLR_MAX_VMS) return -1;
+    if (!g_vm_pool[slot].resident) return -1;
+    g_cur = &g_vm_pool[slot];
+    return prev;
+}
+
+// Slot index the interpreter is currently pointed at.
+extern "C" int clr_current_slot(void) {
+    if (!vm_pool_ensure()) return 0;
+    return (int)(g_cur - g_vm_pool);
+}
+
+// Read-only probe for the slot allocator in mforms.cpp.  Unlike clr_use()
+// this does not change the active slot, so it is safe to call while walking
+// the pool looking for a free slot.
+extern "C" int clr_slot_loaded(int slot) {
+    if (!vm_pool_ensure()) return 0;
+    if (slot < 0 || slot >= CLR_MAX_VMS) return 0;
+    return g_vm_pool[slot].resident ? 1 : 0;
+}
+
+// A slot can be closed independently; the desktop shell in slot 0 is not
+// affected and must be stopped with clr_unload().
+extern "C" int clr_close_slot(int slot) {
+    if (!vm_pool_ensure()) return -1;
+    if (slot <= 0 || slot >= CLR_MAX_VMS) return -1;    // never close the shell
+    ClrVm* v = &g_vm_pool[slot];
+    if (v->heap) { kfree(v->heap); v->heap = 0; }
+    if (v->image) { kfree(v->image); v->image = 0; }
+    v->hdr = 0; v->methods = 0; v->types = 0; v->strtab = 0;
+    v->code = 0; v->names = 0; v->litdata = 0;
+    v->resident = 0; v->heap_used = 0; v->sp = 0; v->name[0] = 0;
+    if (g_cur == v) g_cur = &g_vm_pool[0];
     return 0;
+}
+
+// ---- the original single-image entry points, now slot-0 by convention ----
+// Keeping their signatures means every existing caller (mforms_start, the
+// .mex stub entry point, the tests) keeps working unchanged.
+extern "C" int clr_load(const char* filename) {
+    int rc = clr_load_slot(0, filename);
+    return rc < 0 ? rc : 0;
 }
 
 extern "C" int clr_loaded(void) { return g_resident && !g_fault; }
 
-extern "C" void clr_unload(void) { g_resident = 0; }
+extern "C" void clr_unload(void) {
+    if (!vm_pool_ensure()) return;
+    g_vm_pool[0].resident = 0;
+}
 
 // Load a .mex as the RESIDENT image and run its entry point (Program::Main).
 // Unlike clr_run() (which loads a throwaway image and returns), this makes the
@@ -1485,6 +1676,8 @@ extern "C" int clr_call(const char* fqname, const int32_t* args,
             ser("[CLR] recoverable fault ("); ser_int(g_fail_streak);
             ser("/"); ser_int(CLR_FAIL_STREAK_MAX); ser("): ");
             ser(g_report); ser("\n");
+            ser("       method="); ser_int(g_dbg_mi); ser(" pc="); ser_int(g_dbg_pc);
+            ser(" "); ser(mex_name(g_methods[g_dbg_mi].name_off)); ser("\n");
             // clr_loaded() also gates on g_fault, and every mforms entry
             // point checks it *before* calling in.  Leaving it latched would
             // deadlock the shell exactly the way g_resident = 0 did: no

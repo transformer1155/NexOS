@@ -302,6 +302,12 @@ void mforms_set_running(uint32_t mask);
 // painting the overlay, exactly like mforms_set_running().
 void mforms_set_ime(int mode);
 
+// Managed text controls publish their caret / focused input-box origin with
+// Host.SetImeAnchor(x,y) (client coordinates).  Returns 1 and fills
+// screen-space (x,y) when app `id` published one; 0 when no anchor exists
+// and the compositor should fall back to a window-relative position.
+int mforms_ime_anchor(int id, int* x, int* y);
+
 // Managed heap pressure, 0..100, for the task manager and diagnostics.
 int  mforms_heap_pct(void);
 

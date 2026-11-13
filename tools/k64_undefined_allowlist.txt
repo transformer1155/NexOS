@@ -25,3 +25,10 @@
 # systemalgo.cpp -> build/systemalgo64.o.  They were the first batch of this
 # burn-down list: clr64.o had 19 call sites through them, every one of which
 # would have triple-faulted the machine.
+
+# ---- standalone application entry points ----------------------------
+# mforms.cpp exists only in the 32-bit kernel, so the 64-bit build binds
+# these to 0.  That is safe because launch_app_impl only calls them under
+# APP_NOTEPAD, and the 64-bit kernel never runs the managed shell (the
+# native drawers take over).  They are listed so the gate stays honest
+# rather than silently passing.

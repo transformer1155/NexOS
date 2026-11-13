@@ -106,15 +106,28 @@ namespace NexOS.Forms
         // truth lives in a MKFS file ("installed.cfg") so the Control Panel
         // "Apps" page and the shell share one source of state across boots.
         static bool[]   Installed;        // index == Kind value (0..11)
-        // Highest Kind is AudioPlayer = 17, so the arrays need 18 slots.
-        // This used to be 15 while Kind.WebView was already 15, so index 15
-        // was written past the end of kName/Installed (both sized [KINDS]).
-        const  int     KINDS = 18;
+        // Highest Kind is AiWorkbench = 20, so the arrays need 21 slots (0..20).
+        // KINDS is now only an ALLOCATION UPPER BOUND: the live application
+        // count comes from sfs_files/apps.man via Host.AppCount() and lives
+        // in appN.  MiniCLR runs no static field initialisers, so appN is set
+        // explicitly by LoadAppRegistry() at the top of Init().
+        const  int     KINDS = 21;
+        static int     appN  = 0;
+        // The application kinds in MANIFEST ORDER (the order of
+        // sfs_files/apps.man).  Every list the desktop shows -- Start >
+        // All apps, the installed-app count, the Control Panel "Apps"
+        // page -- walks this array, so the shell's idea of "which apps
+        // exist" comes from the kernel manifest and from nowhere else.
+        static int[]   appKinds;
+        // listed[kind] is true when the manifest offers that kind.
+        static bool[]  listed;
         // Desktop icon slots (see the dKind/dName allocation in Init).
-        const  int     DMAX  = 20;
+        // All 21 Kind values are seeded as desktop shortcuts now, so leave
+        // room for user-dropped shortcuts on top of that.
+        const  int     DMAX  = 32;
         // Public count so other apps (Control Panel "Apps & features") can
-        // enumerate every registered Kind without a magic number.
-        public static int KindCount { get { return KINDS; } }
+        // enumerate every registered app without a magic number.
+        public static int KindCount { get { return appN; } }
         const  int     CFG_FS = 3;        // same volume the Desktop folder uses
         const  string  CFG_NAME = "installed.cfg";
 
@@ -503,7 +516,9 @@ namespace NexOS.Forms
         public const int OWNER_WINX = 6, OWNER_JUMP = 7;   // Win+X menu / taskbar jump list
         public const int OWNER_START = 8;          // Start menu app / tile popup
 
-        static string[] kName;         // canonical name per kind (unsorted)
+        static string[] kName;         // canonical name per kind, from apps.man
+        static int[]    kCol;          // icon colour per kind, from apps.man
+        static int[]    kLet;          // icon letter per kind, from apps.man
         static int fileOwner = -1, fileFs = 0, fileSel = -1;
         static int fileMenuX = 0, fileMenuY = 0;   // popup origin for "Open with..." sub-menu
         // Desktop view preferences (toggled via the "View" flyout).
@@ -529,6 +544,12 @@ namespace NexOS.Forms
         // -------------------------------------------------------------
         public static void Init()
         {
+            // The kernel parses sfs_files/apps.man at boot.  Build every
+            // per-app table from it BEFORE SyncFromFs()/LoadDefaults() use
+            // them.  Hard-coded entries below are a fallback for a disk that
+            // has no manifest (e.g. the WinHost harness).
+            LoadAppRegistry();
+
             // DMAX must exceed the number of Put() calls in LoadDefaults()
             // PLUS every shortcut the user can drop on the desktop.  These were
             // fixed at 16 while LoadDefaults() already Put() into index 14 (15
@@ -543,19 +564,21 @@ namespace NexOS.Forms
             // Desktop icons are read from the "Desktop" folder on MKFS.
             SyncFromFs();
 
-            tN    = 9;
+            // ---- taskbar: restored full pin set --------------------------
+            // The trimmed one-pin taskbar was a debugging aid.  All Kind apps
+            // are back; pin a representative set of eight (arrays hold 10).
+            tN    = 8;
             tKind = new int[10];
             tCol  = new int[10];
             tLet  = new int[10];
-            Pin(0, Kind.FileExplorer, 0xFFC83D, 'P');
-            Pin(1, Kind.Terminal,     0x2F3A45, '>');
-            Pin(2, Kind.Calculator,   0x00A3A3, '=');
-            Pin(3, Kind.TaskManager,  0x0F7B0F, 'T');
-            Pin(4, Kind.ControlPanel, 0x0078D4, 'S');
-            Pin(5, Kind.About,        0xD8541B, 'i');
-            Pin(6, Kind.Browser,      0x1A73E8, 'B');
-            Pin(7, Kind.NetTools,     0x1FB85A, 'W');
-            Pin(8, Kind.AiLauncher,   0x9B6BFF, 'K');
+            Pin(0, Kind.ControlPanel,  0x0F6CBD, 'S');
+            Pin(1, Kind.FileExplorer,  0xFFC83D, 'P');
+            Pin(2, Kind.Terminal,      0x2F3A45, '>');
+            Pin(3, Kind.Notepad,       0x4A6FA5, 'N');
+            Pin(4, Kind.Browser,       0x2D7FF9, 'B');
+            Pin(5, Kind.AiAgent,       0x7B61FF, 'A');
+            Pin(6, Kind.AiLauncher,    0x00A3A3, '>');
+            Pin(7, Kind.AiChat,        0x9B6BFF, 'C');
 
             trayRect = new int[4];
             sortMode = 0;
@@ -587,8 +610,8 @@ namespace NexOS.Forms
             //     narrow -- the menu path itself always assigns these first.
             dragKind       = -1;
             dragSrc        = -1;
-            dPosX = new int[16]; dPosY = new int[16]; dMoved = new bool[16];
-            for (int i = 0; i < 16; i++) { dPosX[i] = 0; dPosY[i] = 0; dMoved[i] = false; }
+            dPosX = new int[DMAX]; dPosY = new int[DMAX]; dMoved = new bool[DMAX];
+            for (int i = 0; i < DMAX; i++) { dPosX[i] = 0; dPosY[i] = 0; dMoved[i] = false; }
             LoadDeskPos();
             fileOwner      = -1;
             fileFs         =  0;
@@ -623,18 +646,10 @@ namespace NexOS.Forms
             dropIdx         = -1;
             dragHover       = -1;
 
-            // NOTE: this table must cover every Kind value.  It was 15 entries
-            // (0..14) while Kind.WebView was already 15, so WebView's name read
-            // past the end until this was corrected -- and any new Kind would
-            // have hit the same hole.  Keep this in step with Shell.Kind.
-            kName = new string[KINDS];
-            kName[0] = "Settings";     kName[1] = "This PC";    kName[2] = "Terminal";
-            kName[3] = "Calculator";   kName[4] = "Task Mgr";   kName[5] = "Optimizer";
-            kName[6] = "Notepad";      kName[7] = "About";      kName[8] = "Browser";
-            kName[9] = "AI Setup";     kName[10] = "AI Agent";  kName[11] = "Demo";
-            kName[12] = "Net Tools";   kName[13] = "AI 命令台";   kName[14] = "NetDefense";
-            kName[15] = "WebView";     kName[16] = "Video Player"; kName[17] = "Audio Player";
-
+            // kName / kCol / kLet were filled by LoadAppRegistry() above from
+            // the kernel's apps.man registry.  There is deliberately NO
+            // second hard-coded name table here: the manifest is the single
+            // source of truth for application names and glyphs.
             Popup.Init();
 
             // Rehydrate the installed-app set from the MKFS data disk (falls
@@ -663,63 +678,162 @@ namespace NexOS.Forms
                              pendingClickIdx, dropIdx, dragHover);
         }
 
+        // -------------------------------------------------------------
+        //  LoadAppRegistry -- build every per-app table from the kernel's
+        //  manifest (sfs_files/apps.man).  This is the ONLY place where the
+        //  shell learns which applications exist.  Adding an app to the
+        //  manifest + dropping one .mex into sfs_files/ is enough: no C#
+        //  table, no native switch, no rebuild of shell.mex.
+        // -------------------------------------------------------------
+        static void LoadAppRegistry()
+        {
+            int n = Host.AppCount();
+            if (n <= 0 || n > KINDS) n = KINDS;   // manifest missing -> fallback
+            appN = n;
+
+            kName = new string[KINDS];
+            kCol  = new int[KINDS];
+            kLet  = new int[KINDS];
+            appKinds = new int[n > 0 ? n : 1];
+            listed   = new bool[KINDS];
+            for (int i = 0; i < KINDS; i++) listed[i] = false;
+
+            // Fallback table, indexed by the REAL Kind values.  The old table
+            // was misaligned (kName[2] said "Terminal" while Kind 2 is
+            // TaskManager); those captions were wrong in Start > All apps.
+            kName[0] = "Settings";      kCol[0] = 0x0F6CBD; kLet[0] = 'S';
+            kName[1] = "This PC";       kCol[1] = 0xFFC83D; kLet[1] = 'P';
+            kName[2] = "Task Mgr";      kCol[2] = 0x2B7A3D; kLet[2] = 'T';
+            kName[3] = "Terminal";      kCol[3] = 0x2F3A45; kLet[3] = '>';
+            kName[4] = "Calculator";    kCol[4] = 0x00A3A3; kLet[4] = '=';
+            kName[5] = "About";         kCol[5] = 0x6060C0; kLet[5] = 'i';
+            kName[6] = "Optimizer";     kCol[6] = 0x8A4FBF; kLet[6] = 'O';
+            kName[7] = "Notepad";       kCol[7] = 0x4A6FA5; kLet[7] = 'N';
+            kName[8] = "Browser";       kCol[8] = 0x2D7FF9; kLet[8] = 'B';
+            kName[9] = "AI Setup";      kCol[9] = 0x2E9E6B; kLet[9] = 'A';
+            kName[10] = "AI Agent";     kCol[10] = 0x7B61FF; kLet[10] = 'A';
+            kName[11] = "Demo";         kCol[11] = 0xD07A3C; kLet[11] = 'D';
+            kName[12] = "Net Tools";    kCol[12] = 0x1F7A8C; kLet[12] = 'N';
+            kName[13] = "AI 命令台";     kCol[13] = 0x00A3A3; kLet[13] = '>';
+            kName[14] = "NetDefense";   kCol[14] = 0xB03A3A; kLet[14] = 'D';
+            kName[15] = "WebView";      kCol[15] = 0x3C6DB5; kLet[15] = 'W';
+            kName[16] = "Video Player"; kCol[16] = 0xC0407A; kLet[16] = 'V';
+            kName[17] = "Audio Player"; kCol[17] = 0x9B4FBF; kLet[17] = 'M';
+            kName[18] = "AI 对话";       kCol[18] = 0x9B6BFF; kLet[18] = 'C';
+            kName[19] = "Bug 上报";      kCol[19] = 0xE0603A; kLet[19] = 'B';
+            kName[20] = "AI 工作台";     kCol[20] = 0x5B3FD6; kLet[20] = 'W';
+
+            for (int i = 0; i < n; i++)
+            {
+                int k = Host.AppKind(i);
+                if (k < 0 || k >= KINDS) continue;
+                string nm = Host.AppName(i);
+                if (nm != null && nm.Length > 0) kName[k] = nm;
+                kCol[k] = Host.AppColor(i);
+                kLet[k] = Host.AppLetter(i);
+                listed[k] = true;
+                // Remember the manifest order: the Start menu and the
+                // Control Panel "Apps" page list applications in exactly
+                // this sequence.
+                int w = 0;
+                while (w < i && w < appKinds.Length) w++;
+                if (i < appKinds.Length) appKinds[i] = k;
+            }
+        }
+
         // Rebuild the desktop icon table from the "Desktop" folder (fs==3).
         // Each .lnk file's body is a single decimal digit: the managed
         // Kind it launches.  Falls back to built-in defaults if the
         // folder is empty (e.g. seeding has not run yet).
         static void SyncFromFs()
         {
+            // Every persisted .lnk is honoured again: the old "keep only
+            // Listed() kinds" filter was a debugging trim that wiped 17 apps
+            // from the desktop without deleting their files.  Missing Kinds
+            // are appended below so a data disk seeded by an older build also
+            // ends up with the complete 19-app set.
             int n = Host.FileCount(3);
             if (n <= 0) { LoadDefaults(); return; }
-            if (n > 16) n = 16;
-            dN = n;
-            for (int i = 0; i < n; i++)
+            int kept = 0;
+            for (int i = 0; i < n && kept < DMAX; i++)
             {
                 string nm = Host.FileName(3, i);
-                dName[i] = StripLnk(nm);
                 int kind = KindForTarget(Host.ReadText(3, nm));
-                // Anything that is not a shortcut payload (a plain file or a folder
-                // created on the desktop) has no Kind digit.  Without this it fell
-                // through to kind 0 == Kind.ControlPanel, i.e. every new file showed
-                // the Settings icon.  Give folders a folder icon and files a page icon.
-                // Bound against KINDS, not a single Kind constant: the old
-                // `kind > Kind.WebView` check silently tracked the LAST kind added,
-                // so it stopped being a real bound the moment anything new arrived.
-                if (kind < 0 || kind >= KINDS)
-                    kind = Host.FileIsDir(3, i) != 0 ? Kind.FileExplorer : Kind.Notepad;
-                dKind[i] = kind;
-                KindStyle(kind);
-                dCol[i] = (int)gCol;
-                dLet[i] = gLet;
+                dName[kept] = StripLnk(nm);
+                dKind[kept] = (kind < 0 || kind >= KINDS)
+                             ? (Host.FileIsDir(3, i) != 0 ? Kind.FileExplorer : Kind.Notepad)
+                             : kind;
+                KindStyle(dKind[kept]);
+                dCol[kept] = (int)gCol;
+                dLet[kept] = gLet;
+                kept++;
+            }
+            dN = kept;
+            EnsureAllKinds();
+        }
+
+        // Append any Kind that has no desktop shortcut yet.  Bounded by DMAX
+        // so a data disk with many user shortcuts can never overflow a table.
+        // Only kinds the kernel manifest offers are seeded.
+        static void EnsureAllKinds()
+        {
+            for (int i = 0; i < appN && dN < DMAX; i++)
+            {
+                int k = appKinds[i];
+                int have = 0;
+                for (int j = 0; j < dN; j++) if (dKind[j] == k) have = 1;
+                if (have != 0) continue;
+                KindStyle(k);
+                Put(dN, k, KindName(k), (int)gCol, gLet);
+                dN++;
             }
         }
 
-        // Built-in desktop set, used only as a fallback before seeding.
+        // Full built-in desktop set.  Every built-in Kind value is seeded
+        // again: every one of them has a real standalone .mex and the
+        // native app_for_managed_kind() maps 0..20, so none of them
+        // silently resolves to APP_NONE any more.
         static void LoadDefaults()
         {
-            // Count MUST equal the number of Put() calls below.  It was 12 while
-            // 15 Put()s wrote indices 0..14, so three of the seeded icons were
-            // never drawn.
-            //
-            // Video Player and Audio Player are INTENTIONALLY ABSENT: they are
-            // installable and openable from Start > All apps, but they are not
-            // given a desktop shortcut by default.
-            dN = 15;
-            Put(0, Kind.FileExplorer, "This PC",    0xFFC83D, 'P');
-            Put(1, Kind.Terminal,     "Terminal",   0x2F3A45, '>');
-            Put(2, Kind.Calculator,   "Calculator", 0x00A3A3, '=');
-            Put(3, Kind.TaskManager,  "Task Mgr",   0x0F7B0F, 'T');
-            Put(4, Kind.ControlPanel, "Settings",   0x0078D4, 'S');
-            Put(5, Kind.MemOptimizer, "Optimizer",  0x8256D0, 'M');
-            Put(6, Kind.Notepad,      "Notepad",    0x4A6FA5, 'N');
-            Put(7, Kind.About,        "About",      0xD8541B, 'i');
-            Put(8, Kind.Browser,      "Browser",    0x1A73E8, 'B');
-            Put(9, Kind.AiSetup,      "AI Setup",   0x6A3EA1, 'A');
-            Put(10, Kind.AiAgent,     "AI Agent",   0x8A5CF6, 'R');
-            Put(11, Kind.Demo,        "Demo",       0x8A5CF6, 'D');
-            Put(12, Kind.NetTools,    "Net Tools",  0x1FB85A, 'W');
-            Put(13, Kind.AiLauncher,  "AI 命令台",  0x9B6BFF, 'K');
-            Put(14, Kind.NetDefense,   "NetDefense", 0x00C8C8, 'N');
+            // The desktop set is derived from the manifest: every kind the
+            // kernel offers gets an icon, in manifest order, with the
+            // manifest's own caption, colour and letter.  Nothing here is
+            // hard-coded, so dropping a new .mex plus one manifest line is
+            // enough to put it on the desktop.
+            dN = 0;
+            for (int i = 0; i < appN && dN < DMAX; i++)
+            {
+                int k = appKinds[i];
+                Put(dN, k, KindName(k), kCol[k], kLet[k]);
+                dN++;
+            }
+            // Fallback when the manifest could not be read at all (no SFS
+            // yet): seed the historical set so the desktop is never empty.
+            if (dN == 0)
+            {
+                Put(0,  Kind.ControlPanel,  "Settings",     0x0F6CBD, 'S');
+                Put(1,  Kind.FileExplorer,  "This PC",      0xFFC83D, 'P');
+                Put(2,  Kind.TaskManager,   "Task Mgr",     0x2B7A3D, 'T');
+                Put(3,  Kind.Terminal,      "Terminal",     0x2F3A45, '>');
+                Put(4,  Kind.Calculator,    "Calculator",   0x00A3A3, '=');
+                Put(5,  Kind.About,         "About",        0x6060C0, 'i');
+                Put(6,  Kind.MemOptimizer,  "Optimizer",    0x8A4FBF, 'O');
+                Put(7,  Kind.Notepad,       "Notepad",      0x4A6FA5, 'N');
+                Put(8,  Kind.Browser,       "Browser",      0x2D7FF9, 'B');
+                Put(9,  Kind.AiSetup,       "AI Setup",     0x2E9E6B, 'A');
+                Put(10, Kind.AiAgent,       "AI Agent",     0x7B61FF, 'A');
+                Put(11, Kind.Demo,          "Demo",         0xD07A3C, 'D');
+                Put(12, Kind.NetTools,      "Net Tools",    0x1F7A8C, 'N');
+                Put(13, Kind.AiLauncher,    "AI 命令台",     0x00A3A3, '>');
+                Put(14, Kind.NetDefense,    "NetDefense",   0xB03A3A, 'D');
+                Put(15, Kind.WebView,       "WebView",      0x3C6DB5, 'W');
+                Put(16, Kind.VideoPlayer,   "Video Player", 0xC0407A, 'V');
+                Put(17, Kind.AudioPlayer,   "Audio Player", 0x9B4FBF, 'M');
+                Put(18, Kind.AiChat,        "AI 对话",       0x9B6BFF, 'C');
+                Put(19, Kind.BugReport,     "Bug 上报",      0xE0603A, 'B');
+                Put(20, Kind.AiWorkbench,   "AI 工作台",     0x5B3FD6, 'W');
+                dN = 21;
+            }
         }
 
         static void Put(int i, int k, string n, int c, int l)
@@ -751,6 +865,9 @@ namespace NexOS.Forms
             else if (kind == Kind.WebView)     { gCol = 0x5A6ACF; gLet = 'V'; }
             else if (kind == Kind.VideoPlayer) { gCol = 0xB83A3A; gLet = 'V'; }
             else if (kind == Kind.AudioPlayer) { gCol = 0xC77A11; gLet = 'M'; }
+            else if (kind == Kind.AiChat)      { gCol = 0x9B6BFF; gLet = 'C'; }
+            else if (kind == Kind.BugReport)   { gCol = 0xE0603A; gLet = 'B'; }
+            else if (kind == Kind.AiWorkbench) { gCol = 0x5B3FD6; gLet = 'W'; }
             else { gCol = 0x888888; gLet = '?'; }
         }
 
@@ -798,6 +915,9 @@ namespace NexOS.Forms
             if (NexOS.Sys.StrEq(body, "WebView.mex"))      return Kind.WebView;
             if (NexOS.Sys.StrEq(body, "VideoPlayer.mex"))  return Kind.VideoPlayer;
             if (NexOS.Sys.StrEq(body, "AudioPlayer.mex"))  return Kind.AudioPlayer;
+            if (NexOS.Sys.StrEq(body, "AiChat.mex"))       return Kind.AiChat;
+            if (NexOS.Sys.StrEq(body, "BugReport.mex"))    return Kind.BugReport;
+            if (NexOS.Sys.StrEq(body, "AiWorkbench.mex"))  return Kind.AiWorkbench;
             return -1;
         }
         // Parse the first decimal integer from a string like "4".
@@ -819,6 +939,13 @@ namespace NexOS.Forms
 
         public static string KindName(int k)
         {
+            // The manifest is authoritative: kName[] was filled from
+            // apps.man by LoadAppRegistry().  The hard-coded table below is
+            // only the fallback for a kernel that could not read the
+            // manifest (no SFS yet).
+            if (k >= 0 && k < KINDS && kName != null && kName[k] != null &&
+                kName[k].Length > 0 && !NexOS.Sys.StrEq(kName[k], "Unknown"))
+                return kName[k];
             if (k == Kind.FileExplorer) return "This PC";
             if (k == Kind.Terminal) return "Terminal";
             if (k == Kind.Calculator) return "Calculator";
@@ -837,6 +964,9 @@ namespace NexOS.Forms
             if (k == Kind.AiLauncher)  return "AI 命令台";
             if (k == Kind.NetDefense)  return "NetDefense";
             if (k == Kind.WebView)     return "WebView";
+            if (k == Kind.AiChat)      return "AI 对话";
+            if (k == Kind.BugReport)   return "Bug 上报";
+            if (k == Kind.AiWorkbench) return "AI 工作台";
             if (k == Kind.VideoPlayer) return "Video Player";
             if (k == Kind.AudioPlayer) return "Audio Player";
             return "Unknown";
@@ -859,6 +989,9 @@ namespace NexOS.Forms
             if (k == Kind.AiSetup)     return "1.0";
             if (k == Kind.AiAgent)     return "1.0";
             if (k == Kind.Demo)        return "1.0";
+            if (k == Kind.AiChat)      return "1.0";
+            if (k == Kind.BugReport)   return "1.0";
+            if (k == Kind.AiWorkbench) return "1.0";
             return "0.0";
         }
 
@@ -876,6 +1009,7 @@ namespace NexOS.Forms
             if (k == Kind.AiSetup)      return "Configure the AI engine";
             if (k == Kind.AiAgent)      return "Chat with the AI agent";
             if (k == Kind.Demo)         return "Demo application";
+            if (k == Kind.AiWorkbench)  return "Local AI agent workspace";
             return "";
         }
 
@@ -920,6 +1054,10 @@ namespace NexOS.Forms
             int n = s.Length;
             for (int i = 0; i < KINDS && i < n; i++)
                 Installed[i] = ((int)s[i] == '1');
+            // No force-off loop any more: Listed() now accepts every Kind, so
+            // the persisted installed.cfg is honoured verbatim.  A Kind the
+            // user explicitly uninstalled stays out of Start > All apps until
+            // they re-install it from the Control Panel.
         }
 
         static void SaveInstalled()
@@ -1175,6 +1313,7 @@ namespace NexOS.Forms
             if (k == Kind.Demo)         return "演示";
             if (k == Kind.NetTools)     return "网络";
             if (k == Kind.AiLauncher)   return "命令台";
+            if (k == Kind.AiChat)       return "AI 对话";
             if (k == Kind.NetDefense)   return "网络防御";
             return "";
         }
@@ -2179,13 +2318,13 @@ static void BeginStartMenuOpen(int showAll, int w, int h)
                 int rowH = 22, lx = x + 28, ly = y + 94, listW = mw - 56;
                 int fyEnd = FootY(y, mh);
                 int sel = 0;
-                for (int i = 0; i < KINDS; i++)
+                for (int i = 0; i < appN; i++)
                 {
-                    if (IsInstalled(i) == 0) continue;
+                    int kind = appKinds[i];
+                    if (IsInstalled(kind) == 0 || !Listed(kind)) continue;
                     if (sel < allScroll) { sel++; continue; }  // skip scrolled-off items
                     int ry = ly + (sel - allScroll) * rowH;
                     if (ry + rowH > fyEnd - 4) break;
-                    int kind = i;
                     if (W.Hot(lx, ry, listW, rowH - 1) || sel == menuSel)
                         Gfx.FillRound(lx, ry, listW, rowH - 1, 4, BarHot);
                     if (Gfx.HasImage(Tex.Icon + kind) != 0)
@@ -2467,7 +2606,8 @@ static void BeginStartMenuOpen(int showAll, int w, int h)
             // Clamp allScroll to [0, installedCount - visibleRows]
             int visibleRows = 8;  // enough to fill visible area above footer
             int totalInstalled = 0;
-            for (int i = 0; i < KINDS; i++) if (IsInstalled(i) != 0) totalInstalled++;
+            for (int i = 0; i < appN; i++)
+                if (IsInstalled(appKinds[i]) != 0) totalInstalled++;
             int maxScroll = totalInstalled > visibleRows ? totalInstalled - visibleRows : 0;
             for (int k = 0; k < notches; k++)
             {
@@ -2513,11 +2653,19 @@ static void BeginStartMenuOpen(int showAll, int w, int h)
             {
                 int rowH = 22, lx = x + 28, ly = y + 94, listW = mw - 56;
                 int fyEnd = FootY(y, mh);
-                for (int i = 0; i < KINDS; i++)
+                // The row index must advance ONLY for offered apps, exactly like
+                // the draw loop above; using the raw Kind value here would make
+                // clicks land one row off (and off the list entirely) for every
+                // app that is filtered out.
+                int row = 0;
+                for (int i = 0; i < appN; i++)
                 {
-                    int ry = ly + i * rowH;
+                    int kind = appKinds[i];
+                    if (IsInstalled(kind) == 0 || !Listed(kind)) continue;
+                    int ry = ly + row * rowH;
                     if (ry + rowH > fyEnd - 4) break;
-                    if (U.In(mx, my, lx, ry, listW, rowH - 1)) return i;
+                    if (U.In(mx, my, lx, ry, listW, rowH - 1)) return kind;
+                    row++;
                 }
             }
             return -1;
@@ -2740,9 +2888,10 @@ static void BeginStartMenuOpen(int showAll, int w, int h)
                 int fy2 = FootY(y, mh);
                 int sel = 0;
                 int sc = (int)Anim.Get(SCROLL_KEY);   // P0-3: eased scroll offset
-                for (int i = 0; i < KINDS; i++)
+                for (int i = 0; i < appN; i++)
                 {
-                    if (IsInstalled(i) == 0) continue;
+                    int kind = appKinds[i];
+                    if (IsInstalled(kind) == 0 || !Listed(kind)) continue;
                     if (sel < sc) { sel++; continue; }
                     int ry = ly + (sel - sc) * rowH;
                     if (ry + rowH > fy2 - 4) break;
@@ -2752,7 +2901,7 @@ static void BeginStartMenuOpen(int showAll, int w, int h)
                         menuOpen = false; Anim.Set(START_KEY, 0, 0, 1);
                         Host.SetAnim(1);
                         menuCloseFrames = 3;
-                        return i;
+                        return kind;
                     }
                     sel++;
                 }
@@ -2798,17 +2947,44 @@ static void BeginStartMenuOpen(int showAll, int w, int h)
             return -1;
         }
 
+        // ---- which applications are OFFERED ---------------------------------
+        // ALL Kind values are offered again.  The old two-item allow-list
+        // (Notepad + AiChat) was a temporary debugging filter: it also fed
+        // LoadInstalled()'s "force everything else off" loop and
+        // InstalledKindAt(), so Start > All apps showed just two rows even
+        // though the installed.cfg file had 19 entries.
+        //
+        // Shell.Make() has a real App for every Kind 0..18 and the native
+        // app_for_managed_kind() maps all of them, so nothing here can resolve
+        // to APP_NONE any more.
+        static bool Listed(int kind)
+        {
+            // A kind is offered only when the kernel manifest lists it.
+            // Before the manifest existed this was "kind < KINDS", which
+            // silently offered kinds that had no .mex behind them.
+            if (kind < 0 || kind >= KINDS) return false;
+            if (listed == null) return false;
+            return listed[kind];
+        }
+
         static int InstalledCount()
         {
             int c = 0;
-            for (int i = 0; i < KINDS; i++) if (IsInstalled(i) != 0) c++;
+            for (int i = 0; i < appN; i++)
+            {
+                int kind = appKinds[i];
+                if (IsInstalled(kind) != 0 && Listed(kind)) c++;
+            }
             return c;
         }
         static int InstalledKindAt(int idx)
         {
             int c = 0;
-            for (int i = 0; i < KINDS; i++)
-                if (IsInstalled(i) != 0) { if (c == idx) return i; c++; }
+            for (int i = 0; i < appN; i++)
+            {
+                int kind = appKinds[i];
+                if (IsInstalled(kind) != 0 && Listed(kind)) { if (c == idx) return kind; c++; }
+            }
             return -1;
         }
 
@@ -2982,9 +3158,32 @@ static void BeginStartMenuOpen(int showAll, int w, int h)
             else if (c == A_DESK_AI)  { SwitchDesktop(1); }
             else if (c == A_DESK_DEF) { SwitchDesktop(0); }
             // Taskbar jump-list actions.
-            else if (c == A_JUMP_UNPIN)    { UnpinFromTaskbar(jumpKind); }
-            else if (c == A_JUMP_NEWWIN)   { Host.OpenAppNew(jumpKind >= 0 ? jumpKind : Kind.FileExplorer); }
-            else if (c == A_JUMP_CLOSEALL) { Shell.CloseApp(jumpKind >= 0 ? jumpKind : Kind.FileExplorer); }
+            // Taskbar jump-list actions.  Each logs first: the two window
+            // actions were reported as "nothing happens" and, with no log
+            // line, there was no way to tell a mis-dispatch from a dead
+            // Host callback.  The log also records the RESOLVED kind, because
+            // jumpKind is a managed static and MiniCLR does not run static
+            // initialisers -- a -1 here means the jump list never stored the
+            // target, which is a different bug from "the callback did nothing".
+            else if (c == A_JUMP_UNPIN)
+            {
+                Host.Log(U.Cat("[JUMP] unpin kind=", U.I(jumpKind)));
+                UnpinFromTaskbar(jumpKind);
+            }
+            else if (c == A_JUMP_NEWWIN)
+            {
+                int k = jumpKind >= 0 ? jumpKind : Kind.Notepad;
+                Host.Log(U.Cat(U.Cat("[JUMP] new window kind=", U.I(jumpKind)),
+                               U.Cat(" -> ", U.I(k))));
+                Host.OpenAppNew(k);
+            }
+            else if (c == A_JUMP_CLOSEALL)
+            {
+                int k = jumpKind >= 0 ? jumpKind : Kind.Notepad;
+                Host.Log(U.Cat(U.Cat("[JUMP] close all kind=", U.I(jumpKind)),
+                               U.Cat(" -> ", U.I(k))));
+                Shell.CloseApp(k);
+            }
         }
 
         // Remove a kind from the pinned taskbar set (jump-list "Unpin").

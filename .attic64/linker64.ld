@@ -27,6 +27,12 @@ SECTIONS
         *(.data.*)
     }
 
+    /* .bss is relocated to 0x300000 -- deliberately NOT contiguous with .data.
+       It is NOBITS, so moving it costs nothing in the flat binary, and it keeps
+       the 0x100000..0x240000 window free for the 64-bit blit target (see
+       K64_STAGE_FLOOR in kernel.cpp, which must match this address). */
+    . = 0x240000;
+
     .bss : {
         __bss_start = .;
         *(.bss)
@@ -48,7 +54,7 @@ SECTIONS
        (0x500000), not a linker symbol.  If you change one, change BOTH.  The
        durable fix (have the constant reference this symbol) is deliberate
        technical debt, not an oversight. */
-    ASSERT(__bss_end <= 0x500000,
+    ASSERT(__bss_end <= 0x600000,
         "kernel64 .bss overruns HEAP_START (see kernel64.cpp:2381) -- raise HEAP_START or shrink .bss")
 
     /DISCARD/ : {

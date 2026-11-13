@@ -347,6 +347,209 @@ static float dot_q6_K(const uint8_t* w, const float* x, int n){
     return sum;
 }
 
+// =====================================================================
+//  Activation quantisation (W4A8 / W8A8 integer dot products)
+// ---------------------------------------------------------------------
+// Weights already live in RAM in 4/5/6/8-bit blocks.  The float dot kernels
+// above pay an int->float conversion and a float multiply for EVERY weight
+// on EVERY token.  Quantising the activations once per matmul (signed int8,
+// per-32-element absmax block -- the same 32-element sub-blocking every
+// supported K-quant format uses) lets the hot loop accumulate in int32 and
+// apply the two scales once per block instead of once per weight.
+//
+// This is a real W4A8 / W8A8 quantised inference path, not just "the model
+// file happens to be Q4_K_M": the accumulator stays integral until the very
+// end.  Call qwen_set_quant_mode(0) to fall back to the legacy float dots.
+// =====================================================================
+#define QX_BLK 32
+static int8_t* g_qx  = 0;      // int8 activations, g_qx_cap entries
+static float*  g_qxs = 0;      // one scale per 32-element block
+static int     g_qx_cap = 0;
+static int     g_quant_mode = 1;
+
+void qwen_set_quant_mode(int m){ g_quant_mode = m ? 1 : 0; }
+int  qwen_quant_mode(void){ return g_quant_mode; }
+
+static void quant_x(const float* x, int n){
+    int nb = (n + QX_BLK - 1) / QX_BLK;
+    for (int b = 0; b < nb; b++){
+        int base = b * QX_BLK;
+        int cnt  = n - base; if (cnt > QX_BLK) cnt = QX_BLK;
+        float amax = 0.0f;
+        for (int i = 0; i < cnt; i++){
+            float a = x[base + i]; if (a < 0.0f) a = -a;
+            if (a > amax) amax = a;
+        }
+        float s = amax / 127.0f;
+        if (s < 1.0e-9f) s = 1.0e-9f;      // all-zero block => q == 0
+        g_qxs[b] = s;
+        float inv = 1.0f / s;
+        for (int i = 0; i < cnt; i++){
+            float v = x[base + i] * inv;
+            int q = (int)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+            if (q >  127) q =  127;
+            if (q < -127) q = -127;
+            g_qx[base + i] = (int8_t)q;
+        }
+        for (int i = cnt; i < QX_BLK; i++) g_qx[base + i] = 0;
+    }
+}
+
+static int quant_supported(uint32_t t){
+    switch (t){
+        case GGUF_T_Q4_0: case GGUF_T_Q4_1: case GGUF_T_Q5_0:
+        case GGUF_T_Q8_0: case GGUF_T_Q4_K: case GGUF_T_Q5_K:
+            return 1;
+        default: return 0;      // F32/F16/BF16/Q6_K keep the float kernels
+    }
+}
+
+static float dot_q4_0_i8(const uint8_t* w, int n){
+    float sum = 0.0f; int nb = n / 32;
+    for (int i = 0; i < nb; i++){
+        const uint8_t* b = w + i * 18;
+        float d = f16_to_f32(rd16(b));
+        const uint8_t* q = b + 2;
+        const int8_t*  xp = g_qx + i * 32;
+        int32_t acc = 0, sx = 0;
+        for (int j = 0; j < 16; j++){
+            int v1 = xp[j], v2 = xp[j + 16];
+            acc += (int)(q[j] & 0xF) * v1 + (int)(q[j] >> 4) * v2;
+            sx  += v1 + v2;
+        }
+        sum += d * g_qxs[i] * (float)(acc - 8 * sx);
+    }
+    return sum;
+}
+static float dot_q4_1_i8(const uint8_t* w, int n){
+    float sum = 0.0f; int nb = n / 32;
+    for (int i = 0; i < nb; i++){
+        const uint8_t* b = w + i * 20;
+        float d = f16_to_f32(rd16(b));
+        float m = f16_to_f32(rd16(b + 2));
+        const uint8_t* q = b + 4;
+        const int8_t*  xp = g_qx + i * 32;
+        int32_t acc = 0, sx = 0;
+        for (int j = 0; j < 16; j++){
+            int v1 = xp[j], v2 = xp[j + 16];
+            acc += (int)(q[j] & 0xF) * v1 + (int)(q[j] >> 4) * v2;
+            sx  += v1 + v2;
+        }
+        sum += g_qxs[i] * (d * (float)acc + m * (float)sx);
+    }
+    return sum;
+}
+static float dot_q5_0_i8(const uint8_t* w, int n){
+    float sum = 0.0f; int nb = n / 32;
+    for (int i = 0; i < nb; i++){
+        const uint8_t* b = w + i * 22;
+        float d = f16_to_f32(rd16(b));
+        const uint8_t* qh = b + 2;
+        const uint8_t* qs = b + 6;
+        const int8_t*  xp = g_qx + i * 32;
+        int32_t acc = 0;
+        for (int j = 0; j < 32; j++){
+            int hi = (qh[j / 8] >> (j % 8)) & 1;
+            int lo = (j < 16) ? (qs[j] & 0xF) : (qs[j - 16] >> 4);
+            acc += ((lo | (hi << 4)) - 16) * xp[j];
+        }
+        sum += d * g_qxs[i] * (float)acc;
+    }
+    return sum;
+}
+static float dot_q8_0_i8(const uint8_t* w, int n){
+    float sum = 0.0f; int nb = n / 32;
+    for (int i = 0; i < nb; i++){
+        const uint8_t* b = w + i * 34;
+        float d = f16_to_f32(rd16(b));
+        const int8_t* q  = (const int8_t*)(b + 2);
+        const int8_t* xp = g_qx + i * 32;
+        int32_t acc = 0;
+        for (int j = 0; j < 32; j++) acc += (int32_t)q[j] * xp[j];
+        sum += d * g_qxs[i] * (float)acc;
+    }
+    return sum;
+}
+// Q4_K: 8 sub-blocks of 32 per 256-weight super block.  is is the sub-block
+// index within the super block, so the activation-scale index is i*8+is.
+static float dot_q4_K_i8(const uint8_t* w, int n){
+    float sum = 0.0f; int nb = n / 256;
+    for (int i = 0; i < nb; i++){
+        const uint8_t* b   = w + i * 144;
+        float d    = f16_to_f32(rd16(b));
+        float dmin = f16_to_f32(rd16(b + 2));
+        const uint8_t* sc = b + 4;
+        const uint8_t* q  = b + 16;
+        int is = 0;
+        for (int j = 0; j < 256; j += 64){
+            uint8_t s1, m1, s2, m2;
+            scale_min_k4(is,     sc, &s1, &m1);
+            scale_min_k4(is + 1, sc, &s2, &m2);
+            const int8_t* x1 = g_qx + i * 256 + j;
+            const int8_t* x2 = x1 + 32;
+            int32_t a1 = 0, t1 = 0, a2 = 0, t2 = 0;
+            for (int l = 0; l < 32; l++){
+                int v1 = x1[l], v2 = x2[l];
+                a1 += (int)(q[l] & 0xF) * v1; t1 += v1;
+                a2 += (int)(q[l] >>  4) * v2; t2 += v2;
+            }
+            int sb = i * 8 + is;
+            sum += d    * ((float)s1 * g_qxs[sb]     * (float)a1
+                         + (float)s2 * g_qxs[sb + 1] * (float)a2)
+                 - dmin * ((float)m1 * g_qxs[sb]     * (float)t1
+                         + (float)m2 * g_qxs[sb + 1] * (float)t2);
+            q += 32; is += 2;
+        }
+    }
+    return sum;
+}
+static float dot_q5_K_i8(const uint8_t* w, int n){
+    float sum = 0.0f; int nb = n / 256;
+    for (int i = 0; i < nb; i++){
+        const uint8_t* b   = w + i * 176;
+        float d    = f16_to_f32(rd16(b));
+        float dmin = f16_to_f32(rd16(b + 2));
+        const uint8_t* sc = b + 4;
+        const uint8_t* qh = b + 16;
+        const uint8_t* q  = b + 48;
+        int is = 0;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < 256; j += 64){
+            uint8_t s1, m1, s2, m2;
+            scale_min_k4(is,     sc, &s1, &m1);
+            scale_min_k4(is + 1, sc, &s2, &m2);
+            const int8_t* x1 = g_qx + i * 256 + j;
+            const int8_t* x2 = x1 + 32;
+            int32_t a1 = 0, t1 = 0, a2 = 0, t2 = 0;
+            for (int l = 0; l < 32; l++){
+                int v1 = x1[l], v2 = x2[l];
+                int lo = (int)(q[l] & 0xF) + ((qh[l] & u1) ? 16 : 0);
+                int hi = (int)(q[l] >>  4) + ((qh[l] & u2) ? 16 : 0);
+                a1 += lo * v1; t1 += v1;
+                a2 += hi * v2; t2 += v2;
+            }
+            int sb = i * 8 + is;
+            sum += d    * ((float)s1 * g_qxs[sb]     * (float)a1
+                         + (float)s2 * g_qxs[sb + 1] * (float)a2)
+                 - dmin * ((float)m1 * g_qxs[sb]     * (float)t1
+                         + (float)m2 * g_qxs[sb + 1] * (float)t2);
+            q += 32; is += 2; u1 <<= 2; u2 <<= 2;
+        }
+    }
+    return sum;
+}
+static float dot_row_i8(const uint8_t* w, uint32_t type, int n){
+    switch (type){
+        case GGUF_T_Q4_0: return dot_q4_0_i8(w, n);
+        case GGUF_T_Q4_1: return dot_q4_1_i8(w, n);
+        case GGUF_T_Q5_0: return dot_q5_0_i8(w, n);
+        case GGUF_T_Q8_0: return dot_q8_0_i8(w, n);
+        case GGUF_T_Q4_K: return dot_q4_K_i8(w, n);
+        case GGUF_T_Q5_K: return dot_q5_K_i8(w, n);
+        default: return 0.0f;
+    }
+}
+
 // Block size required by a type (row length must be a multiple of it).
 static int type_block(uint32_t t){
     switch (t){
@@ -384,11 +587,20 @@ static float dot_row(const uint8_t* w, uint32_t type, const float* x, int n){
 }
 
 // y[j] = <W_row_j, x>   for j in [0, n_out); each row is n_in elements.
+// Quantise the activation ONCE for the whole matrix, then walk every row
+// with the int8 accumulator.  The legacy float path stays available for
+// F32/F16/BF16/Q6_K and for qwen_set_quant_mode(0).
 static void matmul(float* y, const float* x, const uint8_t* w, uint32_t type,
                    int n_in, int n_out){
     uint64_t row_bytes = ai_gguf_type_size(type, (uint64_t)n_in);
-    for (int j = 0; j < n_out; j++)
-        y[j] = dot_row(w + (uint64_t)j * row_bytes, type, x, n_in);
+    int fast = g_quant_mode && g_qx && g_qxs && quant_supported(type) &&
+               (n_in % QX_BLK == 0) && n_in <= g_qx_cap;
+    if (fast) quant_x(x, n_in);
+    for (int j = 0; j < n_out; j++){
+        const uint8_t* row = w + (uint64_t)j * row_bytes;
+        y[j] = fast ? dot_row_i8(row, type, n_in)
+                    : dot_row(row, type, x, n_in);
+    }
 }
 
 // Dequantise a whole (small) tensor row into floats - used for norms/biases
@@ -564,7 +776,25 @@ struct RT {
 
     // activations
     float *x, *xb, *xb2, *hb, *hb2, *q, *att, *logits;
-    float *kcache, *vcache;        // [layer][pos][kv_dim]
+    float *kcache, *vcache;        // legacy flat view (unused with paged KV)
+    // ---- paged KV cache -------------------------------------------------
+    // Instead of allocating (and zeroing) two n_layer*n_ctx*kv_dim float
+    // arrays up front -- ~88 MB for Qwen2-0.5B at ctx 512 -- the cache is a
+    // table of 16-token pages.  Pages are pulled from the arena only when a
+    // position is actually written, so model load does far less zeroing and
+    // a short chat never touches the tail of the context window.
+    float **kpages, **vpages;      // [layer][page] -> KV_PAGE*kv_dim floats
+    int   n_pages;
+#define KV_PAGE 16
+
+    // ---- resumable forward / generation state ---------------------------
+    // A single decode step is split into per-layer slices so the GUI thread
+    // can run a few layers per frame instead of blocking on a whole token.
+    int   fw_active, fw_l, fw_pos, fw_token;
+    int   gen_state, gen_phase, gen_np, gen_prefill_i, gen_pos;
+    int   gen_produced, gen_max_new;
+    float gen_temp;
+    int32_t gen_toks[1024];
 
     // tokenizer
     uint32_t* tok_off;             // byte offset of token text inside blob
@@ -595,6 +825,27 @@ static void* apalloc(uint64_t n){
     g_arena_used += n;
     gi_memset(p, 0, n);
     return p;
+}
+
+// ---- paged KV cache ----------------------------------------------------
+// kv_row() is the only access path.  `create` is set when writing the
+// current position; reads of earlier positions use 0 (the page must already
+// exist because every position is written before it is attended to).
+static float* kv_page(float** table, int l, int p, int create){
+    if (!table || l < 0 || p < 0 || p >= R.n_pages) return 0;
+    int idx = l * R.n_pages + p;
+    float* pg = table[idx];
+    if (!pg && create){
+        pg = (float*)apalloc((uint64_t)KV_PAGE * R.kv_dim * 4);
+        table[idx] = pg;
+    }
+    return pg;
+}
+static float* kv_row(float** table, int l, int t, int create){
+    int p = t / KV_PAGE, o = t % KV_PAGE;
+    float* pg = kv_page(table, l, p, create);
+    if (!pg) return 0;
+    return pg + (uint64_t)o * R.kv_dim;
 }
 
 // GPT-2 byte-level alphabet (same table transformers' bytes_to_unicode builds)
@@ -701,6 +952,7 @@ void qwen_unload(void){
     if (g_arena){ big_free(g_arena, (uint32_t)g_arena_sz); g_arena = 0; }
     if (R.info){ big_free(R.info, (uint32_t)g_info_bytes); }
     g_arena_sz = g_arena_used = 0;
+    g_qx = 0; g_qxs = 0; g_qx_cap = 0;
     gi_memset(&R, 0, sizeof(R));
     R.rng = 0x1234567u;
 }
@@ -783,10 +1035,20 @@ int qwen_load(const uint8_t* blob, uint64_t size, uint32_t max_ctx){
     need += (uint64_t)(3 * R.n_embd + 2 * R.n_ff + 3 * R.n_head * R.head_dim) * 4;
     need += (uint64_t)R.n_head * R.n_ctx * 4;                        // att
     need += (uint64_t)R.n_vocab * 4;                                 // logits
-    need += 2ull * R.n_layer * R.n_ctx * R.kv_dim * 4;               // kv cache
+    need += 2ull * R.n_layer * R.n_ctx * R.kv_dim * 4;               // paged KV pool (pulled lazily)
+    R.n_pages = (R.n_ctx + KV_PAGE - 1) / KV_PAGE;
+    need += 2ull * R.n_layer * R.n_pages * sizeof(float*);            // page tables
     need += (uint64_t)R.n_vocab * (4 + 2);                           // tok tables
     uint32_t hsz = 1024; while (hsz < (uint32_t)R.n_vocab * 2) hsz <<= 1;
     need += (uint64_t)hsz * 4;
+    // int8 activation scratch: one byte per input activation + one float
+    // scale per 32-element block.  The largest matmul input is max(embd,
+    // head*head_dim, ffn).
+    int qx_max = R.n_embd;
+    if (R.n_head * R.head_dim > qx_max) qx_max = R.n_head * R.head_dim;
+    if (R.n_ff > qx_max) qx_max = R.n_ff;
+    g_qx_cap = (qx_max + QX_BLK + 31) & ~(QX_BLK - 1);
+    need += (uint64_t)g_qx_cap + (uint64_t)(g_qx_cap / QX_BLK + 2) * 4 + 128;
     need += 8192;                                                    // map buffer
     need += 64ull * 128;                                             // slack
 
@@ -857,10 +1119,12 @@ int qwen_load(const uint8_t* blob, uint64_t size, uint32_t max_ctx){
     R.q      = (float*)apalloc((uint64_t)R.n_head * R.head_dim * 4);
     R.att    = (float*)apalloc((uint64_t)R.n_head * R.n_ctx * 4);
     R.logits = (float*)apalloc((uint64_t)R.n_vocab * 4);
-    R.kcache = (float*)apalloc((uint64_t)R.n_layer * R.n_ctx * R.kv_dim * 4);
-    R.vcache = (float*)apalloc((uint64_t)R.n_layer * R.n_ctx * R.kv_dim * 4);
+    R.kpages = (float**)apalloc((uint64_t)R.n_layer * R.n_pages * sizeof(float*));
+    R.vpages = (float**)apalloc((uint64_t)R.n_layer * R.n_pages * sizeof(float*));
+    g_qx  = (int8_t*)apalloc((uint64_t)g_qx_cap);
+    g_qxs = (float*) apalloc((uint64_t)(g_qx_cap / QX_BLK + 2) * 4);
     if (!R.x || !R.xb || !R.xb2 || !R.hb || !R.hb2 || !R.q || !R.att ||
-        !R.logits || !R.kcache || !R.vcache){
+        !R.logits || !R.kpages || !R.vpages || !g_qx || !g_qxs){
         set_err("arena exhausted (activations)"); return -13;
     }
 
@@ -1025,83 +1289,117 @@ static void rope_apply(float* v, int nheads, int hd, int pos, float theta, int n
     }
 }
 
-const float* qwen_forward(int32_t token, int32_t pos){
-    if (!R.loaded) return 0;
+// ---------------------------------------------------------------------
+//  transformer forward -- split into resumable phases
+// ---------------------------------------------------------------------
+static float g_fw_scale;
+static int   g_fw_rep;
+
+static void fwd_begin(int32_t token, int32_t pos){
+    const int E = R.n_embd, HD = R.head_dim, H = R.n_head;
+    if (token < 0 || token >= R.n_vocab) token = 0;
     if (pos < 0) pos = 0;
     if (pos >= R.n_ctx) pos = R.n_ctx - 1;
-    const int E = R.n_embd, HD = R.head_dim, KVD = R.kv_dim, H = R.n_head;
-    if (token < 0 || token >= R.n_vocab) token = 0;
-
     dequant_row(R.x, R.tok_w + (uint64_t)token * R.tok_row_bytes, R.tok_t, E);
+    g_fw_scale = 1.0f / mi_sqrtf((float)HD);
+    g_fw_rep   = H / R.n_kv; if (g_fw_rep < 1) g_fw_rep = 1;
+    R.fw_token = token; R.fw_pos = pos; R.fw_l = 0; R.fw_active = 1;
+}
 
-    const float scale = 1.0f / mi_sqrtf((float)HD);
-    int rep = H / R.n_kv; if (rep < 1) rep = 1;
+static int fwd_layer(int l, int pos){
+    const int E = R.n_embd, HD = R.head_dim, KVD = R.kv_dim, H = R.n_head;
+    LayerW* w = &R.L[l];
+    rmsnorm(R.xb, R.x, w->attn_norm, E, R.eps);
 
-    for (int l = 0; l < R.n_layer; l++){
-        LayerW* w = &R.L[l];
-        rmsnorm(R.xb, R.x, w->attn_norm, E, R.eps);
+    float* krow = kv_row(R.kpages, l, pos, 1);
+    float* vrow = kv_row(R.vpages, l, pos, 1);
+    if (!krow || !vrow) return -1;
+    matmul(R.q,  R.xb, w->wq, w->tq, E, H * HD);
+    matmul(krow, R.xb, w->wk, w->tk, E, KVD);
+    matmul(vrow, R.xb, w->wv, w->tv, E, KVD);
+    if (w->bq) for (int i = 0; i < H * HD; i++) R.q[i]  += w->bq[i];
+    if (w->bk) for (int i = 0; i < KVD;    i++) krow[i] += w->bk[i];
+    if (w->bv) for (int i = 0; i < KVD;    i++) vrow[i] += w->bv[i];
 
-        float* krow = R.kcache + ((uint64_t)l * R.n_ctx + pos) * KVD;
-        float* vrow = R.vcache + ((uint64_t)l * R.n_ctx + pos) * KVD;
-        matmul(R.q,  R.xb, w->wq, w->tq, E, H * HD);
-        matmul(krow, R.xb, w->wk, w->tk, E, KVD);
-        matmul(vrow, R.xb, w->wv, w->tv, E, KVD);
-        if (w->bq) for (int i = 0; i < H * HD; i++) R.q[i]  += w->bq[i];
-        if (w->bk) for (int i = 0; i < KVD;    i++) krow[i] += w->bk[i];
-        if (w->bv) for (int i = 0; i < KVD;    i++) vrow[i] += w->bv[i];
+    if (R.has_qk_norm && w->qn && w->kn){
+        for (int h = 0; h < H;      h++) rmsnorm(R.q + h*HD,  R.q + h*HD,  w->qn, HD, R.eps);
+        for (int h = 0; h < R.n_kv; h++) rmsnorm(krow + h*HD, krow + h*HD, w->kn, HD, R.eps);
+    }
+    rope_apply(R.q,  H,      HD, pos, R.rope_theta, R.rope_neox);
+    rope_apply(krow, R.n_kv, HD, pos, R.rope_theta, R.rope_neox);
 
-        if (R.has_qk_norm && w->qn && w->kn){
-            for (int h = 0; h < H;      h++) rmsnorm(R.q + h*HD,  R.q + h*HD,  w->qn, HD, R.eps);
-            for (int h = 0; h < R.n_kv; h++) rmsnorm(krow + h*HD, krow + h*HD, w->kn, HD, R.eps);
-        }
-        rope_apply(R.q,  H,      HD, pos, R.rope_theta, R.rope_neox);
-        rope_apply(krow, R.n_kv, HD, pos, R.rope_theta, R.rope_neox);
-
-        for (int h = 0; h < H; h++){
-            const float* qh = R.q + h * HD;
-            float* a = R.att + (uint64_t)h * R.n_ctx;
-            int kvh = h / rep;
-            for (int t = 0; t <= pos; t++){
-                const float* kk = R.kcache + ((uint64_t)l * R.n_ctx + t) * KVD + kvh * HD;
+    // Paged attention: walk the KV pages in order.  Pages are 16 tokens, so
+    // a 512-token context is 32 page lookups instead of one giant flat walk,
+    // and untouched tail pages are never allocated at all.
+    for (int h = 0; h < H; h++){
+        const float* qh = R.q + h * HD;
+        float* a = R.att + (uint64_t)h * R.n_ctx;
+        int kvh = h / g_fw_rep;
+        for (int p = 0; p <= pos / KV_PAGE; p++){
+            int t0 = p * KV_PAGE;
+            int t1 = t0 + KV_PAGE; if (t1 > pos + 1) t1 = pos + 1;
+            for (int t = t0; t < t1; t++){
+                const float* kk = kv_row(R.kpages, l, t, 0);
+                if (!kk){ a[t] = -1.0e30f; continue; }
+                kk += kvh * HD;
                 float s = 0.0f;
                 for (int i = 0; i < HD; i++) s += qh[i] * kk[i];
-                a[t] = s * scale;
+                a[t] = s * g_fw_scale;
             }
-            softmax_n(a, pos + 1);
-            float* ob = R.xb + h * HD;
-            for (int i = 0; i < HD; i++) ob[i] = 0.0f;
-            for (int t = 0; t <= pos; t++){
-                const float* vv = R.vcache + ((uint64_t)l * R.n_ctx + t) * KVD + kvh * HD;
+        }
+        softmax_n(a, pos + 1);
+        float* ob = R.xb + h * HD;
+        for (int i = 0; i < HD; i++) ob[i] = 0.0f;
+        for (int p = 0; p <= pos / KV_PAGE; p++){
+            int t0 = p * KV_PAGE;
+            int t1 = t0 + KV_PAGE; if (t1 > pos + 1) t1 = pos + 1;
+            for (int t = t0; t < t1; t++){
+                const float* vv = kv_row(R.vpages, l, t, 0);
+                if (!vv) continue;
+                vv += kvh * HD;
                 float aw = a[t];
                 if (aw == 0.0f) continue;
                 for (int i = 0; i < HD; i++) ob[i] += aw * vv[i];
             }
         }
-        matmul(R.xb2, R.xb, w->wo, w->to, H * HD, E);
-        for (int i = 0; i < E; i++) R.x[i] += R.xb2[i];
-
-        rmsnorm(R.xb, R.x, w->ffn_norm, E, R.eps);
-        matmul(R.hb, R.xb, w->wu, w->tu, E, R.n_ff);
-        if (w->wg){
-            matmul(R.hb2, R.xb, w->wg, w->tg, E, R.n_ff);
-            for (int i = 0; i < R.n_ff; i++){
-                float g = R.hb2[i];
-                g = g * (1.0f / (1.0f + mi_expf(-g)));      // SiLU(gate)
-                R.hb[i] = g * R.hb[i];                      // * up
-            }
-        } else {
-            for (int i = 0; i < R.n_ff; i++){
-                float g = R.hb[i];
-                R.hb[i] = g * (1.0f / (1.0f + mi_expf(-g)));
-            }
-        }
-        matmul(R.xb2, R.hb, w->wd, w->td, R.n_ff, E);
-        for (int i = 0; i < E; i++) R.x[i] += R.xb2[i];
     }
+    matmul(R.xb2, R.xb, w->wo, w->to, H * HD, E);
+    for (int i = 0; i < E; i++) R.x[i] += R.xb2[i];
 
+    rmsnorm(R.xb, R.x, w->ffn_norm, E, R.eps);
+    matmul(R.hb, R.xb, w->wu, w->tu, E, R.n_ff);
+    if (w->wg){
+        matmul(R.hb2, R.xb, w->wg, w->tg, E, R.n_ff);
+        for (int i = 0; i < R.n_ff; i++){
+            float g = R.hb2[i];
+            g = g * (1.0f / (1.0f + mi_expf(-g)));      // SiLU(gate)
+            R.hb[i] = g * R.hb[i];                      // * up
+        }
+    } else {
+        for (int i = 0; i < R.n_ff; i++){
+            float g = R.hb[i];
+            R.hb[i] = g * (1.0f / (1.0f + mi_expf(-g)));
+        }
+    }
+    matmul(R.xb2, R.hb, w->wd, w->td, R.n_ff, E);
+    for (int i = 0; i < E; i++) R.x[i] += R.xb2[i];
+    return 0;
+}
+
+static void fwd_finish(int pos){
+    const int E = R.n_embd;
     rmsnorm(R.x, R.x, R.out_norm, E, R.eps);
     matmul(R.logits, R.x, R.out_w, R.out_t, E, R.n_vocab);
     R.pos = pos + 1;
+    R.fw_active = 0;
+}
+
+const float* qwen_forward(int32_t token, int32_t pos){
+    if (!R.loaded) return 0;
+    fwd_begin(token, pos);
+    for (int l = 0; l < R.n_layer; l++)
+        if (fwd_layer(l, R.fw_pos) != 0) return 0;
+    fwd_finish(R.fw_pos);
     return R.logits;
 }
 
@@ -1154,33 +1452,118 @@ int32_t qwen_sample(const float* logits, float temp, float top_p){
 }
 
 // ---------------------------------------------------------------------
-//  end-to-end generation
+//  resumable generation
 // ---------------------------------------------------------------------
-static int32_t g_ptoks[1024];
+// A decode step used to be one opaque qwen_forward() call.  On a single-
+// threaded GUI that meant the "Send" click blocked for the entire token
+// (and often for the whole 64-token answer): the mouse froze.  Generation is
+// now a state machine: qwen_gen_slice() runs at most N transformer layers
+// per call, so the host can spread one token across several frames and keep
+// pumping mouse events in between.  qwen_generate() is the synchronous
+// wrapper used by the shell/autotest path.
+#define GEN_IDLE  0
+#define GEN_RUN   1
+#define GEN_DONE  2
+#define GEN_ERROR 3
 
-int qwen_generate(const char* prompt, int max_new, float temp, QwenEmitFn emit){
+int  qwen_gen_status(void){ return R.loaded ? R.gen_state : GEN_IDLE; }
+int  qwen_gen_produced(void){ return R.gen_produced; }
+void qwen_gen_abort(void){
+    R.gen_state = GEN_IDLE; R.fw_active = 0; R.gen_phase = 0;
+}
+
+static void gen_start_forward(int32_t tok, int pos){ fwd_begin(tok, pos); }
+
+// Called after fwd_finish(): either queue the next prompt token (prefill) or
+// sample one token and queue the forward for it.  Returns 1 = still running,
+// 0 = finished.
+static int gen_after_forward(char* piece, int cap){
+    if (piece && cap > 0) piece[0] = 0;
+    if (R.gen_phase == 0){
+        R.gen_prefill_i++;
+        if (R.gen_prefill_i < R.gen_np){
+            gen_start_forward(R.gen_toks[R.gen_prefill_i], R.gen_pos++);
+            return 1;
+        }
+        R.gen_phase = 1;
+    }
+    int32_t next = qwen_sample(R.logits, R.gen_temp, 0.9f);
+    if (R.info->eos_id != 0xFFFFFFFFu && next == (int32_t)R.info->eos_id){
+        R.gen_state = GEN_DONE; return 0;
+    }
+    if (R.gen_produced >= R.gen_max_new || R.gen_pos >= R.n_ctx){
+        R.gen_state = GEN_DONE; return 0;
+    }
+    const char* t = qwen_detokenize(next);
+    if (piece && cap > 0 && t){
+        int i = 0;
+        while (t[i] && i < cap - 1){ piece[i] = t[i]; i++; }
+        piece[i] = 0;
+    }
+    R.gen_produced++;
+    gen_start_forward(next, R.gen_pos++);
+    return 1;
+}
+
+int qwen_gen_begin(const char* prompt, int max_new, float temp){
     if (!R.loaded) return -1;
     qwen_reset();
-    int n = qwen_tokenize(prompt, g_ptoks, 1024);
+    int n = qwen_tokenize(prompt, R.gen_toks, 1024);
     if (n <= 0){
-        g_ptoks[0] = (R.info->bos_id != 0xFFFFFFFFu) ? (int32_t)R.info->bos_id : 0;
+        R.gen_toks[0] = (R.info->bos_id != 0xFFFFFFFFu) ? (int32_t)R.info->bos_id : 0;
         n = 1;
     }
     if (n > R.n_ctx - 1) n = R.n_ctx - 1;
+    R.gen_np = n; R.gen_prefill_i = 0; R.gen_phase = 0;
+    R.gen_pos = 0; R.gen_produced = 0;
+    R.gen_max_new = (max_new > 0) ? max_new : 64;
+    R.gen_temp = temp;
+    R.gen_state = GEN_RUN;
+    gen_start_forward(R.gen_toks[0], R.gen_pos++);
+    return 0;
+}
 
-    const float* lg = 0;
-    int pos = 0;
-    for (int i = 0; i < n; i++) lg = qwen_forward(g_ptoks[i], pos++);
-
-    int produced = 0;
-    while (produced < max_new && pos < R.n_ctx && lg){
-        int32_t next = qwen_sample(lg, temp, 0.9f);
-        if (R.info->eos_id != 0xFFFFFFFFu && next == (int32_t)R.info->eos_id) break;
-        const char* piece = qwen_detokenize(next);
-        if (emit && piece[0]) emit(piece);
-        produced++;
-        lg = qwen_forward(next, pos++);
+// Run at most `layers` transformer layers, then return control.  `piece`
+// receives any text produced during this slice (empty when the slice only
+// advanced the forward or did prefill).  Returns 1 = still running,
+// 0 = finished, -1 = error.
+int qwen_gen_slice(int layers, char* piece, int cap){
+    if (piece && cap > 0) piece[0] = 0;
+    if (!R.loaded) return -1;
+    if (R.gen_state != GEN_RUN) return 0;
+    if (layers < 1) layers = 1;
+    int budget = layers;
+    while (R.fw_active && budget > 0){
+        if (fwd_layer(R.fw_l, R.fw_pos) != 0){
+            R.gen_state = GEN_ERROR; return -1;
+        }
+        R.fw_l++; budget--;
+        if (R.fw_l >= R.n_layer){
+            fwd_finish(R.fw_pos);
+            int rc = gen_after_forward(piece, cap);
+            if (rc != 1) return rc;
+            // Hand control back after every completed token -- this is the
+            // yield point that keeps the pointer responsive.
+            return 1;
+        }
     }
+    return 1;
+}
+
+int qwen_generate(const char* prompt, int max_new, float temp, QwenEmitFn emit){
+    if (!R.loaded) return -1;
+    if (qwen_gen_begin(prompt, max_new, temp) != 0) return -1;
+    char piece[512];
+    int guard = 0;
+    while (R.gen_state == GEN_RUN){
+        int rc = qwen_gen_slice(R.n_layer, piece, (int)sizeof(piece));
+        if (rc < 0) { qwen_gen_abort(); return -1; }
+        if (piece[0] && emit) emit(piece);
+        if (rc == 0) break;
+        if (++guard > 200000) { qwen_gen_abort(); break; }
+    }
+    int produced = R.gen_produced;
+    R.gen_state = GEN_IDLE;
     return produced;
 }
 

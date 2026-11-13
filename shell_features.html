@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NexOS 托管壳功能清单（含 Bug 记录区）</title>
+<style>
+  :root{
+    --bg:#0f1320; --panel:#171c2e; --panel2:#1e2538; --line:#2a3350;
+    --ink:#e8ecf6; --sub:#9aa6c4; --accent:#7c8cff; --ok:#36d399;
+    --warn:#f6c453; --fixed:#5cc8ff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;line-height:1.6}
+  header{padding:26px 32px 16px;border-bottom:1px solid var(--line);
+         background:linear-gradient(180deg,#1a2138,#0f1320)}
+  h1{margin:0 0 6px;font-size:24px}
+  .meta{color:var(--sub);font-size:13px}
+  .note{margin:16px 32px;padding:14px 18px;background:var(--panel2);
+        border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:8px;font-size:13.5px}
+  .note b{color:#fff}
+  .bar{margin:0 32px 8px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  button{background:#232c48;color:var(--ink);border:1px solid var(--line);
+         border-radius:8px;padding:7px 13px;font-size:13px;cursor:pointer;font-family:inherit}
+  button:hover{background:#2e3a5e;border-color:var(--accent)}
+  button.primary{background:#2b3a6b;border-color:#4a5da8}
+  .stat{font-size:12.5px;color:var(--sub);margin-left:auto}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:18px;padding:16px 32px 36px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .card.filled{border-color:#6b5a2a}
+  .card h3{margin:0;padding:14px 16px 10px;font-size:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .badge{font-size:11px;padding:2px 8px;border-radius:20px;background:#0c1020;border:1px solid var(--line);color:var(--sub)}
+  .tag{font-size:11px;padding:2px 8px;border-radius:6px;font-weight:600;white-space:nowrap}
+  .s-ok{background:rgba(54,211,153,.15);color:var(--ok);border:1px solid rgba(54,211,153,.4)}
+  .s-limit{background:rgba(246,196,83,.15);color:var(--warn);border:1px solid rgba(246,196,83,.4)}
+  .s-unreach{background:rgba(154,166,196,.12);color:var(--sub);border:1px solid var(--line)}
+  .s-fixed{background:rgba(92,200,255,.15);color:var(--fixed);border:1px solid rgba(92,200,255,.4)}
+  .s-restored{background:rgba(124,140,255,.16);color:#aab6ff;border:1px solid rgba(124,140,255,.45)}
+  .s-new{background:rgba(54,211,153,.13);color:#7ee2b8;border:1px solid rgba(54,211,153,.4)}
+  .body{padding:0 16px 6px;font-size:13.5px;color:#d4dbee}
+  .body b{color:#fff}
+  .kv{font-size:12.5px;color:var(--sub);padding:0 16px 8px}
+  code{font-family:"Cascadia Code",Consolas,monospace;background:#0c1020;padding:1px 6px;border-radius:5px;color:#cdd6f4}
+  .bug{padding:12px 16px 16px;border-top:1px dashed var(--line);background:#0c1020}
+  .bug label{display:block;font-size:12.5px;color:var(--warn);font-weight:700;margin-bottom:6px}
+  .bug textarea{width:100%;min-height:66px;resize:vertical;background:#11162a;color:var(--ink);
+        border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-family:inherit;font-size:12.5px}
+  .bug textarea::placeholder{color:#61709a}
+  .sec-title{padding:6px 32px 0;font-size:18px;color:#fff;margin-top:14px}
+  footer{padding:18px 32px 40px;color:var(--sub);font-size:12px;border-top:1px solid var(--line)}
+  .toast{position:fixed;right:22px;bottom:22px;background:#232c48;border:1px solid var(--accent);
+         color:var(--ink);padding:10px 16px;border-radius:8px;font-size:13px;opacity:0;
+         transition:opacity .25s;pointer-events:none}
+  .toast.show{opacity:1}
+</style>
+</head>
+<body>
+<header>
+  <h1>NexOS 托管壳（Managed Shell）功能清单</h1>
+  <div class="meta">生成日期：2026-11-12 ｜ 最近同步：2026-11-12 深夜构建（<b>20 个应用全部独立 .mex</b> · 清单驱动 <code>apps.man</code> · <b>APMS 内核运维</b>）｜ 范围：<code>csharp/apps/Shell/*</code> + <code>csharp/apps/standalone/*</code> + <code>csharp/NexOS.Forms/*</code> + 内核 <code>.attic64/apms.inc</code> + 原生 GUI 桥 <code>src/gui/gui_legacy.cpp</code></div>
+</header>
+
+<div class="note">
+  <b>使用说明：</b>本页列出「托管壳」的全部功能，<b>每个功能下方都有一个可编辑的 Bug 记录区</b>。
+  <ul style="margin:8px 0 0;padding-left:20px">
+    <li>直接在文本框里填写即可，内容会<b>自动保存在本机浏览器</b>（刷新不丢失）；</li>
+    <li>填好后点「导出 Bug 清单」得到 <code>shell_bugs.md</code>，放到项目目录里，对我说「<b>查看</b>」时我就能读到并逐条修复；也可以点「复制全部」粘贴给我；</li>
+    <li>或者最简单的：直接口述给我，由我把 Bug 写进对应功能下面。</li>
+  </ul>
+  状态图例：<span class="tag s-ok">正常</span> <span class="tag s-fixed">已修复</span> <span class="tag s-restored">已恢复</span>
+  <span class="tag s-new">本轮新增</span> <span class="tag s-limit">已知限制</span>
+</div>
+
+<div class="bar">
+  <button class="primary" onclick="exportMd()">导出 Bug 清单 (.md)</button>
+  <button onclick="copyAll()">复制全部</button>
+  <button onclick="clearAll()">清空</button>
+  <span class="stat" id="stat"></span>
+</div>
+
+<div class="sec-title">一、应用（Kind 枚举，共 20 个 · 全部为独立 .mex 程序集）</div>
+<div class="grid">
+  <div class="card" data-key="k0">
+    <h3>控制面板 <span class="badge">Kind 0</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">标识：<code>Kind.ControlPanel</code> ｜ 原生 AppType：<code>APP_CONTROL_PANEL</code> ｜ 程序集：<code>ControlPanel.mex</code>（独立 .mex）</div>
+    <div class="body">系统设置入口，含个性化、任务栏、显示、网络、账户等子页；可由 <code>Shell.OpenSettings(page)</code> 预导航到指定页。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k0" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k1">
+    <h3>文件资源管理器 <span class="badge">Kind 1</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">标识：<code>Kind.FileExplorer</code> ｜ 原生 AppType：<code>APP_FILE_EXPLORER</code> ｜ 程序集：<code>FileExplorer.mex</code>（独立 .mex）</div>
+    <div class="body">浏览 MKFS / 桌面卷文件，支持打开、右键菜单、跨窗口拖放文件。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k1" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k2">
+    <h3>任务管理器 <span class="badge">Kind 2</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">标识：<code>Kind.TaskManager</code> ｜ 原生 AppType：<code>APP_TASK_MANAGER</code> ｜ 程序集：<code>TaskManager.mex</code>（独立 .mex）</div>
+    <div class="body">查看运行进程/窗口，结束任务；任务栏右键「结束进程」调用 <code>Shell.CloseApp</code>。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k2" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k3">
+    <h3>终端 <span class="badge">Kind 3</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">标识：<code>Kind.Terminal</code> ｜ 原生 AppType：<code>APP_TERMINAL</code> ｜ 程序集：<code>Terminal.mex</code>（独立 .mex）</div>
+    <div class="body">C# GUI 终端（支持中文 IME）。桌面单击即开；是退出 GUI 回到文本 shell 的入口。含 <code>ask</code> 等命令。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k3" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k4">
+    <h3>计算器 <span class="badge">Kind 4</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">标识：<code>Kind.Calculator</code> ｜ 原生 AppType：<code>APP_CALCULATOR</code> ｜ 程序集：<code>Calculator.mex</code>（独立 .mex）</div>
+    <div class="body">基础计算器窗口。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k4" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k5">
+    <h3>关于 <span class="badge">Kind 5</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">标识：<code>Kind.About</code> ｜ 原生 AppType：<code>APP_ABOUT</code> ｜ 程序集：<code>About.mex</code>（独立 .mex）</div>
+    <div class="body">NexOS 版本与系统信息页。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k5" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k6">
+    <h3>内存优化器 <span class="badge">Kind 6</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">标识：<code>Kind.MemOptimizer</code> ｜ 原生 AppType：<code>APP_MEM_OPTIMIZER</code> ｜ 程序集：<code>MemOptimizer.mex</code>（独立 .mex）</div>
+    <div class="body">内存清理/优化小工具。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k6" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k7">
+    <h3>记事本 <span class="badge">Kind 7</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">标识：<code>Kind.Notepad</code> ｜ 原生 AppType：<code>APP_NOTEPAD</code> ｜ 程序集：<code>Notepad.mex</code>（独立 .mex）</div>
+    <div class="body">独立 .mex 程序集（<code>csharp/apps/mex/Notepad</code>），通过专属 CLR 槽加载；支持打开指定文件、保存回原卷。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k7" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k8">
+    <h3>浏览器 <span class="badge">Kind 8</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">标识：<code>Kind.Browser</code> ｜ 原生 AppType：<code>APP_BROWSER</code> ｜ 程序集：<code>Browser.mex</code>（独立 .mex）</div>
+    <div class="body">优先加载 WinPE 风格 PE 二进制（iexplore.exe）；若镜像缺失则回退到托管 BrowserApp，图标不会死路。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k8" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k9">
+    <h3>AI 一键开启向导 <span class="badge">Kind 9</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">标识：<code>Kind.AiSetup</code> ｜ 原生 AppType：<code>APP_AISETUP</code> ｜ 程序集：<code>AiSetup.mex</code>（独立 .mex）</div>
+    <div class="body">一键启用 AI 的设置向导。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k9" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k10">
+    <h3>AI Agent <span class="badge">Kind 10</span> <span class="tag s-limit">已知限制</span></h3>
+    <div class="kv">标识：<code>Kind.AiAgent</code> ｜ 原生 AppType：<code>APP_AIAGENT</code> ｜ 程序集：<code>AiAgent.mex</code>（独立 .mex）</div>
+    <div class="body">Planner/Actor/Critic 架构的 AI Agent 运行器。**已知限制**：托管实现 <code>Shell::Open(10)</code> 在 CLR 中会 fault 并拖垮整个桌面渲染（黑屏），故当前**强制走原生 draw_agent 渲染**（原生实现完整）。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k10" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k11">
+    <h3>演示窗口 <span class="badge">Kind 11</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">标识：<code>Kind.Demo</code> ｜ 原生 AppType：<code>APP_DEMO</code> ｜ 程序集：<code>Demo.mex</code>（独立 .mex）</div>
+    <div class="body">按钮收缩 + 回复「啥」演示窗口。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k11" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k12">
+    <h3>网络工具 <span class="badge">Kind 12</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">标识：<code>Kind.NetTools</code> ｜ 原生 AppType：<code>APP_NETTOOLS</code> ｜ 程序集：<code>NetTools.mex</code>（独立 .mex）</div>
+    <div class="body">网络诊断控制台（ipconfig / netstat / ping 等）。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k12" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k13">
+    <h3>AI 命令台 <span class="badge">Kind 13</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">标识：<code>Kind.AiLauncher</code> ｜ 原生 AppType：<code>APP_AILAUNCHER</code> ｜ 程序集：<code>AiLauncher.mex</code>（独立 .mex）</div>
+    <div class="body">自然语言命令控制台 / AI 启动器。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k13" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k14">
+    <h3>网络攻防模拟 <span class="badge">Kind 14</span> <span class="tag s-restored">已恢复</span></h3>
+    <div class="kv">标识：<code>Kind.NetDefense</code> ｜ 原生 AppType：<code>APP_NETDEFENSE</code> ｜ 程序集：<code>NetDefense.mex</code>（独立 .mex）</div>
+    <div class="body">网络路由与攻防模拟。已从桌面/开始菜单恢复：<code>Listed()</code> 现放行 <code>0..18</code> 全部 Kind，<code>LoadDefaults()</code> 种子 19 个图标，<code>EnsureAllKinds()</code> 会补齐旧配置中缺失的 Kind。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k14" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k15">
+    <h3>WebView（Linux VNC） <span class="badge">Kind 15</span> <span class="tag s-restored">已恢复</span></h3>
+    <div class="kv">标识：<code>Kind.WebView</code> ｜ 原生 AppType：<code>APP_WEBVIEW</code> ｜ 程序集：<code>WebView.mex</code>（独立 .mex）</div>
+    <div class="body">Linux guest VNC 帧缓冲查看器。现已同时列入「开始 &gt; 所有应用」与桌面图标，双击即可打开。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k15" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k16">
+    <h3>视频播放器 <span class="badge">Kind 16</span> <span class="tag s-restored">已恢复</span></h3>
+    <div class="kv">标识：<code>Kind.VideoPlayer</code> ｜ 原生 AppType：<code>APP_VIDEOPLAYER</code> ｜ 程序集：<code>VideoPlayer.mex</code>（独立 .mex）</div>
+    <div class="body">视频文件预览/播放。不固定到任务栏，但已在「开始 &gt; 所有应用」与桌面图标中可达（恢复时一并种子到桌面，不再仅限开始菜单）。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k16" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k17">
+    <h3>音频播放器 <span class="badge">Kind 17</span> <span class="tag s-restored">已恢复</span></h3>
+    <div class="kv">标识：<code>Kind.AudioPlayer</code> ｜ 原生 AppType：<code>APP_AUDIOPLAYER</code> ｜ 程序集：<code>AudioPlayer.mex</code>（独立 .mex）</div>
+    <div class="body">音频文件预览/播放。同样不固定到任务栏，但已列入「开始 &gt; 所有应用」与桌面图标，UI 可达。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k17" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k18">
+    <h3>AI 对话（AiChat） <span class="badge">Kind 18</span> <span class="tag s-fixed">已修复</span> <span class="tag s-new">异步化</span></h3>
+    <div class="kv">标识：<code>Kind.AiChat</code> ｜ 原生 AppType：<code>APP_AICHAT</code> ｜ 程序集：<code>AiChat.mex</code>（独立 .mex）</div>
+    <div class="body">本地 GGUF 模型对话窗口。<b>2026-11-12 夜间起改为异步流式</b>：点「发送」只调 <code>Host.AiStart(q)</code> 挂载解码作业并立即返回，<code>OnPaint()</code> 的 <code>Pump()</code> 每帧用 <code>Host.AiPoll() / AiStatus()</code> 拉取增量文本；生成中再点「发送」即 <code>Host.AiCancel()</code> 取消。原生侧 <code>ai_async_tick(3)</code> 每帧最多推进 3 个 transformer layer，鼠标不再卡顿；底层另有 <code>aiquant 0|1</code>、分页 KV cache 与 16KiB 分页 DMA 模型加载。<br>**打不开的根因与修复**：原生 <code>app_for_managed_kind()</code> 只映射 Kind 0–13，AiChat(18) 落入 <code>default: APP_NONE</code>，双击桌面图标调用 <code>launch_app(APP_NONE)</code> 时 <code>launch_app_impl</code> 命中 <code>default: return</code>，既不创建窗口也不调用 <code>mforms_open</code> → 静默无反应。已在 <code>src/gui/gui_legacy.cpp</code> 补齐 Kind 14–18 的 AppType 枚举、双向映射与窗口尺寸分支。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k18" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k34">
+    <h3>Bug 上报（BugReport） <span class="badge">Kind 19</span> <span class="tag s-new">本轮新增</span></h3>
+    <div class="kv">标识：<code>Kind.BugReport</code> ｜ 原生 AppType：<code>APP_BUGREPORT</code> ｜ 程序集：<code>BugReport.mex</code>（独立 .mex）</div>
+    <div class="body"><b>把 bug 直接交给我</b>的专用窗口。左侧填写「出现情况 / 复现步骤 / 期望结果 / 实际结果」，点「抓取当前屏幕」调用 <code>Host.ApmsCapture(scale)</code> 把 VBE 帧缓冲降采样成 <code>apms_shot.ppm</code> 存到数据盘，点「生成报告」调 <code>Host.ApmsReport(text)</code> 写出 <code>apms_report.md</code>（含运行环境、内存堆指标、应用清单、事件环、串口日志尾部、你的描述）。之后在 Windows 侧执行 <code>python tools/apms_extract.py --disk build/data_vbox.vdi --out build/apms</code> 即可取出报告与 PNG 截图。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k34" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+</div>
+
+<div class="sec-title">二、系统 / 壳功能（Shell 子系统）</div>
+<div class="grid">
+  <div class="card" data-key="k19">
+    <h3>开始菜单 <span class="badge">Shell</span> <span class="tag s-restored">已恢复</span></h3>
+    <div class="kv">入口：<code>Desktop.Click</code> 左上角 ｜ 文件：<code>Desktop.cs</code></div>
+    <div class="body">置顶磁贴 + 所有应用列表 + 搜索框。磁贴可固定/取消固定，右键弹出菜单。<b>列表内容改为由内核清单 <code>apps.man</code> 驱动</b>（<code>Desktop.LoadAppRegistry()</code> → <code>appKinds[] / listed[]</code>），不再有编译期应用列表；清单读不到时才回退到历史硬编码种子。当前列出全部 20 个应用。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k19" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k20">
+    <h3>任务栏 <span class="badge">Shell</span> <span class="tag s-restored">已恢复</span></h3>
+    <div class="kv">文件：<code>Desktop.cs</code> ｜ 原生：<code>gui_legacy.cpp</code></div>
+    <div class="body">置顶固定应用 + 运行中窗口按钮 + 跳转列表（Jump List，含新建窗口/取消固定/结束进程）。现默认固定 <b>8 个 Pin</b>：控制面板 / 此电脑 / 终端 / 记事本 / 浏览器 / AI Agent / AI 命令台 / AI 对话；其余应用从开始菜单或桌面打开。窗口按钮同时区分壳窗口与独立应用窗口（句柄 ≥ 64）。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k20" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k21">
+    <h3>桌面图标 <span class="badge">Shell</span> <span class="tag s-restored">已恢复</span></h3>
+    <div class="kv">文件：<code>Desktop.cs</code> ｜ 数据：MKFS「Desktop」文件夹</div>
+    <div class="body">图标网格、拖放排序、内联重命名、每个图标对应 .lnk 文件。双击打开（终端为单击）。<code>DMAX</code> 已从 20 提到 32，<code>LoadDefaults()</code> <b>按清单种子全部 20 个应用</b> 图标（名字/颜色/字母都取自 <code>apps.man</code>）；<code>SyncFromFs()</code> 末尾的 <code>EnsureAllKinds()</code> 保证从旧配置启动时也能补齐。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k21" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k22">
+    <h3>锁屏 / 登录 <span class="badge">Shell</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">文件：<code>Login.cs</code></div>
+    <div class="body">登录界面，未登录时屏蔽桌面。VM 测试通过 <code>Login.BypassForHost()</code> 自动跳过。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k22" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k23">
+    <h3>主题 / 个性化 <span class="badge">Shell</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">文件：<code>Forms.cs</code>(Theme) ｜ 持久化：<code>nexos.cfg</code></div>
+    <div class="body">壁纸渐变、强调色、深色模式、像素/CRT 复古模式、桌面小组件开关、Gamma 自检。MiniCLR 不运行静态初始化器，所有字段在 <code>Shell.Init</code> 显式初始化。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k23" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k24">
+    <h3>语音控制 <span class="badge">Shell</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">文件：<code>Voice.cs</code> ｜ 总开关：<code>Theme.VoiceOn</code></div>
+    <div class="body">主麦克风总开关；仅显式标记 <code>W.Voice(...)</code> 的控件响应。识别到的短语作为合成点击分派给匹配控件。可用 <code>voice on/off</code> 切换。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k24" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k25">
+    <h3>Toast 通知 <span class="badge">Shell</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">文件：<code>Toast.cs</code></div>
+    <div class="body">瞬时通知栈（如开机「系统就绪」）。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k25" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k26">
+    <h3>HUD 桌面小组件 <span class="badge">Shell</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">开关：<code>Theme.WidgetsOn</code> ｜ 文件：<code>Desktop.cs</code></div>
+    <div class="body">时钟/负载表/火花线遥测覆盖层，每帧重绘（<code>Host.SetAnim(1)</code>）。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k26" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k27">
+    <h3>中文输入法（IME） <span class="badge">Shell</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">文件：<code>gfx_ime.cpp</code> ｜ 路由：<code>ime_route_global()</code></div>
+    <div class="body">统一中文 IME 路由器，覆盖锁屏、内联重命名与每个 C# 文本框。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k27" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k28">
+    <h3>窗口管理 <span class="badge">Shell</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">原生：<code>gui_legacy.cpp</code> ｜ 桥：<code>mforms.cpp</code></div>
+    <div class="body">打开/聚焦/最小化/关闭、动画补间（Anim）。托管窗口统一为 <code>APP_MANAGED</code>，客户区交给 C# 绘制。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k28" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k29">
+    <h3>设置持久化 <span class="badge">Shell</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">文件：<code>Theme.cs</code> / <code>Desktop.cs</code>（Installed[]）</div>
+    <div class="body">主题与「已安装应用」位图写入 MKFS 数据盘 <code>nexos.cfg</code> / <code>installed.cfg</code>，下次启动恢复。<code>LoadInstalled()</code> 已移除对未放行 Kind 的强制关闭循环，<code>SyncFromFs()</code> 之后由 <code>EnsureAllKinds()</code> 补齐缺失图标，旧配置不会再把 17 个应用抹掉。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k29" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k30">
+    <h3>右键 / 上下文菜单 <span class="badge">Shell</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">文件：<code>Popup.cs</code> / <code>Desktop.cs</code></div>
+    <div class="body">桌面图标、任务栏、窗口、托盘、Win+X 等右键菜单。含固定到开始/任务栏、打开文件所在位置等。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k30" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k31">
+    <h3>文件拖放（跨窗口） <span class="badge">Shell</span> <span class="tag s-ok">正常</span></h3>
+    <div class="kv">文件：<code>Desktop.cs</code></div>
+    <div class="body">桌面图标与资源管理器间的拖放，支持把文件拖到另一个资源管理器窗口。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k31" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+</div>
+
+<div class="sec-title">三、本轮新增：异步推理与引擎加速</div>
+<div class="grid">
+  <div class="card" data-key="k32">
+    <h3>异步 AI 推理（协作式按帧分片） <span class="badge">Engine</span> <span class="tag s-new">本轮新增</span></h3>
+    <div class="kv">C#：<code>AiChat.cs</code> ｜ icall：<code>Forms.cs</code> / <code>mforms.cpp</code> ｜ 原生：<code>kernel64.cpp</code> / <code>gguf_infer.cpp</code></div>
+    <div class="body">4 个 Host icall：<code>AiStart / AiPoll / AiStatus / AiCancel</code>，状态 <code>0 idle · 1 running · 2 done · 3 error</code>。原生 <code>ai_async_start()</code> 组 ChatML prompt 后调 <code>qwen_gen_begin()</code>；<code>mforms_paint_overlay()</code> 每帧 <code>ai_async_tick(3)</code> 最多推进 3 个 transformer layer，<code>g_mforms_anim</code> 在作业运行期间保持置位。64 位内核无 IRQ / 抢占式线程调度，因此这是<b>协作式分片而非真线程</b>；每产出一个 token 让出一次，流式文本经 <code>ai_async_take()</code> 交给 C#，点击「发送」当帧即可返回。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k32" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k33">
+    <h3>推理引擎加速（量化 / 分页 / DMA 加载） <span class="badge">Engine</span> <span class="tag s-new">本轮新增</span></h3>
+    <div class="kv">文件：<code>gguf_infer.cpp</code> / <code>gguf_infer.h</code> / <code>.attic64/kernel64.cpp</code> ｜ 命令：<code>aiquant 0|1</code>、<code>dma on|off</code></div>
+    <div class="body">① <b>W4A8/W8A8 量化</b>：激活按 32 元素 absmax 块量化为 int8，Q4_0/Q4_1/Q5_0/Q8_0/Q4_K/Q5_K 权重块改用 int32 整数累加再乘 scale，默认开启，<code>qwen_set_quant_mode(0)</code> 可回退浮点。② <b>分页 KV cache</b>：<code>KV_PAGE=16</code>，<code>kpages / vpages[layer][page]</code> 按需 <code>apalloc()</code>，不再一次性分配并清零约 88MB 的平坦数组。③ <b>更快加载</b>：16KiB/页 BM-DMA（64KiB 对齐 bounce、PRDT 正确 EOT 与 <code>0x09</code> 方向），首页面校验 GGUF 魔数，失败自动关 DMA + soft reset + 降级单扇区 PIO；QEMU 仍走 virtio-blk 1MiB 快路，VBox 永不使用会 busy-spin 的多扇区 PIO。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k33" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+</div>
+
+<div class="sec-title">四、本轮新增：独立应用架构 + APMS 内核运维</div>
+<div class="grid">
+  <div class="card" data-key="k35">
+    <h3>独立应用（每个 .mex 单独加载） <span class="badge">Arch</span> <span class="tag s-new">本轮新增</span></h3>
+    <div class="kv">清单：<code>sfs_files/apps.man</code> ｜ 解析：<code>.attic64/apms.inc</code> ｜ 加载：<code>mforms.cpp</code></div>
+    <div class="body"><b>shell.mex 里已没有任何内嵌应用</b>：桌面 / 开始菜单 / 任务栏 / 原生启动器全部改为向内核询问应用清单。清单格式为 <code>kind | 显示名 | mex 文件 | 图标色 | 字母 | 说明</code>，一行一个应用，<code>#</code> 开头为注释。内核启动时 <code>sfs.read("apps.man")</code> 解析后填入 <code>g_apms_apps[]</code>（上限 32 个）。新增一个应用 = 放一个 <code>.mex</code> + 写一行清单，无需改内核或壳代码。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k35" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k36">
+    <h3>独立 CLR 槽（应用之间互不污染） <span class="badge">Arch</span> <span class="tag s-new">本轮新增</span></h3>
+    <div class="kv">文件：<code>clr.h</code> / <code>clr.cpp</code> / <code>mforms.cpp</code></div>
+    <div class="body">每个独立应用窗口分配一个专属 CLR slot（slot 0 = 壳，slot 1..11 = 独立应用），拥有独立的 image / heap / 静态字段；窗口关闭时 <code>clr_close_slot(slot)</code> 释放约 840 KiB。窗口句柄从 <code>NEX_APP_HANDLE_BASE = 64</code> 起，与壳管理的 0..15 app id 完全隔离；<code>mforms_drag</code> / <code>mforms_rclick</code> 对独立句柄直接 opt-out，避免调用应用里不存在的 <code>Shell::WindowDrag</code> / <code>Shell::RightClick</code>。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k36" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k37">
+    <h3>APMS 串口日志环（8 KiB tee） <span class="badge">APMS</span> <span class="tag s-new">本轮新增</span></h3>
+    <div class="kv">文件：<code>.attic64/apms.inc</code> ｜ 内核：<code>.attic64/kernel64.cpp</code></div>
+    <div class="body">所有 <code>serial_puts()</code> / <code>serial_tx()</code> 逐字节 tee 进 8 KiB 环形缓冲；CLR fault 因直写 UART 不经过 <code>serial_puts</code>，故由 <code>apms_on_clr_fault()</code> 显式补录。文本 shell 命令 <code>apms log</code> 可打印尾部，托管侧 <code>Host.ApmsLogTail()</code> 同源读取。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k37" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k38">
+    <h3>APMS 结构化事件环 <span class="badge">APMS</span> <span class="tag s-new">本轮新增</span></h3>
+    <div class="kv">文件：<code>.attic64/apms.inc</code> ｜ 命令：<code>apms status / apps / events / log / clear</code></div>
+    <div class="body">64 条 <code>ApmsEvent{seq, stamp, code, tag[12], msg[84]}</code> 环形记录，覆盖：启动步进（boot step）、CPU fault、CLR fault、应用启动（app-launch）、截图（capture）、报告（report）。<code>apms events</code> 打印，托管侧 <code>Host.ApmsEvent(idx)</code> 逐条取回，报告里会整段带上。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k38" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k39">
+    <h3>APMS 屏幕截图 <span class="badge">APMS</span> <span class="tag s-new">本轮新增</span></h3>
+    <div class="kv">文件：<code>.attic64/apms.inc</code> ｜ 命令：<code>apms shot [1..8]</code> ｜ icall：<code>Host.ApmsCapture(scale)</code></div>
+    <div class="body">读 VBE info block <code>0x5000</code>（fb 物理地址、宽高、pitch、像素格式），支持 BGRX32 / RGBX32 / RGB24 / RGB565 四种格式；<b>先把帧缓冲读进 RAM 再写盘</b>（规避 &gt;4 GiB LFB 的 heisenbug），按 scale 降采样后写成 P6 PPM，落到 MKFS 数据盘 <code>apms_shot.ppm</code>。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k39" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+  <div class="card" data-key="k40">
+    <h3>APMS 报告生成与提取 <span class="badge">APMS</span> <span class="tag s-new">本轮新增</span></h3>
+    <div class="kv">内核：<code>apms_report(user_text)</code> → <code>apms_report.md</code> ｜ 工具：<code>tools/apms_extract.py</code></div>
+    <div class="body">报告为 Markdown，含运行环境、内存堆指标、应用清单、事件环、串口日志尾部、截图说明，以及你填写的出现情况与复现步骤。Windows 侧用 <code>python tools/apms_extract.py --disk build/data_vbox.vdi --out build/apms</code> 解析 MKFS 超级块与文件表，取出 <code>apms_report.md</code>，并把 <code>apms_shot.ppm</code> 转换成可直接附图的 <code>apms_shot.png</code>。</div>
+    <div class="bug"><label>Bug 记录（待填写）</label><textarea data-key="k40" placeholder="（在此填写本功能的 bug；对我说「查看」时我会读取）"></textarea></div>
+  </div>
+</div>
+
+<footer>
+  共 41 个功能（20 个应用 + 13 个壳子系统 + 2 个引擎能力 + 6 个独立应用/APMS 能力），每个功能下均有一个 Bug 记录区。本页由助手根据源码静态整理，状态以当前代码为准。
+</footer>
+<div class="toast" id="toast"></div>
+<script>
+  const KEY = 'nexos_shell_bugs_v1';
+  const areas = Array.from(document.querySelectorAll('.bug textarea'));
+  const meta  = {"k0": {"name": "控制面板", "badge": "Kind 0"}, "k1": {"name": "文件资源管理器", "badge": "Kind 1"}, "k2": {"name": "任务管理器", "badge": "Kind 2"}, "k3": {"name": "终端", "badge": "Kind 3"}, "k4": {"name": "计算器", "badge": "Kind 4"}, "k5": {"name": "关于", "badge": "Kind 5"}, "k6": {"name": "内存优化器", "badge": "Kind 6"}, "k7": {"name": "记事本", "badge": "Kind 7"}, "k8": {"name": "浏览器", "badge": "Kind 8"}, "k9": {"name": "AI 一键开启向导", "badge": "Kind 9"}, "k10": {"name": "AI Agent", "badge": "Kind 10"}, "k11": {"name": "演示窗口", "badge": "Kind 11"}, "k12": {"name": "网络工具", "badge": "Kind 12"}, "k13": {"name": "AI 命令台", "badge": "Kind 13"}, "k14": {"name": "网络攻防模拟", "badge": "Kind 14"}, "k15": {"name": "WebView（Linux VNC）", "badge": "Kind 15"}, "k16": {"name": "视频播放器", "badge": "Kind 16"}, "k17": {"name": "音频播放器", "badge": "Kind 17"}, "k18": {"name": "AI 对话（AiChat）", "badge": "Kind 18"}, "k19": {"name": "开始菜单", "badge": "Shell"}, "k20": {"name": "任务栏", "badge": "Shell"}, "k21": {"name": "桌面图标", "badge": "Shell"}, "k22": {"name": "锁屏 / 登录", "badge": "Shell"}, "k23": {"name": "主题 / 个性化", "badge": "Shell"}, "k24": {"name": "语音控制", "badge": "Shell"}, "k25": {"name": "Toast 通知", "badge": "Shell"}, "k26": {"name": "HUD 桌面小组件", "badge": "Shell"}, "k27": {"name": "中文输入法（IME）", "badge": "Shell"}, "k28": {"name": "窗口管理", "badge": "Shell"}, "k29": {"name": "设置持久化", "badge": "Shell"}, "k30": {"name": "右键 / 上下文菜单", "badge": "Shell"}, "k31": {"name": "文件拖放（跨窗口）", "badge": "Shell"}, "k32": {"name": "异步 AI 推理（协作式按帧分片）", "badge": "Engine"}, "k33": {"name": "推理引擎加速（量化 / 分页 / DMA 加载）", "badge": "Engine"}, "k34": {"name": "Bug 上报（BugReport）", "badge": "Kind 19"}, "k35": {"name": "独立应用（每个 .mex 单独加载）", "badge": "Arch"}, "k36": {"name": "独立 CLR 槽（应用之间互不污染）", "badge": "Arch"}, "k37": {"name": "APMS 串口日志环（8 KiB tee）", "badge": "APMS"}, "k38": {"name": "APMS 结构化事件环", "badge": "APMS"}, "k39": {"name": "APMS 屏幕截图", "badge": "APMS"}, "k40": {"name": "APMS 报告生成与提取", "badge": "APMS"}};
+  let store = {};
+  try { store = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) { store = {}; }
+
+  function refresh() {
+    let n = 0;
+    areas.forEach(function (t) {
+      const k = t.dataset.key;
+      if (store[k]) t.value = store[k];
+      const filled = (t.value || '').trim().length > 0;
+      t.closest('.card').classList.toggle('filled', filled);
+      if (filled) n++;
+    });
+    document.getElementById('stat').textContent = '已填写 ' + n + ' / ' + areas.length + ' 个功能的 Bug';
+  }
+  areas.forEach(function (t) {
+    t.addEventListener('input', function () {
+      store[t.dataset.key] = t.value;
+      try { localStorage.setItem(KEY, JSON.stringify(store)); } catch (e) {}
+      refresh();
+    });
+  });
+  function toast(msg) {
+    const el = document.getElementById('toast');
+    el.textContent = msg; el.classList.add('show');
+    clearTimeout(el._t); el._t = setTimeout(function () { el.classList.remove('show'); }, 2200);
+  }
+  function exportMd() {
+    let out = '# NexOS 托管壳 Bug 清单\n\n> 导出时间：' + new Date().toLocaleString('zh-CN') + '\n';
+    let n = 0;
+    areas.forEach(function (t) {
+      const v = (t.value || '').trim();
+      if (!v) return;
+      n++;
+      const m = meta[t.dataset.key];
+      out += '\n## ' + m.name + '  (' + m.badge + ')\n\n' + v + '\n';
+    });
+    if (!n) { toast('还没有填写任何 Bug'); return; }
+    const blob = new Blob([out], {type:'text/markdown;charset=utf-8'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'shell_bugs.md';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); }, 1000);
+    toast('已导出 shell_bugs.md（' + n + ' 条）');
+  }
+  function copyAll() {
+    let out = '', n = 0;
+    areas.forEach(function (t) {
+      const v = (t.value || '').trim();
+      if (!v) return;
+      n++;
+      out += '【' + meta[t.dataset.key].name + '】\n' + v + '\n\n';
+    });
+    if (!n) { toast('还没有填写任何 Bug'); return; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(out).then(function(){ toast('已复制 ' + n + ' 条 Bug'); },
+                                              function(){ toast('复制失败，请改用导出'); });
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = out; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); toast('已复制 ' + n + ' 条 Bug'); }
+      catch (e) { toast('复制失败，请改用导出'); }
+      ta.remove();
+    }
+  }
+  function clearAll() {
+    if (!confirm('确定清空全部 Bug 记录？此操作不可撤销。')) return;
+    store = {};
+    try { localStorage.removeItem(KEY); } catch (e) {}
+    areas.forEach(function (t) { t.value = ''; });
+    refresh(); toast('已清空');
+  }
+  refresh();
+</script>
+</body>
+</html>

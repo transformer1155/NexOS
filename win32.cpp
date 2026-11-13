@@ -12,6 +12,7 @@
 // =====================================================================
 #include <stdint.h>
 #include "win32.h"
+#include "nexos_compat.h"
 
 extern "C" void* kmalloc(uint32_t size);
 extern "C" void  kfree(void* ptr);
@@ -2099,6 +2100,15 @@ static void* w32_resolve(const char* dll, const char* fn){
     return 0;
 }
 
+// ---- AI compat layer hook --------------------------------------------
+// The compat layer asks "which builtin implements kernel32!GetTickCount64?"
+// so it can rebind an IAT slot to an already-compiled-in implementation.
+// No code is ever uploaded: this only ever returns a pointer to a
+// function that is already in the binary.
+extern "C" void* compat_resolve_builtin(const char* dll, const char* fn){
+    return w32_resolve(dll, fn);
+}
+
 // =====================================================================
 //  10.  PE32 loader
 // =====================================================================
@@ -2350,7 +2360,17 @@ static int win64_run(const char* filename, const char* args, int info_only){
                     }
                 }
                 uint64_t* wp = (uint64_t*)(g_base + ft + k);
-                if (fn){ resolved++; *wp = (uint64_t)(uintptr_t)fn; }
+                if (fn){
+                    resolved++;
+                    *wp = (uint64_t)(uintptr_t)fn;
+                    // AI compat layer (D1/D2): register this IAT slot so the
+                    // external agent can look it up by name (reverse index)
+                    // and later rebind it to a different builtin without
+                    // reloading the PE.  Registering here -- at the single
+                    // point where the IAT is written -- covers every API
+                    // with one line instead of 111.
+                    compat_iat_register((uint64_t)(uintptr_t)wp, dll, nm, fn);
+                }
                 else    { missing++; if (missing <= 8){ rep("\n      MISSING "); rep(nm); } *wp = 0; }
                 cnt++;
             }
@@ -2613,6 +2633,8 @@ extern "C" int win32_run(const char* filename, const char* args, int info_only){
                     w32_serial(" (was "); w32_serial_hex(*wp); w32_serial(")\n");
                 }
                 *wp = (uint32_t)(uintptr_t)fn;
+                // AI compat layer (D1/D2): register the 32-bit IAT slot too.
+                if (fn) compat_iat_register((uint64_t)(uintptr_t)wp, dll, nm, fn);
                 cnt++;
             }
             rep_num((uint32_t)cnt); rep(" fn\n");

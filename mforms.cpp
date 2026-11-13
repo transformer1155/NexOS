@@ -16,6 +16,8 @@
 // =====================================================================
 #include "mforms.h"
 #include "clr.h"
+#include "app_registry.h"
+#include "nexos_compat.h"
 
 // Keep-repainting flag polled by the GUI main loop.  DEFINED AT FILE SCOPE
 // (outside any anonymous namespace) so both the 32-bit and the 64-bit link see
@@ -36,6 +38,107 @@ extern "C" int g_text_aa     = 1;
 // setter: a variable would not survive the namespace/linkage boundary -- the
 // 64-bit link bound it to 0 and check-k64 caught it.  See gfx_draw.inc.
 extern "C" int gui_set_text_gamma(int sel);
+#endif
+
+// ---- asynchronous inference worker -----------------------------------
+// The 64-bit kernel owns a resumable generation job.  AiChat.cs starts it
+// and polls the delta text every paint; mforms_paint_overlay() advances it
+// a few transformer layers per frame.  On the 32-bit build there is no
+// GGUF engine, so the icalls degrade to harmless empty results.
+#if defined(__x86_64__)
+extern "C" int  ai_async_start(const char* prompt, int max_new, float temp);
+extern "C" int  ai_async_status(void);
+extern "C" int  ai_async_take(char* out, int outsz);
+extern "C" void ai_async_cancel(void);
+extern "C" int  ai_async_tick(int layers);
+
+static char g_ai_poll_buf[4096];
+static int32_t h_ai_start(int32_t* a){
+    const char* p = clr_str(a[0]);
+    return ai_async_start(p ? p : "", 96, 0.8f);
+}
+static int32_t h_ai_poll(int32_t*){
+    g_ai_poll_buf[0] = 0;
+    ai_async_take(g_ai_poll_buf, (int)sizeof(g_ai_poll_buf));
+    return clr_new_str(g_ai_poll_buf);
+}
+static int32_t h_ai_status(int32_t*){ return ai_async_status(); }
+static int32_t h_ai_cancel(int32_t*){ ai_async_cancel(); return 0; }
+#else
+static int32_t h_ai_start(int32_t*)  { return -1; }
+static int32_t h_ai_poll(int32_t*)   { return clr_new_str(""); }
+static int32_t h_ai_status(int32_t*) { return 0; }
+static int32_t h_ai_cancel(int32_t*) { return 0; }
+#endif
+
+// ---- manifest registry + APMS icalls ---------------------------------
+// The 64-bit kernel parses sfs_files/apps.man at boot and owns the APMS
+// event/log/screenshot subsystems.  Both are exposed verbatim to managed
+// code; 32-bit builds degrade to empty results so the same Forms.cs can be
+// compiled into either kernel.
+#if defined(__x86_64__)
+extern "C" int         apms_app_count(void);
+extern "C" int         apms_app_kind(int);
+extern "C" const char* apms_app_name(int);
+extern "C" const char* apms_app_mex(int);
+extern "C" uint32_t    apms_app_color(int);
+extern "C" int         apms_app_letter(int);
+extern "C" const char* apms_app_desc(int);
+extern "C" int         apms_app_kind_by_mex(const char*);
+extern "C" const char* apms_mex_for_kind(int);
+extern "C" int         apms_event_count(void);
+extern "C" int         apms_event_text(int, char*, int);
+extern "C" int         apms_log_tail(char*, int);
+extern "C" int         apms_capture(int);
+extern "C" int         apms_report(const char*);
+extern "C" void        apms_clear(void);
+extern "C" void        apms_event(int, const char*, const char*);
+
+static char g_apms_buf[1024];
+
+static int32_t h_app_count(int32_t*)       { return apms_app_count(); }
+static int32_t h_app_kind(int32_t* a)      { return apms_app_kind(a[0]); }
+static int32_t h_app_name(int32_t* a)      { return clr_new_str(apms_app_name(a[0])); }
+static int32_t h_app_mex(int32_t* a)       { return clr_new_str(apms_app_mex(a[0])); }
+static int32_t h_app_color(int32_t* a)     { return (int32_t)apms_app_color(a[0]); }
+static int32_t h_app_letter(int32_t* a)    { return apms_app_letter(a[0]); }
+static int32_t h_app_desc(int32_t* a)      { return clr_new_str(apms_app_desc(a[0])); }
+static int32_t h_app_kind_by_mex(int32_t* a) {
+    const char* s = clr_str(a[0]);
+    return apms_app_kind_by_mex(s ? s : "");
+}
+static int32_t h_apms_status(int32_t*)     { return apms_event_count(); }
+static int32_t h_apms_event(int32_t* a) {
+    g_apms_buf[0] = 0;
+    apms_event_text(a[0], g_apms_buf, (int)sizeof(g_apms_buf));
+    return clr_new_str(g_apms_buf);
+}
+static int32_t h_apms_log_tail(int32_t*) {
+    g_apms_buf[0] = 0;
+    apms_log_tail(g_apms_buf, 512);
+    return clr_new_str(g_apms_buf);
+}
+static int32_t h_apms_capture(int32_t* a)  { return apms_capture(a[0]); }
+static int32_t h_apms_report(int32_t* a) {
+    const char* s = clr_str(a[0]);
+    return apms_report(s ? s : "");
+}
+static int32_t h_apms_clear(int32_t*)      { apms_clear(); return 0; }
+#else
+static int32_t h_app_count(int32_t*)            { return 0; }
+static int32_t h_app_kind(int32_t*)             { return -1; }
+static int32_t h_app_name(int32_t*)             { return clr_new_str(""); }
+static int32_t h_app_mex(int32_t*)              { return clr_new_str(""); }
+static int32_t h_app_color(int32_t*)            { return 0x4A6FA5; }
+static int32_t h_app_letter(int32_t*)           { return 'A'; }
+static int32_t h_app_desc(int32_t*)             { return clr_new_str(""); }
+static int32_t h_app_kind_by_mex(int32_t*)      { return -1; }
+static int32_t h_apms_status(int32_t*)          { return 0; }
+static int32_t h_apms_event(int32_t*)           { return clr_new_str(""); }
+static int32_t h_apms_log_tail(int32_t*)        { return clr_new_str(""); }
+static int32_t h_apms_capture(int32_t*)         { return -1; }
+static int32_t h_apms_report(int32_t*)          { return -1; }
+static int32_t h_apms_clear(int32_t*)           { return 0; }
 #endif
 
 // ---- Linux guest backend (WebView control) ----
@@ -66,6 +169,130 @@ static void serial_putdec(int v) {
     else { int t = v; if (v < 0){ b[i++]='-'; t=-t; } while(t){ b[i++]=(char)('0'+t%10); t/=10; } }
     for (int j = i-1; j >= 0; j--) mf_outb(0x3F8, (uint8_t)b[j]);
 }
+
+// =====================================================================
+//  OS API layer 0+1 icalls (osapi.cpp) -- declared at FILE scope
+// ---------------------------------------------------------------------
+//  LINKAGE NOTE (2026-11-12): these declarations used to sit INSIDE the
+//  anonymous namespace that starts a few lines below.  A declaration inside
+//  an anonymous namespace denotes a member of that namespace, so the
+//  references resolved to internal-linkage symbols
+//  (_ZN12_GLOBAL__N_1osapi_ic_...E) that no other translation unit can
+//  define.  The 64-bit link therefore reported every osapi symbol as
+//  undefined and refused to produce kernel64.elf.
+//
+//  The definitions live in osapi.cpp at FILE scope with ordinary C++
+//  linkage, so the declarations must match: plain C++ declarations at
+//  FILE scope, outside any namespace.  (They are NOT extern "C" -- that
+//  would change the mangling and break the match with osapi.cpp.)
+// =====================================================================
+extern int32_t osapi_ic_set_last_error(int32_t*);
+extern int32_t osapi_ic_get_last_error(int32_t*);
+extern int32_t osapi_ic_clear_last_error(int32_t*);
+extern int32_t osapi_ic_api_version(int32_t*);
+extern int32_t osapi_ic_caps_mask(int32_t*);
+extern int32_t osapi_ic_handle_alloc(int32_t*);
+extern int32_t osapi_ic_handle_close(int32_t*);
+extern int32_t osapi_ic_uid(int32_t*);
+extern int32_t osapi_ic_fs_vol_mask(int32_t*);
+extern int32_t osapi_ic_fs_prefix_count(int32_t*);
+extern int32_t osapi_ic_fs_prefix_vol(int32_t*);
+extern int32_t osapi_ic_fs_prefix_mode(int32_t*);
+extern int32_t osapi_ic_fs_can_path(int32_t*);
+extern int32_t osapi_ic_dev_allowed(int32_t*);
+extern int32_t osapi_ic_net_port_allowed(int32_t*);
+extern int32_t osapi_ic_net_addr_allowed(int32_t*);
+extern int32_t osapi_ic_syscall_allowed(int32_t*);
+// L2 processes + L3 glob (osapi.cpp)
+extern int32_t osapi_ic_proc_spawn(int32_t*);
+extern int32_t osapi_ic_proc_wait(int32_t*);
+extern int32_t osapi_ic_proc_kill(int32_t*);
+extern int32_t osapi_ic_proc_exit(int32_t*);
+extern int32_t osapi_ic_proc_count(int32_t*);
+extern int32_t osapi_ic_proc_pid_at(int32_t*);
+extern int32_t osapi_ic_proc_state_at(int32_t*);
+extern int32_t osapi_ic_proc_tick(int32_t*);
+extern int32_t osapi_ic_proc_self_test(int32_t*);
+extern int32_t osapi_ic_fs_glob(int32_t*);
+// ---- OS API L12: configuration store ----
+extern int32_t osapi_ic_cfg_open(int32_t*);
+extern int32_t osapi_ic_cfg_get(int32_t*);
+extern int32_t osapi_ic_cfg_set(int32_t*);
+extern int32_t osapi_ic_cfg_del(int32_t*);
+extern int32_t osapi_ic_cfg_key_at(int32_t*);
+extern int32_t osapi_ic_cfg_flush(int32_t*);
+extern int32_t osapi_ic_cfg_close(int32_t*);
+extern int32_t osapi_ic_cfg_count(int32_t*);
+extern int32_t osapi_ic_cfg_dirty(int32_t*);
+extern int32_t osapi_ic_cfg_self_test(int32_t*);
+// ---- OS API L4: memory (heap / arena / shm / mapping ledger) ----
+extern int32_t osapi_ic_mem_heap_alloc(int32_t*);
+extern int32_t osapi_ic_mem_heap_free(int32_t*);
+extern int32_t osapi_ic_mem_heap_realloc(int32_t*);
+extern int32_t osapi_ic_mem_heap_size(int32_t*);
+extern int32_t osapi_ic_mem_heap_poke(int32_t*);
+extern int32_t osapi_ic_mem_heap_peek(int32_t*);
+extern int32_t osapi_ic_mem_arena_new(int32_t*);
+extern int32_t osapi_ic_mem_arena_alloc(int32_t*);
+extern int32_t osapi_ic_mem_arena_mark(int32_t*);
+extern int32_t osapi_ic_mem_arena_release(int32_t*);
+extern int32_t osapi_ic_mem_arena_used(int32_t*);
+extern int32_t osapi_ic_mem_arena_free(int32_t*);
+extern int32_t osapi_ic_mem_shm_create(int32_t*);
+extern int32_t osapi_ic_mem_shm_open(int32_t*);
+extern int32_t osapi_ic_mem_shm_size(int32_t*);
+extern int32_t osapi_ic_mem_shm_close(int32_t*);
+extern int32_t osapi_ic_mem_mmap(int32_t*);
+extern int32_t osapi_ic_mem_unmap(int32_t*);
+extern int32_t osapi_ic_mem_mappings(int32_t*);
+extern int32_t osapi_ic_mem_live(int32_t*);
+extern int32_t osapi_ic_mem_self_test(int32_t*);
+extern int32_t osapi_ic_job_tick(int32_t*);
+extern int32_t osapi_ic_proc_tick(int32_t*);
+// L2
+extern int32_t osapi_ic_mutex_new(int32_t*);
+extern int32_t osapi_ic_mutex_lock(int32_t*);
+extern int32_t osapi_ic_mutex_unlock(int32_t*);
+extern int32_t osapi_ic_sem_new(int32_t*);
+extern int32_t osapi_ic_sem_wait(int32_t*);
+extern int32_t osapi_ic_sem_post(int32_t*);
+extern int32_t osapi_ic_event_new(int32_t*);
+extern int32_t osapi_ic_event_wait(int32_t*);
+extern int32_t osapi_ic_event_set(int32_t*);
+extern int32_t osapi_ic_event_clear(int32_t*);
+extern int32_t osapi_ic_cond_new(int32_t*);
+extern int32_t osapi_ic_cond_wait(int32_t*);
+extern int32_t osapi_ic_cond_signal(int32_t*);
+extern int32_t osapi_ic_job_start(int32_t*);
+extern int32_t osapi_ic_job_status(int32_t*);
+extern int32_t osapi_ic_job_progress(int32_t*);
+extern int32_t osapi_ic_job_progress_total(int32_t*);
+extern int32_t osapi_ic_job_cancel(int32_t*);
+extern int32_t osapi_ic_job_tick(int32_t*);
+extern int32_t osapi_ic_timer_new(int32_t*);
+extern int32_t osapi_ic_timer_poll(int32_t*);
+// L3
+extern int32_t osapi_ic_vfs_resolve(int32_t*);
+extern int32_t osapi_ic_file_open(int32_t*);
+extern int32_t osapi_ic_file_read(int32_t*);
+extern int32_t osapi_ic_file_write(int32_t*);
+extern int32_t osapi_ic_file_seek(int32_t*);
+extern int32_t osapi_ic_file_size(int32_t*);
+extern int32_t osapi_ic_file_close(int32_t*);
+extern int32_t osapi_ic_file_flush(int32_t*);
+extern int32_t osapi_ic_file_rename(int32_t*);
+extern int32_t osapi_ic_file_unlink(int32_t*);
+extern int32_t osapi_ic_file_mkdir(int32_t*);
+extern int32_t osapi_ic_dir_open(int32_t*);
+extern int32_t osapi_ic_dir_next(int32_t*);
+extern int32_t osapi_ic_file_lock(int32_t*);
+
+// osapi_init / osapi_ic_self_test are called from the kernel directly.
+extern void     osapi_init(void);
+extern int32_t  osapi_ic_self_test(int32_t*);
+extern int32_t  osapi_ic_l2l3_self_test(int32_t*);
+extern int32_t  osapi_ic_proc_self_test(int32_t*);
+extern int32_t  osapi_ic_l2l3_self_test(int32_t*);
 
 // =====================================================================
 //  local string helpers (freestanding: no libc)
@@ -125,6 +352,16 @@ int g_max_cw = 0, g_max_ch = 0;
 // single update per frame stays valid for every window painted after
 // it; Gfx::MouseX/Y subtract the client origin on the way out.
 int g_msx = -1, g_msy = -1;
+
+// IME candidate / pre-edit popup anchor, in SCREEN pixels.  A managed text
+// control publishes its caret (or input-box) origin with Host.SetImeAnchor
+// while it paints; g_ox/g_oy (pan included) convert it to screen space.
+// The publishing app id is kept alongside it so a paint of another window
+// later in the same frame cannot steal the anchor from the focused field.
+int g_paint_id      = -1;   // managed app id of the window currently painted
+int g_ime_anchor_id = -1;
+int g_ime_anchor_x  = -1;
+int g_ime_anchor_y  = -1;
 
 void set_context(int ox, int oy, int w, int h) {
     g_pan_x = 0; g_pan_y = 0;
@@ -543,17 +780,39 @@ int32_t h_run_mask(int32_t*) { return (int32_t)g_run_mask; }
 uint32_t g_ime_mode = 0;
 int32_t h_ime_mode(int32_t*) { return (int32_t)g_ime_mode; }
 
+// Host.SetImeAnchor(x, y): the focused managed text control reports where
+// its caret / input box starts, in CLIENT coordinates.  The compositor asks
+// for it back through mforms_ime_anchor() and places the pinyin candidate
+// bar just above that point.  No heap allocation: paint calls are wrapped
+// in a managed-heap mark/reset, so an icall used here must be side-effect
+// only.
+int32_t h_set_ime_anchor(int32_t* a) {
+    if (!a) return 0;
+    g_ime_anchor_id = g_paint_id;
+    g_ime_anchor_x  = g_ox + a[0];
+    g_ime_anchor_y  = g_oy + a[1];
+    return 0;
+}
+
 // ---- BUG-9: per-window paint-fault flags -----------------------------
 // One slot per managed window id.  mforms_paint sets 1 when the managed
 // OnPaint faulted (unbound icall, heap exhaustion, bad method) and 0 on a
 // successful frame.  The compositor reads it back through
 // mforms_paint_failed() to decide whether to fall back to the native drawer
 // instead of showing a transparent, empty client area.
-#define MFORMS_MAX_WIN 16
+#define MFORMS_MAX_WIN NEX_APP_MAX_WINDOWS
 static int g_paint_fail[MFORMS_MAX_WIN] = {0};
+
+// Standalone handles start at NEX_APP_HANDLE_BASE; map them back into the
+// fault table so they never alias the shell-managed ids.
+static int paint_fail_index(int id) {
+    int idx = nex_handle_index(id);
+    if (idx < 0) idx = id;
+    if (idx < 0 || idx >= MFORMS_MAX_WIN) return 0;
+    return idx;
+}
 extern "C" int mforms_paint_failed(int id) {
-    if (id < 0 || id >= MFORMS_MAX_WIN) return 0;
-    return g_paint_fail[id] ? 1 : 0;
+    return g_paint_fail[paint_fail_index(id)] ? 1 : 0;
 }
 
 // ---- display scaling (devicePixelRatio) -----------------------------
@@ -1150,6 +1409,10 @@ int32_t h_linux_blit(int32_t* a) {
 // =====================================================================
 struct Reg { const char* name; clr_icall_fn fn; };
 
+// (The osapi icall declarations live at FILE scope near the top of this
+// file -- they must NOT be inside the anonymous namespace, or the linker
+// looks for internal-linkage symbols that osapi.cpp never defines.)
+
 const Reg g_regs[] = {
     // ---- Gfx ----
     { "NexOS.Forms.Gfx::FillRect",    g_fill_rect    },
@@ -1211,6 +1474,7 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::Repaint",      h_repaint     },
     { "NexOS.Forms.Host::RunningMask",  h_run_mask    },
     { "NexOS.Forms.Host::ImeMode",     h_ime_mode    },
+    { "NexOS.Forms.Host::SetImeAnchor", h_set_ime_anchor },
     { "NexOS.Forms.Host::SetDpi",      h_set_dpi     },
     { "NexOS.Forms.Host::FileCount",    h_file_count  },
     { "NexOS.Forms.Host::FileName",     h_file_name   },
@@ -1230,6 +1494,10 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::ReadHex",      h_read_hex    },
     { "NexOS.Forms.Host::WriteText",    h_write_text  },
     { "NexOS.Forms.Host::Exec",         h_exec        },
+    { "NexOS.Forms.Host::AiStart",      h_ai_start    },
+    { "NexOS.Forms.Host::AiPoll",       h_ai_poll     },
+    { "NexOS.Forms.Host::AiStatus",     h_ai_status   },
+    { "NexOS.Forms.Host::AiCancel",     h_ai_cancel   },
     { "NexOS.Forms.Host::RunExe",       h_run_exe     },
     { "NexOS.Forms.Host::Shutdown",     h_shutdown    },
     { "NexOS.Forms.Host::Reboot",       h_reboot      },
@@ -1275,6 +1543,117 @@ const Reg g_regs[] = {
     { "NexOS.Forms.Host::AudioInfo",      h_audio_info      },
     { "NexOS.Forms.Host::AudioPlay",      h_audio_play      },
 #endif
+    // ---- standalone app registry (apps.man) ----
+    { "NexOS.Forms.Host::AppCount",       h_app_count        },
+    { "NexOS.Forms.Host::AppKind",        h_app_kind         },
+    { "NexOS.Forms.Host::AppName",        h_app_name         },
+    { "NexOS.Forms.Host::AppMex",         h_app_mex          },
+    { "NexOS.Forms.Host::AppColor",       h_app_color        },
+    { "NexOS.Forms.Host::AppLetter",      h_app_letter       },
+    { "NexOS.Forms.Host::AppDesc",        h_app_desc         },
+    { "NexOS.Forms.Host::AppKindByMex",   h_app_kind_by_mex  },
+    // ---- APMS operations ----
+    { "NexOS.Forms.Host::ApmsStatus",     h_apms_status      },
+    { "NexOS.Forms.Host::ApmsEvent",      h_apms_event       },
+    { "NexOS.Forms.Host::ApmsLogTail",    h_apms_log_tail    },
+    { "NexOS.Forms.Host::ApmsCapture",    h_apms_capture     },
+    { "NexOS.Forms.Host::ApmsReport",     h_apms_report      },
+    { "NexOS.Forms.Host::ApmsClear",      h_apms_clear       },
+    // ---- OS API layer 0+1 (osapi.cpp) ----
+    { "NexOS.Forms.Host::SetLastError",     osapi_ic_set_last_error     },
+    { "NexOS.Forms.Host::LastError",        osapi_ic_get_last_error     },
+    { "NexOS.Forms.Host::ClearError",       osapi_ic_clear_last_error   },
+    { "NexOS.Forms.Host::ApiVersion",       osapi_ic_api_version        },
+    { "NexOS.Forms.Host::CapsMask",         osapi_ic_caps_mask          },
+    { "NexOS.Forms.Host::HandleAlloc",      osapi_ic_handle_alloc       },
+    { "NexOS.Forms.Host::HandleClose",      osapi_ic_handle_close       },
+    { "NexOS.Forms.Perm::Uid",              osapi_ic_uid                },
+    { "NexOS.Forms.Perm::FsVolMask",        osapi_ic_fs_vol_mask        },
+    { "NexOS.Forms.Perm::FsPrefixCount",    osapi_ic_fs_prefix_count    },
+    { "NexOS.Forms.Perm::FsPrefixVol",      osapi_ic_fs_prefix_vol      },
+    { "NexOS.Forms.Perm::FsPrefixMode",     osapi_ic_fs_prefix_mode     },
+    { "NexOS.Forms.Perm::FsCanPath",        osapi_ic_fs_can_path        },
+    { "NexOS.Forms.Perm::DevAllowed",       osapi_ic_dev_allowed        },
+    { "NexOS.Forms.Perm::NetPortAllowed",   osapi_ic_net_port_allowed   },
+    { "NexOS.Forms.Perm::NetAddrAllowed",   osapi_ic_net_addr_allowed   },
+    { "NexOS.Forms.Perm::SyscallAllowed",   osapi_ic_syscall_allowed    },
+    // ---- OS API layer 2 (sync / job / timer) ----
+    { "NexOS.Forms.Sync::MutexNew",       osapi_ic_mutex_new     },
+    { "NexOS.Forms.Sync::Lock",           osapi_ic_mutex_lock    },
+    { "NexOS.Forms.Sync::Unlock",         osapi_ic_mutex_unlock  },
+    { "NexOS.Forms.Sync::SemNew",         osapi_ic_sem_new       },
+    { "NexOS.Forms.Sync::SemWait",        osapi_ic_sem_wait      },
+    { "NexOS.Forms.Sync::SemPost",        osapi_ic_sem_post      },
+    { "NexOS.Forms.Sync::EventNew",       osapi_ic_event_new     },
+    { "NexOS.Forms.Sync::EventWait",      osapi_ic_event_wait    },
+    { "NexOS.Forms.Sync::EventSet",       osapi_ic_event_set     },
+    { "NexOS.Forms.Sync::EventClear",     osapi_ic_event_clear   },
+    { "NexOS.Forms.Sync::CondNew",        osapi_ic_cond_new      },
+    { "NexOS.Forms.Sync::CondWait",       osapi_ic_cond_wait     },
+    { "NexOS.Forms.Sync::CondSignal",     osapi_ic_cond_signal   },
+    { "NexOS.Forms.Job::Start",           osapi_ic_job_start     },
+    { "NexOS.Forms.Job::Status",          osapi_ic_job_status    },
+    { "NexOS.Forms.Job::Progress",        osapi_ic_job_progress  },
+    { "NexOS.Forms.Job::ProgressTotal",   osapi_ic_job_progress_total },
+    { "NexOS.Forms.Job::CancelJob",       osapi_ic_job_cancel    },
+    { "NexOS.Forms.Job::Tick",            osapi_ic_job_tick      },
+    { "NexOS.Forms.Timer::New",           osapi_ic_timer_new     },
+    { "NexOS.Forms.Timer::Poll",          osapi_ic_timer_poll    },
+    // ---- OS API layer 3 (VFS / files / dirs) ----
+    { "NexOS.Forms.Fs::Resolve",          osapi_ic_vfs_resolve   },
+    { "NexOS.Forms.File::Open",           osapi_ic_file_open     },
+    { "NexOS.Forms.File::Read",           osapi_ic_file_read     },
+    { "NexOS.Forms.File::Write",          osapi_ic_file_write    },
+    { "NexOS.Forms.File::Seek",           osapi_ic_file_seek     },
+    { "NexOS.Forms.File::Size",           osapi_ic_file_size     },
+    { "NexOS.Forms.File::Close",          osapi_ic_file_close    },
+    { "NexOS.Forms.File::Flush",          osapi_ic_file_flush    },
+    { "NexOS.Forms.File::Rename",         osapi_ic_file_rename   },
+    { "NexOS.Forms.File::Unlink",         osapi_ic_file_unlink   },
+    { "NexOS.Forms.File::MkDir",          osapi_ic_file_mkdir    },
+    { "NexOS.Forms.Fs::DirOpen",          osapi_ic_dir_open      },
+    { "NexOS.Forms.Fs::DirNext",          osapi_ic_dir_next      },
+    { "NexOS.Forms.File::Lock",           osapi_ic_file_lock     },
+    // ---- OS API layer 2 processes + layer 3 glob ----
+    { "NexOS.Forms.Proc::Spawn",          osapi_ic_proc_spawn    },
+    { "NexOS.Forms.Proc::Wait",           osapi_ic_proc_wait     },
+    { "NexOS.Forms.Proc::Kill",           osapi_ic_proc_kill     },
+    { "NexOS.Forms.Proc::Exit",           osapi_ic_proc_exit     },
+    { "NexOS.Forms.Proc::Count",          osapi_ic_proc_count    },
+    { "NexOS.Forms.Proc::PidAt",          osapi_ic_proc_pid_at   },
+    { "NexOS.Forms.Proc::StateAt",        osapi_ic_proc_state_at },
+    { "NexOS.Forms.Fs::Glob",             osapi_ic_fs_glob       },
+    // ---- OS API layer 12 (configuration store) ----
+    { "NexOS.Forms.Cfg::Open",            osapi_ic_cfg_open      },
+    { "NexOS.Forms.Cfg::Get",             osapi_ic_cfg_get       },
+    { "NexOS.Forms.Cfg::Set",             osapi_ic_cfg_set       },
+    { "NexOS.Forms.Cfg::Del",             osapi_ic_cfg_del       },
+    { "NexOS.Forms.Cfg::KeyAt",           osapi_ic_cfg_key_at    },
+    { "NexOS.Forms.Cfg::Flush",           osapi_ic_cfg_flush     },
+    { "NexOS.Forms.Cfg::Close",           osapi_ic_cfg_close     },
+    { "NexOS.Forms.Cfg::Count",           osapi_ic_cfg_count     },
+    { "NexOS.Forms.Cfg::Dirty",           osapi_ic_cfg_dirty     },
+    // ---- OS API layer 4 (memory: handles only, never pointers) ----
+    { "NexOS.Forms.Mem::HeapAlloc",       osapi_ic_mem_heap_alloc      },
+    { "NexOS.Forms.Mem::HeapFree",        osapi_ic_mem_heap_free       },
+    { "NexOS.Forms.Mem::HeapRealloc",     osapi_ic_mem_heap_realloc    },
+    { "NexOS.Forms.Mem::HeapSize",        osapi_ic_mem_heap_size       },
+    { "NexOS.Forms.Mem::HeapPoke",        osapi_ic_mem_heap_poke       },
+    { "NexOS.Forms.Mem::HeapPeek",        osapi_ic_mem_heap_peek       },
+    { "NexOS.Forms.Mem::ArenaNew",        osapi_ic_mem_arena_new       },
+    { "NexOS.Forms.Mem::ArenaAlloc",      osapi_ic_mem_arena_alloc     },
+    { "NexOS.Forms.Mem::ArenaMark",       osapi_ic_mem_arena_mark      },
+    { "NexOS.Forms.Mem::ArenaRelease",    osapi_ic_mem_arena_release   },
+    { "NexOS.Forms.Mem::ArenaUsed",       osapi_ic_mem_arena_used      },
+    { "NexOS.Forms.Mem::ArenaFree",       osapi_ic_mem_arena_free      },
+    { "NexOS.Forms.Mem::ShmCreate",       osapi_ic_mem_shm_create      },
+    { "NexOS.Forms.Mem::ShmOpen",         osapi_ic_mem_shm_open        },
+    { "NexOS.Forms.Mem::ShmSize",         osapi_ic_mem_shm_size        },
+    { "NexOS.Forms.Mem::ShmClose",        osapi_ic_mem_shm_close       },
+    { "NexOS.Forms.Mem::Mmap",            osapi_ic_mem_mmap            },
+    { "NexOS.Forms.Mem::Unmap",           osapi_ic_mem_unmap           },
+    { "NexOS.Forms.Mem::Mappings",        osapi_ic_mem_mappings        },
+    { "NexOS.Forms.Mem::Live",            osapi_ic_mem_live            },
 };
 const int G_REG_COUNT = (int)(sizeof(g_regs) / sizeof(g_regs[0]));
 
@@ -1324,6 +1703,21 @@ extern "C" void mforms_init(const MFormsHost* host) {
     if (!host) return;
     g_h = *host;
     g_have_host = true;
+    // OS API layer 0+1: arm error channel + handle table + default token,
+    // then run the serial self-test once (failures are visible on serial).
+    // NOTE: declarations live at FILE scope (near the top of this file):
+    // inside this extern "C" function body they would inherit C language
+    // linkage and bind to unmangled names osapi.cpp never defines.
+    osapi_init();
+    osapi_ic_self_test(0);
+    osapi_ic_l2l3_self_test(0);
+    osapi_ic_proc_self_test(0);
+    osapi_ic_proc_self_test(0);
+    osapi_ic_cfg_self_test(0);
+    // L4 self-test is pure C (no CLR strings) and idempotent: run it twice
+    // so a skipped assertion cannot masquerade as a pass.
+    osapi_ic_mem_self_test(0);
+    osapi_ic_mem_self_test(0);
     for (int i = 0; i < G_REG_COUNT; i++)
         clr_register_icall(g_regs[i].name, g_regs[i].fn);
     set_context(0, 0, g_h.screen_w, g_h.screen_h);
@@ -1377,14 +1771,257 @@ extern "C" int mforms_start(void) {
     g_ready = true;
     scpy(g_report, "mforms: shell.mex ready", sizeof(g_report));
     serial_puts("[MFORMS] managed shell ready\n");
+
+    // ---- instance pool self-check ------------------------------------
+    // Prove that a SECOND assembly can be resident while the desktop shell is
+    // still loaded in slot 0.  This is the whole premise of "applications are
+    // real applications": before the pool existed, clr_load() would reset
+    // g_resident and overwrite the single image, so a second .mex destroyed the
+    // shell.  Loading hello.mex into slot 1 and switching back is the cheapest
+    // end-to-end check of that.
+    //
+    // Deliberately non-fatal: if this fails the desktop must still work, so it
+    // is reported on the serial line and then the shell is restored.
+    {
+        int prev = clr_current_slot();
+        int slot = clr_load_slot(1, "Notepad.mex");
+        if (slot == 1) {
+            serial_puts("[MFORMS] pool: slot 1 loaded Notepad.mex (shell still in slot ");
+            serial_putdec(prev);
+            serial_puts(")\n");
+            // Execute the standalone application's entry point while its slot is
+            // active.  "App.Main::Init" is the contract slot_symbol() maps to for
+            // any window this application owns.
+            int32_t rr = 0;
+            int rc2 = clr_call("App.Main::Init", nullptr, 0, &rr);
+            serial_puts(rc2 == 0 ? "[MFORMS] pool: slot 1 ran App.Main::Init (standalone app live)\n"
+                                 : "[MFORMS] pool: slot 1 entry FAILED\n");
+            clr_use(prev);                       // back to the desktop shell
+            // This is only a pool self-test.  Release the slot again so the
+            // first real standalone window can allocate it -- leaving it
+            // resident consumed one application slot before the desktop even
+            // appeared.
+            clr_close_slot(1);
+            // Verify the shell is still intact after the switch back.
+            serial_puts(clr_loaded() ? "[MFORMS] pool: shell intact after the switch\n"
+                                     : "[MFORMS] pool: SHELL LOST after the switch\n");
+        } else {
+            serial_puts("[MFORMS] pool: slot 1 load FAILED -> ");
+            serial_puts(clr_last_report());
+            serial_puts("\n");
+            clr_use(prev);
+        }
+    }
     return 0;
 }
 
 extern "C" int mforms_ready(void) { return g_ready && clr_loaded(); }
 extern "C" const char* mforms_report(void) { return g_report; }
 
+// ---- window -> CLR slot ownership -------------------------------------
+// Slot 0 is the desktop shell (the default for every window that does not
+// declare otherwise).  An application resident in slot N registers the windows
+// it owns, and every later Paint / Click / Key for those windows is executed
+// with that slot active.
+// MFORMS_MAX_WIN is defined ONCE, next to g_paint_fail above.  This used to be
+// a second #define (32 here, 16 there), which let ids 16..31 write past the
+// end of g_paint_fail[].
+static int g_win_slot[MFORMS_MAX_WIN];      // -1 = unassigned, default slot 0
+static int g_win_slot_init = 0;
+
+// One CLR slot PER standalone window: each window owns an independent image,
+// managed heap and set of static fields, so two Notepad windows can no longer
+// reset each other's document.  The handle is opaque to gui_legacy.cpp;
+// g_handle_slot maps it back to the owning slot.
+static int g_handle_slot[NEX_APP_MAX_SLOTS];   // handle index -> slot, -1 free
+static int g_slot_handle[NEX_APP_MAX_SLOTS];   // slot -> handle, -1 free
+static int g_handle_init = 0;
+
+static void handle_table_init(void) {
+    if (g_handle_init) return;
+    for (int i = 0; i < NEX_APP_MAX_SLOTS; i++) {
+        g_handle_slot[i] = -1;
+        g_slot_handle[i] = -1;
+    }
+    g_handle_init = 1;
+}
+
+static void win_slot_init(void) {
+    if (!g_win_slot_init) {
+        for (int i = 0; i < MFORMS_MAX_WIN; i++) g_win_slot[i] = -1;
+        g_win_slot_init = 1;
+    }
+    handle_table_init();
+}
+
+extern "C" void mforms_set_window_slot(int win, int slot) {
+    win_slot_init();
+    if (slot < 0 || slot >= CLR_MAX_VMS) return;
+    int h = nex_handle_index(win);
+    if (h >= 0) { g_handle_slot[h] = slot; return; }
+    if (win < 0 || win >= MFORMS_MAX_WIN) return;
+    g_win_slot[win] = slot;
+}
+
+// ---- slot-aware symbol dispatch ---------------------------------------
+// clr_call() resolves by fully-qualified NAME, so the way to run a method in a
+// DIFFERENT slot is simply to call a different name there.  Slot 0 (the desktop
+// shell) keeps the historical contract "NexOS.Forms.Shell::<Method>"; an
+// application resident in slot N exposes the same four methods under
+// "App.Main::<Method>".
+//
+// That keeps the C# side simple: an app implements Paint/Click/Key/Title with
+// the signatures it already uses, and mforms picks the right assembly by
+// switching slots first.
+//
+// Only the four per-window entry points are redirected.  Everything genuinely
+// shell-level (Init, Open, Close, the desktop/wallpaper/icon layers, the context
+// menu) stays hard-wired to NexOS.Forms.Shell, because those belong to the
+// desktop rather than to any single window.
+static const char* slot_symbol(const char* shell_name, char* buf, int bufsz, int slot) {
+    if (slot <= 0) return shell_name;              // slot 0 -> the shell itself
+    // shell_name is always "NexOS.Forms.Shell::<Method>"; rebuild it as
+    // "App.Main::<Method>" for the application slot.
+    const char* cut = shell_name;
+    while (*cut && !(cut[0] == ':' && cut[1] == ':')) cut++;
+    if (!*cut) return shell_name;                  // unexpected shape: no rewrite
+    cut += 2;
+    const char* prefix = "App.Main::";
+    int p = 0;
+    for (int i = 0; prefix[i] && p < bufsz - 1; i++) buf[p++] = prefix[i];
+    for (int i = 0; cut[i] && p < bufsz - 1; i++) buf[p++] = cut[i];
+    buf[p] = 0;
+    return buf;
+}
+
+static int window_owner_slot(int win) {
+    win_slot_init();
+    int h = nex_handle_index(win);
+    if (h >= 0) {
+        int s = g_handle_slot[h];
+        return (s > 0 && s < CLR_MAX_VMS) ? s : 0;
+    }
+    if (win < 0 || win >= MFORMS_MAX_WIN) return 0;
+    // -1 means "no explicit owner" -> the desktop shell draws it, exactly as
+    // before this mechanism existed.
+    return (g_win_slot[win] < 0) ? 0 : g_win_slot[win];
+}
+
+// ---- standalone application launch --------------------------------
+// Every standalone WINDOW gets its own CLR slot: independent image, managed
+// heap and static fields, so two Notepad windows cannot reset each other.
+// Returns an opaque handle in the NEX_APP_HANDLE_BASE range (deliberately
+// outside the 0..15 shell-managed app ids), or -1.
+//
+// Registration lives in app_registry.h.  The old code compared against 7,
+// which is Kind.Notepad / APP_MEM_OPTIMIZER, while AppType APP_NOTEPAD is 11
+// -- that mismatch is why the standalone path never fired.
+extern "C" const char* mforms_standalone_mex(int app) {
+    const NexAppEntry* e = nex_app_find(app);
+    return e ? e->mex : 0;
+}
+
+// Advisory preferred slot; the allocator may choose a different free one.
+extern "C" int mforms_standalone_slot_for(int app) {
+    return nex_app_find(app) ? 1 : -1;
+}
+
+static int standalone_alloc_slot(int hint) {
+    win_slot_init();
+    if (hint > 0 && hint < CLR_MAX_VMS &&
+        !clr_slot_loaded(hint) && g_slot_handle[hint] < 0) return hint;
+    for (int s = 1; s < CLR_MAX_VMS; s++)
+        if (!clr_slot_loaded(s) && g_slot_handle[s] < 0) return s;
+    return -1;
+}
+
+extern "C" int mforms_open_standalone(const char* mex, int slot_hint) {
+    if (!mforms_ready()) return -1;
+    if (!mex || !mex[0]) return -1;
+    win_slot_init();
+
+    int h = -1;
+    for (int i = 0; i < NEX_APP_MAX_SLOTS; i++)
+        if (g_handle_slot[i] < 0) { h = i; break; }
+    if (h < 0) {
+        serial_puts("[MFORMS] standalone: no free window handle\n");
+        return -1;
+    }
+    int slot = standalone_alloc_slot(slot_hint);
+    if (slot < 0) {
+        serial_puts("[MFORMS] standalone: all application slots are in use\n");
+        return -1;
+    }
+
+    int prev = clr_current_slot();
+    int rc = clr_load_slot(slot, mex);
+    if (rc < 0) {
+        serial_puts("[MFORMS] standalone load failed: ");
+        serial_puts(mex);
+        serial_puts(" -> ");
+        serial_puts(clr_last_report());
+        serial_puts("\n");
+        clr_use(prev);
+        return -1;
+    }
+
+    // Run the app entry point while its slot is active.
+    int32_t r = 0;
+    if (clr_call("App.Main::Init", nullptr, 0, &r) != 0) {
+        serial_puts("[MFORMS] App.Main::Init failed: ");
+        serial_puts(clr_last_report());
+        serial_puts("\n");
+        clr_use(prev);
+        return -1;
+    }
+
+    int handle = NEX_APP_HANDLE_BASE + h;
+    g_handle_slot[h] = slot;
+    g_slot_handle[slot] = handle;
+    clr_use(prev);
+    serial_puts("[MFORMS] standalone app live in slot ");
+    serial_putdec(slot);
+    serial_puts(" handle ");
+    serial_putdec(handle);
+    serial_puts("\n");
+    return handle;
+}
+
 extern "C" int mforms_open(int kind) {
     if (!mforms_ready()) return -1;
+#if defined(__x86_64__)
+    // =================================================================
+    //  ALL applications are now independent .mex images.  shell.mex no
+    //  longer contains a single App subclass: it is only the desktop,
+    //  Start menu, taskbar and window-surface dispatcher.
+    //
+    //  The kernel parses sfs_files/apps.man at boot; apms_mex_for_kind()
+    //  returns the image basename for this kind.  mforms_open_standalone()
+    //  loads it into its own MiniCLR slot and binds a handle in the
+    //  NEX_APP_HANDLE_BASE range, which mforms_title/paint/click/key
+    //  already route to "App.Main::*" (see slot_symbol).
+    // =================================================================
+    const char* mex = apms_mex_for_kind(kind);
+    if (!mex || !mex[0]) {
+        scpy(g_report, "APMS: no apps.man entry for this kind", sizeof(g_report));
+        serial_puts("[MFORMS] no standalone mex registered for kind ");
+        serial_putdec(kind);
+        serial_puts("\n");
+        return -1;
+    }
+    int handle = mforms_open_standalone(mex, 1);
+    if (handle < 0) {
+        scpy(g_report, "APMS: standalone app could not be loaded (",
+             sizeof(g_report));
+        scat(g_report, mex, sizeof(g_report));
+        scat(g_report, ")", sizeof(g_report));
+        return -1;
+    }
+    // Record the launch so a bug report shows exactly which app was open.
+    apms_event(3, "app-launch", mex);
+    return handle;
+#else
+    // 32-bit WinHost / legacy kernel still hosts apps inside the shell.
     int32_t a = kind, r = -1;
     if (clr_call("NexOS.Forms.Shell::Open", &a, 1, &r) != 0) {
         scpy(g_report, clr_last_report(), sizeof(g_report));
@@ -1392,14 +2029,6 @@ extern "C" int mforms_open(int kind) {
         return -1;
     }
     // ---- BUG-9: a managed app that cannot paint must NOT become a window ----
-    // Shell::Open returning < 0 means the C# side could not instantiate the
-    // app (unknown kind, OOM in the managed heap, ctor fault).  The caller used
-    // to still create the window: the client area was then handed to an app
-    // that paints nothing, and because the window body is alpha-blended glass
-    // the result is the reported ".mex window is transparent and empty".
-    // Fail loudly instead, with the reason in g_report, and let the caller
-    // fall back to the native drawer (or show an error) rather than opening a
-    // see-through window.
     if (r < 0) {
         scpy(g_report, "mforms: managed app unavailable (Shell::Open returned ",
              sizeof(g_report));
@@ -1412,12 +2041,33 @@ extern "C" int mforms_open(int kind) {
         serial_puts("\n");
         return -1;
     }
-    rebaseline();                    // the new app's state must persist
+    rebaseline();
     return (int)r;
+#endif
 }
 
 extern "C" void mforms_close(int id) {
     if (!mforms_ready() || id < 0) return;
+    // A closed window must not leave a stale caret anchor behind: a later
+    // app may reuse the same managed id.
+    if (g_ime_anchor_id == id) g_ime_anchor_id = -1;
+    // A standalone window owns a whole CLR slot.  Release it on close so the
+    // next window can reuse the slot instead of leaking ~840 KiB per launch.
+    // clr_close_slot() used to have NO callers anywhere in the tree.
+    int h = nex_handle_index(id);
+    if (h >= 0) {
+        win_slot_init();
+        int slot = g_handle_slot[h];
+        if (slot > 0 && slot < CLR_MAX_VMS) {
+            g_slot_handle[slot] = -1;
+            clr_close_slot(slot);
+            serial_puts("[MFORMS] standalone slot ");
+            serial_putdec(slot);
+            serial_puts(" released\n");
+        }
+        g_handle_slot[h] = -1;
+        return;
+    }
     int32_t a = id, r = 0;
     // Only re-baseline on success: baselining after a fault would bake the
     // blown watermark into the persistent floor and never give it back.
@@ -1428,16 +2078,25 @@ extern "C" void mforms_close(int id) {
 extern "C" const char* mforms_title(int id) {
     g_title[0] = 0;
     if (!mforms_ready() || id < 0) return g_title;
+    // Previously hard-wired to Shell::Title, so a standalone window could
+    // never show its own title.  Dispatch into the owning slot instead.
+    int owner = window_owner_slot(id);
+    int prev = clr_current_slot();
+    if (owner > 0 && clr_use(owner) < 0) owner = 0;
     uint32_t mark = clr_heap_mark();
     int32_t a = id, r = 0;
-    if (clr_call("NexOS.Forms.Shell::Title", &a, 1, &r) == 0 && r)
+    char sym[64];
+    if (clr_call(slot_symbol("NexOS.Forms.Shell::Title", sym, sizeof(sym), owner),
+                 &a, 1, &r) == 0 && r)
         scpy(g_title, clr_str(r), sizeof(g_title));
     clr_heap_reset(mark);
+    if (owner > 0) clr_use(prev);
     return g_title;
 }
 
 extern "C" void mforms_paint(int id, int ox, int oy, int w, int h) {
     if (!mforms_ready() || id < 0) return;
+    g_paint_id = id;              // tag any SetImeAnchor() from this paint
     set_context(ox, oy, w, h);
     g_flist_fs = -1;                 // listings are per-frame snapshots
     uint32_t mark = clr_heap_mark();
@@ -1448,10 +2107,31 @@ extern "C" void mforms_paint(int id, int ox, int oy, int w, int h) {
     // contentless window.  Track that here so the compositor can fall back to
     // the native drawer (see gui.cpp mforms_paint_failed) and so the fault is
     // visible on the serial log instead of silently eating frames.
-    int rc = clr_call("NexOS.Forms.Shell::Paint", a, 3, &r);
+    // ---- dispatch to the SLOT that owns this window --------------------
+    // A window can now belong to an application that lives in its own CLR slot
+    // instead of to the desktop shell.  The slot decides WHICH assembly the
+    // call executes in; the symbol is the same contract either way
+    // (NexOS.Forms.Shell::Paint), so an app keeps calling the same API it always
+    // did and mforms does not need a second entry-point naming scheme.
+    //
+    // clr_use() returns the previously active slot so we can restore it: the
+    // compositor interleaves paint calls for several owners within one frame.
+    int prev_slot = clr_current_slot();
+    int owner_slot = window_owner_slot(id);
+    // A failed clr_use() means that slot has no resident image.  Previously
+    // the return value was ignored and the event SILENTLY ran in whatever
+    // slot happened to be current (usually the shell).
+    if (owner_slot > 0 && clr_use(owner_slot) < 0) owner_slot = 0;
+
+    char sym[64];
+    int rc = clr_call(slot_symbol("NexOS.Forms.Shell::Paint", sym, sizeof(sym), owner_slot),
+                      a, 3, &r);
+
+    if (owner_slot > 0) clr_use(prev_slot);
     clr_heap_reset(mark);
+    int fidx = paint_fail_index(id);
     if (rc != 0) {
-        g_paint_fail[id < MFORMS_MAX_WIN ? id : 0] = 1;
+        g_paint_fail[fidx] = 1;
         serial_puts("[MFORMS] paint fault on window ");
         serial_putdec(id);
         serial_puts(": ");
@@ -1459,7 +2139,7 @@ extern "C" void mforms_paint(int id, int ox, int oy, int w, int h) {
         serial_puts("\n");
         heap_recover();
     } else {
-        g_paint_fail[id < MFORMS_MAX_WIN ? id : 0] = 0;
+        g_paint_fail[fidx] = 0;
     }
 }
 
@@ -1469,12 +2149,19 @@ extern "C" void mforms_paint(int id, int ox, int oy, int w, int h) {
 extern "C" void mforms_paint_pan(int id, int ox, int oy, int w, int h,
                                  int px, int py) {
     if (!mforms_ready() || id < 0) return;
+    g_paint_id = id;              // tag any SetImeAnchor() from this paint
     set_context_pan(ox, oy, w, h, px, py);
     g_flist_fs = -1;
+    int owner = window_owner_slot(id);
+    int prev = clr_current_slot();
+    if (owner > 0 && clr_use(owner) < 0) owner = 0;
     uint32_t mark = clr_heap_mark();
     int32_t a[3] = { id, w, h }, r = 0;
-    clr_call("NexOS.Forms.Shell::Paint", a, 3, &r);
+    char sym[64];
+    clr_call(slot_symbol("NexOS.Forms.Shell::Paint", sym, sizeof(sym), owner),
+             a, 3, &r);
     clr_heap_reset(mark);
+    if (owner > 0) clr_use(prev);
 }
 
 extern "C" int mforms_content_w(void) { return g_max_cw; }
@@ -1488,7 +2175,17 @@ extern "C" int mforms_click(int id, int ox, int oy, int w, int h,
     g_flist_fs = -1;
     press_screen(mx, my);            // arm button press animation (screen)
     int32_t a[3] = { id, mx - ox, my - oy }, r = 0;
-    if (clr_call("NexOS.Forms.Shell::Click", a, 3, &r) != 0) { heap_recover(); return 0; }
+    int prev_slot = clr_current_slot();
+    int owner_slot = window_owner_slot(id);
+    // A failed clr_use() means that slot has no resident image.  Previously
+    // the return value was ignored and the event SILENTLY ran in whatever
+    // slot happened to be current (usually the shell).
+    if (owner_slot > 0 && clr_use(owner_slot) < 0) owner_slot = 0;
+    char sym[64];
+    int rc = clr_call(slot_symbol("NexOS.Forms.Shell::Click", sym, sizeof(sym), owner_slot),
+                      a, 3, &r);
+    if (owner_slot > 0) clr_use(prev_slot);
+    if (rc != 0) { heap_recover(); return 0; }
     rebaseline();                    // a click may create durable state
     return (int)r;
 }
@@ -1501,6 +2198,10 @@ extern "C" int mforms_drag(int id, int phase, int mx, int my,
     g_msx = mx; g_msy = my;
     g_flist_fs = -1;
     int32_t a[7] = { id, phase, mx, my, hit_id, hx, hy }, r = 0;
+    // Standalone apps expose only Init/Paint/Click/Key/Title.  Rewriting this
+    // to App.Main::WindowDrag would fault the managed heap on every drag, so
+    // standalone windows deliberately opt out until the contract is extended.
+    if (nex_handle_index(id) >= 0) return 0;
     if (clr_call("NexOS.Forms.Shell::WindowDrag", a, 7, &r) != 0) { heap_recover(); return 0; }
     rebaseline();
     if (phase != 1) {            // one line per press / release, not per sample
@@ -1516,13 +2217,32 @@ extern "C" int mforms_drag(int id, int phase, int mx, int my,
 extern "C" int mforms_key(int id, int ch) {
     if (!mforms_ready() || id < 0) return 0;
     int32_t a[2] = { id, ch }, r = 0;
-    int rc = clr_call("NexOS.Forms.Shell::Key", a, 2, &r);
+    int prev_slot = clr_current_slot();
+    int owner_slot = window_owner_slot(id);
+    // A failed clr_use() means that slot has no resident image.  Previously
+    // the return value was ignored and the event SILENTLY ran in whatever
+    // slot happened to be current (usually the shell).
+    if (owner_slot > 0 && clr_use(owner_slot) < 0) owner_slot = 0;
+    char sym[64];
+    int rc = clr_call(slot_symbol("NexOS.Forms.Shell::Key", sym, sizeof(sym), owner_slot),
+                      a, 2, &r);
+    if (owner_slot > 0) clr_use(prev_slot);
     if (rc != 0) { heap_recover(); return 0; }
     rebaseline();
     return (int)r;
 }
 
 extern "C" void mforms_set_mouse(int mx, int my) { g_msx = mx; g_msy = my; }
+
+// IME candidate-bar anchor lookup for the compositor.  Returns 1 and fills
+// screen-space (x,y) only when THIS managed app published an anchor; 0 lets
+// the caller use its window-relative fallback instead.
+extern "C" int mforms_ime_anchor(int id, int* x, int* y) {
+    if (g_ime_anchor_id < 0 || g_ime_anchor_id != id) return 0;
+    if (x) *x = g_ime_anchor_x;
+    if (y) *y = g_ime_anchor_y;
+    return 1;
+}
 
 // Deliver a keystroke to the desktop surface (inline rename editor).
 extern "C" int mforms_desktop_key(int ch) {
@@ -1640,6 +2360,23 @@ extern "C" void mforms_paint_overlay(int w, int h) {
         heap_recover();
     else
         rebaseline();
+#if defined(__x86_64__)
+    // Cooperative async inference: advance at most 3 transformer layers per
+    // frame.  Mouse/keyboard are polled between frames, so a running decode
+    // never freezes the pointer the way the old blocking Host.Exec("ask ...")
+    // did.  The job itself is pure native state (no CLR heap involved).
+    if (ai_async_status() == 1) ai_async_tick(3);
+    // OS API layer 2: advance generic async jobs each frame (small budget).
+    int32_t job_budget = 2;
+    osapi_ic_job_tick(&job_budget);
+    // reap exited processes (frees their CLR slots)
+    osapi_ic_proc_tick(0);
+    // AI-assisted Win32 compat layer: read the external agent's commands,
+    // advance the PE by a few API calls, sample health and publish events.
+    // Same cooperative discipline as the job tick above -- bounded, never
+    // blocking, and it keeps the frame loop turning while a PE runs.
+    compat_pump(4);
+#endif
 }
 
 // -2 == "not mine, hit-test your windows".  Note the failure path also
@@ -1698,6 +2435,12 @@ extern "C" int mforms_desktop_rclick(int mx, int my) {
 extern "C" int mforms_rclick(int id, int ox, int oy, int w, int h,
                              int mx, int my) {
     if (!mforms_ready() || id < 0) return 0;
+    // A standalone application slot only exposes App.Main::{Init,Paint,
+    // Click,Key,Title}.  Calling Shell::RightClick there would raise an
+    // unresolved-method fault in the MiniCLR and tear the frame down, so
+    // standalone windows opt out until the contract is extended.  The
+    // desktop still owns every context menu it shows.
+    if (nex_handle_index(id) >= 0) return 0;
     set_context(ox, oy, w, h);
     g_msx = mx; g_msy = my;
     int32_t a[5] = { id, mx - ox, my - oy, ox, oy }, r = 0;

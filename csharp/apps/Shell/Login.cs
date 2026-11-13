@@ -283,7 +283,9 @@ namespace NexOS.Forms
             if (ch == -2 || ch == 10 || ch == 13)     { Submit();          return; }   // Enter
             if (ch == -1 || ch == 8)                  { Back();            return; }   // Backspace
             if (ch == 27) return;                                                      // ESC: no escape hatch
-            if (ch < 32 || ch > 126) return;                                           // ignore the rest
+            // Accept full BMP codepoints: the kernel IME commits one Unicode
+            // codepoint per key event, so >126 is a valid CJK glyph.
+            if (ch < 32 || ch > 0xFFFF) return;
 
             if (focus == 0) { if (user.Length < 15) user = U.Cat(user, Host.CharStr(ch)); }
             else            { if (pass.Length < 32) pass = U.Cat(pass, Host.CharStr(ch)); }

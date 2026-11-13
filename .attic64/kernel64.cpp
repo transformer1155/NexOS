@@ -40,6 +40,7 @@
 #include "smp64.h"            // Stage 8.1: SMP / multiprocessor bring-up
 #include "font_vec.h"         // vec_* signatures: the rasteriser now lives in fontvec.drv
 #include "driver_contract.h"   // hot-loadable driver framework (32/64 shared ABI)
+#include "nexos_compat.h"      // AI-assisted Win32 compat layer (D/E class)
 
 // Phase 0 ggml adapter self-test (declared here, defined just before kmain64).
 void gguf_adapter_selftest(void);
@@ -87,6 +88,84 @@ extern "C" void serial_lock_release(void){
 }
 extern "C" void serial_enter(void){ serial_lock_acquire(); }
 extern "C" void serial_leave(void){ serial_lock_release(); }
+
+// =====================================================================
+//  APMS -- Application Problem / Performance Management System
+// ---------------------------------------------------------------------
+//  The 64-bit kernel historically had NO in-memory log buffer: serial_puts
+//  was pure port I/O, so a bug report could only ever contain what the user
+//  managed to copy out of a serial capture.  APMS adds:
+//
+//    * a byte ring that tees every serial character (kernel AND, through
+//      apms_on_clr_fault(), MiniCLR faults);
+//    * a structured event ring for boot steps, CPU faults, CLR faults,
+//      application launches and capture operations;
+//    * a manifest-driven application registry read from sfs_files/apps.man;
+//    * framebuffer screenshot -> P6 PPM on the MKFS data disk;
+//    * a Markdown report combining all of the above with the user's text.
+//
+//  All buffers are deliberately SMALL and static: the .bss ceiling is
+//  0x9C0000 (see HEAP_START).  The screenshot/report scratch space is
+//  big_alloc()'d at runtime and freed immediately, never placed in .bss.
+// =====================================================================
+#define APMS_LOG_SZ       8192
+#define APMS_EVENT_MAX    64
+#define APMS_APP_MAX      32
+#define APMS_NAME_SZ      24
+#define APMS_MEX_SZ       20
+#define APMS_DESC_SZ      56
+#define APMS_REPORT_MAX   12288
+#define APMS_SHOT_PIX_CAP 3000000u   // ~3 MB max PPM payload
+
+static char     g_apms_log[APMS_LOG_SZ];
+static int      g_apms_log_pos = 0;
+static int      g_apms_log_len = 0;
+static uint32_t g_apms_seq = 0;
+static uint32_t g_apms_clr_faults = 0;
+static uint32_t g_apms_faults = 0;
+static uint32_t g_apms_captures = 0;
+static uint32_t g_apms_reports = 0;
+
+struct ApmsEvent {
+    uint32_t seq;
+    uint32_t stamp;
+    int      code;
+    char     tag[12];
+    char     msg[84];
+};
+static ApmsEvent g_apms_events[APMS_EVENT_MAX];
+static int       g_apms_ev_n = 0;      // events currently stored (<= MAX)
+static int       g_apms_ev_head = 0;   // next write slot
+
+struct ApmsApp {
+    int      kind;
+    char     name[APMS_NAME_SZ];
+    char     mex[APMS_MEX_SZ];
+    uint32_t color;
+    int      letter;
+    char     desc[APMS_DESC_SZ];
+};
+static ApmsApp g_apms_apps[APMS_APP_MAX];
+static int     g_apms_app_n = 0;
+static int     g_apms_apps_tried = 0;
+
+// Defined in .attic64/apms.inc (included below, before run_command()).
+extern "C" void apms_event(int code, const char* tag, const char* msg);
+static inline uint32_t apms_stamp(void) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return (uint32_t)((((uint64_t)hi << 32) | lo) >> 20);
+}
+
+// Tee one byte of serial output.  Called from serial_puts() and serial_tx(),
+// so every kernel log line (including hex/dec helpers) lands in the ring.
+static inline void apms_log_byte(uint8_t b) {
+    g_apms_log[g_apms_log_pos] = (char)b;
+    g_apms_log_pos++;
+    if (g_apms_log_pos >= APMS_LOG_SZ) g_apms_log_pos = 0;
+    if (g_apms_log_len < APMS_LOG_SZ) g_apms_log_len++;
+}
+
 void serial_puts(const char* s){
     while (*s) {
         // Wait for THR-empty before each byte: the UART FIFO is only 16 deep
@@ -100,7 +179,9 @@ void serial_puts(const char* s){
         for (uint32_t spin = 0; spin < 100000u; ++spin) {
             if (inb(0x3FD) & 0x20) break;
         }
-        outb(0x3F8, (uint8_t)*s++);
+        outb(0x3F8, (uint8_t)*s);
+        apms_log_byte((uint8_t)*s);
+        s++;
     }
 }
 // EVERY character goes through this one wait.  serial_puts already throttles,
@@ -117,6 +198,7 @@ static inline void serial_tx(uint8_t b){
         if (inb(0x3FD) & 0x20) break;       // THRE: transmitter holding empty
     }
     outb(0x3F8, b);
+    apms_log_byte(b);
 }
 void serial_hex(uint32_t v){
     const char* h = "0123456789ABCDEF";
@@ -341,8 +423,11 @@ static bool ata_drq_base(uint16_t base, int to){
 }
 static bool ata_drq(int to){ return ata_drq_base(0x1F0, to); }
 
-// Read one sector from the given channel, master device (drv = 0xA0).
-static void ata_read_sector_base(uint16_t base, uint32_t lba, uint16_t* buf){
+// Read one sector from the given channel with an explicit drive-select byte.
+// The model lives on the SECONDARY channel's master (0xE0) and the boot disk
+// on the PRIMARY one, so a single hard-coded 0xE0 would silently read the
+// wrong volume -- hence the drive byte is now a parameter.
+static void ata_read_sector_drive(uint16_t base, uint8_t drv, uint32_t lba, uint16_t* buf){
     ata_last_err = 0;
     // 1) device must be idle before we touch any registers
     if(!ata_nobsy_base(base, 50000)) { ata_last_status = inb(base+ATA_CMD); ata_last_err = 1; return; }
@@ -350,7 +435,7 @@ static void ata_read_sector_base(uint16_t base, uint32_t lba, uint16_t* buf){
     //    assert BSY, and any register write while BSY is set is dropped by the
     //    controller -- which is exactly why the old driver always read LBA0
     //    (the LBA registers never latched and the drive used its default CHS).
-    outb(base+6, 0xE0 | ((lba>>24)&0x0F));
+    outb(base+6, (uint8_t)(drv | ((lba>>24)&0x0F)));
     if(!ata_nobsy_base(base, 50000)) { ata_last_status = inb(base+ATA_CMD); ata_last_err = 2; return; }
     // 3) now the parameters will actually latch
     outb(base+1, 0x00);
@@ -363,6 +448,12 @@ static void ata_read_sector_base(uint16_t base, uint32_t lba, uint16_t* buf){
     if(!ata_drq_base(base, 2000000)) { ata_last_status = inb(base+ATA_CMD); ata_last_err = 3; return; }
     __asm__ __volatile__("cld; rep insw" :: "d"(base), "D"(buf), "c"(256) : "memory");
     ata_last_status = inb(base+ATA_CMD);   // final status / clear IRQ
+}
+
+// Same as above with the default master drive select (0xE0).  Every
+// pre-existing caller keeps its exact behaviour.
+static void ata_read_sector_base(uint16_t base, uint32_t lba, uint16_t* buf){
+    ata_read_sector_drive(base, 0xE0, lba, buf);
 }
 
 // Boot-disk read: unchanged signature and unchanged channel (PRIMARY), because
@@ -381,21 +472,65 @@ static void ata_fs_read_sector(uint32_t lba, uint16_t* buf){
 // ata_read_sector in a loop (776964 single-sector commands for the model).
 // Uses `rep insw` (string I/O) so QEMU can transfer the whole block in one
 // shot instead of one inw per word.
-static void ata_read_multi(uint32_t lba, uint8_t count, uint16_t* buf){
+// Multi-sector PIO read on an ARBITRARY channel / drive.  The secondary
+// channel (0x170) has no usable BM-DMA or virtio fast path, so pulling the
+// 379 MiB model off the data disk has to go through this path: one READ
+// SECTORS command per 128 sectors instead of one per sector.
+static bool ata_read_multi_drive(uint16_t base, uint8_t drv, uint32_t lba, uint8_t count, uint16_t* buf){
     ata_last_err = 0;
-    if(!ata_nobsy(50000)) { ata_last_status = inb(0x1F7); ata_last_err = 1; return; }
-    outb(0x1F6, 0xE0 | ((lba>>24)&0x0F));
-    if(!ata_nobsy(50000)) { ata_last_status = inb(0x1F7); ata_last_err = 2; return; }
-    outb(0x1F1, 0x00);
-    outb(0x1F2, count);
-    outb(0x1F3, (uint8_t)(lba & 0xFF));
-    outb(0x1F4, (uint8_t)((lba>>8) & 0xFF));
-    outb(0x1F5, (uint8_t)((lba>>16) & 0xFF));
-    outb(0x1F7, 0x20);                 // READ SECTORS
-    if(!ata_drq(2000000)) { ata_last_status = inb(0x1F7); ata_last_err = 3; return; }
-    // One rep insw for the whole batch (count*256 words).
-    __asm__ __volatile__("cld; rep insw" :: "d"((uint16_t)0x1F0), "D"(buf), "c"((uint32_t)count*256u) : "memory");
-    ata_last_status = inb(0x1F7);
+    if(!ata_nobsy_base(base, 50000)) { ata_last_status = inb(base+ATA_CMD); ata_last_err = 1; return false; }
+    outb(base+6, (uint8_t)(drv | ((lba>>24)&0x0F)));
+    if(!ata_nobsy_base(base, 50000)) { ata_last_status = inb(base+ATA_CMD); ata_last_err = 2; return false; }
+    outb(base+1, 0x00);
+    outb(base+2, count);
+    outb(base+3, (uint8_t)(lba & 0xFF));
+    outb(base+4, (uint8_t)((lba>>8) & 0xFF));
+    outb(base+5, (uint8_t)((lba>>16) & 0xFF));
+    outb(base+ATA_CMD, 0x20);         // READ SECTORS
+    // Read sector by sector: each rep insw is bounded to 256 words and we
+    // re-poll DRQ between sectors.  A single unbounded 64KB string transfer
+    // overruns VMware's virtual IDE FIFO and wedges the device (BSY latched,
+    // no error) -- this per-sector loop is safe on QEMU and VMware alike.
+    for (uint8_t s = 0; s < count; s++){
+        if(!ata_drq_base(base, 2000000)) { ata_last_status = inb(base+ATA_CMD); ata_last_err = 3; return false; }
+        __asm__ __volatile__("cld; rep insw" :: "d"(base), "D"(buf), "c"((uint32_t)256) : "memory");
+        buf += 256;
+    }
+    // Command complete: BSY clears (no more DRQ), then read status to clear IRQ.
+    if(!ata_nobsy_base(base, 2000000)) { ata_last_status = inb(base+ATA_CMD); ata_last_err = 5; return false; }
+    ata_last_status = inb(base+ATA_CMD);
+    if (ata_last_status & 0x01) { ata_last_err = 4; return false; }   // ERR latched
+    return true;
+}
+
+// PRIMARY-channel multi-sector read (the original behaviour, unchanged).
+static bool ata_read_multi(uint32_t lba, uint8_t count, uint16_t* buf){
+    return ata_read_multi_drive(ATA_PRIMARY, 0xE0, lba, count, buf);
+}
+
+// Soft-reset the PRIMARY ATA channel.  Assert SRST via the device control
+// register, hold briefly, release, then wait for BSY to clear.  Call this
+// after a read error leaves the device stuck (BSY latched) so the next
+// command can be issued cleanly.  VMware's virtual IDE is strict: a failed
+// multi-sector transfer leaves BSY asserted until a reset.
+// Soft-reset an arbitrary ATA channel.  The device-control register sits at
+// base + ATA_CTL (0x376 for the secondary channel, 0x3F6 for the primary).
+static void ata_soft_reset_base(uint16_t base){
+    uint16_t ctl = (uint16_t)(base + 0x06 + 0x20);   // 0x3F6 / 0x376
+    outb(ctl, 0x04);                 // SRST assert
+    for (volatile int i = 0; i < 200000; i++) {}
+    outb(ctl, 0x00);                 // SRST release
+    for (volatile int i = 0; i < 200000; i++) {}
+    ata_nobsy_base(base, 2000000);
+}
+
+static void ata_soft_reset(){
+    outb(0x3F6, 0x04);                 // SRST assert (primary device control)
+    for (volatile int i = 0; i < 200000; i++) {}
+    outb(0x3F6, 0x00);                 // release
+    for (volatile int i = 0; i < 200000; i++) {}
+    int to = 0;
+    while (inb(0x1F7) & 0x80) { if (++to > 3000000) break; }   // wait BSY clear
 }
 
 // =====================================================================
@@ -453,66 +588,95 @@ static uint32_t g_bm_base = 0;
 static uint32_t g_prdt[4] __attribute__((aligned(16)));
 static uint32_t g_prdt_phys = 0;
 
-// Read up to 64KiB (128 sectors) via BM-DMA into a physically-contiguous
-// buffer `buf_phys` (which, in identity-mapped long mode, is also the VA).
-static bool ata_read_dma_block(uint32_t lba, uint8_t* buf_phys){
-    if (!g_bm_base) return false;
+// ---- paged BM-DMA ------------------------------------------------------
+// The old single-shot 64KiB DMA had THREE bugs that made VirtualBoxVM.exe
+// assert (0x80000003) and die:
+//   1. The PRDT EOT bit is bit 31 of the *second dword*, not a third dword.
+//      prdt[2] = 1 was actually the PHYSICAL ADDRESS of a second PRD, so the
+//      controller happily DMA'd another 64 KiB to physical address 1.
+//   2. prdt[1] = 0x00010000 set reserved bits (count field must be the low
+//      16 bits only; 0 means 64 KiB).
+//   3. The bus-master command used 0x01 (bit3 = 0 => memory-to-device) for a
+//      READ DMA command; it must be 0x09 (bit3 = 1 => device-to-memory).
+// Now each transaction is a 16 KiB page into a 64 KiB-aligned static bounce
+// buffer with exactly ONE correctly terminated PRD, then memcpy'd to the
+// destination.  Page-sized transfers keep the PRD from ever crossing a 64K
+// boundary and make a failure cheap to retry / fall back from.
+#define IDE_DMA_PAGE_SECT   32                      // 16 KiB
+static uint8_t g_dma_bounce[IDE_DMA_PAGE_SECT * 512] __attribute__((aligned(65536)));
+static bool    g_ide_dma_enabled = true;
+
+static bool ata_read_dma_page(uint32_t lba, uint8_t sectors, uint8_t* buf_phys){
+    if (!g_bm_base || !sectors || sectors > IDE_DMA_PAGE_SECT) return false;
     uint16_t bm = (uint16_t)g_bm_base;
-    // Program PRDT: one entry, 64KiB, EOT (bit0).
     volatile uint32_t* prdt = (volatile uint32_t*)(uintptr_t)g_prdt_phys;
+    // ONE PRD: dword0 = 32-bit physical address, dword1 = byte count (low
+    // 16 bits) | EOT (bit 31).  Zero the rest of the table so a controller
+    // that ignores EOT still sees a harmless all-zero entry.
     prdt[0] = (uint32_t)(uintptr_t)buf_phys;
-    prdt[1] = 0x00010000u;   // 64KiB explicit (byte count; 0x10000 = 65536)
-    prdt[2] = 0x00000001u;   // EOT
-    outl(bm+4, g_prdt_phys); // PRD table address
+    prdt[1] = 0x80000000u | (uint32_t)((uint32_t)sectors * 512u);
+    prdt[2] = 0;
+    prdt[3] = 0;
+    outl(bm+4, g_prdt_phys);
     outb(bm+2, 0x06);        // clear BM status (INTR|ERROR)
-    // Enable DMA transfer mode on the device (SET FEATURES, subcmd 0x03),
-    // once. Without this the drive answers READ DMA with a PIO DRQ and the
-    // bus master never sees data -> BM error.
-    static bool dma_enabled = false;
-    if (!dma_enabled){
+
+    // Enable DMA transfer mode on the device once (SET FEATURES / 0x03).
+    static bool dma_mode_set = false;
+    if (!dma_mode_set){
         if(ata_nobsy(50000)){
             outb(0x1F6, 0xE0 | ((lba>>24)&0x0F));
             if(ata_nobsy(50000)){
-                outb(0x1F1, 0x03);   // DMA mode
+                outb(0x1F1, 0x03);
                 outb(0x1F2, 0x00);
                 outb(0x1F3, 0x00);
                 outb(0x1F4, 0x00);
                 outb(0x1F5, 0x00);
-                outb(0x1F7, 0xEF);   // SET FEATURES
-                // wait for completion
-                uint32_t w=0; while(!(inb(0x1F7)&0x40) && w<2000000u){w++;}
-                dma_enabled = true;
+                outb(0x1F7, 0xEF);
+                uint32_t w = 0;
+                while(!(inb(0x1F7)&0x40) && w < 2000000u) w++;
+                dma_mode_set = true;
             }
         }
     }
-    // Issue READ DMA (LBA28, 128 sectors = 64KiB).
     if(!ata_nobsy(50000)) { ata_last_err = 11; return false; }
     outb(0x1F6, 0xE0 | ((lba>>24)&0x0F));
     if(!ata_nobsy(50000)) { ata_last_err = 12; return false; }
     outb(0x1F1, 0x00);
-    outb(0x1F2, 128);
+    outb(0x1F2, sectors);
     outb(0x1F3, (uint8_t)(lba & 0xFF));
     outb(0x1F4, (uint8_t)((lba>>8) & 0xFF));
     outb(0x1F5, (uint8_t)((lba>>16) & 0xFF));
     outb(0x1F7, 0xC8);       // READ DMA
-    outb(bm+0, 0x01);        // start bus master read (bit0=start, bit3=0 => device->memory)
-    // One-time diagnostic on first call.
+    outb(bm+0, 0x09);        // start, direction = device -> memory
+
     static bool dbg_done = false;
     if (!dbg_done){
         dbg_done = true;
-        serial_puts("[DMA-DBG] bmcmd="); serial_hex(inb(bm+0));
+        serial_puts("[DMA] bmcmd="); serial_hex(inb(bm+0));
         serial_puts(" bmstat="); serial_hex(inb(bm+2));
-        serial_puts(" ide="); serial_hex(inb(0x1F7));
         serial_puts(" prdt0="); serial_hex(prdt[0]);
+        serial_puts(" prdt1="); serial_hex(prdt[1]);
         serial_puts("\n");
     }
-    // Poll BM status (bit0 = active -> clears on completion) with timeout.
     uint32_t t = 0;
-    while (inb(bm+2) & 0x01) { if (++t > 4000000u) { outb(bm+0, 0x00); ata_last_err = 13; if(!dbg_done){} serial_puts("[DMA-DBG] TIMEOUT bmstat="); serial_hex(inb(bm+2)); serial_puts("\n"); return false; } }
+    while (inb(bm+2) & 0x01){
+        if (++t > 4000000u){
+            outb(bm+0, 0x00);
+            ata_last_err = 13;
+            serial_puts("[DMA] timeout bmstat="); serial_hex(inb(bm+2));
+            serial_puts("\n");
+            return false;
+        }
+    }
     outb(bm+0, 0x00);        // stop BM
-    uint8_t st = inb(0x1F7);
-    ata_last_status = st;
-    if (inb(bm+2) & 0x02) { ata_last_err = 14; serial_puts("[DMA-DBG] BM-ERROR bmstat="); serial_hex(inb(bm+2)); serial_puts("\n"); return false; } // BM error
+    ata_last_status = inb(0x1F7);
+    if ((inb(bm+2) & 0x02) || (ata_last_status & 0x01)){
+        ata_last_err = 14;
+        serial_puts("[DMA] error bmstat="); serial_hex(inb(bm+2));
+        serial_puts(" ide="); serial_hex(ata_last_status);
+        serial_puts("\n");
+        return false;
+    }
     return true;
 }
 
@@ -620,7 +784,7 @@ static bool virtio_blk_read(uint32_t lba, uint8_t* buf, uint32_t nsect){
     uint16_t base = g_vblk_io;
     // Request header: type(4) + reserved(4) + sector(8) = 16 bytes.
     static uint8_t hdr[16] __attribute__((aligned(16)));
-    static uint8_t status __attribute__((aligned(8)));
+    static volatile uint8_t status __attribute__((aligned(8)));   // volatile: the device writes it via DMA
     status = 0xFF;
     *(volatile uint32_t*)(hdr+0) = VIRTIO_BLK_T_IN;
     *(volatile uint32_t*)(hdr+4) = 0;
@@ -644,11 +808,11 @@ static bool virtio_blk_read(uint32_t lba, uint8_t* buf, uint32_t nsect){
     *(volatile uint16_t*)(d+doff+44) = (1u<<1);    // WRITE
     *(volatile uint16_t*)(d+doff+46) = 0;
 
-    // Available ring: place head index 0, bump idx.
+    // Available ring: place head descriptor at ring[idx % qsz], bump idx.
     volatile uint8_t* av = g_vq.avail;
     uint16_t idx = *(volatile uint16_t*)(av+2);
-    *(volatile uint16_t*)(av+4) = 0;               // ring[0] = head desc
-    *(volatile uint16_t*)(av+2) = (uint16_t)(idx + 1); // idx++
+    *(volatile uint16_t*)(av+4 + (idx % g_vq.qsz)*2) = 0;   // ring[idx%qsz] = head desc
+    *(volatile uint16_t*)(av+2) = (uint16_t)(idx + 1);      // idx++
     outl(base+0x10, 0);                            // notify queue 0 (32-bit write)
     // tiny delay so the device can pick up the notification
     for (volatile uint32_t d=0; d<1000; d++){}
@@ -657,7 +821,7 @@ static bool virtio_blk_read(uint32_t lba, uint8_t* buf, uint32_t nsect){
     volatile uint8_t* us = g_vq.used;
     uint32_t t = 0;
     while (*(volatile uint16_t*)(us+2) == idx){
-        if (++t > 20000000u){
+        if (++t > 200000000u){
             serial_puts("[VBLK] TIMEOUT devstat="); serial_hex(inb(base+0x12));
             serial_puts(" isr="); serial_hex(inb(base+0x14));
             serial_puts(" usedidx="); serial_hex(*(volatile uint16_t*)(us+2));
@@ -669,6 +833,12 @@ static bool virtio_blk_read(uint32_t lba, uint8_t* buf, uint32_t nsect){
             serial_puts("\n");
             return false;
         }
+    }
+    if (status != 0){
+        serial_puts("[VBLK] done but status="); serial_hex(status);
+        serial_puts(" usedlen="); serial_hex(*(volatile uint32_t*)(us+8));
+        serial_puts(" usedidx="); serial_hex(*(volatile uint16_t*)(us+2));
+        serial_puts("\n");
     }
     return status == 0;
 }
@@ -752,6 +922,10 @@ extern "C" void diag_step(uint32_t id, const char* name){
         g_last_step = id;
         for (int i = 0; i < 31 && name[i]; i++) g_last_step_name[i] = name[i];
         g_last_step_name[31] = 0;
+        // APMS: record the boot/phase transition in the structured event
+        // ring.  Only the changed step is recorded, so GUI repaint steps do
+        // not flood the 64-slot ring.
+        apms_event(1, "boot", name);
 
         // Persist progress to LBA1500 so a freeze can be diagnosed from disk
         // without serial or screen colour.  Skip the per-icon mh_* draw calls
@@ -783,7 +957,12 @@ extern "C" void diag_step(uint32_t id, const char* name){
 
 // Synchronous fault handler (called from isr_common in entry64.asm).
 // Dumps context to serial and writes a 512-byte record to LBA1500.
-extern "C" void fault_common(uint32_t intno, uint32_t errcode, uint64_t rip,
+// force_align_arg_pointer: the interrupted context's RSP is NOT guaranteed
+// 16-byte aligned (no IST on these gates), and GCC may emit SSE stores for
+// the local frame -- movaps on a misaligned RSP #GP'd inside the handler
+// itself on VMware (recursive fault -> triple fault -> VM shutdown dialog).
+extern "C" __attribute__((force_align_arg_pointer))
+void fault_common(uint32_t intno, uint32_t errcode, uint64_t rip,
                          uint64_t cs, uint64_t rflags, uint64_t cr2){
     serial_puts("[DIAG-FAULT] vec=");
     serial_dec(intno);
@@ -798,6 +977,12 @@ extern "C" void fault_common(uint32_t intno, uint32_t errcode, uint64_t rip,
     serial_puts(" name=");
     serial_puts(g_last_step_name);
     serial_puts("\n");
+
+    // APMS: a synchronous CPU fault is the single most valuable event to
+    // attach to a bug report.  Record it BEFORE the cli;hlt below -- the
+    // hook only writes to static memory, never allocates or touches ATA.
+    g_apms_faults++;
+    apms_event(9, "cpu-fault", g_last_step_name);
 
     // Persist a 512-byte record to LBA1500 (genuinely spare: kernel.bin @33
     // spans 33..1056, kernel64 @2048, so 1500 is in the unused gap -- writing
@@ -829,7 +1014,187 @@ extern "C" void fault_common(uint32_t intno, uint32_t errcode, uint64_t rip,
         ((uint8_t*)rec)[28 + i] = (uint8_t)g_last_step_name[i];
     ata_write_sector(1500, rec);
 
+    // -----------------------------------------------------------------
+    //  AI compat layer (D4): a fault inside a PE must NOT take the
+    //  machine down.  Record the fault for the external AI, then abandon
+    //  the PE and return to the kernel frame loop with its state intact.
+    //
+    //  compat_abort_pe() longjmps back into compat_pe_resume()'s
+    //  checkpoint, so the kernel keeps running and the AI gets a report
+    //  through ai_events.bin.  Without this, one wild pointer inside a PE
+    //  would park the whole system and the AI would never hear about it.
+    // -----------------------------------------------------------------
+    compat_on_fault(intno, errcode, rip, cr2);
+    compat_abort_pe();
+    // If compat_abort_pe() could not find a checkpoint we are still in a
+    // fault context with no safe way back: park the machine.
     for (;;) __asm__ __volatile__("cli; hlt");
+}
+
+// =====================================================================
+//  V2.1 HEADLESS STAGE  (kernel evolution -- see docs for the roadmap)
+// ---------------------------------------------------------------------
+//  Stage 0 : unchanged legacy GUI path (the compile-time escape hatch).
+//  Stage 1 : bypass GUI / login / model autotest, run the OS API self-tests
+//            on COM1, then hlt with IF=0 -- prove the CPU really sleeps.
+//  Stage 2 : remap the 8259A to vectors 32..47, start the PIT at 100 Hz,
+//            unmask IRQ0 only, sti.  irq0_stub (entry64.asm) prints [TICK]
+//            from interrupt context, proving a hardware IRQ wakes hlt.
+//  Stage 3 : two kernel threads with private 4 KiB stacks; the timer handler
+//            saves the interrupted frame into a PCB and returns the next
+//            thread's frame, so iretq lands in the other thread (A/B).
+//
+//  DISCIPLINE / WHY THIS IS SAFE
+//   * Everything here is compiled UNCONDITIONALLY.  Only behaviour branches
+//     on NEX_HEADLESS_STAGE (a compile-time constant), so check-k64's strict
+//     re-link always sees the same symbol set at every stage and can never
+//     report a stage-dependent undefined symbol.
+//   * The PIC is fully masked at kmain64 entry (0x21/0xA1 = 0xFF).  Nothing
+//     unmasks an IRQ unless stage >= 2, and then ONLY IRQ0.
+//   * Interrupt-context printing uses hs_puts() (raw port I/O, NO lock):
+//     serial_puts() takes a test-and-set lock, and an IRQ arriving while a
+//     thread holds it would spin forever with IF=0.
+//   * PIT + 8259A is the explicitly allowed TRANSITION path.  LAPIC timer,
+//     per-process PML4 and ring3 are the next milestones, not this one.
+// =====================================================================
+#ifndef NEX_HEADLESS_STAGE
+#define NEX_HEADLESS_STAGE 0
+#endif
+
+// Lazy model loading.  The weights no longer live in the system image, so
+// booting must NOT drag 379 MiB into ring0 before the OS is usable.  With
+// NEX_MODEL_LAZY=1 the boot only PRINTS the descriptor it found and the
+// weights are pulled in on demand ('model load').  Set it to 0 to restore the
+// old "load and run one inference during boot" behaviour, which is how the
+// externalised data-disk path gets regression-tested.
+#ifndef NEX_MODEL_LAZY
+#define NEX_MODEL_LAZY 1
+#endif
+#define HS_STR2(x) #x
+#define HS_STR(x)  HS_STR2(x)
+
+// OS API self-tests normally run from mforms_init() inside gui_enter().
+// Skipping the GUI must NOT skip them (acceptance criterion #2).
+extern void    osapi_init(void);
+extern int32_t osapi_ic_self_test(int32_t*);
+extern int32_t osapi_ic_l2l3_self_test(int32_t*);
+extern int32_t osapi_ic_proc_self_test(int32_t*);
+extern int32_t osapi_ic_cfg_self_test(int32_t*);
+extern int32_t osapi_ic_mem_self_test(int32_t*);
+
+// entry64.asm: hardware IRQ entry, never routes to fault_common().
+extern "C" void irq0_stub(void);
+
+// Raw, lock-free COM1 writer for interrupt / thread context.
+static inline void hs_putc(char c){
+    for (uint32_t spin = 0; spin < 100000u; ++spin)
+        if (inb(0x3FD) & 0x20) break;
+    outb(0x3F8, (uint8_t)c);
+}
+static void hs_puts(const char* s){ while (*s) hs_putc(*s++); }
+
+static inline void hs_iowait(){ outb(0x80, 0); }   // POST-port delay
+
+// Remap the 8259A: master 32..39, slave 40..47.  Without this, IRQ0 arrives
+// as vector 8 = #DF (exactly the triple fault recorded at kmain64 entry).
+static void hs_pic_remap(){
+    outb(0x20, 0x11); hs_iowait();
+    outb(0xA0, 0x11); hs_iowait();
+    outb(0x21, 0x20); hs_iowait();
+    outb(0xA1, 0x28); hs_iowait();
+    outb(0x21, 0x04); hs_iowait();
+    outb(0xA1, 0x02); hs_iowait();
+    outb(0x21, 0x01); hs_iowait();
+    outb(0xA1, 0x01); hs_iowait();
+    outb(0x21, 0xFE);       // IRQ0 (PIT) only
+    outb(0xA1, 0xFF);       // every slave IRQ stays masked
+}
+static void hs_pit_init(uint32_t hz){
+    uint32_t div = 1193182u / hz;
+    outb(0x43, 0x36);                      // ch0, lobyte/hibyte, mode 3
+    outb(0x40, (uint8_t)(div & 0xFF));
+    outb(0x40, (uint8_t)(div >> 8));
+}
+
+// ---- Task 3: PCB + context switch ----------------------------------
+struct HSThread {
+    uint64_t    rsp;
+    uint64_t    stack[512];               // 4 KiB private kernel stack
+    const char* tag;
+};
+static HSThread         g_hs_threads[2];
+static volatile int     g_hs_cur    = -1; // -1 = idle (kmain64 hlt loop)
+static volatile uint64_t g_hs_ticks = 0;
+static volatile int     g_hs_credit = 0;
+
+extern "C" void headless_thread_entry(void){
+    for (;;){
+        if (g_hs_credit){
+            g_hs_credit = 0;
+            hs_puts(g_hs_threads[g_hs_cur].tag);
+        }
+        __asm__ __volatile__("hlt");      // sleep until the next timer IRQ
+    }
+}
+
+static void hs_thread_init(HSThread* t, const char* tag){
+    t->tag = tag;
+    uint64_t* sp = (uint64_t*)(uintptr_t)(t->stack + 512);
+    *(--sp) = 0x10;                                    // ss   (dummy)
+    *(--sp) = (uint64_t)(uintptr_t)(t->stack + 512);   // rsp  (dummy)
+    *(--sp) = 0x202;                                   // rflags: IF=1
+    *(--sp) = 0x08;                                    // cs
+    *(--sp) = (uint64_t)(uintptr_t)&headless_thread_entry; // rip
+    for (int i = 0; i < 15; i++) *(--sp) = 0;          // r15..rax
+    // 20 qwords pushed => after iretq pops 3, rsp % 16 == 8 (SysV ABI).
+    t->rsp = (uint64_t)(uintptr_t)sp;
+}
+
+// irq0_stub passes the interrupted frame pointer in rdi; we return the
+// frame whose registers + iret frame the stub must restore.
+extern "C" uint64_t headless_irq0_c(uint64_t rsp){
+    g_hs_ticks++;
+    // ODD period on purpose: threads round-robin with period 2, so an even
+    // credit period (20) always lands on the SAME thread and the log shows
+    // only "B" forever.  25 alternates A/B on successive credits.
+    if ((g_hs_ticks % 25) == 0) g_hs_credit = 1;
+    if ((g_hs_ticks % (NEX_HEADLESS_STAGE >= 3 ? 100u : 50u)) == 0)
+        hs_puts("[TICK]\n");
+    if (NEX_HEADLESS_STAGE < 3){
+        return rsp;                        // no switch: back into the hlt loop
+    }
+    if (g_hs_cur >= 0) g_hs_threads[g_hs_cur].rsp = rsp;
+    g_hs_cur = (g_hs_cur + 1) & 1;
+    return g_hs_threads[g_hs_cur].rsp;
+}
+
+// Not static: keeping external linkage means GCC never emits
+// -Wunused-function for this code at stage 0 (acceptance: zero warnings).
+void headless_run(){
+    serial_puts("[KERNEL] headless stage=" HS_STR(NEX_HEADLESS_STAGE) "\n");
+    // Acceptance #2: L0/L1/L2/L3/L12/L4 self-tests must still be visible on
+    // COM1 even though gui_enter() / mforms_init() never runs.
+    osapi_init();
+    osapi_ic_self_test(0);
+    osapi_ic_l2l3_self_test(0);
+    osapi_ic_proc_self_test(0);
+    osapi_ic_proc_self_test(0);
+    osapi_ic_cfg_self_test(0);
+    osapi_ic_mem_self_test(0);
+    osapi_ic_mem_self_test(0);
+    serial_puts("[KERNEL] OS API self-tests done (headless)\n");
+    if (NEX_HEADLESS_STAGE >= 2){
+        hs_pic_remap();
+        hs_pit_init(100);
+    }
+    if (NEX_HEADLESS_STAGE >= 3){
+        hs_thread_init(&g_hs_threads[0], "A\n");
+        hs_thread_init(&g_hs_threads[1], "B\n");
+    }
+    serial_puts("[KERNEL] Entered headless hlt loop.\n");
+    if (NEX_HEADLESS_STAGE >= 2)
+        __asm__ __volatile__("sti" ::: "memory");
+    for (;;) __asm__ __volatile__("hlt");
 }
 
 // Build the IDT from the stub table exported by entry64.asm and load it.
@@ -882,14 +1247,107 @@ idt_self:
         uint64_t a = isr_stub_table[i] + delta;
         g_idt[i].offlow    = (uint16_t)(a & 0xFFFF);
         g_idt[i].sel       = 0x08;
-        g_idt[i].ist_flags = 0x8E00;
+        // Fault vectors get IST=1 so the CPU pushes the exception frame on
+        // a dedicated stack instead of the interrupted one.  That matters
+        // for the AI compat layer: a PE that overflows its own stack would
+        // otherwise fault while the CPU tries to push the frame, and the
+        // resulting double fault would take the whole machine down -- the
+        // external AI would never see the report.
+        //   8  #DF   10 #TS  11 #NP  12 #SS  13 #GP  14 #PF  17 #AC
+        static const int fault_vecs[] = { 8, 10, 11, 12, 13, 14, 17 };
+        bool is_fault = false;
+        for (unsigned k = 0; k < sizeof(fault_vecs)/sizeof(fault_vecs[0]); k++)
+            if (fault_vecs[k] == i) { is_fault = true; break; }
+        g_idt[i].ist_flags = is_fault ? 0x8E01 : 0x8E00;
         g_idt[i].offmid    = (uint16_t)((a >> 16) & 0xFFFF);
         g_idt[i].offhigh   = (uint32_t)(a >> 32);
         g_idt[i].rsv       = 0;
     }
+    // V2.1: vector 32 is the remapped PIT IRQ.  The generic stub for 32
+    // funnels into fault_common() (which halts), so a hardware interrupt
+    // MUST get its own iretq-capable entry.  IST=0: this is an IRQ, not a
+    // fault, and it must use the interrupted thread's own stack.
+    if (NEX_HEADLESS_STAGE >= 2){
+        uint64_t a32 = (uint64_t)(uintptr_t)&irq0_stub;
+        g_idt[32].offlow    = (uint16_t)(a32 & 0xFFFF);
+        g_idt[32].sel       = 0x08;
+        g_idt[32].ist_flags = 0x8E00;
+        g_idt[32].offmid    = (uint16_t)((a32 >> 16) & 0xFFFF);
+        g_idt[32].offhigh   = (uint32_t)(a32 >> 32);
+        g_idt[32].rsv       = 0;
+        serial_puts("[K64-IDT] vector 32 -> headless irq0_stub\n");
+    }
     g_idt_desc.limit = (uint16_t)(sizeof(g_idt) - 1);
     g_idt_desc.base  = (uint64_t)g_idt + delta;
     __asm__ __volatile__("lidt %0" :: "m"(g_idt_desc));
+}
+
+// ---- IST: dedicated fault stack ------------------------------------
+// The TSS lives in entry64.asm's .data (gdt64_tss).  We patch ist[0] with
+// the address of this page and load the TSS, so IST=1 gates use it.
+extern "C" char gdt64_tss[];          // defined in .attic64/entry64.asm
+extern "C" char gdt64_tss_end[];       // end of the TSS, for the limit
+extern "C" uint8_t gdt64_tss_desc[16]; // the 6th GDT entry (written below)
+extern "C" uint8_t gdt64[];           // the 64-bit GDT (entry64.asm .data)
+extern "C" uint8_t gdt64_end[];
+struct __attribute__((packed)) Gdtr64 { uint16_t limit; uint64_t base; };
+static uint64_t g_fault_stack[1024]; // 8 KiB, 16-byte aligned
+
+// Build the 64-bit TSS descriptor in the GDT at runtime.  NASM cannot
+// encode the TSS base relocation (it spans the 16-byte descriptor), so we
+// do it in C exactly like build_idt() builds the IDT.
+static void gdt_install_tss(void){
+    uint64_t base = (uint64_t)(uintptr_t)gdt64_tss;
+    uint64_t lim  = (uint64_t)(gdt64_tss_end - gdt64_tss) - 1; // 107
+    uint8_t* d = gdt64_tss_desc;
+    // IA-32e 16-byte SYSTEM descriptor layout (same byte order as the
+    // static GDT entries above):
+    //   +0..1 limit[15:0] | +2..3 base[15:0] | +4 base[23:16]
+    //   +5 ACCESS (P/DPL/S/Type) | +6 limit[19:16]+flags | +7 base[31:24]
+    //   +8..11 base[63:32] | +12..15 reserved
+    // An earlier version put 0x89 at +7 and base[31:24] at +5.  The CPU
+    // then saw access=0 (P=0), so `ltr 0x28` raised #GP(0x28); the #GP
+    // gate uses IST=1 from a TSS that was never loaded, the handler faulted
+    // again, and the machine triple-faulted right after
+    // "[DIAG] step=1 kmain64 post-build_idt" (VBox: #GP -> #PF -> #DF).
+    *(uint16_t*)(d + 0) = (uint16_t)lim;
+    *(uint16_t*)(d + 2) = (uint16_t)(base & 0xFFFF);
+    d[4] = (uint8_t)((base >> 16) & 0xFF);
+    d[5] = 0x89;                            // P=1 DPL=0 S=0 type=9 (64-bit TSS)
+    d[6] = (uint8_t)((lim >> 16) & 0xF);   // limit[19:16], flags=0
+    d[7] = (uint8_t)((base >> 24) & 0xFF);  // base[31:24]
+    *(uint32_t*)(d + 8)  = (uint32_t)(base >> 32); // base[63:32]
+    *(uint32_t*)(d + 12) = 0;                       // reserved
+}
+
+static void fault_ist_setup(){
+    // The 32->64 hand-off leaves GDTR on the boot loader's 3-entry GDT
+    // (measured in VBox at the triple fault: gdtr=0x11048:0x17).  Selector
+    // 0x28 is then OUT OF LIMITS and `ltr 0x28` raises #GP(0x28) no matter
+    // how correct the descriptor bytes are.  Reload GDTR from the real
+    // 64-bit GDT symbols here, right before patching the TSS descriptor,
+    // so the CPU reads the very table we just wrote.  Segment caches keep
+    // their current (valid long-mode) values; no segment register reload is
+    // needed between the lgdt and the ltr.
+    struct Gdtr64 gdtr;
+    gdtr.limit = (uint16_t)((uint64_t)(uintptr_t)(gdt64_end - gdt64) - 1);
+    gdtr.base  = (uint64_t)(uintptr_t)gdt64;
+    __asm__ __volatile__("lgdt %0" :: "m"(gdtr) : "memory");
+    gdt_install_tss();
+    // The CPU reads IST1 at TSS byte offset 36.  entry64.asm opens the TSS
+    // with an 8-byte `dq 0` instead of the architectural 4-byte `dd 0`, so
+    // its own "ist[0]" slot sits at 40 (4 bytes late).  Store a full 8-byte
+    // pointer at 36: the CPU then sees the right value, and the reserved
+    // half of the asm slot is unused anyway.
+    // Stacks grow DOWN, so point at the END of the 8 KiB array -- pointing
+    // at its base makes the first exception push into the preceding .bss.
+    uint64_t ist1 = (uint64_t)(uintptr_t)(g_fault_stack + 1024);
+    *(uint64_t*)(gdt64_tss + 36) = ist1;
+    // Load the TSS: the 64-bit TSS descriptor sits at GDT selector 0x28.
+    __asm__ __volatile__("ltr %%ax" :: "a"((uint16_t)0x28));
+    serial_puts("[K64-IDT] IST1 fault stack at ");
+    serial_hex((uint32_t)ist1);
+    serial_puts("\n");
 }
 
 // =====================================================================
@@ -1264,11 +1722,16 @@ enum KbdType {
     K_NONE, K_CHAR, K_UP, K_DOWN, K_LEFT, K_RIGHT, K_TAB,
     K_CTRL_C, K_CTRL_V, K_CTRL_L, K_CTRL_UP, K_CTRL_DOWN,
     K_PAGEUP, K_PAGEDN, K_HOME, K_END,
-    // The Windows/Super key (scancode set 1: E0 5B).  Needed as its own event
-    // because the desktop toggles the Start menu with it, and the old event
-    // table had no representation for a non-character modifier key at all --
-    // so pressing Win opened the menu and pressing it again could not close it.
-    K_WIN
+    // Windows/Super key (scancode set 1: E0 5B / E0 5C).  K_WIN now means
+    // "clean key-UP of the Win modifier", emitted by Keyboard::process() only
+    // when no other key was pressed during the hold.  The desktop toggles the
+    // Start menu on it; Win+<key> chords never produce this event.
+    K_WIN,
+    // Shift is a language toggle as well as a modifier.  The 32-bit driver
+    // has emitted this on the rising edge since the IME work; the 64-bit
+    // desktop (the one actually running) never had it, so g_ime_cn stayed
+    // false forever and Chinese input could not be switched on at all.
+    K_SHIFT
 };
 struct KbdEvent { KbdType type; char ch; };
 
@@ -1302,11 +1765,32 @@ public:
         if(brk){
             if(key==SC_LSHIFT||key==SC_RSHIFT) m_shift=false;
             if(key==SC_LCTRL) m_ctrl=false;
+            // Win/Super releases arrive as E0 DB (left) / E0 DC (right).
+            // Win is a MODIFIER: the Start menu must open on the key-UP of a
+            // clean tap only, never on key-down.  A chord (Win+E / Win+R /
+            // Win+D / Win+arrow ...) suppresses the menu entirely.
+            if(m_ext && (key==0x5B || key==0x5C)){
+                bool clean = m_gui && !m_gui_combo;
+                m_gui = false;
+                m_gui_combo = false;
+                m_ext = false;
+                if(clean) e.type = K_WIN;
+                else      serial_puts("[KBD] Win chord - Start menu suppressed\n");
+                return e;
+            }
             m_ext=false;
             return e;
         }
         if(m_ext){
             m_ext=false;
+            // Key DOWN: only arm the tap detector, do not emit an event.
+            // K_WIN used to be emitted here, so every Windows shortcut popped
+            // the Start menu before its own key even arrived.
+            if(key==0x5B || key==0x5C){
+                if(!m_gui){ m_gui=true; m_gui_combo=false; }
+                return e;
+            }
+            if(m_gui) m_gui_combo=true;   // extended-key chord (Win+arrows...)
             if(key==0x48){
                 if(m_ctrl) e.type=K_CTRL_UP;
                 else       e.type=K_UP;
@@ -1321,15 +1805,18 @@ public:
             else if(key==0x51) e.type=K_PAGEDN;
             else if(key==0x47) e.type=K_HOME;
             else if(key==0x4F) e.type=K_END;
-            // Windows/Super keys: E0 5B (left) and E0 5C (right).  Reported as
-            // their own event so the desktop can toggle the Start menu.  Without
-            // this the byte fell through m_ext and vanished: the menu could be
-            // opened (via its own internal path) but never closed by the same
-            // key, which read as "the Win key only works once".
-            else if(key==0x5B || key==0x5C) e.type=K_WIN;
             return e;
         }
-        if(key==SC_LSHIFT||key==SC_RSHIFT){ m_shift=true; return e; }
+        // Any ordinary key pressed while Win is held belongs to a Windows
+        // shortcut chord.  Still forward the event so existing combos keep
+        // working; only the Start-menu tap is suppressed.
+        if(m_gui) m_gui_combo=true;
+        if(key==SC_LSHIFT||key==SC_RSHIFT){
+            // Rising edge only: one K_SHIFT per press toggles the IME once,
+            // while the held modifier still produces upper-case letters.
+            if(!m_shift){ m_shift=true; e.type=K_SHIFT; }
+            return e;
+        }
         if(key==SC_LCTRL){ m_ctrl=true; return e; }
         if(key==SC_CAPSLOCK){ m_caps=!m_caps; return e; }
 
@@ -1354,6 +1841,7 @@ public:
     }
 private:
     bool m_shift=false, m_caps=false, m_ext=false, m_ctrl=false;
+    bool m_gui=false, m_gui_combo=false;   // Win modifier + chord detector
 };
 
 // =====================================================================
@@ -1543,11 +2031,16 @@ extern "C" {
     void gui_mouse_up(void);
     void gui_mouse_down_right(void);
     int  gui_handle_key(char ch);
+    // Open the standalone Notepad application in its own CLR slot.
     // Keyboard-driven desktop control.  These were EXPORTED by gui_legacy.cpp
     // but never declared or called here, so the arrows / Tab / Win key had no
     // effect even though the driver recognised them.
     void gui_toggle_start_menu(void);
+    void gui_toggle_ime(void);            // Shift -> Chinese/English IME mode
     void gui_desktop_nav(int code);
+    // Send a non-character key to the focused managed window.
+    // Returns 1 when that window consumed it, 0 when the desktop should handle it.
+    int  gui_special_key_to_managed(int code);
     int  gui_bga_available(void);
     int  gui_vbe_mode_set_by_bios(void);
     void gui_create_window(int x, int y, int w, int h, const char* title);
@@ -2553,7 +3046,7 @@ constexpr uint32_t PMM_MAX_PAGES   = 1u * 1024 * 1024 * 1024 / PAGE_SIZE; // 262
 // corrupt each other -> blank desktop).  0x400000 leaves room for the 1 MiB
 // PMM bitmap that now follows .bss (ends ~0x33ACF8) and matches the 32-bit
 // kernel's heap convention.
-constexpr uint32_t HEAP_START      = 0x500000;     // 5 MiB (past .bss end 0x4354A0 + PMM bitmap)
+constexpr uint32_t HEAP_START      = 0x600000;     // 6 MiB. Raised from 0x500000 when .bss moved to 0x240000 (linker64.ld), which pushes its end past the old bound.
 constexpr uint32_t HEAP_SIZE       = 0x1000000;    // 16 MiB (expanded for AI engine)
 constexpr uint32_t HEAP_END        = HEAP_START + HEAP_SIZE;
 
@@ -4050,10 +4543,116 @@ static void ask_collect(const char* piece){
 }
 static void ask_collect_reset(void){ g_dn_ai_len = 0; g_dn_ai_buf[0] = 0; }
 
+// =====================================================================
+//  Async inference job (cooperative, frame-driven worker)
+// ---------------------------------------------------------------------
+// The 64-bit kernel never enables IRQs (no STI), so there is no preemptive
+// thread scheduler to park a whole generation on.  Instead the job is a
+// resumable state machine: ai_async_start() arms it, and the GUI frame loop
+// calls ai_async_tick(N) to run at most N transformer layers per frame.
+// Mouse and keyboard are polled between frames, so clicking "Send" returns
+// immediately and the pointer keeps moving while tokens stream in.
+//
+// This is deliberately a *cooperative process*, not a blocking call: the
+// managed AiChat window starts the job and polls the delta text each paint.
+// =====================================================================
+#define AI_ASYNC_DELTA_SZ 8192
+static char  g_async_delta[AI_ASYNC_DELTA_SZ];
+static int   g_async_delta_len = 0;
+static int   g_async_state = 0;        // 0 idle, 1 running, 2 done, 3 error
+static char  g_async_prompt[4096];
+
+extern "C" int ai_async_start(const char* prompt, int max_new, float temp){
+    if (!prompt || !prompt[0]) return -1;
+    if (!(qwen_ready() || model_try_load())) return -2;
+    qwen_gen_abort();                  // one inference context at a time
+    char sys[768];
+    kb_build_prompt(prompt, sys, (int)sizeof(sys));
+    const char* roles[1] = { "user" };
+    const char* conts[1] = { prompt };
+    qwen_format_chat(sys, roles, conts, 1,
+                     g_async_prompt, (int)sizeof(g_async_prompt));
+    if (qwen_gen_begin(g_async_prompt, max_new > 0 ? max_new : 96, temp) != 0)
+        return -3;
+    g_async_delta_len = 0; g_async_delta[0] = 0;
+    g_async_state = 1;
+    serial_puts("[AI-ASYNC] started\n");
+    return 0;
+}
+
+extern "C" int ai_async_tick(int layers){
+    if (g_async_state != 1) return g_async_state;
+    char piece[256];
+    int rc = qwen_gen_slice(layers > 0 ? layers : 2,
+                            piece, (int)sizeof(piece));
+    if (piece[0]){
+        int p = 0;
+        while (piece[p] && g_async_delta_len < AI_ASYNC_DELTA_SZ - 1)
+            g_async_delta[g_async_delta_len++] = piece[p++];
+        g_async_delta[g_async_delta_len] = 0;
+    }
+    if (rc < 0){ g_async_state = 3; qwen_gen_abort(); }
+    else if (rc == 0){
+        g_async_state = 2;
+        serial_puts("[AI-ASYNC] done tokens=");
+        serial_dec((uint32_t)qwen_gen_produced());
+        serial_puts("\n");
+    }
+    return g_async_state;
+}
+
+extern "C" int ai_async_status(void){ return g_async_state; }
+
+extern "C" int ai_async_take(char* out, int outsz){
+    if (!out || outsz < 1) return 0;
+    int n = g_async_delta_len; if (n > outsz - 1) n = outsz - 1;
+    for (int k = 0; k < n; k++) out[k] = g_async_delta[k];
+    out[n] = 0;
+    if (n < g_async_delta_len){
+        int rem = g_async_delta_len - n;
+        for (int k = 0; k < rem; k++) g_async_delta[k] = g_async_delta[n + k];
+        g_async_delta_len = rem;
+    } else g_async_delta_len = 0;
+    g_async_delta[g_async_delta_len] = 0;
+    return n;
+}
+
+extern "C" void ai_async_cancel(void){
+    if (g_async_state == 1) qwen_gen_abort();
+    g_async_state = 0;
+    g_async_delta_len = 0; g_async_delta[0] = 0;
+}
+
+// Shell toggles: `aiquant 0|1` (int8 activation quantisation) and
+// `dma on|off` (paged IDE DMA for the next model load).
+static void cmd_aiquant(const char* args){
+    while (*args == ' ') args++;
+    if (*args == '0'){ qwen_set_quant_mode(0); term.write("A8 quant off (float dots)\n"); }
+    else if (*args == '1'){ qwen_set_quant_mode(1); term.write("A8 quant on (W4A8 int8 dots)\n"); }
+    else {
+        term.write("A8 quant mode: ");
+        term.write(qwen_quant_mode() ? "1 (W4A8 int8)\n" : "0 (float)\n");
+        term.write("Usage: aiquant [0|1]\n");
+    }
+}
+static void cmd_dma(const char* args){
+    while (*args == ' ') args++;
+    if (args[0] == 'o' && args[1] == 'f' && args[2] == 'f'){
+        g_ide_dma_enabled = false; term.write("IDE paged DMA off\n");
+    } else if (args[0] == 'o' && args[1] == 'n'){
+        g_ide_dma_enabled = true; term.write("IDE paged DMA on\n");
+    } else {
+        term.write(g_ide_dma_enabled ? "IDE paged DMA: on\n" : "IDE paged DMA: off\n");
+        term.write("Usage: dma [on|off]\n");
+    }
+}
+
 static void cmd_ask(const char* args){
     // A real GGUF beats the built-in toy engine whenever one is loaded,
-    // regardless of whether 'ai init' was ever run.
-    if(qwen_ready()){
+    // regardless of whether 'ai init' was ever run.  If weights are on
+    // disk but not resident yet, load them on demand (first `ask` pays
+    // the ~1 minute blob read + parse).
+    if(qwen_ready() || model_try_load()){
         if(!*args){ term.write("Usage: ask <question>\n"); return; }
         const GGUFModelInfo* mi = qwen_info();
         term.write("AI ("); term.write(mi ? mi->arch : "gguf");
@@ -4199,33 +4798,125 @@ static uint32_t approx_mb_k64(unsigned long long bytes){ return (uint32_t)(bytes
 // The descriptor location has moved once already (SFS grew past LBA 4096),
 // so probe a list instead of trusting a single hard-coded sector.
 #define MODEL_DATA_LBA  16384u
-static const uint32_t g_model_hdr_lbas[] = { 16383u, 8191u, 4095u };
 
+// The model now lives on the DATA disk (IDE secondary, 0x170) at a high LBA
+// instead of being welded into the system image.  The descriptor sits at
+// MODEL_HDR_LBA_DATA and the payload starts on the next sector.  LBA 20000 is
+// well past the MKFS area (900..16116), so the filesystem and the weights
+// never share a sector.
+#define MODEL_HDR_LBA_DATA  20000u
+
+// Legacy descriptor, still probed so an old 429 MB system image keeps working.
 struct ModelBlobHdr {
     char     magic[8];      // "MINIMDL1"
     uint64_t size;          // payload bytes
     uint64_t start_lba;     // where the payload begins
 };
 
-static uint8_t*  g_model_blob   = 0;   // big_alloc'd copy of the weights
-static uint64_t  g_model_bytes  = 0;
+// Descriptor v2: self-describing, so the kernel does not have to guess which
+// channel and which drive the payload sits on.
+struct ModelDescV2 {
+    char     magic[8];      // "NEXMODL2"
+    uint32_t version;       // 2
+    uint32_t header_size;   // sizeof(ModelDescV2)
+    uint64_t size;          // payload bytes
+    uint64_t start_lba;     // where the payload begins on that disk
+    uint16_t io_base;       // 0x1F0 primary / 0x170 secondary
+    uint8_t  drive;         // 0xE0 master
+    uint8_t  flags;         // bit0 lazy, bit1 verified
+    uint32_t crc32;         // descriptor + payload head checksum
+    char     name[48];      // human-readable model name
+    uint8_t  reserved[424];  // -> sizeof(ModelDescV2) == 512 = one sector
+};
 
-// Read the descriptor; returns payload size or 0 when no blob is present.
-static uint64_t model_blob_probe(uint64_t* out_lba){
+// A resolved model location.
+struct ModelDesc {
+    uint16_t io_base;
+    uint8_t  drive;
+    uint64_t hdr_lba;
+    uint64_t start_lba;
+    uint64_t size;
+    uint32_t version;
+    uint32_t crc32;         // CRC-32 of the payload's first 4 KiB (0 = none)
+    char     name[48];
+};
+
+// Where to look for a descriptor.  The data disk comes first: that is where
+// the weights live now.  The remaining entries are the legacy system-disk
+// positions, so an old image still boots and still finds its model.
+struct ModelCand {
+    uint16_t io_base;
+    uint8_t  drive;
+    uint32_t hdr_lba;
+};
+static const struct ModelCand g_model_cands[] = {
+    { ATA_SECONDARY, 0xE0, MODEL_HDR_LBA_DATA },
+    { ATA_PRIMARY,   0xE0, 61440u },
+    { ATA_PRIMARY,   0xE0, 16383u },
+    { ATA_PRIMARY,   0xE0, 8191u  },
+    { ATA_PRIMARY,   0xE0, 4095u  },
+};
+
+static uint8_t*  g_model_blob   = 0;   // big_alloc'd copy of the weights
+static uint64_t  g_model_bytes  = 0;   // payload size handed to the parser
+static uint64_t  g_model_alloc  = 0;   // bytes actually allocated (for free)
+
+static bool magic_is(const uint8_t* sec, const char* m){
+    for (int i = 0; i < 8; i++) if (sec[i] != (uint8_t)m[i]) return false;
+    return true;
+}
+
+// Resolve the model descriptor.  Returns true and fills *out when a
+// descriptor with a plausible payload size was found.
+static bool model_locate(struct ModelDesc* out){
     uint8_t sec[512];
-    const char* m = "MINIMDL1";
-    for (unsigned c = 0; c < sizeof(g_model_hdr_lbas)/sizeof(g_model_hdr_lbas[0]); c++){
-        ata_read_sector(g_model_hdr_lbas[c], (uint16_t*)sec);
-        bool hit = true;
-        for (int i = 0; i < 8; i++) if (sec[i] != (uint8_t)m[i]) { hit = false; break; }
-        if (!hit) continue;
-        ModelBlobHdr h;
-        memcpy_(&h, sec, sizeof(h));
-        if (h.size == 0 || h.size > (1ull << 32)) continue;
-        if (out_lba) *out_lba = h.start_lba ? h.start_lba : MODEL_DATA_LBA;
-        return h.size;
+    for (unsigned c = 0; c < sizeof(g_model_cands)/sizeof(g_model_cands[0]); c++){
+        const struct ModelCand* cd = &g_model_cands[c];
+        ata_read_sector_drive(cd->io_base, cd->drive, cd->hdr_lba, (uint16_t*)sec);
+        if (ata_last_err != 0) continue;
+        struct ModelDesc d;
+        memset(&d, 0, sizeof(d));
+        d.io_base = cd->io_base;
+        d.drive   = cd->drive;
+        d.hdr_lba = cd->hdr_lba;
+        d.version = 1;
+        if (magic_is(sec, "NEXMODL2")){
+            ModelDescV2 v2;
+            memcpy_(&v2, sec, sizeof(v2));
+            if (v2.version != 2) continue;
+            if (v2.header_size != (uint32_t)sizeof(ModelDescV2)) continue;
+            if (v2.size == 0 || v2.size > (1ull << 32)) continue;
+            d.size      = v2.size;
+            d.start_lba = v2.start_lba ? v2.start_lba : (uint64_t)(cd->hdr_lba + 1);
+            if (v2.io_base) d.io_base = v2.io_base;
+            if (v2.drive)   d.drive   = v2.drive;
+            d.version = 2;
+            d.crc32   = v2.crc32;
+            memcpy_(d.name, v2.name, 47);
+            d.name[47] = 0;
+            *out = d;
+            return true;
+        }
+        if (magic_is(sec, "MINIMDL1")){
+            ModelBlobHdr h;
+            memcpy_(&h, sec, sizeof(h));
+            if (h.size == 0 || h.size > (1ull << 32)) continue;
+            d.size      = h.size;
+            d.start_lba = h.start_lba ? h.start_lba : MODEL_DATA_LBA;
+            memcpy_(d.name, "legacy MINIMDL1", 15);
+            *out = d;
+            return true;
+        }
     }
-    return 0;
+    return false;
+}
+
+// Legacy accessor: returns the payload size (0 = none) and the start LBA.
+static uint64_t model_blob_probe(uint64_t* out_lba){
+    struct ModelDesc d;
+    if (!model_locate(&d)) return 0;
+    if (out_lba) *out_lba = d.start_lba;
+    return d.size;
 }
 
 // Pull `size` bytes starting at `lba` into a big_alloc'd buffer.
@@ -4237,47 +4928,261 @@ static uint8_t* model_blob_read(uint64_t lba, uint64_t size){
         g_vblk_tried = true;
         virtio_blk_init();
     }
-    // Fast path: pull the entire model from a virtio-blk disk in ONE request.
+    // Fast path: pull the model from a virtio-blk disk in 1MiB chunks.
+    // A single 379MB request times out in QEMU (used ring never advances);
+    // chunked requests complete at memory speed.
     if (g_vblk_io){
-        uint64_t sectors = (size + 511) / 512;
-        serial_puts("[VBLK] reading "); serial_dec((uint32_t)(size>>20)); serial_puts("MB in one DMA...\n");
-        if (virtio_blk_read(0, dst, (uint32_t)sectors)){
-            serial_puts("[VBLK] model read OK\n");
-            return dst;
+        uint64_t whole = (size >> 9) << 9;              // full-sector part
+        uint64_t sectors = whole >> 9;
+        serial_puts("[VBLK] reading "); serial_dec((uint32_t)(size>>20)); serial_puts("MB in chunks...\n");
+        // 1 MiB per request; if the device rejects the chunk size, retry the
+        // whole model with 64 KiB chunks before giving up.
+        const uint32_t CHUNKS[2] = {2048, 128};        // sectors (1MB, 64KB)
+        for (int ci = 0; ci < 2; ci++){
+            const uint32_t CHUNK_SECT = CHUNKS[ci];
+            bool ok = true;
+            for (uint64_t s = 0; s < sectors && ok; ){
+                uint32_t n = (sectors - s > CHUNK_SECT) ? CHUNK_SECT : (uint32_t)(sectors - s);
+                if (virtio_blk_read((uint32_t)s, dst + (s << 9), n)) {
+                    s += n;
+                    if ((s & 0x1FFFFu) == 0u) { serial_puts("[VBLK] "); serial_dec((uint32_t)(s >> 11)); serial_puts("MB\n"); }
+                } else {
+                    ok = false;
+                }
+            }
+            if (ok){
+                if (whole < size){                          // tail < 512 bytes via PIO
+                    uint8_t sec[512];
+                    ata_read_sector((uint32_t)sectors, (uint16_t*)sec);
+                    memcpy_(dst + whole, sec, (int)(size - whole));
+                }
+                serial_puts("[VBLK] model read OK\n");
+                return dst;
+            }
+            if (ci == 0) serial_puts("[VBLK] 1MB chunks failed, retrying with 64KB chunks\n");
         }
-        serial_puts("[VBLK] read failed, falling back to IDE PIO\n");
+        serial_puts("[VBLK] chunk read failed, falling back to IDE PIO\n");
     }
     uint64_t sectors = (size + 511) / 512;
-    uint64_t done = 0;
-    uint8_t sec[512];
     uint64_t i = 0;
-    bool use_dma = (g_bm_base != 0) && (g_prdt_phys != 0);
-    while (i < sectors){
-        uint64_t remaining = sectors - i;
-        uint8_t batch = (remaining > 255) ? 255 : (uint8_t)remaining;
-        if (use_dma && (done + (uint64_t)batch*512 <= size)){
-            // BM-DMA: 128 sectors = 64KiB straight into the (physically
-            // contiguous, identity-mapped) destination buffer.
-            if (!ata_read_dma_block((uint32_t)(lba + i), dst + done)){
-                // Fall back to PIO for the rest if DMA hiccups.
-                use_dma = false;
-                ata_read_multi((uint32_t)(lba + i), batch, (uint16_t*)(dst + done));
+    // ---- paged BM-DMA fast path -----------------------------------------
+    // The old BM-DMA implementation crashed VirtualBoxVM.exe because its PRDT
+    // never set EOT (see ata_read_dma_page()).  With one correctly terminated
+    // PRD per 16 KiB page and a 64 KiB-aligned bounce buffer, bulk loads no
+    // longer need 776964 separate single-sector PIO commands.  Any failure
+    // disables DMA for the rest of THIS load, soft-resets the channel and
+    // resumes the proven single-sector PIO path at the first unread sector,
+    // so a broken controller can never wedge the loader again.
+    if (g_bm_base && g_ide_dma_enabled){
+        serial_puts("[DMA] paged load: ");
+        serial_dec((uint32_t)(sectors >> 11));
+        serial_puts("MB in 16K pages\n");
+        bool all_ok = true;
+        while (i < sectors){
+            uint32_t n = (uint32_t)(sectors - i);
+            if (n > IDE_DMA_PAGE_SECT) n = IDE_DMA_PAGE_SECT;
+            if (!ata_read_dma_page((uint32_t)(lba + i), (uint8_t)n, g_dma_bounce)){
+                all_ok = false;
+                break;
             }
-            done += (uint64_t)batch*512;
-        } else if (done + (uint64_t)batch*512 <= size){
-            ata_read_multi((uint32_t)(lba + i), batch, (uint16_t*)(dst + done));
-            done += (uint64_t)batch*512;
-        } else {
-            ata_read_sector((uint32_t)(lba + i), (uint16_t*)sec);
-            uint64_t chunk = size - done;
-            memcpy_(dst + done, sec, (int)chunk);
-            done += chunk;
+            memcpy_(dst + (i << 9), g_dma_bounce, (int)(n * 512));
+            i += n;
+            // Integrity gate: a DMA engine that reports success without
+            // transferring anything would otherwise feed garbage into
+            // ai_gguf_parse.  Validate the very first page and, on failure,
+            // restart the WHOLE load over single-sector PIO (v2: first page
+            // must carry the GGUF magic, checked before any progress marker).
+            if (i == n && (dst[0] != 'G' || dst[1] != 'G' ||
+                           dst[2] != 'U' || dst[3] != 'F')){
+                serial_puts("[DMA] bad head, discarding and using PIO\n");
+                all_ok = false; i = 0;
+                break;
+            }
+            if ((i & 0x7FFFu) == 0u){
+                serial_puts("[DMA] "); serial_dec((uint32_t)(i >> 11));
+                serial_puts("MB\n");
+            }
         }
-        i += batch;
-        // Progress dots keep long transfers from looking like a hang.
+        if (all_ok){
+            serial_puts("[DMA] model read OK, head: ");
+            for (int b = 0; b < 16; b++){ serial_puthex(dst[b]); serial_putc(' '); }
+            serial_puts("\n");
+            return dst;
+        }
+        serial_puts("[DMA] disabled after failure at ");
+        serial_dec((uint32_t)(i >> 11));
+        serial_puts("MB; resuming with single-sector PIO\n");
+        g_ide_dma_enabled = false;
+        ata_soft_reset();
+    }
+    // ---- universal fallback: single-sector PIO --------------------------
+    // VirtualBox's PIIX3 IDE wedges on a count>1 READ SECTORS command
+    // (BSY/DRQ never clear), so ata_read_multi() is deliberately NOT used.
+    // This is the exact path SFS uses and is proven on QEMU/VBox/VMware.
+    while (i < sectors){
+        ata_read_sector((uint32_t)(lba + i), (uint16_t*)(dst + (uint64_t)i*512));
+        if (ata_last_err != 0){
+            // One recovery attempt: soft-reset the channel and re-read the
+            // same sector.  If it STILL fails, bail out -- never spin forever.
+            serial_puts("[load] PIO err lba=");
+            serial_hex((uint32_t)(lba + i));
+            serial_puts(" err=");
+            serial_hex(ata_last_err);
+            serial_puts(" (reset+retry)\n");
+            ata_soft_reset();
+            ata_read_sector((uint32_t)(lba + i), (uint16_t*)(dst + (uint64_t)i*512));
+            if (ata_last_err != 0){
+                serial_puts("[load] FATAL: sector unreadable at lba=");
+                serial_hex((uint32_t)(lba + i));
+                serial_puts("\n");
+                return 0;
+            }
+        }
+        i++;
+        // Data sanity: dump the blob head once (first sector) so a wrong PIO
+        // path shows up as garbage here instead of a #GP in ai_gguf_parse.
+        if (i == 1){
+            serial_puts("[BLOB] head: ");
+            for (int b = 0; b < 16; b++){
+                serial_puthex(dst[b]);
+                serial_putc(' ');
+            }
+            serial_puts("\n");
+        }
+        // Progress dots / markers keep long transfers from looking like a hang.
         if ((i & 1023u) == 0u) term.put_char('.');
         if ((i & 32767u) == 0u) { serial_puts("[load "); serial_dec((uint32_t)(i>>17)); serial_puts("MB]\n"); }
     }
+    return dst;
+}
+
+// Standard CRC-32 (reflected, poly 0xEDB88320) -- the same function the host
+// tool uses, so the descriptor checksum can be verified in-kernel.
+static uint32_t crc32_bytes(const uint8_t* p, uint32_t n){
+    uint32_t c = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < n; i++){
+        c ^= p[i];
+        for (int k = 0; k < 8; k++) c = (c & 1u) ? ((c >> 1) ^ 0xEDB88320u) : (c >> 1);
+    }
+    return c ^ 0xFFFFFFFFu;
+}
+
+// Read the payload off the DATA disk.
+//
+// The secondary channel has no usable BM-DMA or virtio fast path (both are
+// hard-bound to the primary device), and VirtualBox's PIIX3 has been observed
+// to wedge on a count>1 READ SECTORS command -- BSY/DRQ never clear.  So the
+// load starts with ONE small multi-sector PROBE: if it completes and the data
+// carries the GGUF magic, bulk mode is used for the rest; otherwise the
+// channel is soft-reset and the load falls back to the single-sector PIO path
+// that SFS uses (proven on QEMU / VirtualBox / VMware).
+static bool model_read_data_disk(uint8_t* dst, const struct ModelDesc* d){
+    uint64_t sectors = (d->size + 511) / 512;
+    uint64_t i = 0;
+    bool bulk = false;
+
+    if (sectors >= 2){
+        uint8_t probe[8 * 512];
+        uint32_t want = (uint32_t)(sectors < 8 ? sectors : 8);
+        if (ata_read_multi_drive(d->io_base, d->drive, (uint32_t)d->start_lba,
+                                 (uint8_t)want, (uint16_t*)probe)
+            && probe[0]=='G' && probe[1]=='G' && probe[2]=='U' && probe[3]=='F'){
+            bulk = true;
+            memcpy_(dst, probe, (int)(want * 512));
+            i = want;
+            serial_puts("[MDL] multi-sector PIO works -> bulk mode\n");
+        } else {
+            serial_puts("[MDL] multi-sector probe failed -> single-sector PIO\n");
+            ata_soft_reset_base(d->io_base);
+        }
+    }
+
+    while (i < sectors){
+        if (bulk){
+            uint32_t n = (uint32_t)(sectors - i);
+            if (n > 128) n = 128;
+            if (!ata_read_multi_drive(d->io_base, d->drive, (uint32_t)(d->start_lba + i),
+                                      (uint8_t)n, (uint16_t*)(dst + (i << 9)))){
+                serial_puts("[MDL] bulk PIO failed at sector ");
+                serial_dec((uint32_t)i);
+                serial_puts(" -> single-sector PIO\n");
+                ata_soft_reset_base(d->io_base);
+                bulk = false;
+                continue;                       // retry this sector, slowly
+            }
+            i += n;
+        } else {
+            ata_read_sector_drive(d->io_base, d->drive, (uint32_t)(d->start_lba + i),
+                                  (uint16_t*)(dst + (i << 9)));
+            if (ata_last_err != 0){
+                serial_puts("[MDL] PIO err lba=");
+                serial_dec((uint32_t)(d->start_lba + i));
+                serial_puts(" err=");
+                serial_dec(ata_last_err);
+                serial_puts(" (reset+retry)\n");
+                ata_soft_reset_base(d->io_base);
+                ata_read_sector_drive(d->io_base, d->drive, (uint32_t)(d->start_lba + i),
+                                      (uint16_t*)(dst + (i << 9)));
+                if (ata_last_err != 0){
+                    serial_puts("[MDL] FATAL: sector unreadable\n");
+                    return false;
+                }
+            }
+            i++;
+        }
+        if ((i & 0x3FFFu) == 0u){
+            serial_puts("[MDL] ");
+            serial_dec((uint32_t)(i >> 11));
+            serial_puts(" MB\n");
+        }
+    }
+    return true;
+}
+
+// Read the payload described by `d` into a fresh big_alloc'd buffer.
+static uint8_t* model_blob_read_desc(const struct ModelDesc* d){
+    bool primary = (d->io_base == ATA_PRIMARY) && (d->drive == 0xE0);
+    if (primary) return model_blob_read(d->start_lba, d->size);
+    uint64_t alloc = (d->size + 511) & ~511ull;   // whole sectors only
+    uint8_t* dst = (uint8_t*)big_alloc((uint32_t)alloc);
+    if (!dst) return 0;
+    serial_puts("[MDL] data-disk read: io=0x");
+    serial_puthex((uint8_t)(d->io_base >> 8));
+    serial_puthex((uint8_t)(d->io_base & 0xFF));
+    serial_puts(" lba=");
+    serial_dec((uint32_t)d->start_lba);
+    serial_puts(" size=");
+    serial_dec((uint32_t)(d->size >> 20));
+    serial_puts(" MB\n");
+    if (!model_read_data_disk(dst, d)){
+        big_free(dst, (uint32_t)alloc);
+        return 0;
+    }
+    // Integrity gate: a read that silently returned the wrong sector would
+    // feed garbage into the GGUF parser, so the payload must start with the
+    // GGUF magic and (when the descriptor carries one) the first 4 KiB must
+    // match the recorded CRC-32.
+    if (dst[0]!='G' || dst[1]!='G' || dst[2]!='U' || dst[3]!='F'){
+        serial_puts("[MDL] FATAL: payload head is not GGUF -- wrong LBA?\n");
+        big_free(dst, (uint32_t)alloc);
+        return 0;
+    }
+    if (d->crc32 != 0){
+        uint32_t n = (d->size < 4096) ? (uint32_t)d->size : 4096u;
+        uint32_t c = crc32_bytes(dst, n);
+        if (c != d->crc32){
+            serial_puts("[MDL] WARNING: head CRC mismatch (want ");
+            serial_puthex((uint8_t)(d->crc32 >> 24)); serial_puthex((uint8_t)(d->crc32 >> 16));
+            serial_puthex((uint8_t)(d->crc32 >> 8));  serial_puthex((uint8_t)(d->crc32));
+            serial_puts(", got ");
+            serial_puthex((uint8_t)(c >> 24)); serial_puthex((uint8_t)(c >> 16));
+            serial_puthex((uint8_t)(c >> 8));  serial_puthex((uint8_t)(c));
+            serial_puts(")\n");
+        }
+    }
+    serial_puts("[MDL] read OK, head: ");
+    for (int b = 0; b < 8; b++){ serial_puthex(dst[b]); serial_putc(' '); }
+    serial_puts("\n");
     return dst;
 }
 
@@ -4434,21 +5339,25 @@ static void cmd_model(const char* args){
             if(!g_model_blob){ term.write("\nOut of memory.\n"); return; }
             sfs.read(args, g_model_blob, (int)size);
         } else {
-            size = model_blob_probe(&lba);
-            if(!size){
-                term.write("No model blob on disk (descriptor sector missing).\n");
-                term.write("Rebuild the image with a GGUF in build/, or use\n");
-                term.write("'model load <sfsfile>' for a small model.\n");
+            struct ModelDesc md;
+            if(!model_locate(&md)){
+                term.write("No model descriptor found.\n");
+                term.write("The system image ships WITHOUT weights; the model lives\n");
+                term.write("on the DATA disk (IDE secondary, LBA 20000).\n");
+                term.write("Build it with: make model-pack\n");
                 return;
             }
+            size = md.size;
+            lba  = md.start_lba;
             char n[24];
             term.write("Reading "); uint_to_str_k64((uint32_t)(size >> 10), n);
-            term.write(n); term.write(" KB from LBA ");
+            term.write(n); term.write(" KB from the ");
+            term.write(md.io_base == ATA_SECONDARY ? "data disk" : "system disk");
+            term.write(" at LBA ");
             uint_to_str_k64((uint32_t)lba, n); term.write(n); term.write(" ");
-            g_model_blob = model_blob_read(lba, size);
-            if(!g_model_blob){ term.write("\nOut of memory (need ");
-                uint_to_str_k64(approx_mb_k64(size), n); term.write(n);
-                term.write(" MB contiguous).\n"); return; }
+            if (md.name[0]){ term.write("["); term.write(md.name); term.write("] "); }
+            g_model_blob = model_blob_read_desc(&md);
+            if(!g_model_blob){ term.write("\nRead failed (I/O error or out of memory).\n"); return; }
         }
         g_model_bytes = size;
         term.write("\nParsing GGUF...\n");
@@ -4467,8 +5376,8 @@ static void cmd_model(const char* args){
     else if(!strcmp_(sub,"unload")){
         if(!qwen_ready()){ term.write("No model loaded.\n"); return; }
         qwen_unload();
-        if(g_model_blob) big_free(g_model_blob, (uint32_t)g_model_bytes);
-        g_model_blob = 0; g_model_bytes = 0;
+        if(g_model_blob) big_free(g_model_blob, (uint32_t)(g_model_alloc ? g_model_alloc : g_model_bytes));
+        g_model_blob = 0; g_model_bytes = 0; g_model_alloc = 0;
         term.write("Model unloaded, weights freed.\n");
     }
     else if(!strcmp_(sub,"status")){
@@ -4477,13 +5386,16 @@ static void cmd_model(const char* args){
             model_report_loaded();
         } else {
             term.write("Real GGUF model: not loaded\n");
-            uint64_t lba = 0, size = model_blob_probe(&lba);
-            if(size){
+            struct ModelDesc md;
+            if(model_locate(&md)){
                 char n[24];
                 term.write("  A blob is available on disk: ");
-                uint_to_str_k64((uint32_t)(size >> 10), n); term.write(n);
-                term.write(" KB at LBA "); uint_to_str_k64((uint32_t)lba, n);
-                term.write(n); term.write(" -> run 'model load'\n");
+                uint_to_str_k64((uint32_t)(md.size >> 10), n); term.write(n);
+                term.write(" KB at LBA "); uint_to_str_k64((uint32_t)md.start_lba, n);
+                term.write(n);
+                term.write(md.io_base == ATA_SECONDARY ? " on the DATA disk" : " on the system disk");
+                if (md.name[0]){ term.write(" ["); term.write(md.name); term.write("]"); }
+                term.write(" -> run 'model load'\n");
             } else {
                 term.write("  No blob on disk. Built-in engine handles 'ask'.\n");
             }
@@ -4609,6 +5521,17 @@ static void clr_ensure_init(){
             return r;
         });
     g_clr_ready = true;
+}
+
+// Launch the standalone Notepad application (its own CLR slot).
+//
+// This exists so the standalone path can be exercised from the shell without
+// needing a mouse: the desktop icon click goes through the window manager,
+// which is a much longer chain.
+static void cmd_appnotepad(const char* args) {
+    (void)args;
+    (void)gui_is_active();
+    term.write("appnotepad: standalone Notepad is not wired up yet\n");
 }
 
 static void cmd_gui(const char* args){
@@ -4747,7 +5670,7 @@ static const char* g_cmd_table[] = {
     "run", "runfs", "ai", "generate", "agent",
     "netinfo", "netstat", "netstart",
     "switch", "shutdown", "reboot", "exit",
-    "gui", "nogui", "voice"
+    "gui", "nogui", "voice", "appnotepad", "apms"
 };
 static const int g_cmd_count = sizeof(g_cmd_table)/sizeof(g_cmd_table[0]);
 
@@ -5694,17 +6617,30 @@ static int perm_ui_console(const PermRequest* req, int* remember){
 // Try to load the embedded GGUF model blob; returns 1 when qwen is ready.
 static int model_try_load(void){
     if (qwen_ready()) return 1;
-    serial_puts("[K64] loading embedded GGUF model...\n");
-    uint64_t lba = 0;
-    uint64_t size = model_blob_probe(&lba);
-    if (!size){ serial_puts("[K64] no model blob on disk\n"); return 0; }
-    uint8_t* blob = model_blob_read(lba, size);
+    struct ModelDesc md;
+    if (!model_locate(&md)){
+        serial_puts("[K64] no model descriptor found (data disk carries no NEXMODL2)\n");
+        return 0;
+    }
+    serial_puts("[K64] loading GGUF model: ");
+    serial_dec((uint32_t)(md.size >> 20));
+    serial_puts(" MB from the ");
+    serial_puts(md.io_base == ATA_SECONDARY ? "data disk" : "system disk");
+    serial_puts(" [");
+    serial_puts(md.name[0] ? md.name : "unnamed");
+    serial_puts("]\n");
+    uint8_t* blob = model_blob_read_desc(&md);
     if (!blob){ serial_puts("[K64] blob read failed\n"); return 0; }
-    int rc = qwen_load(blob, size, 512);
+    g_model_blob  = blob;
+    g_model_bytes = md.size;
+    g_model_alloc = (md.size + 511) & ~511ull;
+    int rc = qwen_load(blob, md.size, 512);
     if (rc != 0){
         serial_puts("[K64] qwen_load failed: ");
         serial_puts(qwen_error());
         serial_puts("\n");
+        big_free(blob, (uint32_t)g_model_alloc);
+        g_model_blob = 0; g_model_bytes = 0; g_model_alloc = 0;
         return 0;
     }
     serial_puts("[K64] model loaded\n");
@@ -5793,6 +6729,12 @@ static void cmd_plugin(const char* args){
 // match the declaration in distnet.h (so the symbol mangles identically).
 extern "C" void cmd_distnet(const char* args);
 
+// APMS (application problem/performance management) + the manifest-driven
+// standalone application registry.  Included as a .inc rather than a second
+// translation unit because it needs the file-scope statics above (mkfs, sfs,
+// pmm_*, heap_*, g_cwd).  See .attic64/apms.inc for the design notes.
+#include "apms.inc"
+
 static void run_command(const char* line){
     auto_ask_backdoor();
     while(*line==' ') line++;
@@ -5847,6 +6789,9 @@ static void run_command(const char* line){
     else if(!strcmp_(cmd,"agent"))      cmd_agent(args);
     else if(!strcmp_(cmd,"ask"))        cmd_ask(args);
     else if(!strcmp_(cmd,"model"))      cmd_model(args);
+    else if(!strcmp_(cmd,"aiquant"))    cmd_aiquant(args);
+    else if(!strcmp_(cmd,"dma"))        cmd_dma(args);
+    else if(!strcmp_(cmd,"apms"))       cmd_apms(args);
     // Plugin subsystem (catalogue manager + Settings > Plugins UI backend)
     else if(!strcmp_(cmd,"plugin"))     cmd_plugin(args);
     // Network commands
@@ -5857,6 +6802,7 @@ static void run_command(const char* line){
     else if(!strcmp_(cmd,"switch")||!strcmp_(cmd,"switch32")) cmd_switch32();
     // GUI
     else if(!strcmp_(cmd,"gui"))  cmd_gui(args);
+    else if(!strcmp_(cmd,"appnotepad")) cmd_appnotepad(args);
     else if(!strcmp_(cmd,"nogui")) cmd_nogui(args);
     // Voice interaction engine
     else if(!strcmp_(cmd,"voice")) cmd_voice(args);
@@ -6200,6 +7146,29 @@ static int gui_cb_session_load(const char* name, void* buf, int bufsize) {
 extern "C" int kern_fs_create(const char* name, const unsigned char* data, int len){
     if (!mkfs.mounted) return -2;
     return mkfs.create(name, (const uint8_t*)data, len);
+}
+
+// ---- hooks for the AI compat layer -------------------------------------
+// The compat layer talks to the MKFS data volume through these two
+// functions, so it never has to know that the volume is a file-static
+// class living in this translation unit.
+static int compat_mkfs_read_hook(const char* name, void* buf, int cap){
+    if (!mkfs.mounted) return -1;
+    return mkfs.read(name, buf, cap);
+}
+static int compat_mkfs_write_hook(const char* name, const unsigned char* data,
+                                  int len){
+    if (!mkfs.mounted) return -2;
+    return mkfs.create(name, (const uint8_t*)data, len);
+}
+
+// The heap and PMM counters are file-static here, so the compat layer's
+// health sampler (E1) reaches them through this provider.
+static void compat_mem_stats_hook(uint32_t* heap_bytes, uint32_t* heap_allocs,
+                                  uint32_t* pmm_free){
+    if (heap_bytes)  *heap_bytes  = heap_bytes_alloc - heap_bytes_freed;
+    if (heap_allocs) *heap_allocs = heap_alloc_count - heap_free_count;
+    if (pmm_free)    *pmm_free    = pmm_free_pages;
 }
 
 // ---- Host absolute-mouse flag (read by gui.cpp) -------------------------
@@ -6710,7 +7679,7 @@ void gguf_adapter_selftest(void){
     }
 
     // 2) file adapter: disk backend probe (reads the "MINIMDL1" descriptor)
-    static const uint32_t hdr_lbas[] = {16383u, 8191u, 4095u, 0u};
+    static const uint32_t hdr_lbas[] = {61440u, 16383u, 8191u, 4095u, 0u};
     gguf_io* dio = gguf_io_disk_create(hdr_lbas, ata_read_sector);
     if (dio){
         char n[24];
@@ -6936,6 +7905,80 @@ static void fb_mapping_selfcheck(void){
 //  '.compat_path' emits serial 'H' after installing PDPT[fb>>30]); we simply
 //  were not drawing through it.  Do not re-derive "mapping missing" from a
 //  blank screen without first confirming the draw address. ===
+// =====================================================================
+//  Framebuffer fill helper -- surface-format aware
+// ---------------------------------------------------------------------
+//  (diag_pack is defined just below; it is forward-declared so this helper
+//  can use it for the 32bpp case.)
+// =====================================================================
+static uint32_t diag_pack(uint8_t fmt, uint8_t r, uint8_t g, uint8_t b);
+
+// =====================================================================
+//  Framebuffer fill helper -- surface-format aware
+// ---------------------------------------------------------------------
+//  WHY THIS EXISTS (2026-11-12)
+//  ---------------------------
+//  Every "paint the whole screen" routine in the kernel (the milestone
+//  markers, the SVM result panel) used to assume a 32-bit framebuffer:
+//  it computed the row stride as pitch/4 and stored 32-bit pixels.  On a
+//  16bpp surface (pitch 2048 for 1024px) that writes 4096 bytes into a
+//  2048-byte row, so each row bleeds into the next two and the display
+//  shows the classic "purple vertical stripes" instead of the intended
+//  solid colour.
+//
+//  The immediate trigger was a STALE stage2 in the VDI that picked a 16bpp
+//  mode and never recorded the pixel format at 0x500F -- but the kernel
+//  must not depend on the bootloader's bookkeeping.  This helper reads the
+//  real bpp from the VBE block and writes 16/24/32-bit pixels correctly.
+//
+//  The rectangle is clipped to the surface, and the row stride is taken
+//  from `pitch` (which may exceed width*bpp on real GOP hardware).
+// =====================================================================
+static void fb_fill_rect(uintptr_t fbva, uint16_t w, uint16_t h, uint16_t pitch,
+                          uint8_t bpp, uint8_t fmt,
+                          uint32_t x0, uint32_t y0, uint32_t rw, uint32_t rh,
+                          uint8_t r, uint8_t g, uint8_t b) {
+    if (!fbva || w == 0 || h == 0) return;
+    if (x0 >= w || y0 >= h) return;
+    if (x0 + rw > w) rw = (uint32_t)w - x0;
+    if (y0 + rh > h) rh = (uint32_t)h - y0;
+    if (rw == 0 || rh == 0) return;
+
+    if (bpp == 16) {
+        uint32_t stride = (pitch != 0) ? (pitch / 2u) : (uint32_t)w;
+        uint16_t px = (uint16_t)((((uint16_t)r >> 3) << 11) |
+                                 (((uint16_t)g >> 2) << 5)  |
+                                  ((uint16_t)b >> 3));
+        volatile uint16_t* fb = (volatile uint16_t*)fbva;
+        for (uint32_t y = y0; y < y0 + rh; y++) {
+            volatile uint16_t* row = fb + (uint32_t)y * stride;
+            for (uint32_t x = x0; x < x0 + rw; x++) row[x] = px;
+        }
+        return;
+    }
+    if (bpp == 24) {
+        uint32_t stride = (pitch != 0) ? (pitch / 3u) : (uint32_t)w * 3u;
+        volatile uint8_t* fb = (volatile uint8_t*)fbva;
+        for (uint32_t y = y0; y < y0 + rh; y++) {
+            volatile uint8_t* row = fb + (uint32_t)y * stride;
+            for (uint32_t x = x0; x < x0 + rw; x++) {
+                row[x*3]   = b;
+                row[x*3+1] = g;
+                row[x*3+2] = r;
+            }
+        }
+        return;
+    }
+    // 32bpp: honour the byte order the surface actually uses.
+    uint32_t px = diag_pack(fmt, r, g, b);
+    uint32_t stride = (pitch != 0) ? (pitch / 4u) : (uint32_t)w;
+    volatile uint32_t* fb = (volatile uint32_t*)fbva;
+    for (uint32_t y = y0; y < y0 + rh; y++) {
+        volatile uint32_t* row = fb + (uint32_t)y * stride;
+        for (uint32_t x = x0; x < x0 + rw; x++) row[x] = px;
+    }
+}
+
 static uint32_t diag_pack(uint8_t fmt, uint8_t r, uint8_t g, uint8_t b){
     if (fmt == 1)      return ((uint32_t)b << 16) | ((uint32_t)g << 8) | r;   // RGBX32
     else if (fmt == 0) return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;   // BGRX32
@@ -6974,13 +8017,10 @@ static void diag_mark(uint8_t r, uint8_t g, uint8_t b, bool freeze){
         uint32_t fb32 = *(volatile uint32_t*)(vb + 0x00);
         fbva = (uintptr_t)fb32;
     }
-    uint32_t pstride = (pitch != 0) ? (pitch / 4u) : (uint32_t)w;
-    volatile uint32_t* fb = (volatile uint32_t*)fbva;
-    uint32_t px = diag_pack(fmt, r, g, b);
-    for (uint32_t y = 0; y < h; y++) {
-        volatile uint32_t* row = fb + (uint32_t)y * pstride;
-        for (uint32_t x = 0; x < w; x++) row[x] = px;
-    }
+    // Fill the whole screen through the surface-format aware helper: a 16bpp
+    // surface must NOT be written as 32-bit pixels (see fb_fill_rect).
+    uint8_t  bpp = *(volatile uint8_t*)(vb + 0x08);
+    fb_fill_rect(fbva, w, h, pitch, bpp, fmt, 0, 0, w, h, r, g, b);
     if (freeze) __asm__ __volatile__("cli;hlt");
 }
 
@@ -7673,25 +8713,18 @@ static void svmk_paint(int ok, int rc){
     else                      fbva = (uintptr_t)(*(volatile uint32_t*)(vb + 0x00));
     if (fbva == 0) return;
 
-    uint32_t pstride = (pitch != 0) ? (pitch / 4u) : (uint32_t)w;
-    volatile uint32_t* fb = (volatile uint32_t*)fbva;
-
-    uint32_t bg = ok ? diag_pack(fmt, 0, 200, 0)      /* green */
-                     : diag_pack(fmt, 200, 0, 0);     /* red   */
-    for (uint32_t y = 0; y < h; y++) {
-        volatile uint32_t* row = fb + (uint32_t)y * pstride;
-        for (uint32_t x = 0; x < w; x++) row[x] = bg;
-    }
+    // Surface-format aware painting (see fb_fill_rect): a 16bpp surface must
+    // not be filled with 32-bit pixels.
+    uint8_t  bpp = *(volatile uint8_t*)(vb + 0x08);
+    fb_fill_rect(fbva, w, h, pitch, bpp, fmt, 0, 0, w, h,
+                 ok ? 0 : 200, ok ? 200 : 0, 0);
 
     /* Status band: |rc| encoded as N white blocks followed by the code in
      * "bits".  Also draw a black band first so the count is legible. */
     if (!ok) {
         uint32_t band = (uint32_t)h > 48u ? (uint32_t)h - 40u : 0u;
-        uint32_t white = diag_pack(fmt, 255, 255, 255);
-        uint32_t black = diag_pack(fmt, 0, 0, 0);
         for (uint32_t y = band; y < (uint32_t)h && y < band + 24u; y++) {
-            volatile uint32_t* row = fb + y * pstride;
-            for (uint32_t x = 0; x < w; x++) row[x] = black;
+            fb_fill_rect(fbva, w, h, pitch, bpp, fmt, 0, y, w, 1, 0, 0, 0);
         }
         uint32_t code = (uint32_t)(-rc);
         uint32_t x0 = 16u;
@@ -7699,13 +8732,11 @@ static void svmk_paint(int ok, int rc){
             uint32_t cw = 16u;
             uint32_t ch = ((code >> bit) & 1u) ? 20u : 6u;   /* tall = 1 */
             for (uint32_t y = band + 2u; y < band + 2u + ch && y < (uint32_t)h; y++) {
-                volatile uint32_t* row = fb + y * pstride;
-                for (uint32_t x = x0; x < x0 + cw && x < (uint32_t)w; x++) row[x] = white;
+                fb_fill_rect(fbva, w, h, pitch, bpp, fmt, x0, y, cw, 1, 255, 255, 255);
             }
             x0 += cw + 6u;
             if (x0 + cw >= (uint32_t)w) break;
         }
-        (void)white;
     }
 }
 
@@ -7860,6 +8891,16 @@ extern "C" void kmain64(){
     build_idt();
     serial_puts("[K64-IDT] installed\n");
     diag_step(1, "kmain64 post-build_idt");
+    // Install the TSS so the IST=1 fault gates can use a dedicated stack.
+    fault_ist_setup();
+
+    // --- AI-assisted Win32 compat layer (D/E class) ---
+    // Arms the layer and teaches it how to read the MKFS data volume, which
+    // is the channel the external AI uses to watch the PE and feed back
+    // decisions.  The pump itself is driven once per frame.
+    compat_init();
+    compat_attach_volume(compat_mkfs_read_hook, compat_mkfs_write_hook);
+    serial_puts("[K64-COMPAT] armed\n");
 
     // --- Stage 8.1: bring up Application Processors (SMP) ---
     smp_init();
@@ -8239,18 +9280,38 @@ extern "C" void kmain64(){
     term.write("\nShell ready. Type 'help' for commands.\n");
     term.write("Tab=autocomplete, Arrows=cursor/history, PgUp/PgDn=scroll, Home/End, Ctrl+C/V/L.\n\n");
 
-    // ---- AUTOTEST: probe embedded GGUF and run one real inference (serial) ----
-    serial_puts("[AUTOTEST] probing embedded GGUF...\n");
+    // ---- V2.1 headless bypass ------------------------------------------
+    // Placed BEFORE the model AUTOTEST, login_prompt() and cmd_gui(): every
+    // piece of hardware (serial, PMM, ATA, IDT/TSS, VBE info) is already
+    // initialised above, and the three things headless must NOT do are
+    // exactly those three -- block on a password, pull 397 MB of GGUF into
+    // ring0, and start the GUI.  headless_run() never returns.
+    if (NEX_HEADLESS_STAGE >= 1) headless_run();
+
+    // ---- AUTOTEST: locate the GGUF descriptor (serial) --------------------
+    // The weights are NOT in the system image any more: they live on the data
+    // disk.  Booting therefore only PRINTS where they are; pulling 379 MiB
+    // into ring0 is an explicit 'model load' (or NEX_MODEL_LAZY=0) away.
+    serial_puts("[AUTOTEST] probing model descriptor...\n");
     {
-        uint64_t plba = 0;
-        uint64_t psize = model_blob_probe(&plba);
-        if (psize) {
-            serial_puts("[AUTOTEST] model blob found at LBA ");
-            serial_dec((uint32_t)plba);
-            serial_puts(" size=");
-            serial_dec((uint32_t)(psize>>20));
-            serial_puts(" MB\n");
-            serial_puts("[AUTOTEST] loading model (this may take a while)...\n");
+        struct ModelDesc md;
+        if (model_locate(&md)) {
+            serial_puts("[AUTOTEST] model descriptor: ");
+            serial_dec((uint32_t)(md.size>>20));
+            serial_puts(" MB, io=0x");
+            serial_puthex((uint8_t)(md.io_base>>8));
+            serial_puthex((uint8_t)(md.io_base&0xFF));
+            serial_puts(", lba=");
+            serial_dec((uint32_t)md.start_lba);
+            serial_puts(", v");
+            serial_dec(md.version);
+            serial_puts(", name=");
+            serial_puts(md.name[0] ? md.name : "(unnamed)");
+            serial_puts("\n");
+#if NEX_MODEL_LAZY
+            serial_puts("[AUTOTEST] lazy: weights stay on disk; use 'model load'.\n");
+#else
+            serial_puts("[AUTOTEST] NEX_MODEL_LAZY=0 -> loading model now...\n");
             if (model_try_load()) {
                 serial_puts("[AUTOTEST] model loaded; real inference (DeepSeek)...\n");
                 qwen_generate("DeepSeek is which company?", 96, 0.8f, ask_emit);
@@ -8258,8 +9319,9 @@ extern "C" void kmain64(){
             } else {
                 serial_puts("[AUTOTEST] model load or inference FAILED.\n");
             }
+#endif
         } else {
-            serial_puts("[AUTOTEST] no model blob found.\n");
+            serial_puts("[AUTOTEST] no model descriptor found (system image ships without weights).\n");
         }
     }
 
@@ -8367,6 +9429,11 @@ extern "C" void kmain64(){
                     } else {
                         // ----- Keyboard event -----
                         KbdEvent e = kbd.process(data);
+                        serial_puts("[KBD] sc=");
+                        serial_putdec((int)data);
+                        serial_puts(" type=");
+                        serial_putdec((int)e.type);
+                        serial_puts(" ");
                         if (e.type == K_CHAR) {
                             // ESC used to call gui_exit() here, so a single
                             // stray keypress tore the desktop down and looked
@@ -8391,20 +9458,35 @@ extern "C" void kmain64(){
                             //
                             // The scancodes are the driver's business; this
                             // table is just the wiring from event to GUI.
+                            // ---- the FOCUSED WINDOW gets first refusal.
+                            //
+                            // A text editor needs its own arrows / Home / End /
+                            // Delete / PageUp / PageDown, but these were consumed
+                            // unconditionally by desktop navigation, so a C# TextBox
+                            // could never move its caret: the key never reached it.
+                            // gui_special_key_to_managed() returns 1 when a managed
+                            // window took the key, and only then is desktop nav skipped.
+                            //
+                            // Codes are the negative values TBox::Key() understands
+                            // (see Forms.cs): -7 Left -8 Right -11 Up -12 Down
+                            // -13 Home -14 End -15 PageUp -16 PageDown.
                             switch (e.type) {
-                                case K_UP:         gui_desktop_nav(1); break;
-                                case K_DOWN:       gui_desktop_nav(2); break;
-                                case K_LEFT:       gui_desktop_nav(3); break;
-                                case K_RIGHT:      gui_desktop_nav(4); break;
-                                case K_TAB:        gui_desktop_nav(5); break;
-                                case K_PAGEUP:     gui_desktop_nav(1); break;
-                                case K_PAGEDN:     gui_desktop_nav(2); break;
-                                case K_HOME:       gui_desktop_nav(1); break;
-                                case K_END:        gui_desktop_nav(2); break;
-                                case K_WIN:        gui_toggle_start_menu(); break;
-                                // Win key: the driver reports it as K_WIN
-                                // (added below) precisely so the desktop can
-                                // toggle the Start menu with one keypress.
+                                case K_LEFT:   if (!gui_special_key_to_managed(-7))  gui_desktop_nav(3); break;
+                                case K_RIGHT:  if (!gui_special_key_to_managed(-8))  gui_desktop_nav(4); break;
+                                case K_UP:     if (!gui_special_key_to_managed(-11)) gui_desktop_nav(1); break;
+                                case K_DOWN:   if (!gui_special_key_to_managed(-12)) gui_desktop_nav(2); break;
+                                case K_HOME:   if (!gui_special_key_to_managed(-13)) gui_desktop_nav(1); break;
+                                case K_END:    if (!gui_special_key_to_managed(-14)) gui_desktop_nav(2); break;
+                                case K_PAGEUP: if (!gui_special_key_to_managed(-15)) gui_desktop_nav(1); break;
+                                case K_PAGEDN: if (!gui_special_key_to_managed(-16)) gui_desktop_nav(2); break;
+                                // Tab stays with the desktop: it cycles window focus,
+                                // which is what a user expects from the shell.  An
+                                // editor that wants a literal tab types spaces.
+                                case K_TAB:    gui_desktop_nav(5); break;
+                                // K_WIN = clean Win key-UP (never key-down).
+                                case K_WIN:    gui_toggle_start_menu(); break;
+                                // Shift rising edge toggles 中文/English.
+                                case K_SHIFT:  gui_toggle_ime(); break;
                                 default: break;
                             }
                         }

@@ -38,6 +38,7 @@ NexOS 是一个从零自研的 **x86 操作系统**：起点是一个支持 BIOS
 - **中文与 IME**：GB2312 16×16 点阵字库（387 字）+ 拼音输入法（GUI Terminal 内拼音→选字→UTF-8）。
 - **Web 控制台**：`win11-ui/` 浏览器 Win11 桌面 + 分布式网络面板 + Agent Forge，经 WebSocket 桥连真内核。
 - **AI 推理**：`ai_engine.cpp`（Markov+GPT）文本生成；`gguf_infer.cpp` 内置 Qwen2-0.5B GGUF Transformer，`ask64` 流式推理；`agent/` 智能体。
+- **AI 工作台（独立应用）**：`AiWorkbench.mex`（kind 20）把本地 GGUF 对话、4 个持久会话、`ws_*` 工作区文件、只读 shell、本地检索与 Markdown 文档生成合并到一个窗口；模型可通过 `[SHELL]/[READ]/[WRITE]/[DOC]/[SEARCH]/[WEB]` 指令调用工具。详见 [`docs/AI_WORKBENCH_PORT.md`](docs/AI_WORKBENCH_PORT.md)。
 - **分布式算力**：`distnet.cpp` UDP 发现/调度 + `dcn/` 运行时（crypto/sched/transport），任务分片到多节点合并推理。
 - **兼容层**：自研 PE/Win32 子系统（`winloader.cpp`+`win32.cpp`，可跑自研 IE）；Linux 二进制兼容（`linux_compat.cpp`+`linux_root/`）；Mono 运行时移植（`mono_port/`）。
 - **网络**：NE2000 驱动 + TCP/IP + HTTP 服务器（`netstart` 后浏览器可访问）。
@@ -881,6 +882,7 @@ NexOS is a from-scratch **x86 operating system**. It started as a C++ kernel + t
 - **GUI desktop**: `gui.cpp` draws a Win11-style desktop on the framebuffer; on top sits a **C# managed shell** (`csharp/NexOS.Forms` / `NexOS.Core`, `csharp/apps/Shell` implements the window manager, menus, tray, login and AI Agent via `Desktop.cs`/`Browser.cs`/`Login.cs`/`Shell.cs`/`AiAgent.cs`).
 - **Web console**: `win11-ui/` provides a browser-based Win11 desktop + distributed-network panel + Visual Agent Forge, talking to the **real QEMU kernel** over a WebSocket bridge (`tools/net/nexos_bridge.py`) through the serial port — login/commands/compute tasks execute for real (no local simulation).
 - **AI**: Markov + GPT-style text engine (`ai_engine.cpp`) + built-in **Qwen2-0.5B (Q4_K_M) GGUF Transformer inference engine** (`gguf_infer.cpp`, `ask64` switches to 64-bit streaming inference); `agent/` agents + Agent Forge visual orchestration.
+- **AI Workbench (standalone app)**: `AiWorkbench.mex` (kind 20) combines local GGUF chat, four persistent sessions, `ws_*` workspace files, a read-only shell, local search and Markdown document generation in one window; the model can call tools via `[SHELL]/[READ]/[WRITE]/[DOC]/[SEARCH]/[WEB]` directives. See [`docs/AI_WORKBENCH_PORT.md`](docs/AI_WORKBENCH_PORT.md).
 - **Distributed compute**: in-kernel `distnet.cpp` (UDP discovery + scheduling + result collection) + standalone runtime `dcn/` (crypto/discovery/sched/transport/wifi) can shard inference/compute tasks to multiple VMs / host nodes for merged inference.
 - **Compat layers**: self-built **PE/Win32 subsystem** (`winloader.cpp` + `win32.cpp`, already runs a self-built IE browser); **Linux binary compatibility** (`linux_compat.cpp` + `linux_root/`, runs ELF/dynamically-linked programs); **Mono runtime port** (`mono_port/`, runs .NET managed code on NexOS).
 - **System facilities**: dual file systems MKFS (writable, dedicated data-disk persistence) + SFS (read-only); user/permission/sudo; network stack (NE2000 + HTTP); Chinese bitmap font + pinyin IME.

@@ -1,6 +1,17 @@
 // =====================================================================
 //  kernel.cpp  -  Freestanding C++ kernel with shell, mouse & scrollback
 // ---------------------------------------------------------------------
+//  *** RETIRED FROM THE BUILD (2026-11-11, user directive) ***
+//
+//  The 64-bit kernel (.attic64/kernel64.cpp) is the OS now: GUI desktop,
+//  MiniCLR managed apps, SFS/MKFS file systems, networking, distnet and
+//  the GGUF AI engine all live there (see KERNEL64_OBJS in the Makefile).
+//  kernel.elf links ONLY entry.o + switch32to64.o + boot32_min.cpp --
+//  a minimal 32-bit bootstrap that stages kernel64.bin and enters long
+//  mode.  This file is kept for reference (and the UEFI kernel_diag
+//  target, which still links kernel.o) but is no longer part of
+//  `make all`.  Do not add features here; put them in kernel64.cpp.
+//
 //  Runs in 32-bit protected mode, no standard library.
 //
 //  Features:
@@ -23,7 +34,9 @@
 
 #include <stdint.h>
 #include "win32.h"        // Win32 subsystem: registry, PE32 loader, GUI bridge
-#include "linux_compat.h" // Linux binary-compat shim (Wine-on-NexOS Milestone 0)
+#if !NEXOS_NO_COMPAT
+#include "linux_compat.h"
+#endif // Linux binary-compat shim (Wine-on-NexOS Milestone 0)
 #include "mm.h"           // Foundation 0: USER_BASE/USER_END ring-3 region bounds
 #include "gdt.h"          // Foundation 0: ring-3 GDT/TSS
 #include "syscall.h"      // Foundation 0: unified int 0x80 syscall ABI
@@ -1207,12 +1220,17 @@ static bool ata_find_hdd(uint16_t* out_base, uint8_t* out_drv){
     // the boot disk and the real data filesystem was never found: MKFS reported
     // "not formatted" and every create/rename/delete in the shell silently failed
     // (fs 0 and the Desktop folder fs 3 had no volume behind them).
-    uint16_t bases[] = {0x170, 0x1F0};
-    uint8_t  drvs[]  = {0xE0, 0xF0};
-    for(int b = 0; b < 2; b++){
-        for(int d = 0; d < 2; d++){
-            uint16_t base = bases[b];
-            uint8_t drv = drvs[d];
+    //    Scan ORDER matters too: secondary channel first (VBox IDE-1-0 data
+    //    disk), then primary SLAVE (QEMU attaches a second plain "-drive"
+    //    there), and the primary MASTER -- the boot disk itself -- only as
+    //    the last-resort single-disk fallback.  Probing primary master before
+    //    primary slave picked the boot image as "the data disk", so MKFS
+    //    mounted an empty gap at LBA 900 of the boot image.
+    uint16_t bases[] = {0x170, 0x170, 0x1F0, 0x1F0};
+    uint8_t  drvs[]  = {0xE0, 0xF0, 0xF0, 0xE0};  // sec-m, sec-s, pri-s, pri-m
+    for(int s = 0; s < 4; s++){
+            uint16_t base = bases[s];
+            uint8_t drv = drvs[s];
             // Controller presence check
             outb(base+2, 0x55);
             if(inb(base+2) != 0x55) continue;
@@ -1240,7 +1258,6 @@ static bool ata_find_hdd(uint16_t* out_base, uint8_t* out_drv){
                     return true;
                 }
             }
-        }
     }
     return false;
 }
@@ -1754,15 +1771,29 @@ public:
         if(brk){
             if(key==SC_LSHIFT||key==SC_RSHIFT) m_shift=false;
             if(key==SC_LCTRL) m_ctrl=false;
+            // Win/Super releases are E0 DB / E0 DC.  The Start menu opens on
+            // the key-UP of a clean tap only; a chord (Win+E, Win+D, ...)
+            // must not pop it.  This is the 32-bit mirror of kernel64.cpp.
+            if(m_ext && (key==SC_LGUI||key==SC_RGUI)){
+                bool clean = m_gui && !m_gui_combo;
+                m_gui=false; m_gui_combo=false; m_ext=false;
+                if(clean) e.type=K_MENU;
+                else      serial_puts("[KBD] Win chord - Start menu suppressed\n");
+                return e;
+            }
             if(key==SC_LGUI||key==SC_RGUI) m_gui=false;
             m_ext=false;
             return e;
         }
         if(m_ext){
             m_ext=false;
-            // Windows key: also raise a K_MENU event so a plain Win press opens
-            // the Start menu (the GUI treats it as a menu toggle).
-            if(key==SC_LGUI||key==SC_RGUI){ m_gui=true; e.type=K_MENU; return e; }
+            // Key DOWN only arms the tap detector.  K_MENU used to be emitted
+            // here, so every Windows shortcut popped the Start menu first.
+            if(key==SC_LGUI||key==SC_RGUI){
+                if(!m_gui){ m_gui=true; m_gui_combo=false; }
+                return e;
+            }
+            if(m_gui) m_gui_combo=true;
             if(key==0x48){
                 if(m_ctrl && (m_gui || gui_is_active())) e.type=K_DESK_TGL;
                 else if(m_ctrl)                          e.type=K_CTRL_UP;
@@ -1785,6 +1816,9 @@ public:
             else if(key==0x4F) e.type=K_END;
             return e;
         }
+        // Ordinary key while Win is held -> Windows shortcut chord.  Forward
+        // it as before (Ctrl+Win+arrows etc. still work), but no Start tap.
+        if(m_gui) m_gui_combo=true;
         if(key==SC_LSHIFT||key==SC_RSHIFT){
             // Emit a single SHIFT event on the rising edge (not while held)
             // so that pressing Shift toggles the IME language mode once.
@@ -1820,7 +1854,7 @@ public:
     // each discrete input read so a stale 0xE0 (extended-key prefix)
     // left in the PS/2 buffer at boot cannot swallow the first real
     // keystroke (symptom: first typed character silently lost).
-    void reset(){ m_shift=m_caps=m_ext=m_ctrl=m_gui=false; }
+    void reset(){ m_shift=m_caps=m_ext=m_ctrl=m_gui=m_gui_combo=false; }
     // Discard bytes already queued in the PS/2 output buffer (keyboard
     // BAT / ACK / identify responses from power-on) so they are not
     // misinterpreted as the start of a key.  Always paired with reset().
@@ -1835,6 +1869,7 @@ public:
     }
 private:
     bool m_shift=false, m_caps=false, m_ext=false, m_ctrl=false, m_gui=false;
+    bool m_gui_combo=false;   // true once another key was pressed during a Win hold
 };
 
 // =====================================================================
@@ -2343,10 +2378,25 @@ public:
         // Prefer a dedicated user-data ATA hard disk. Fall back to the
         // boot disk (primary master) for compatibility with single-disk setups.
         fs_detect_data_disk();
-        fs_read_sector(MKFS_SUPER_LBA, (uint16_t*)g_fsbuf);
-        memcpy_(&sb, g_fsbuf, sizeof(sb));
-        mounted = (sb.magic[0]=='M' && sb.magic[1]=='K' &&
-                   sb.magic[2]=='F' && sb.magic[3]=='S');
+        // The FIRST read issued to a freshly-detected ATA disk occasionally
+        // returns garbage (IDENTIFY-to-read race on the channel): the same
+        // disk then mounts on the next boot.  Retry the superblock read a
+        // couple of times with a small settle delay before declaring the
+        // disk unformatted.
+        bool ok = false;
+        for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+            if (attempt > 0) {
+                for (volatile int d = 0; d < 200000; d++) { /* settle */ }
+                serial_puts("[MKFS] superblock retry ");
+                serial_puts_dec(attempt);
+                serial_puts("\n");
+            }
+            fs_read_sector(MKFS_SUPER_LBA, (uint16_t*)g_fsbuf);
+            memcpy_(&sb, g_fsbuf, sizeof(sb));
+            ok = (sb.magic[0]=='M' && sb.magic[1]=='K' &&
+                  sb.magic[2]=='F' && sb.magic[3]=='S');
+        }
+        mounted = ok;
         if(mounted){
             serial_puts("[MKFS] Mounted, data area ");
             serial_puts(g_fs_is_data_disk ? "(user data disk)\n" : "(boot disk)\n");
@@ -3601,9 +3651,17 @@ static void vmm_init(){
     for (int i = 0x40; i < 0x60; i++)
         page_directory[i] = (i * 0x400000u) | PG_PRESENT | PG_RW | PG_PSE;
 
-    // Enable PSE (CR4.PSE = bit 4)
+    // AI model band: identity-map 384-832 MiB (supervisor) for the runtime
+    // AI inference module (0x18000000), the GGUF weights blob (0x18100000)
+    // and its scratch arena (0x2D000000).  Harmless PTEs when the machine
+    // has less RAM; the AI loader checks g_hw.mem_total_kb >= 768 MB first.
+    for (int i = 0x60; i < 0xD0; i++)
+        page_directory[i] = (i * 0x400000u) | PG_PRESENT | PG_RW | PG_PSE;
+
+    // Enable PSE (CR4.PSE = bit 4) plus OSFXSR/OSXMMEXCPT so the AI
+    // inference module's -mfpmath=sse code never raises #UD/#NM.
     uint32_t cr4 = read_cr4();
-    write_cr4(cr4 | 0x10);
+    write_cr4(cr4 | 0x10 | (1u<<9) | (1u<<10));
 
     // Load page directory into CR3 (identity-mapped, so VA == PA)
     write_cr3((uint32_t)(uintptr_t)page_directory);
@@ -3611,6 +3669,16 @@ static void vmm_init(){
     // Enable paging (CR0.PG = bit 31)
     uint32_t cr0 = read_cr0();
     write_cr0(cr0 | 0x80000000u);
+
+    // x87/SSE: MP|NE set, EM cleared, FPU state initialised.
+    {
+        uint32_t c0 = read_cr0();
+        c0 |= 0x22u;      // MP (bit1) | NE (bit5)
+        c0 &= ~0x4u;      // EM (bit2) = 0
+        write_cr0(c0);
+        __asm__ __volatile__("fninit");
+    }
+
 
     vmm_paging_on  = true;
     vmm_our_paging = true;
@@ -5030,6 +5098,8 @@ static void cmd_run(const char* name){
         term.write("Launching in GUI: "); term.write(wl_file); term.put_char('\n');
         term.set_color(make_color(LIGHT_GREY, BLACK));
         // 注册 winloader 回调 (首次)
+#if !NEXOS_NO_COMPAT
+#if !NEXOS_NO_COMPAT
         static bool wl_registered = false;
         if(!wl_registered){
             winloader_init(
@@ -5043,9 +5113,12 @@ static void cmd_run(const char* name){
             );
             wl_registered = true;
         }
+#endif
+#endif
         gui_open_file(wl_file, wl_args[0] ? wl_args : nullptr);
         return;
     }
+#if !NEXOS_NO_COMPAT
     // NexOS 原生用户程序 (.nex): 平铺 ELF32, 经 linux_compat ELF32 加载器运行
     // (int 0x80 系统调用 ABI; 内核已在启动时注册 SFS 读取器).
     if (strncmp_(ext, ".nex", 4) == 0) {
@@ -5056,6 +5129,7 @@ static void cmd_run(const char* name){
         linux_run(wl_file, 1, nex_av);
         return;
     }
+#endif
     // 默认: NexOS shell 脚本 (.sh)
     int ret = mkfs.read(wl_file, g_iobuf, FS_IOBUF_SIZE);
     if (ret < 0) {
@@ -6261,7 +6335,9 @@ static void cmd_ai(const char* args){
         serial_puts("[AI] argv[1] = mem:"); serial_puts(arg1); serial_puts("\n");
         const char* av[3];
         av[0] = "python"; av[1] = arg1;
+#if !NEXOS_NO_COMPAT
         linux_run("python", 2, av);
+#endif
     } else if(!strcmp_(sub,"gateway")){
         // Where the kernel TCP stack dials for /ai.  QEMU SLIRP exposes the
         // host as 10.0.2.2, so the guest NIC reaches the host gateway there.
@@ -6999,8 +7075,16 @@ extern "C" int kern_ai_boot(void){
     return r;
 }
 
+static int ai32_ask(const char* prompt, char* out, int outsz, int max_new);
+
 extern "C" int kern_ai_ask(const char* prompt, char* out, int outsz){
     if(!prompt || !out || outsz < 2) return -1;
+    // Prefer the real GGUF model (AI-32 module) when available; fall back
+    // to the Markov mini-engine.  A permanent AI-32 failure (no module /
+    // no model / low RAM) caches a negative g_ai32_state so this probe is
+    // one branch, not a 400 MB re-read per question.
+    int n32 = ai32_ask(prompt, out, outsz, 128);
+    if (n32 >= 0) return n32;
     if(!g_ai_initialized && kern_ai_boot() != 0) return -2;
     char* r = ai_generate(prompt, 160);
     if(!r) return -3;
@@ -7009,6 +7093,169 @@ extern "C" int kern_ai_ask(const char* prompt, char* out, int outsz){
     out[i] = 0;
     kfree(r);
     return i;
+}
+
+// =====================================================================
+//  AI-32: native GGUF inference, runtime-loaded module
+//
+//  kernel.bin is hard-capped at 576 KiB (0x10000..0xA0000 load window),
+//  so the transformer engine (gguf_infer.cpp, ~50 KiB with SSE2) cannot
+//  be linked into it.  It ships as a standalone flat binary
+//  (build/aiinfer32.bin, linked at 0x18000000 by aiinfer/aiinfer.ld,
+//  stored on disk at LBA 4608).  On the first AI request the kernel:
+//    1. copies the module into 0x18000000 and zeroes its .bss,
+//    2. reads the "MINIMDL1" descriptor at MODEL_DESC_LBA (61440) and
+//       streams the GGUF payload to MODEL_BLOB_BASE (0x18100000),
+//    3. calls qwen_load() through the module's export table.
+//  Memory band 384-832 MiB is identity-mapped by vmm_init() for this.
+//  Every failure is cached in g_ai32_state so a missing module/model
+//  degrades to the Markov engine with ONE cheap probe, not a re-read
+//  of 400 MB per question.
+// =====================================================================
+#define AIINFER_LBA_DISK    4608u
+#define AIINFER_MAX_SECTORS 160u
+#define AIINFER_BASE        0x18000000u
+#define AIINFER_MAGIC       0x464E4941u   // "AINF"
+#define AI_RAM_MIN_KB       (768u*1024u)  // blob+arena need ~736 MiB top
+
+struct AiModTable {
+    uint32_t magic, version;
+    uint32_t fn_self_boot, fn_load, fn_unload, fn_ready, fn_generate, fn_chat,
+             fn_reset, fn_arena_reset;
+    uint32_t bss_start, bss_end;
+};
+typedef int      (*pfn_qwen_load)(const uint8_t*, unsigned long long, uint32_t);
+typedef void     (*pfn_qwen_void)(void);
+typedef int      (*pfn_qwen_ready)(void);
+typedef int      (*pfn_qwen_gen)(const char*, int, float, void (*)(const char*));
+typedef int      (*pfn_qwen_chat)(const char*, const char*, int, float, void (*)(const char*));
+typedef void     (*pfn_seed)(uint32_t);
+
+// 0 = nothing tried, 1 = module only, 2 = model ready,
+// negative = permanent failure of the corresponding step.
+static int g_ai32_state = 0;
+static const AiModTable* g_ai32_tbl = 0;
+
+// Answer buffer sink used as the qwen emit callback: pieces stream to the
+// serial port (headless verification) AND into the caller's buffer.
+static char*  g_ai32_out   = 0;
+static int    g_ai32_outsz = 0;
+static int    g_ai32_outn  = 0;
+static void ai32_emit(const char* piece){
+    if (piece) serial_puts(piece);
+    if (!g_ai32_out || !piece) return;
+    while (*piece && g_ai32_outn < g_ai32_outsz - 1)
+        g_ai32_out[g_ai32_outn++] = *piece++;
+    g_ai32_out[g_ai32_outn] = 0;
+}
+
+// Multi-sector PIO read (up to 200 sectors per command).  The single-sector
+// ata_read_sector() needs ~781k commands for a 397 MB model; batching 128
+// sectors per READ SECTORS command cuts the command overhead ~128x.
+static bool ata_read_block(uint32_t lba, uint16_t count, uint8_t* buf){
+    uint16_t base = 0x1F0;
+    if (!ata_wait_bsy_base(base)) return false;
+    outb(base+6, 0xE0 | ((lba>>24)&0x0F));
+    outb(base+1, 0x00);
+    outb(base+2, (uint8_t)count);
+    outb(base+3, lba & 0xFF);
+    outb(base+4, (lba>>8) & 0xFF);
+    outb(base+5, (lba>>16) & 0xFF);
+    outb(base+7, 0x20);                        // READ SECTORS
+    for (uint16_t s = 0; s < count; s++){
+        if (!ata_wait_bsy_base(base)) return false;
+        if (!ata_wait_drq_base(base)) return false;
+        if (inb(base+7) & 0x01) return false;  // ERR
+        uint16_t* p = (uint16_t*)(buf + (uint32_t)s * 512);
+        for (int i = 0; i < 256; i++) p[i] = inw(base);
+    }
+    return true;
+}
+
+// The inference module is compiled with -mfpmath=sse, so SSE must be
+// enabled before its first call: CR4.OSFXSR|OSXMMEXCPT, CR0 MP|NE, EM=0.
+static void ai32_sse_enable(void){
+    uint32_t cr4 = read_cr4();
+    write_cr4(cr4 | (1u<<9) | (1u<<10));
+    uint32_t cr0 = read_cr0();
+    cr0 &= ~(1u<<2);      // EM = 0
+    cr0 |=  (1u<<1);      // MP = 1
+    cr0 |=  (1u<<5);      // NE = 1
+    write_cr0(cr0);
+    __asm__ __volatile__("fninit");
+}
+
+static int ai32_load_module(void){
+    if (g_ai32_state < 0) return -1;
+    if (g_ai32_tbl) return 0;
+    if (g_hw.mem_total_kb > 0 && g_hw.mem_total_kb < AI_RAM_MIN_KB){
+        g_ai32_state = -1; return -1;
+    }
+    uint8_t* dst = (uint8_t*)(uintptr_t)AIINFER_BASE;
+    for (uint32_t off = 0; off < AIINFER_MAX_SECTORS; off += 128){
+        uint32_t cnt = (AIINFER_MAX_SECTORS - off > 128) ? 128 : (AIINFER_MAX_SECTORS - off);
+        if (!ata_read_block(AIINFER_LBA_DISK + off, (uint16_t)cnt, dst + off * 512)){
+g_ai32_state = -2; return -1;
+        }
+    }
+    AiModTable* t = (AiModTable*)(uintptr_t)AIINFER_BASE;
+    if (t->magic != AIINFER_MAGIC){
+        g_ai32_state = -2; return -1;
+    }
+    if (t->bss_end > t->bss_start && t->bss_end < AIINFER_BASE + 0x40000u){
+        for (uint32_t p = t->bss_start; p < t->bss_end; p++) *(uint8_t*)(uintptr_t)p = 0;
+    }
+    ai32_sse_enable();
+    g_ai32_tbl  = t;
+    if (g_ai32_state < 1) g_ai32_state = 1;
+    return 0;
+}
+
+static int ai32_load_model(void){
+    if (g_ai32_state == 2) return 0;
+    if (g_ai32_state < 0)  return -1;
+    if (ai32_load_module() != 0) return -1;
+    // The module loads the model itself (descriptor at LBA 61440, blob to
+    // 0x18100000, qwen_load) and owns its serial progress logging, so the
+    // kernel side stays within the EBDA budget.
+    typedef int (*pfn_boot)(void);
+    pfn_boot b = (pfn_boot)g_ai32_tbl->fn_self_boot;
+    if (b() != 0){ g_ai32_state = -3; return -1; }
+    g_ai32_state = 2;
+    return 0;
+}
+
+// Chat completion: ChatML template + streaming decode.  Returns answer
+// length in bytes (>=0) or a negative error (module/model unavailable).
+static int ai32_ask(const char* prompt, char* out, int outsz, int max_new){
+    if (!prompt || !out || outsz < 2) return -1;
+    if (ai32_load_model() != 0) return -2;
+    g_ai32_out = out; g_ai32_outsz = outsz; g_ai32_outn = 0;
+    out[0] = 0;
+    pfn_qwen_chat chat = (pfn_qwen_chat)g_ai32_tbl->fn_chat;
+    int n = chat("You are NexOS AI. Answer concisely in the user's language.",
+                 prompt, max_new, 0.7f, ai32_emit);
+    out[g_ai32_outn] = 0;
+    g_ai32_out = 0;
+    return (n > 0 || g_ai32_outn > 0) ? g_ai32_outn : -3;
+}
+
+// `aiq <question>` - one-shot chat answer, plain text (exec-capture
+// friendly: the managed AI chat window calls Host.Exec("aiq ...")).
+static void cmd_aiq(const char* args){
+    while (args && *args == ' ') args++;
+    if (!args || !*args){
+        term.write("Usage: aiq <question>\n");
+        return;
+    }
+    char out[640];
+    int n = ai32_ask(args, out, (int)sizeof(out), 128);
+    if (n < 0){
+term.write("AI engine unavailable.\n");
+        return;
+    }
+    term.write(out);
+    term.write("\n");
 }
 
 // =====================================================================
@@ -7572,11 +7819,11 @@ extern "C" void switch_to_64bit(uint32_t stage_phys);
 // and the staging buffer (the blit SOURCE) must sit ABOVE that window -- the
 // check below enforces the floor.  This constant is therefore also the target's
 // upper bound:
-//     k64sz <= K64_STAGE_FLOOR - 0x100000        (1 MiB at 0x200000)
+//     k64sz <= K64_STAGE_FLOOR - 0x100000        (1.25 MiB at 0x240000)
 // The Makefile guard reads THIS definition with sed and asserts that bound, so
 // the constant and the guard cannot drift apart.  See
 // .attic64/KERNEL64_BYTES_AUDIT.md sections 2 and 5.
-#define K64_STAGE_FLOOR     0x00200000u
+#define K64_STAGE_FLOOR     0x00240000u   // matches .bss at 0x240000
 
 // Load kernel64.bin from the disk into a staging buffer and jump to long
 // mode.  Shared by `switch` and `ask64`; never returns on success.
@@ -8043,7 +8290,9 @@ static void cmd_linux(const char* args){
     for (int i = 0; i < nwords; i++) av[i] = words[i];
 
     term.write("Launching Linux ELF: "); term.write(av[0]); term.write("\n");
+#if !NEXOS_NO_COMPAT
     linux_run(av[0], ac, av);
+#endif
 }
 
 // =====================================================================
@@ -8781,12 +9030,17 @@ static void cmd_flag(const char* args){
                          : "flag: ring-3 never ran\n");
 }
 
+#if !NEXOS_NO_COMPAT
 #include "dos_compat/dos_exec.h"
+#endif
+#if !NEXOS_NO_COMPAT
 #include "dos_compat/dos_prim.h"
+#endif
 
 // DOS console output goes to COM1 by default, which the VBox GUI does not
 // show.  Install a sink so whatever a .COM program prints also lands in the
 // on-screen terminal -- visible in both VBox and headless/QEMU runs.
+#if !NEXOS_NO_COMPAT
 static void dos_term_sink(const char* s){
     if (!s) return;
     term.write(s);
@@ -8807,11 +9061,14 @@ static void cmd_dos(const char* args){
     term.write(args);
     term.write("\n");
 
+#if !NEXOS_NO_COMPAT
     dos_exec_com(args);
+#endif
 
     dos_console_set_sink(0);           // back to serial-only for the shell
     term.write("DOS: program returned\n");
 }
+#endif
 
 // Inspect the VFS: mount state, the caller's sandbox root, and a couple of
 // resolves.  Run as the kernel process, so every check takes the SYSTEM
@@ -8913,7 +9170,9 @@ static void run_command(const char* line){
     else if(!strcmp_(cmd,"skill")) cmd_skill(args);
     else if(!strcmp_(cmd,"runfs")) cmd_runfs(args);
     // Win32 subsystem
+#if !NEXOS_NO_COMPAT
     else if(!strcmp_(cmd,"winapp")||!strcmp_(cmd,"start")) cmd_winapp(args);
+#endif
     else if(!strcmp_(cmd,"reg")||!strcmp_(cmd,"regedit"))  cmd_reg(args);
     else if(!strcmp_(cmd,"winver"))                        cmd_winver();
     else if(!strcmp_(cmd,"winenv")||!strcmp_(cmd,"set32")) cmd_winenv(args);
@@ -8927,11 +9186,14 @@ static void run_command(const char* line){
     else if(!strcmp_(cmd,"user"))                          cmd_user(args);
     else if(!strcmp_(cmd,"probe"))                         cmd_probe(args);
     else if(!strcmp_(cmd,"flag"))                          cmd_flag(args);
+#if !NEXOS_NO_COMPAT
     else if(!strcmp_(cmd,"dos"))                           cmd_dos(args);
+#endif
     else if(!strcmp_(cmd,"vfs"))                           cmd_vfs(args);
     else if(!strcmp_(cmd,"perm"))                          cmd_perm(args);
     // AI engine commands
     else if(!strcmp_(cmd,"ai"))         cmd_ai(args);
+    else if(!strcmp_(cmd,"aiq"))        cmd_aiq(args);
     else if(!strcmp_(cmd,"kb"))         cmd_kb(args);
     else if(!strcmp_(cmd,"generate")||!strcmp_(cmd,"gen")) cmd_generate(args);
     else if(!strcmp_(cmd,"agent"))      cmd_agent(args);
@@ -10156,7 +10418,9 @@ __asm__ (
 // MS-DOS INT 21h / INT 20h entry points (dos_compat/dos_int21_isr.cpp).
 // Declared at file scope: an `extern "C"` declaration inside a function
 // body is ill-formed C++ and was rejected by the compiler.
+#if !NEXOS_NO_COMPAT
 #include "dos_compat/dos_int21_isr.h"
+#endif
 
 static void idt_set_gate(uint8_t num, uint32_t offset, uint16_t selector, uint8_t flags){
     g_idt[num].offset_low  = (uint16_t)(offset & 0xFFFF);
@@ -10280,7 +10544,9 @@ static void idt_init(){
     // (the PIT timer) to 0x20, so overwriting it hijacks the system timer.
     // INT 20h termination is therefore handled by the loader's exit stub,
     // which uses INT 21h AH=4Ch instead.
+#if !NEXOS_NO_COMPAT
     idt_set_gate(0x21, (uint32_t)&isr_int21, 0x08, 0xEE);   // DPL 3 interrupt gate
+#endif
 
     g_idtp.limit = (uint16_t)(sizeof(g_idt) - 1);
     g_idtp.base  = (uint32_t)&g_idt;
@@ -10603,6 +10869,7 @@ extern "C" void kmain(){
     // Register the SFS reader with the Linux-compat shim so `linux <file>`
     // can load ELF images.  The dedicated Linux partition wins; fall back to
     // the main SFS volume so the feature works even without the partition.
+#if !NEXOS_NO_COMPAT
     linux_compat_init([](const char* name, unsigned char* buf, int sz) -> int {
         if (linux_fs.mounted) {
             int r = linux_fs.read(name, buf, sz);
@@ -10611,6 +10878,9 @@ extern "C" void kmain(){
         if (!sfs.mounted) return -1;
         return sfs.read(name, buf, sz);
     });
+#else
+    // linux_compat is compiled out of this build: no ELF32/.nex execution.
+#endif
 
     // Mount the sandboxed VFS on top of the same SFS volume. Every ring-3
     // file access goes through vfs_check_access() from here on.
@@ -10970,7 +11240,7 @@ extern "C" void kmain(){
                         } else if(e.type == K_TAB){
                             gui_desktop_nav(5);            // Tab: next window / menu item
                         } else if(e.type == K_MENU){
-                            gui_toggle_start_menu();       // Win key -> Start menu
+                            gui_toggle_start_menu();       // Win key-UP -> Start menu
                         } else if(e.type == K_UP){
                             gui_desktop_nav(1);
                         } else if(e.type == K_DOWN){

@@ -87,6 +87,36 @@ const char* clr_str(int32_t obj);
 // Allocate a managed string from a C string.  0 on failure.
 int32_t clr_new_str(const char* s);
 
+// Managed int[] accessors (OS API L3+): header is
+// [0]=OBJ_ARRAY [4]=count [8]=elemSize [12..]=int32 data.
+// 0 / -1 for null arrays.
+int     clr_arr_len(int32_t obj);
+int32_t* clr_arr_data(int32_t obj);
+
+// ---------------------------------------------------------------------
+//  Instance slots -- several .mex assemblies resident at once
+// ---------------------------------------------------------------------
+// The CLR used to hold exactly ONE image, so an "application" could only be a
+// stub that asked the desktop shell to open its window.  A slot now holds an
+// independent assembly with its own image, managed heap, stack and static
+// fields; slot 0 is the desktop shell.
+//
+// Every call below switches the interpreter's CURRENT slot, so a subsystem
+// that interleaves work for several owners must save and restore it with
+// clr_current_slot() / clr_use().
+// Shared capacity: one slot per independently resident application image.
+// app_registry.h and the GUI window table derive their limits from this value.
+// Budget check: each loaded slot costs ~840 KiB (image + heap + ClrVm tables).
+// The 32-bit kernel has a 128 MiB heap; the 64-bit one only 16 MiB, so do not
+// raise this without re-checking that budget.
+#define CLR_MAX_VMS 12          // slot 0 = shell, 1..11 = independent apps
+#define CLR_SLOT_SHELL 0
+int clr_load_slot(int slot, const char* mex);   // <0 on failure
+int clr_use(int slot);                          // returns the previous slot, or -1
+int clr_current_slot(void);
+int clr_close_slot(int slot);                   // slot 0 is refused
+int clr_slot_loaded(int slot);                  // 1 when the slot holds a live image
+
 } // extern "C"
 
 #endif // NexOS_CLR_H

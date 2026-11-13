@@ -11,6 +11,11 @@
 #    POST /quota             AI quota 查询
 #    POST /ai                AI 生成请求 (默认走 OpenCode Zen 免费模型, 无需账号)
 #    POST /mcp/<app_id>      MCP tool dispatch
+#    POST /v1/chat/completions  OpenAI-compatible chat (HOST-HELD API key)
+#    GET|POST /v1/models     shared model catalogue (system + app-added)
+#    GET|POST /quota         per-platform / per-app quota ledger
+#    GET  /providers         masked key inventory (no secret is exposed)
+#    POST /models/register   an application contributes a model
 #
 #  依赖: Python 3.8+ 标准库 (http.server + socket + struct)
 #  启动: python3 tools/net/gateway_server.py [--port 19387]
@@ -25,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # or NEXOS_AI_BACKEND=openai + OPENCODE_ZEN_KEY for a real key.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import opencode_free  # noqa: E402  (same directory)
+import ai_platforms   # noqa: E402  hosted keys / quota / OpenAI protocol
 
 AI_BACKEND = os.environ.get("NEXOS_AI_BACKEND", "opencode").strip().lower()
 AI_MODEL   = os.environ.get("OPENCODE_ZEN_MODEL", "").strip()
@@ -214,6 +220,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if path == "/package/install":
             return self._handle_package_install()
 
+        # OpenAI-compatible AI protocol (hosted keys + quota + app models)
+        if path == "/v1/chat/completions":
+            return self._handle_openai_chat()
+        if path == "/v1/models":
+            return self._send_json(200, ai_platforms.list_models())
+        if path == "/models/register":
+            return self._handle_model_register()
+
         # /ai
         if path == "/ai":
             return self._handle_ai()
@@ -275,6 +289,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             with quota_lock:
                 quota_left -= 1
                 left = quota_left
+            # Feed the unified per-platform / per-app ledger as well, so the
+            # legacy /ai path and the OpenAI protocol share one quota pool.
+            ai_platforms.quota_charge(ai_platforms.default_platform_id(),
+                                      str(payload.get("app_id") or ""),
+                                      len(reply))
             return self._send_json(200, {
                 "ok": True, "reply": reply, "model": meta.get("model"),
                 "mode": mode, "quotaLeft": left,
@@ -296,10 +315,36 @@ class GatewayHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_quota(self):
-        with quota_lock:
-            return self._send_json(200, {
-                "total": QUOTA_TOTAL, "remaining": quota_left
-            })
+        """GET/POST /quota -- full per-platform / per-app ledger.
+
+        `total` / `remaining` are kept for the legacy Backend.cs caller, which
+        does GET /quota; the endpoint used to be POST-only, so that call got a
+        404 and silently fell back to a hard-coded 1000.
+        """
+        return self._send_json(200, ai_platforms.quota_report())
+
+    def _handle_openai_chat(self):
+        """POST /v1/chat/completions -- OpenAI shape, key injected by the host."""
+        body = self._read_body()
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            return self._send_json(400, {"error": {
+                "message": "bad json", "type": "invalid_request_error"}})
+        app_id = str(self.headers.get("X-NexOS-App", "") or "")
+        status, resp = ai_platforms.chat_completions(payload, app_id)
+        return self._send_json(status, resp)
+
+    def _handle_model_register(self):
+        """POST /models/register -- an application contributes a model."""
+        body = self._read_body()
+        app_id = str(self.headers.get("X-NexOS-App", "") or "")
+        try:
+            raw = body.decode("utf-8")
+        except Exception:
+            raw = "{}"
+        res = ai_platforms.add_model(raw, app_id)
+        return self._send_json(200 if res.get("ok") else 400, res)
 
     def _handle_mcp(self, target_app_id):
         body = self._read_body()
@@ -317,8 +362,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/package/status":
             return self._handle_package_status()
+        if path == "/v1/models":
+            return self._send_json(200, ai_platforms.list_models())
+        if path == "/quota":
+            return self._handle_quota()
+        if path == "/providers":
+            return self._send_json(200, {
+                "default": ai_platforms.default_platform_id(),
+                "platforms": ai_platforms.key_report()})
         if path == "/health":
-            return self._send_json(200, {"ok": True, "service": "nexos-gateway"})
+            return self._send_json(200, {"ok": True, "service": "nexos-gateway",
+                                        "ai_protocol": "openai/v1",
+                                        "providers": len(ai_platforms.platforms())})
         self._send_json(404, {"error": "not found"})
 
     def _handle_package_status(self):

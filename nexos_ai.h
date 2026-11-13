@@ -111,6 +111,13 @@ int  ai_request(const char* prompt, int mode,
    engine as fallback.  Returns bytes written (0 = no answer / gateway error
    left in out when non-empty). */
 int  ai_ask_text(const char* prompt, char* out, int outsize);
+/* ---- OpenAI-compatible protocol (hosted keys / quota / app models) ----
+ * All four take/return plain JSON strings.  The host gateway owns every
+ * API key; these functions only forward the request over the guest NIC. */
+int  ai_openai_chat(const char* request_json, char* out, int outsize);
+int  ai_list_models(char* out, int outsize);
+int  ai_platform_quota(const char* platform_id, char* out, int outsize);
+int  ai_add_model(const char* spec_json, char* out, int outsize);
 /* Host the kernel's TCP stack dials for /ai.  QEMU SLIRP maps the host to
    10.0.2.2; override with the "ai gateway <ip>" shell command. */
 const char* ai_gateway_host(void);

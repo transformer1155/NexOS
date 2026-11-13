@@ -16,6 +16,7 @@ REPO_ROOT = os.path.dirname(_REPO)
 if os.path.basename(_HERE) != "tools" and os.path.basename(os.path.dirname(_HERE)) != "tools":
     TOOLS = os.path.join(os.path.dirname(os.path.dirname(_HERE)), "tools")
     REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
+GUI_JS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nexos_gui.js")
 MEX_PACK  = os.path.join(TOOLS, "mex_pack.py")
 NEXPACK   = os.path.join(TOOLS, "nexpack.py")
 MEX_PROPS = os.path.join(REPO_ROOT, "csharp", "apps", "mex.shared.props")
@@ -218,7 +219,7 @@ class Bridge:
         except Exception as e: return {"ok": False, "error": str(e)}
 
 
-FRONTEND_HTML = """<!DOCTYPE html>
+FRONTEND_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -322,7 +323,16 @@ FRONTEND_HTML = """<!DOCTYPE html>
 </div></div></section>
 
 </main>
-<script>
+<script>__NEXOS_JS__</script>
+</body>
+</html>
+"""
+
+
+def _probe_gui_libs():
+    """诊断 pywebview + WebView2 可用性."""
+
+GUI_JS = r"""
 document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
   document.querySelectorAll('.tab').forEach(x => x.classList.remove('tab-active'));
   document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
@@ -466,10 +476,9 @@ async function testBridge() {
     alert('❌ Bridge error: ' + e.message + '\n\nCheck that nexos_gui.py main() is running and has js_api=bridge set.');
   }
 }
-</script>
-</body>
-</html>
 """
+
+FRONTEND_HTML = FRONTEND_HTML.replace("__NEXOS_JS__", GUI_JS)
 
 
 def _probe_gui_libs():
@@ -535,6 +544,15 @@ def main():
     html_path = os.path.join(tempfile.gettempdir(), "nexos_gui.html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(FRONTEND_HTML)
+    js_dst = os.path.join(os.path.dirname(html_path), "nexos_gui.js")
+    try:
+        with open(GUI_JS_FILE, "r", encoding="utf-8") as f:
+            js_src = f.read()
+        with open(js_dst, "w", encoding="utf-8") as f:
+            f.write(js_src)
+        _log(f"JS  written to {js_dst} ({len(js_src)} B)")
+    except Exception as e:
+        _log(f"JS  copy FAILED: {e}")
     _log(f"HTML written to {html_path}")
 
     bridge = Bridge()
