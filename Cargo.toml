@@ -1,0 +1,27 @@
+[package]
+name = "nexos-plugin-runtime"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "NexOS application-level plugin runtime: sandboxed tool execution + MCP JSON-RPC server"
+license = "MIT"
+
+[lib]
+name = "nexos_plugin_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+# 只要 rt/time/sync/macros：本 crate 不做 socket，HTTP 由宿主传入的
+# HttpGuard 授权后交给上层客户端。因此不需要 tokio 的 net feature，
+# 也不会把 mio/bytes 拖进依赖树。
+tokio = { version = "1.54", features = ["rt", "time", "sync", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 关键：catch_unwind 在 panic=abort 下是空操作。整个 crate 必须以
+# unwind 构建，否则一个插件 panic 会带走宿主进程。
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
