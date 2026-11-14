@@ -447,6 +447,7 @@ wsl -d Ubuntu-24.04 -e bash /mnt/e/NexOS/NexOS/tools/verify/check_kernel_ai.sh
 | 二 · 宿主运行时 | 异步调度 / 超时 abort / panic 隔离 / 域名白名单 / MCP 路由 | `src/plugin_runtime.rs` | `cargo test --lib` → **13 passed** |
 | 三 · 协议 | 清单规范 / 能力表 / JSON-RPC 报文 / `ui_layout` | `docs/MCP_PLUGIN_PROTOCOL.md`、`docs/NEXBUNDLE.md`、`docs/schemas/manifest.schema.json` | 示例 manifest 通过 2020-12 Schema |
 | 四 · 示例 | 只读系统信息插件 + UI 声明 + 打包链路 | `plugins/samples/sysinfo/` | `bash plugins/samples/sysinfo/build.sh` → 生成并 verify `.nexbundle` |
+| 五 · 机制层 | 自旋锁 / 影子页表 / FNV-1a 路由 / 代际句柄 / 并发配额 / OOM 熔断 | `plugins/loader/plugin_core.{h,cpp}` | `make plugin-core-selftest` → **68 passed** |
 
 ### 加载器的硬约束
 
@@ -461,6 +462,30 @@ wsl -d Ubuntu-24.04 -e bash /mnt/e/NexOS/NexOS/tools/verify/check_kernel_ai.sh
 - **禁止标准库**：内核侧只含 `<stdint.h>`，内存/字符串全部手写
   （`memset_c` / `strcpy_c` / `strcmp_c`）。未做 `.bss` 容量检查前，加载器
   默认不链入 `kernel64`：需要时 `make ... K64_PLUGIN_LOADER=1`。
+
+### 机制层：`plugin_core`（自旋锁 / 影子页表 / FNV 路由）
+
+`plugin_loader` 管“策略”，`plugin_core` 管“机制”：`spinlock_t`（`__atomic` CAS +
+`pause`，内核态另有关中断版本）、`safe_memcpy`/`safe_strcpy`（空指针与越界截断）、
+`is_valid_user_ptr()`（用户地址域 + 页包含 + 权限位）、`PagePermission` 影子页表、
+FNV-1a + 开放寻址（Knuth 回移删除，不留墓碑）的 `McpRouter`、一层 JSON 解析，
+以及 `load_plugin` / `dispatch_mcp` / `unload_plugin` 全生命周期。
+
+- **未签名插件**：加载时硬重置为唯一一段 `/sandbox/<id>` 读写页，manifest 申请的
+  额外页与 `PC_PROT_EXEC` 全部丢弃。
+- **派发七道闸**：句柄代际 → 并发配额（默认 10）→ 路由归属 → 能力位 → 路径沙盒 →
+  用户指针 → 锁外调用。
+- **卸载**：`inflight>0` 返回 `PC_ERR_BUSY`；否则先注销整条路由链再清上下文，
+  `Gen++` 让旧句柄立即 `PC_ERR_STALE`。
+- **OOM 熔断**：128 槽满后锁存，即使有空槽也拒绝加载，直到 `pc_clear_oom_fuse()`。
+- **体积**：`.text ≈ 31 KiB`、`.bss ≈ 98 KiB`，默认不链入内核；
+  启用需 `make ... K64_PLUGIN_CORE=1` 且先过 `tools/verify/check_k64_fit.sh`。
+
+```bash
+make plugin-core-selftest     # 68 passed, 0 failed（场景 A–D + 路由回移 + JSON 对抗 + OOM）
+```
+
+设计与威胁模型见 [`docs/PLUGIN_CORE.md`](docs/PLUGIN_CORE.md)。
 
 ### 打包与校验
 

@@ -16,6 +16,13 @@
 - `.nexbundle` = ZIP 全 STORE + `manifest.json` + `plugins/<id>/{plugin.json,*.mex,ui/}`；`pack/verify` 同一套校验，确定性 ZIP（固定时间戳/排序），签名覆盖 `tree_sha256`，纯 Python Ed25519（无第三方依赖）。
 - 坑：`plugin_loader.cpp` 在 freestanding 下 `<stdint.h>` 不保证 `NULL`，文件内自行 `#define NULL 0`；`pl_emit_int`/selftest 仅 `NEX_PL_HOST_TEST` 编译，避免把无用分支带进内核 `.text`。示例 csproj 必须带 `STANDALONE_APP`，否则 `Forms.cs` 会拉进 `Desktop/Voice` 分支；`Voice.cs` 不要直接加进插件工程。
 
+## 机制层 `plugin_core`（2026-11-14 落地，五模块）
+- 文件：`plugins/loader/plugin_core.{h,cpp}` + `core_selftest.cpp`（宿主 main + `osapi_*` 桩 + `pc_set_emit_hook(stdout)`）。与 `plugin_loader` 的 `pl_*` 完全独立，可串联：`pl_load_plugin` 校验 → `load_plugin` 建上下文 → `dispatch_mcp` 派发。
+- 验证：`make plugin-core-selftest` → **68 passed, 0 failed**（场景 A 伪造指针 / B `/etc/passwd` / C 8 线程×8 插件真并发 / D 卸载后旧句柄 + 配额 + OOM + 200 路由回移）；`make build/plugin_core64.o` → **0 warning**，`.text=31520` `.bss=100488`。
+- 机制要点：`spinlock_t` CAS+`pause`（内核态 `spin_lock_irqsave` 先 cli，恢复只在原 IF=1 时 sti）；句柄 `(gen<<8)|(slot+1)`、24 位代际、位图 `ctz` 分配；未签名插件影子页表硬重置为唯一 `/sandbox/<id>` RW 页（EXEC/额外页全丢）；FNV-1a + 512 槽开放寻址，**Knuth 回移删除不留墓碑**，每插件一条路由链，`unload` 一次摘链；并发配额 `inflight`（默认 10/硬上限 32）；128 槽满锁存 `g_oom_tripped`，需 `pc_clear_oom_fuse()`。
+- **两个真坑**：① `is_valid_user_ptr()` 返回 `1` 合法 / 负值拒绝，调用点写成 `if (!rc)` 会把 `-5` 当成功 → 必须 `!= 1`（曾导致 `safe_copy_from_user(forged)` 段错误）；② 路由回移不能「遇到 `home==j` 就 break」，必须按环状区间 `can_move` 判断并**跳过不可搬条目继续扫描**，否则空洞会挡住后续同簇条目（200 路由 churn 的 `churn.t121` 曾因此命不中）。
+- 默认不链入 kernel64（`.bss` 约 98 KiB）：`make ... K64_PLUGIN_CORE=1` 并先跑 `tools/verify/check_k64_fit.sh`。设计文档 `docs/PLUGIN_CORE.md`（含威胁模型边界：本层不做抢占/ring3，死循环靠运行时超时 abort，故障靠 `nexos_compat` IST+longjmp）。
+
 ## AI 辅助 Win32 兼容层（D0–D4 + E，骨架已编译进镜像，**执行路径尚未接线**）
 - ⚠️ **状态（2026-11-13 实测 ELF 符号表）**：`compat_pump`/IAT 登记/fault 钩子已接线并链接；但 `compat_pe_start`/`compat_note_call`/`compat_pe_yield` **只有定义、零调用点**。`win64_run` 仍是同步 `int rc = fn();`，PE 运行期间帧循环照旧冻结，AI 观测不到；`compat_pe_start` 复用 slot 还漏重置 `p->started`（第二次启动会 longjmp 进旧 PE 上下文）。用户拍板的「加载同步、执行异步」**未落地**。当前交付镜像 = 骨架版，`make all` RC=0 / `check-k64 0 (clean)` / VDI IN SYNC，用户自测中；后续接线建议用 `winapp /a` 显式异步开关隔离风险，勿改默认同步路径。
 - 文件：`nexos_compat.h`(契约) / `nexos_compat.cpp`(实现) / `nexos_compat_asm.cpp`(64位 setjmp/longjmp/fiber_switch，`__attribute__((naked))`+内联 asm，`CompatCtx` 布局 rbx,rbp,r12,r13,r14,r15,rsp,rip)。

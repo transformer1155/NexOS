@@ -2004,6 +2004,25 @@ plugin-loader-selftest: plugins/loader/plugin_loader.cpp plugins/loader/host_sel
 	    -o $(BUILD)/plugin_loader_selftest
 	$(BUILD)/plugin_loader_selftest
 
+# ---- plugin_core (自旋锁/影子页表/FNV 路由/生命周期) ---------------------
+# 同样默认不链入 kernel64：128 槽上下文 + 512 槽路由表实测
+# .bss = 100488 B（约 98 KiB）、.text = 31520 B（约 31 KiB），
+# 启用前必须跑 tools/verify/check_k64_fit.sh。
+# 需要启用时：make ... K64_PLUGIN_CORE=1
+K64_PLUGIN_CORE ?= 0
+
+$(BUILD)/plugin_core64.o: plugins/loader/plugin_core.cpp plugins/loader/plugin_core.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -I plugins/loader -c plugins/loader/plugin_core.cpp -o $@
+
+# 宿主自测：__atomic 自旋锁 + 8 线程并发 load + 伪造指针/路径/悬空句柄。
+.PHONY: plugin-core-selftest
+plugin-core-selftest: plugins/loader/plugin_core.cpp plugins/loader/core_selftest.cpp plugins/loader/plugin_core.h | $(BUILD)
+	$(HOST_CXX) -std=c++17 -O2 -Wall -Wextra -DNEX_PC_HOST_TEST \
+	    -I plugins/loader -I . \
+	    plugins/loader/plugin_core.cpp plugins/loader/core_selftest.cpp \
+	    -o $(BUILD)/plugin_core_selftest -pthread
+	$(BUILD)/plugin_core_selftest
+
 # The 64-bit object list lives in ONE variable: the real link and the
 # strict re-link used by tools/check_k64_undefined.sh must never diverge,
 # otherwise the gate would validate a different binary than we ship.
@@ -2013,6 +2032,11 @@ KERNEL64_OBJS := $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o 
 # 可选：把插件加载器链进 64 位内核（默认 0，避免未做 .bss 容量检查就加 8 KiB）。
 ifeq ($(K64_PLUGIN_LOADER),1)
 KERNEL64_OBJS += $(BUILD)/plugin_loader64.o
+endif
+
+# 可选：微内核级插件核心（自旋锁/影子页表/哈希路由），默认 0。
+ifeq ($(K64_PLUGIN_CORE),1)
+KERNEL64_OBJS += $(BUILD)/plugin_core64.o
 endif
 
 $(BUILD)/kernel64.elf: $(KERNEL64_OBJS) .attic64/linker64.ld | $(BUILD)
