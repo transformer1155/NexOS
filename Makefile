@@ -2005,14 +2005,27 @@ plugin-loader-selftest: plugins/loader/plugin_loader.cpp plugins/loader/host_sel
 	$(BUILD)/plugin_loader_selftest
 
 # ---- plugin_core (自旋锁/影子页表/FNV 路由/生命周期) ---------------------
-# 同样默认不链入 kernel64：128 槽上下文 + 512 槽路由表实测
-# .bss = 100488 B（约 98 KiB）、.text = 31520 B（约 31 KiB），
-# 启用前必须跑 tools/verify/check_k64_fit.sh。
-# 需要启用时：make ... K64_PLUGIN_CORE=1
-K64_PLUGIN_CORE ?= 0
+# 实测（64 位内核镜像）：
+#   关闭 K64_PLUGIN_CORE=0 : .bss = 3707552, __bss_end = 0x5c92a0
+#   打开 K64_PLUGIN_CORE=1 : .bss = 3801104, __bss_end = 0x5e0010
+#   增量 = 93552 B（91 KiB）：plugin_core 78176 + plugin_bridge 12296
+#          + malicious(真实恶意插件 TU) 8 + 对齐/夹逼 ≈ 3 KiB
+# 链接期上限 0x600000 (6291456) -> 余量 130544 B (127 KiB)。
+# .text 增量 = 21120 B。kernel64.bin = 1203600 B，限 2097152 B。
+# 关闭：make ... K64_PLUGIN_CORE=0
+K64_PLUGIN_CORE ?= 1
 
 $(BUILD)/plugin_core64.o: plugins/loader/plugin_core.cpp plugins/loader/plugin_core.h | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -I plugins/loader -c plugins/loader/plugin_core.cpp -o $@
+
+# 内核接线层：开机自检 + 托管 icall（NexOS.Plugin::Dispatch/Count）。
+$(BUILD)/plugin_bridge64.o: plugins/loader/plugin_bridge.cpp plugins/loader/plugin_bridge.h \
+                            plugins/loader/plugin_core.h plugins/loader/malicious_plugin.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -I plugins/loader -c plugins/loader/plugin_bridge.cpp -o $@
+
+# 真实恶意插件 TU：与宿主破坏性测试**同一个**源码，只换 ABI 后端。
+$(BUILD)/malicious64.o: plugins/loader/malicious_plugin.cpp plugins/loader/malicious_plugin.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -I plugins/loader -c plugins/loader/malicious_plugin.cpp -o $@
 
 # 宿主自测：__atomic 自旋锁 + 8 线程并发 load + 伪造指针/路径/悬空句柄。
 .PHONY: plugin-core-selftest
@@ -2022,6 +2035,21 @@ plugin-core-selftest: plugins/loader/plugin_core.cpp plugins/loader/core_selftes
 	    plugins/loader/plugin_core.cpp plugins/loader/core_selftest.cpp \
 	    -o $(BUILD)/plugin_core_selftest -pthread
 	$(BUILD)/plugin_core_selftest
+
+# 破坏性测试（阶段三 + 阶段四）：真实未签名恶意插件 + SIGSEGV 故障陷阱 +
+# 16 线程 x 10000 次并发 + 中途热拔插。
+# 被测代码与内核完全相同：plugin_core.cpp + malicious_plugin.cpp。
+# 退出码 = 失败用例数；alarm(300) 是死锁看门狗。
+.PHONY: plugin-core-breach
+plugin-core-breach: plugins/loader/plugin_core.cpp plugins/loader/plugin_core.h \
+                    plugins/loader/malicious_plugin.cpp plugins/loader/malicious_plugin.h \
+                    plugins/loader/breach_test.cpp | $(BUILD)
+	$(HOST_CXX) -std=c++17 -O2 -Wall -Wextra -DNEX_PC_HOST_TEST \
+	    -I plugins/loader -I . \
+	    plugins/loader/plugin_core.cpp plugins/loader/malicious_plugin.cpp \
+	    plugins/loader/breach_test.cpp \
+	    -o $(BUILD)/plugin_core_breach -pthread
+	$(BUILD)/plugin_core_breach
 
 # The 64-bit object list lives in ONE variable: the real link and the
 # strict re-link used by tools/check_k64_undefined.sh must never diverge,
@@ -2034,9 +2062,11 @@ ifeq ($(K64_PLUGIN_LOADER),1)
 KERNEL64_OBJS += $(BUILD)/plugin_loader64.o
 endif
 
-# 可选：微内核级插件核心（自旋锁/影子页表/哈希路由），默认 0。
+# 可选：微内核级插件核心（自旋锁/影子页表/哈希路由），默认 1。
+# plugin_bridge 是内核侧接线（开机自检 + NexOS.Plugin::Dispatch icall），
+# malicious64 是**真实**未签名恶意插件 TU（与宿主破坏性测试同一份源码）。
 ifeq ($(K64_PLUGIN_CORE),1)
-KERNEL64_OBJS += $(BUILD)/plugin_core64.o
+KERNEL64_OBJS += $(BUILD)/plugin_core64.o $(BUILD)/plugin_bridge64.o $(BUILD)/malicious64.o
 endif
 
 $(BUILD)/kernel64.elf: $(KERNEL64_OBJS) .attic64/linker64.ld | $(BUILD)

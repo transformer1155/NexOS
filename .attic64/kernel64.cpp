@@ -1085,6 +1085,35 @@ extern int32_t osapi_ic_mem_self_test(int32_t*);
 // entry64.asm: hardware IRQ entry, never routes to fault_common().
 extern "C" void irq0_stub(void);
 
+// ---------------------------------------------------------------------
+//  微内核插件总线（plugins/loader/plugin_bridge.cpp）
+// ---------------------------------------------------------------------
+//  这样接线的原因：plugin_core 是**可选**模块（K64_PLUGIN_CORE=0/1）。
+//  用 weak 引用，模块没链进来时符号为 0，这里直接跳过 —— 既不会把
+//  未定义符号绑到 0 后调用（那是 triple fault 的经典成因，见
+//  tools/check_k64_undefined.sh），也不需要额外的编译期宏来同步
+//  kernel64.o 与 KERNEL64_OBJS。weak 未定义符号不会被 -Wl 报成
+//  "undefined reference"，所以 check-k64 仍然干净。
+extern "C" void    pc_bridge_boot(void)                    __attribute__((weak));
+extern "C" int32_t osapi_ic_plugin_dispatch(int32_t* a)    __attribute__((weak));
+extern "C" int32_t osapi_ic_plugin_count(int32_t* a)       __attribute__((weak));
+
+// clr.cpp: 宿主注册的 InternalCall（在 mex 加载前必须完成）。
+typedef int32_t (*k64_icall_fn)(int32_t* args);
+extern "C" int clr_register_icall(const char* fqname, k64_icall_fn fn);
+
+// 幂等：两处启动点（headless / GUI）都会调，真正的初始化只做一次。
+static void plugin_core_try_boot(void){
+    if (!pc_bridge_boot) return;          // 模块未链入：静默跳过
+    pc_bridge_boot();
+    // C# 侧：NexOS.Plugin.Dispatch(handle, tool, argsJson) -> string
+    if (osapi_ic_plugin_dispatch)
+        clr_register_icall("NexOS.Plugin::Dispatch", osapi_ic_plugin_dispatch);
+    if (osapi_ic_plugin_count)
+        clr_register_icall("NexOS.Plugin::Count", osapi_ic_plugin_count);
+    serial_puts("[K64] plugin core bridge: icall NexOS.Plugin::Dispatch registered\n");
+}
+
 // Raw, lock-free COM1 writer for interrupt / thread context.
 static inline void hs_putc(char c){
     for (uint32_t spin = 0; spin < 100000u; ++spin)
@@ -1183,6 +1212,8 @@ void headless_run(){
     osapi_ic_mem_self_test(0);
     osapi_ic_mem_self_test(0);
     serial_puts("[KERNEL] OS API self-tests done (headless)\n");
+    // 插件总线的开机自检：真实恶意插件 + 内核闸门，结果直接进 COM1。
+    plugin_core_try_boot();
     if (NEX_HEADLESS_STAGE >= 2){
         hs_pic_remap();
         hs_pit_init(100);
@@ -5575,6 +5606,9 @@ static void cmd_gui(const char* args){
     serial_puts("[K64] Entering Win11 GUI mode\n");
 
     // Enter GUI - renders Win11-style desktop with top bar, icons, and cursor
+    // 插件总线必须在 gui_enter() -> mforms_init() -> clr_load(shell.mex) 之前
+    // 完成注册，否则托管侧的 InternalCall 绑定会落空。
+    plugin_core_try_boot();
     gui_enter();
     serial_puts("[M-GE]\n");   // after gui_enter returned
     gui_render();
