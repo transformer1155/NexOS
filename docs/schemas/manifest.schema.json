@@ -1,0 +1,406 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexos.dev/schemas/nexbundle-manifest-v1.json",
+  "title": "NexOS .nexbundle manifest",
+  "description": "Bundle-level manifest.json for a NexOS plugin bundle. See docs/NEXBUNDLE.md and docs/MCP_PLUGIN_PROTOCOL.md.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "id",
+    "name",
+    "version",
+    "network",
+    "capabilities",
+    "ui_layout",
+    "plugins"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Format version. Only 1 is defined today."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9._-]{1,63}$",
+      "description": "Globally unique bundle id, lowercase."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]{1,9}\\.[0-9]{1,9}\\.[0-9]{1,9}$"
+    },
+    "publisher": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 2048
+    },
+    "license": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "homepage": {
+      "type": "string",
+      "maxLength": 512
+    },
+    "icon": {
+      "$ref": "#/$defs/singleSegment"
+    },
+    "network": {
+      "$ref": "#/$defs/network"
+    },
+    "capabilities": {
+      "$ref": "#/$defs/capabilityList"
+    },
+    "ui_layout": {
+      "$ref": "#/$defs/uiLayoutRef"
+    },
+    "plugins": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": {
+        "$ref": "#/$defs/plugin"
+      }
+    },
+    "signatures": {
+      "type": "array",
+      "description": "Reserved. Real signature records live in signatures/<alg>.json inside the archive.",
+      "items": {
+        "type": "object"
+      },
+      "default": []
+    }
+  },
+  "additionalProperties": false,
+
+  "$defs": {
+    "singleSegment": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[^/\\\\\\u0000-\\u001f]+$",
+      "not": {
+        "enum": [".", ".."]
+      }
+    },
+
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "Bundle-relative POSIX path. No leading '/', no backslash, no control characters, no '.'/'..' segments.",
+      "pattern": "^[^/\\\\\\u0000-\\u001f][^\\\\\\u0000-\\u001f]*$",
+      "not": {
+        "pattern": "(^|/)\\.\\.(/|$)"
+      }
+    },
+
+    "pluginId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9._-]{1,31}$"
+    },
+
+    "toolName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{1,63}$"
+    },
+
+    "hostPattern": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 253,
+      "description": "Bare hostname, or a leading '*.domain'. No scheme, port, path or userinfo.",
+      "pattern": "^(\\*\\.)?[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$",
+      "not": {
+        "enum": ["*"]
+      }
+    },
+
+    "network": {
+      "type": "object",
+      "required": ["allow_hosts"],
+      "properties": {
+        "allow_hosts": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/hostPattern"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "capability": {
+      "type": "string",
+      "description": "Mirrors CAP_* in plugins/loader/plugin_loader.h. 'ipc' is intentionally absent: NexOS is single-process with zero IPC.",
+      "enum": [
+        "fs.read",
+        "fs.write",
+        "net",
+        "proc",
+        "ui",
+        "ai",
+        "dev",
+        "sys.info"
+      ]
+    },
+
+    "capabilityList": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/capability"
+      }
+    },
+
+    "entry": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "enum": ["managed", "native", "builtin"]
+        },
+        "assembly": {
+          "$ref": "#/$defs/singleSegment"
+        },
+        "init_symbol": {
+          "$ref": "#/$defs/symbol"
+        },
+        "dispatch_symbol": {
+          "$ref": "#/$defs/symbol"
+        },
+        "symbol": {
+          "type": "string",
+          "maxLength": 128
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "kind": { "const": "managed" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["assembly"],
+            "properties": {
+              "assembly": {
+                "type": "string",
+                "pattern": "^[^/\\\\\\u0000-\\u001f]+\\.mex$"
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+
+    "symbol": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_.]*::[A-Za-z_][A-Za-z0-9_]*$"
+    },
+
+    "tool": {
+      "type": "object",
+      "required": ["name", "description", "inputSchema"],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/toolName"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "inputSchema": {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": {
+              "const": "object"
+            },
+            "properties": {
+              "type": "object"
+            },
+            "required": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "additionalProperties": true
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "uiLayoutRef": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/relativePath"
+        },
+        {
+          "$ref": "#/$defs/uiLayout"
+        }
+      ]
+    },
+
+    "uiLayout": {
+      "type": "object",
+      "required": ["schema_version", "root"],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "window": {
+          "type": "object",
+          "properties": {
+            "title": { "type": "string", "maxLength": 128 },
+            "width": { "type": "integer", "minimum": 160, "maximum": 8192 },
+            "height": { "type": "integer", "minimum": 120, "maximum": 8192 },
+            "resizable": { "type": "boolean" }
+          },
+          "additionalProperties": true
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "tool": { "type": "string", "maxLength": 64 },
+            "plugin": { "$ref": "#/$defs/pluginId" },
+            "refresh_ms": { "type": "integer", "minimum": 0, "maximum": 600000 }
+          },
+          "additionalProperties": true
+        },
+        "root": {
+          "$ref": "#/$defs/widget"
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "widget": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "enum": [
+            "column",
+            "row",
+            "panel",
+            "tabs",
+            "metric",
+            "progress",
+            "keyvalue",
+            "text",
+            "heading",
+            "badge",
+            "button",
+            "spacer",
+            "list"
+          ]
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/widget"
+          }
+        },
+        "layout": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "plugin": {
+          "$ref": "#/$defs/pluginId"
+        },
+        "label": { "type": "string" },
+        "text": { "type": "string" },
+        "bind": { "type": "string" },
+        "item_bind": { "type": "string" },
+        "unit": { "type": "string" },
+        "max": { "type": "number" },
+        "gap": { "type": "integer", "minimum": 0 },
+        "padding": { "type": "integer", "minimum": 0 },
+        "true_text": { "type": "string" },
+        "false_text": { "type": "string" },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": { "type": "string" },
+              "bind": { "type": "string" },
+              "value": { "type": ["string", "number", "boolean"] },
+              "unit": { "type": "string" }
+            },
+            "additionalProperties": true
+          }
+        },
+        "action": {
+          "type": "object",
+          "required": ["tool"],
+          "properties": {
+            "tool": { "$ref": "#/$defs/toolName" },
+            "arguments": { "type": "object" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "plugin": {
+      "type": "object",
+      "required": ["id", "name", "version", "entry"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/pluginId"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]{1,9}\\.[0-9]{1,9}\\.[0-9]{1,9}$"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "entry": {
+          "$ref": "#/$defs/entry"
+        },
+        "network": {
+          "$ref": "#/$defs/network"
+        },
+        "capabilities": {
+          "$ref": "#/$defs/capabilityList"
+        },
+        "ui_layout": {
+          "$ref": "#/$defs/uiLayoutRef"
+        },
+        "sandbox_root": {
+          "type": "string",
+          "pattern": "^/sandbox/[A-Za-z0-9._/-]+$",
+          "description": "Only honoured for signed bundles; anything outside /sandbox/ falls back to /sandbox/<plugin_id>."
+        },
+        "tools": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/tool"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -8,6 +8,14 @@
 - **check-k64 门禁**：64 位内核 `--unresolved-symbols=ignore-all`，裸调用未定义符号→跳 0→三故障重启。`tools/check_k64_undefined.sh` 严格重链比对 `tools/k64_undefined_allowlist.txt`。坑：`g_compat_resolve_exact` 因陈旧 `.o` 被误报 bound-to-0，强制重编后 `0 (clean)`。
 - VBox 测试 VM 名 **NexOS**（串口 uartmode1=file→`build/vbox_serial.log`）。同步：`tools/vbox_sync.ps1`（VM 须 poweroff，`VBoxManage controlvm NexOS poweroff` 硬断电，NexOS 不响应 acpi）。`python tools/vbox_check.py` 校验 IN SYNC。VBoxManage=`C:\Program Files\Oracle\VBoxManage.exe`。
 
+## 内核态插件加载器 + `.nexbundle`（2026-11-14 落地）
+- 四阶段交付：① `plugins/loader/plugin_loader.{h,cpp}`（能力位/沙盒/128 槽/句柄代际/`bnd_prefix_hit`）② `src/plugin_runtime.rs`（tokio 超时 abort、`CatchUnwind` 逐 poll 隔离、域名白名单、MCP JSON-RPC）③ `docs/MCP_PLUGIN_PROTOCOL.md` + `docs/NEXBUNDLE.md` + `docs/schemas/manifest.schema.json` ④ `plugins/samples/sysinfo/`（C# MiniCLR 插件 + UI + `build.sh`）。
+- 验证入口：`make plugin-loader-selftest`（**33 passed**；`NEX_PL_HOST_TEST` 下同一份策略代码跑空宿主）；`cargo test --lib`（**13 passed**）；`python tools/image/nexbundle.py selftest`（22 项，含 RFC 8032 Ed25519 向量）；`bash plugins/samples/sysinfo/build.sh` 产出并 verify `dist/sysinfo.suite-1.0.0.nexbundle`。
+- 句柄：`h=(gen<<8)|(slot+1)`；卸载/复用槽位都 `Gen++`，旧句柄 `PL_ERR_STALE(-4)`。未签名：先摘 `CAP_FS_WRITE`，根强制 `/sandbox/<id>`；路径读写都独立过 `bnd_prefix_hit`（`..`/反斜杠/兄弟前缀全拒）。
+- 内核默认**不链入**加载器（128 槽注册表 = 约 8 KiB `.bss`，未做 `check_k64_fit`）：`make ... K64_PLUGIN_LOADER=1` 才追加 `plugin_loader64.o`。
+- `.nexbundle` = ZIP 全 STORE + `manifest.json` + `plugins/<id>/{plugin.json,*.mex,ui/}`；`pack/verify` 同一套校验，确定性 ZIP（固定时间戳/排序），签名覆盖 `tree_sha256`，纯 Python Ed25519（无第三方依赖）。
+- 坑：`plugin_loader.cpp` 在 freestanding 下 `<stdint.h>` 不保证 `NULL`，文件内自行 `#define NULL 0`；`pl_emit_int`/selftest 仅 `NEX_PL_HOST_TEST` 编译，避免把无用分支带进内核 `.text`。示例 csproj 必须带 `STANDALONE_APP`，否则 `Forms.cs` 会拉进 `Desktop/Voice` 分支；`Voice.cs` 不要直接加进插件工程。
+
 ## AI 辅助 Win32 兼容层（D0–D4 + E，骨架已编译进镜像，**执行路径尚未接线**）
 - ⚠️ **状态（2026-11-13 实测 ELF 符号表）**：`compat_pump`/IAT 登记/fault 钩子已接线并链接；但 `compat_pe_start`/`compat_note_call`/`compat_pe_yield` **只有定义、零调用点**。`win64_run` 仍是同步 `int rc = fn();`，PE 运行期间帧循环照旧冻结，AI 观测不到；`compat_pe_start` 复用 slot 还漏重置 `p->started`（第二次启动会 longjmp 进旧 PE 上下文）。用户拍板的「加载同步、执行异步」**未落地**。当前交付镜像 = 骨架版，`make all` RC=0 / `check-k64 0 (clean)` / VDI IN SYNC，用户自测中；后续接线建议用 `winapp /a` 显式异步开关隔离风险，勿改默认同步路径。
 - 文件：`nexos_compat.h`(契约) / `nexos_compat.cpp`(实现) / `nexos_compat_asm.cpp`(64位 setjmp/longjmp/fiber_switch，`__attribute__((naked))`+内联 asm，`CompatCtx` 布局 rbx,rbp,r12,r13,r14,r15,rsp,rip)。

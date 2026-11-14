@@ -42,7 +42,7 @@ NexOS 是一个从零自研的 **x86 操作系统**：起点是一个支持 BIOS
 - **分布式算力**：`distnet.cpp` UDP 发现/调度 + `dcn/` 运行时（crypto/sched/transport），任务分片到多节点合并推理。
 - **兼容层**：自研 PE/Win32 子系统（`winloader.cpp`+`win32.cpp`，可跑自研 IE）；Linux 二进制兼容（`linux_compat.cpp`+`linux_root/`）；Mono 运行时移植（`mono_port/`）。
 - **网络**：NE2000 驱动 + TCP/IP + HTTP 服务器（`netstart` 后浏览器可访问）。
-- **应用生态**：`.nexpack` 第三方应用包格式 + `PackageInstaller`（解包 → 写 MKFS → 合并注册表 → 刷新桌面）+ **MCP SDK**（继承 `McpServerBase`、打 `[McpTool]`，构建期自动发现并注册到 MCP 总线）。详见 [`docs/NEXPACK.md`](docs/NEXPACK.md)。
+- **应用生态**：`.nexpack` 第三方应用包格式 + `PackageInstaller`（解包 → 写 MKFS → 合并注册表 → 刷新桌面）+ **MCP SDK**（继承 `McpServerBase`、打 `[McpTool]`，构建期自动发现并注册到 MCP 总线）。详见 [`docs/NEXPACK.md`](docs/NEXPACK.md)。新的插件体系改为**一切皆插件**：内核态加载器 + 多插件 `.nexbundle`，见下文与 [`docs/NEXBUNDLE.md`](docs/NEXBUNDLE.md)。
 
 ## 顶层目录与子模块
 
@@ -435,6 +435,52 @@ wsl -d Ubuntu-24.04 -e bash /mnt/e/NexOS/NexOS/tools/verify/check_kernel_ai.sh
   或使用 `>= 100` 的扩展区，不能动态新增 Kind。
 - **安装器在宿主侧执行**：内核没有 ZIP 解包与二进制写能力，安装由 WinHost 宿主完成，
   内核只读结果。
+
+## 内核态插件加载器与插件整合包 `.nexbundle`
+
+`.nexpack` 描述的是“一个应用 = 一个 `.mex`”。新的插件体系改为**一切皆插件**：
+分发单位是多插件 Bundle `.nexbundle`，内核只认识插件，不认识“应用”。
+
+| 阶段 | 交付物 | 位置 | 验证 |
+|------|--------|------|------|
+| 一 · 内核加载器 | 能力位 / 沙盒根 / 128 槽位 / 句柄代际 / `bnd_prefix_hit` | `plugins/loader/plugin_loader.{h,cpp}` | `make plugin-loader-selftest` → **33 passed** |
+| 二 · 宿主运行时 | 异步调度 / 超时 abort / panic 隔离 / 域名白名单 / MCP 路由 | `src/plugin_runtime.rs` | `cargo test --lib` → **13 passed** |
+| 三 · 协议 | 清单规范 / 能力表 / JSON-RPC 报文 / `ui_layout` | `docs/MCP_PLUGIN_PROTOCOL.md`、`docs/NEXBUNDLE.md`、`docs/schemas/manifest.schema.json` | 示例 manifest 通过 2020-12 Schema |
+| 四 · 示例 | 只读系统信息插件 + UI 声明 + 打包链路 | `plugins/samples/sysinfo/` | `bash plugins/samples/sysinfo/build.sh` → 生成并 verify `.nexbundle` |
+
+### 加载器的硬约束
+
+- **单进程零 IPC**：插件是同一地址空间里的函数指针 / 托管方法调用；
+  manifest 申请 `ipc` 直接 `PL_ERR_CAP`。
+- **未签名降权**：`CAP_FS_WRITE` 被摘除，沙盒根强制 `/sandbox/<plugin_id>`，
+  manifest 里写 `/` 或 `/etc` 都不算数。
+- **路径边界独立生效**：读写都过 `bnd_prefix_hit`；`..`、反斜杠、兄弟前缀
+  （`/sandbox/sysinfo2`）一律拒绝。
+- **句柄防悬空**：`handle = (generation << 8) | (slot + 1)`，卸载或复用槽位
+  都 `Gen++`，旧句柄立即 `PL_ERR_STALE`（`-4`）。
+- **禁止标准库**：内核侧只含 `<stdint.h>`，内存/字符串全部手写
+  （`memset_c` / `strcpy_c` / `strcmp_c`）。未做 `.bss` 容量检查前，加载器
+  默认不链入 `kernel64`：需要时 `make ... K64_PLUGIN_LOADER=1`。
+
+### 打包与校验
+
+```bash
+# 一键：扫描 [McpTool] → dotnet build → .mex → .nexbundle → verify
+bash plugins/samples/sysinfo/build.sh
+
+# 或分步
+python tools/image/nexbundle.py pack   --src <dir> --out <pkg> [--sign HEXSEED]
+python tools/image/nexbundle.py verify <pkg> [--pubkey HEX] [--strict]
+python tools/image/nexbundle.py inspect <pkg>
+python tools/image/nexbundle.py selftest     # Ed25519 RFC 8032 向量 + 路径 + 清单
+```
+
+`.nexbundle` 仍是 **ZIP + 全 STORE**（内核无 inflate），成员结构为
+`manifest.json` + `plugins/<id>/{plugin.json,*.mex,ui/...}`。签名用纯 Python
+Ed25519，覆盖确定性树哈希 `tree_sha256`；未签名包允许安装但按上文降权。
+
+完整规范见 [`docs/MCP_PLUGIN_PROTOCOL.md`](docs/MCP_PLUGIN_PROTOCOL.md)
+与 [`docs/NEXBUNDLE.md`](docs/NEXBUNDLE.md)。
 
 ## AI 推理(GGUF / Qwen2)
 
