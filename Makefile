@@ -1985,11 +1985,35 @@ $(BUILD)/linux_manager64.o: plugins/linux_manager.cpp | $(BUILD)
 $(BUILD)/linux_guest_backend64.o: plugins/linux_guest_backend.cpp | $(BUILD)
 	$(CC64) $(CXX64FLAGS) -I plugins -c plugins/linux_guest_backend.cpp -o $@
 
+# ---- plugin_loader (内核态能力/沙盒/句柄层) ------------------------------
+# 默认不链接进 kernel64：注册表是 128 * sizeof(PlSlot) 的 .bss，是否放得下
+# 必须由 tools/verify/check_k64_fit.sh 现场判断（见 docs/RULES.md）。
+# 需要启用时：make ... K64_PLUGIN_LOADER=1
+K64_PLUGIN_LOADER ?= 0
+
+$(BUILD)/plugin_loader64.o: plugins/loader/plugin_loader.cpp plugins/loader/plugin_loader.h | $(BUILD)
+	$(CC64) $(CXX64FLAGS) -I plugins/loader -c plugins/loader/plugin_loader.cpp -o $@
+
+# 宿主自测：同一份策略代码用 malloc/fputs 跑 33 条用例（不需要启动 VM）。
+HOST_CXX ?= g++
+.PHONY: plugin-loader-selftest
+plugin-loader-selftest: plugins/loader/plugin_loader.cpp plugins/loader/host_selftest.cpp plugins/loader/plugin_loader.h | $(BUILD)
+	$(HOST_CXX) -std=c++17 -O2 -Wall -Wextra -DNEX_PL_HOST_TEST \
+	    -I plugins/loader \
+	    plugins/loader/plugin_loader.cpp plugins/loader/host_selftest.cpp \
+	    -o $(BUILD)/plugin_loader_selftest
+	$(BUILD)/plugin_loader_selftest
+
 # The 64-bit object list lives in ONE variable: the real link and the
 # strict re-link used by tools/check_k64_undefined.sh must never diverge,
 # otherwise the gate would validate a different binary than we ship.
 KERNEL64_OBJS := $(BUILD)/entry64.o $(BUILD)/switch64to32.o $(BUILD)/kernel64.o $(BUILD)/silent_telemetry64.o $(BUILD)/ai_engine64.o $(BUILD)/ai_plugin64.o $(BUILD)/kb64.o $(BUILD)/gguf64.o $(BUILD)/gguf_infer64.o $(BUILD)/memory_adapter64.o $(BUILD)/file_adapter64.o $(BUILD)/gguf_loader64.o $(BUILD)/knowledge_base64.o $(BUILD)/net64.o $(BUILD)/net_tls64.o $(BUILD)/tls_crypto64.o $(BUILD)/tls1364.o $(BUILD)/tls_x50964.o $(BUILD)/ai_config64.o $(BUILD)/ai_tooluse64.o $(BUILD)/ai_context64.o $(BUILD)/ai_usage64.o $(BUILD)/ai_kb64.o $(BUILD)/ai_redact64.o $(BUILD)/ai_coop64.o $(BUILD)/ai_market64.o $(BUILD)/distnet64.o $(BUILD)/gui64.o $(BUILD)/driver_loader64.o $(BUILD)/driver_elf64.o $(BUILD)/addrman64.o $(BUILD)/winloader64.o $(BUILD)/win32_64.o $(BUILD)/gdt64.o $(BUILD)/proc64.o $(BUILD)/vfs64.o $(BUILD)/perm64.o $(BUILD)/clr64.o $(BUILD)/osapi64.o $(BUILD)/nexos_compat64.o $(BUILD)/nexos_compat_asm64.o $(BUILD)/mforms64.o $(BUILD)/smp_impl64.o $(BUILD)/ap_trampoline.o $(BUILD)/systemalgo64.o $(BUILD)/hda64.o \
 	$(BUILD)/vmm64.o $(BUILD)/vnc_client64.o $(BUILD)/linux_manager64.o $(BUILD)/linux_guest_backend64.o $(BUILD)/svga64.o $(BUILD)/nexos_ai64.o $(BUILD)/gfx_engine64.o $(BUILD)/gfx_ime64.o
+
+# 可选：把插件加载器链进 64 位内核（默认 0，避免未做 .bss 容量检查就加 8 KiB）。
+ifeq ($(K64_PLUGIN_LOADER),1)
+KERNEL64_OBJS += $(BUILD)/plugin_loader64.o
+endif
 
 $(BUILD)/kernel64.elf: $(KERNEL64_OBJS) .attic64/linker64.ld | $(BUILD)
 	$(LD64) $(LDFLAGS64) -o $@ $(KERNEL64_OBJS)
