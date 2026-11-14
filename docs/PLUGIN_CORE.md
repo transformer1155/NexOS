@@ -279,3 +279,206 @@ make ... K64_PLUGIN_CORE=1
 
 两层可以直接串联：`pl_load_plugin()` 校验通过后，用其规范化的 manifest 调
 `load_plugin()` 建立机制层上下文；MCP 请求统一从 `dispatch_mcp()` 进入。
+
+---
+
+## 7. 内核集成（阶段二：C++ 到 C# 的跨界网关）
+
+```text
+  C# (MiniCLR)                     .attic64/kernel64.cpp        plugins/loader/
+  ────────────                     ─────────────────────        ───────────────
+  NexOS.Plugin.Dispatch(h,t,a)  →  clr_register_icall(      →   osapi_ic_plugin_dispatch()
+                                     "NexOS.Plugin::Dispatch")        │
+                                                                      ├ clr_str(a[1]) / clr_str(a[2])
+                                                                      ├ dispatch_mcp(h,t,a,out)
+                                                                      │     ├ 句柄代际校验
+                                                                      │     ├ 能力位 & 路由归属
+                                                                      │     ├ 路径沙盒 / 用户指针闸门
+                                                                      │     └ 锁外执行插件回调
+                                                                      └ clr_new_str(out) → 托管字符串
+```
+
+**文件**
+
+| 文件 | 角色 |
+|------|------|
+| `plugins/loader/plugin_bridge.{h,cpp}` | 内核接线层：开机自检 + `osapi_ic_plugin_dispatch` / `osapi_ic_plugin_count` / `osapi_ic_plugin_alive` |
+| `plugins/loader/malicious_plugin.{h,cpp}` | **真实**的未签名恶意插件 TU（宿主测试与内核 demo 共用同一份源码） |
+| `plugins/loader/breach_test.cpp` | 宿主破坏性测试（阶段三 + 阶段四），`make plugin-core-breach` |
+| `csharp/NexOS.Core/Plugin.cs` | 托管侧 `NexOS.Plugin.Bus`（`#if !WINHOST` 时是 InternalCall 声明） |
+
+**icall 契约**（`NexOS.Plugin::Dispatch`）
+
+| 参数 | 含义 |
+|------|------|
+| `a[0]` | 插件句柄（内核 load 时分配，C# 不可伪造语义） |
+| `a[1]` | 工具名（托管字符串） |
+| `a[2]` | 参数 JSON（托管字符串），空则按 `{}` 处理 |
+| 返回值 | 托管字符串：成功 = 工具 JSON；失败 = JSON-RPC 2.0 error 信封 |
+
+失败时同时 `osapi_set_last_error()`，映射关系与 `dispatch_mcp` 一致
+（`PC_ERR_SANDBOX`→`ERR_PERMDENIED`、`PC_ERR_STALE`→`ERR_STALE`、
+`PC_ERR_BUSY`→`ERR_BUSY`…）。零拷贝路径可读 `pc_bridge_result_buffer()`
+拿同一块 `PC_MAX_OUT` 字节缓冲。
+
+**接线方式：weak 符号。** `kernel64.cpp` 以 `__attribute__((weak))` 引用
+`pc_bridge_boot` / `osapi_ic_plugin_dispatch`，模块没链进来时地址为 0 直接跳过。
+这样 `K64_PLUGIN_CORE=0/1` 都不需要额外的 `-D` 宏，也不会把未定义符号绑成
+0 后调用（triple fault 的经典成因，见 `tools/check_k64_undefined.sh`）——
+weak 未定义符号不进 `undefined reference`，`check-k64` 报告保持 `0 (clean)`。
+
+**容量实测**（`tools/verify/check_k64_fit.sh`）
+
+| 配置 | `.bss` | `__bss_end` | `.text` |
+|------|-------:|------------:|--------:|
+| `K64_PLUGIN_CORE=0` | 3707552 | `0x5c92a0` | 890227 |
+| `K64_PLUGIN_CORE=1` | 3801104 | `0x5e0010` | 911347 |
+| 增量 | **+93552** | +94064 | +21120 |
+
+链接期上限 `0x600000`（`ASSERT(__bss_end <= 0x600000)`）→ 余量 **130544 B**（127 KiB）。
+`kernel64.bin` = 1203600 B（限 2097152 B，spare 1745 sectors）。
+明细：`plugin_core64.o` 78176 + `plugin_bridge64.o` 12296 + `malicious64.o` 8 + 夹逼。
+
+三个目标文件在 `-ffreestanding` 下编译均 **0 warning**（`plugin_core.cpp` 的
+`pc_emit()` 在无测试脚手架时会被判 `-Wunused-function`，标 `__attribute__((used))`
+解决 —— 注意 `maybe_unused` 对函数是 no-op 且会被 GCC 警告 `attribute directive ignored`）。
+
+阶段一还顺手省了 22 KiB：`plugin_core.cpp` 模块五（内核防线自测）带编译门禁
+`#if defined(NEX_PC_HOST_TEST) || defined(PC_ENABLE_CORE_SELFTEST)`，内核镜像
+只链 `plugin_bridge` 的精简版自检（4 KiB 沙盒页）。首次启用时该模块曾把
+`__bss_end` 顶到 `0x600010` —— 比 `ASSERT` 上限还高 16 字节，链接直接失败；
+这就是“先跑容量门禁再打开开关”的教科书案例。
+
+---
+
+## 8. 真实恶意插件防穿透（阶段三）
+
+`malicious_plugin.cpp` 不是伪代码：它被真的编译成独立目标文件，
+`nm -u build/malicious64.o` **输出为空** —— 没有 `fopen`、没有 `malloc`、
+没有 `printf`。它能看到的全部世界就是一行 `EvilAbi` 函数指针表。
+
+> 这就是“插件调 `fopen("/etc/shadow")` 会被拦下”的真正原因：不是我们给
+> `fopen` 打了补丁，而是**插件里根本没有 `fopen`**。任何文件访问都必须走
+> 宿主的 `mcp_call()`，也就是内核的 `dispatch_mcp()`。控制点等于必经之路，
+> 这是微内核式能力模型成立的前提。
+
+`make plugin-core-breach`（宿主，16 线程 + fork 故障隔离）**40 / 40 通过**：
+
+> 两个宿主侧的“坑”值得记下来：① 指针参数必须按 **64 位**打印 —— 宿主是
+> PIE，沙盒页常落在 `0x5555_xxxx_xxxx`，用 `%u` 截断成 32 位后闸门会**正确地**
+> 拒绝那个错地址，测试就会误判成闸门失效；② errno 必须在拒绝的**当下**采样
+> （`EvilAbi.last_errno`），否则后面那次 `mcp_call` 会把错误通道改写，
+> 断言读到的是别人的 errno（生产代码里的等价铁律：用完即弃的错误码要立刻取值）。
+
+| 断言 | 结果 |
+|------|------|
+| `load_plugin(manifest.sandbox_root="/etc", is_signed=0)` | OK，且 `sandbox_root` 被强制改写成 `/sandbox/evil.host` |
+| 未签名 → `CAP_FS_WRITE` | 加载期硬裁剪 |
+| 影子页表 | 恰好一个 RW 页、无 EXEC、基址 == 宿主给的沙盒页 |
+| `is_valid_user_ptr(0xDEADBEEF, 8, WRITE)` | `PC_ERR_DENIED`，errno = `ERR_PERMDENIED` |
+| 插件的裸解引用 | **从未执行**（闸门先命中） |
+| 对照：沙盒内合法指针 | 放行（证明不是“一律拒绝”） |
+| `fs.read /etc/passwd`、`/etc/shadow` | `PC_ERR_SANDBOX`（→ `ERR_PERMDENIED`） |
+| `fs.read /sandbox/evil.host/../../etc/shadow` | `PC_ERR_SANDBOX`（穿越被规范化拦下） |
+| 对照：`/sandbox/evil.host/notes.txt` | `PC_OK` |
+| 绕过闸门的裸野指针 | 在 fork 出的插件上下文里真的 `SIGSEGV`，**宿主进程完好** |
+
+红线日志（串口 / stdout 同款格式）：
+
+```text
+[REDLINE] A: forged pointer 0xdeadbeef  is_valid_user_ptr  addr=0xdeadbeef  rc=-5  errno=4  -> blocked, kernel alive
+[REDLINE] B: open /etc/shadow  sandbox prefix  rc=-8  errno=4  -> blocked, kernel alive
+[REDLINE] raw write to 0xdeadbeef faulted the plugin process, host alive
+```
+
+### 内核侧等价自检（开机跑一次）
+
+`pc_bridge_boot()` 在内核里现场加载同一个恶意 TU，逐条撞闸门并打印到 COM1：
+
+```text
+[PLUGIN-CORE] bridge boot: core init ok, router slots=512, plugins max=128
+===== plugin_core kernel breach selftest (unsigned, real TU) =====
+[PLUGIN-CORE] PASS  load_plugin(unsigned malicious plugin)
+[PLUGIN-CORE] PASS  sandbox_root forced to /sandbox/evil.k64 (manifest said /etc)
+[PLUGIN-CORE] PASS  A1 is_valid_user_ptr(0xDEADBEEF) == PC_ERR_DENIED
+[REDLINE] forged wild pointer 0xdeadbeef  is_valid_user_ptr  addr=0xdeadbeef  rc=-5  errno=4  -> blocked, kernel alive
+[REDLINE] open /etc/shadow  sandbox prefix check  rc=-8  errno=4  -> blocked, kernel alive
+```
+
+内核镜像**永不**执行 `evil_raw_deref`：裸写 `0xDEADBEEF` 在 ring0 是 #PF →
+`fault_common` → 若没人兜住就是 triple fault。宿主测试用 `fork()` 隔离出
+一个“插件进程”，内核侧则由 `nexos_compat.cpp` 的 IST + `longjmp` 兜底 ——
+两者语义一致：**故障被限制在插件上下文内，系统继续运行**。
+
+---
+
+## 9. 并发压力与热拔插（阶段四）
+
+`breach_test.cpp` 阶段四：16 线程 × 10000 次 = **160000 次** `dispatch_mcp`，
+混合合法读、越权绝对路径、路径穿越、伪造用户指针；跑到第 48000 次（30%）
+时热拔插。
+
+确定性来自一条握手协议，而不是靠时序碰运气：
+
+1. 恰好第 48000 次完成的那个线程置 `g_mid_reached=1` 并**原地自旋等待**。
+2. 主线程卸载插件（`unload_plugin` 与 `dispatch_mcp` 互斥；正因为第 48000 次
+   的调用已经返回，inflight 已归零，所以这里一次就拿到 `PC_OK`）。
+   —— 这同时验证了半个 `PC_ERR_BUSY` 契约：另有 4a 用例专门制造 in-flight
+   并断言卸载返回 `PC_ERR_BUSY`。
+3. 主线程置 `g_unplug_done=1` 放行。此后 160000 − 48000 = **112000** 次调用
+   必然看到 `PC_ERR_STALE`。
+
+实测：
+
+```text
+[BREACH] PASS  evil.block is in-flight (inflight > 0)
+[BREACH] PASS  unload while in-flight -> PC_ERR_BUSY
+[BREACH] PASS  blocked tool completed after gate opened
+[BREACH] PASS  unload after inflight drains -> OK
+[BREACH] PASS  reload for stress phase
+[BREACH] PASS  unload_plugin succeeded while 16 threads still dispatching
+[BREACH] PASS  no deadlock: 16/16 threads joined
+[BREACH] PASS  no unexpected return code under contention
+[BREACH] PASS  both legal and malicious requests observed
+[BREACH] PASS  old handle dispatches observed PC_ERR_STALE after unplug
+[BREACH] PASS  exactly 160000 dispatches completed (none lost)
+[BREACH] PASS  hot-plug happened while the load was still running
+[BREACH] completed 160000 dispatches in 12 ms (ok=54000 sandbox=54000 stale=52000 other=0)
+```
+
+4a 用例本身也有两个陷阱：`evil.block` 的自旋窗口要靠**墙钟**（2 s）等，
+不能用迭代计数（超卖的 VM 上“线程还没被调度”会被误读成“锁没生效”）；
+而且必须等到 `plugin_snapshot().inflight > 0` 再尝试卸载，否则卸载可能
+恰好落在调用之间的空隙里 —— 那时返回 `PC_OK` 是正确的，断言却会失败。
+
+**关键不变量**（都写成了硬断言，不是“看起来没崩”）：
+
+| 不变量 | 断言 |
+|--------|------|
+| 无死锁 | 16/16 `pthread_join` 成功；`alarm(300)` 是兜底看门狗 |
+| 不丢请求 | 结果总数**恰好** 160000（多线程计数精确切分） |
+| 旧句柄失效 | 卸载后 52000 次调用全为 `PC_ERR_STALE`，0 例外 |
+| 防穿透 | 越权请求在并发路径上 0 次返回 `PC_OK`（否则计入 `other`） |
+| 无异常返回码 | `other == 0`；合法请求 `ok=54000`，越权被拦 `sandbox=54000` |
+| 槽位复用安全 | 复用后 `g_h != oldh`，旧句柄仍 `PC_ERR_STALE`，新句柄可用 |
+| 幂等卸载 | 二次 `unload_plugin` 返回 `PC_ERR_STALE`（不是二次释放） |
+
+---
+
+## 10. 复现步骤
+
+```bash
+# 阶段一：容量门禁（必须先跑）
+bash tools/verify/check_k64_fit.sh
+make build/kernel64.bin K64_PLUGIN_CORE=1      # 期望 k64 undefined: 0 (clean)
+bash tools/verify/check_kernel_sizes.sh
+
+# 阶段三 + 四：宿主破坏性测试（40/40）
+make plugin-core-breach
+
+# 旧的机制层自测（68/68）
+make plugin-core-selftest
+```
+
+阶段五（机制层自测）与阶段六（真实恶意插件破坏性测试）是两个独立目标：
+前者验证机制本身的正确性，后者验证**在敌意输入下**这些机制真的守住了。

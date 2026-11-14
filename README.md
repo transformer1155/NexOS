@@ -448,6 +448,7 @@ wsl -d Ubuntu-24.04 -e bash /mnt/e/NexOS/NexOS/tools/verify/check_kernel_ai.sh
 | 三 · 协议 | 清单规范 / 能力表 / JSON-RPC 报文 / `ui_layout` | `docs/MCP_PLUGIN_PROTOCOL.md`、`docs/NEXBUNDLE.md`、`docs/schemas/manifest.schema.json` | 示例 manifest 通过 2020-12 Schema |
 | 四 · 示例 | 只读系统信息插件 + UI 声明 + 打包链路 | `plugins/samples/sysinfo/` | `bash plugins/samples/sysinfo/build.sh` → 生成并 verify `.nexbundle` |
 | 五 · 机制层 | 自旋锁 / 影子页表 / FNV-1a 路由 / 代际句柄 / 并发配额 / OOM 熔断 | `plugins/loader/plugin_core.{h,cpp}` | `make plugin-core-selftest` → **68 passed** |
+| 六 · 内核集成 + 破坏性测试 | 真宿主 icall 网关 / 真实未签名恶意插件 / 16 线程 160000 次并发 / 热拔插 | `plugins/loader/plugin_bridge.{h,cpp}`、`plugin_bridge` + `malicious_plugin` + `breach_test`、`csharp/NexOS.Core/Plugin.cs` | `make plugin-core-breach` → **40 passed**；`make build/kernel64.bin K64_PLUGIN_CORE=1` → `k64 undefined: 0` |
 
 ### 加载器的硬约束
 
@@ -478,14 +479,43 @@ FNV-1a + 开放寻址（Knuth 回移删除，不留墓碑）的 `McpRouter`、�
 - **卸载**：`inflight>0` 返回 `PC_ERR_BUSY`；否则先注销整条路由链再清上下文，
   `Gen++` 让旧句柄立即 `PC_ERR_STALE`。
 - **OOM 熔断**：128 槽满后锁存，即使有空槽也拒绝加载，直到 `pc_clear_oom_fuse()`。
-- **体积**：`.text ≈ 31 KiB`、`.bss ≈ 98 KiB`，默认不链入内核；
-  启用需 `make ... K64_PLUGIN_CORE=1` 且先过 `tools/verify/check_k64_fit.sh`。
+- **体积**：`plugin_core64.o` 为 `.text ≈ 18 KiB` / `.bss ≈ 76 KiB`；接入内核
+  （含 `plugin_bridge` + 真实恶意插件 TU）后总 `.bss` 增量 **93552 B**，
+  `__bss_end = 0x5e0010`，链接期上限 `0x600000` → 余量 **130544 B**。
+  默认**已启用**（`K64_PLUGIN_CORE ?= 1`）；关闭用 `make ... K64_PLUGIN_CORE=0`。
+  三个目标文件在 `-ffreestanding` 下均 **0 warning**。
 
 ```bash
 make plugin-core-selftest     # 68 passed, 0 failed（场景 A–D + 路由回移 + JSON 对抗 + OOM）
 ```
 
-设计与威胁模型见 [`docs/PLUGIN_CORE.md`](docs/PLUGIN_CORE.md)。
+### 内核集成与破坏性测试（阶段六）
+
+`plugin_core` 已经真正接进 64 位内核，并且用**真实的**恶意插件证明过防线：
+
+- **跨界网关**：`.attic64/kernel64.cpp` 用 weak 符号引用 `pc_bridge_boot` /
+  `osapi_ic_plugin_dispatch`（模块没链进来时地址为 0，直接跳过），注册托管
+  InternalCall `NexOS.Plugin::Dispatch(handle, tool, argsJson)` / `::Count`。
+  C# 侧见 `csharp/NexOS.Core/Plugin.cs`。weak 未定义符号不进 `undefined reference`，
+  所以 `check-k64` 报告保持 `0 (clean)`，也不需要额外的 `-D` 宏同步。
+- **真实恶意插件**：`plugins/loader/malicious_plugin.cpp` 被单独编译成目标文件，
+  `nm -u` 输出为空 —— 没有 `fopen`/`malloc`/`printf`。插件能看到的只有一行
+  `EvilAbi` 函数指针表，所以“调 `fopen("/etc/shadow")` 被拦下”的本质是
+  **插件里根本没有 `fopen`**：文件访问必须走宿主的 `mcp_call()` → `dispatch_mcp()`。
+- **阶段六用例 40/40**：未签名加载时 `CAP_FS_WRITE` 被摘、`sandbox_root` 从
+  manifest 写的 `/etc` 强制改成 `/sandbox/...`；伪造指针 `0xDEADBEEF` →
+  `PC_ERR_DENIED`；`/etc/shadow` 与 `../../etc/shadow` → `PC_ERR_SANDBOX`；
+  对照组（沙盒内合法路径）仍可读；绕过闸门的裸野指针在 fork 出的插件上下文里
+  真的 `SIGSEGV`，宿主完好；16 线程 × 10000 次并发 + 中途热拔插：16/16 join、
+  结果**恰好** 160000（不丢请求）、卸载后 52000 次全 `PC_ERR_STALE`、并发路径上
+  0 次穿透、`other == 0`。
+
+```bash
+make plugin-core-breach       # 40 passed, 0 failed（阶段三 + 阶段四）
+make build/kernel64.bin K64_PLUGIN_CORE=1 && bash tools/verify/check_k64_fit.sh
+```
+
+设计与威胁模型、红线日志样例、icall 契约见 [`docs/PLUGIN_CORE.md`](docs/PLUGIN_CORE.md)。
 
 ### 打包与校验
 

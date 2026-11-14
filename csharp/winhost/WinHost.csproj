@@ -58,6 +58,7 @@
          WINHOST these resolve to NexOS.Forms.Backend; guarded by #if in the
          files themselves. -->
     <Compile Include="../NexOS.Core/AI.cs" />
+    <Compile Include="../NexOS.Core/Plugin.cs" />
     <Compile Include="../NexOS.Core/MCP.cs" />
   <Compile Include="../NexOS.Core/McpSdk.cs" />
   </ItemGroup>

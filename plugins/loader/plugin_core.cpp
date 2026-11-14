@@ -43,6 +43,14 @@ void pc_set_emit_hook(void (*fn)(const char* s))
     g_emit_hook = fn;
 }
 
+/* 内核镜像里 pc_emit 只有 hook 一条出口（serial_puts 由 plugin_bridge
+ * 通过 pc_set_emit_hook 注入），模块五的测试脚手架又不编译 —— 于是它会
+ * 成为“定义了但没被引用”的函数，触发 -Wunused-function。
+ * 用 `used`（不是 maybe_unused：后者对函数是 no-op 且会被 GCC 警告
+ * “attribute directive ignored”）把它标成“可能被外部引用”，保住 0 warning。 */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((used))
+#endif
 static void pc_emit(const char* s)
 {
     if (!s) return;
@@ -1697,7 +1705,13 @@ int dispatch_mcp(uint32_t h, const char* tool, const char* args_json,
 }
 /* =====================================================================
  *  模块五：内核防线自测
+ * ---------------------------------------------------------------------
+ *  编译门禁：这套用例占约 22 KiB 静态缓冲（128+ 条 manifest / id 表），
+ *  只有宿主自测或显式打开 PC_ENABLE_CORE_SELFTEST 时才编译。
+ *  内核镜像默认只链 plugin_bridge 的**精简版**自检（4 KiB 沙盒页），
+ *  避免把测试脚手架塞进 .bss —— 内核 .bss 是稀缺资源。
  * ===================================================================== */
+#if defined(NEX_PC_HOST_TEST) || defined(PC_ENABLE_CORE_SELFTEST)
 #if defined(NEX_PC_HOST_TEST) && !defined(_WIN32)
 #  include <pthread.h>
 #endif
@@ -2269,3 +2283,14 @@ int run_core_selftest(void)
 
     return g_cs_fail;
 }
+
+#else  /* 内核镜像：不链接测试脚手架 */
+
+int run_core_selftest(void)
+{
+    /* 内核侧的精简自检在 plugins/loader/plugin_bridge.cpp 里
+     * （真实恶意插件 + 4 KiB 沙盒页），这里保持符号存在即可。 */
+    return 0;
+}
+
+#endif /* NEX_PC_HOST_TEST || PC_ENABLE_CORE_SELFTEST */
