@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    MiniCLR 插件工程。和 csharp/apps/standalone/*/App.csproj 使用同一
+    套约束：/nostdlib、netstandard2.0、无隐式框架引用、只编译显式列出的
+    源文件。这样 mex_pack.py 才能把程序集扁平化成 .mex。
+  -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <AssemblyName>sysinfo</AssemblyName>
+    <RootNamespace>SysInfo</RootNamespace>
+    <NoStdLib>true</NoStdLib>
+    <DisableImplicitFrameworkReferences>true</DisableImplicitFrameworkReferences>
+    <RuntimeMetadataVersion>v4.0.30319</RuntimeMetadataVersion>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <DebugType>none</DebugType>
+    <Optimize>true</Optimize>
+    <Deterministic>true</Deterministic>
+    <NoWarn>CS0626;CS0649;CS8021;CS1591;CS0169;CS0414;CS0108</NoWarn>
+    <!-- 与 csharp/apps/standalone/* 一致：关掉 shell 专属的 Voice/Desktop 分支 -->
+    <DefineConstants>$(DefineConstants);STANDALONE_APP</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- MiniCLR 的最小 BCL + InternalCall 声明 -->
+    <Compile Include="../../../../csharp/NexOS.Core/Corelib.cs" />
+    <Compile Include="../../../../csharp/NexOS.Core/Sys.cs" />
+    <!-- MCP SDK：[McpTool] / McpServerBase -->
+    <Compile Include="../../../../csharp/NexOS.Core/McpSdk.cs" />
+    <!-- 宿主只读 API：Host.CpuLoad / PagesUsed / OsName ... -->
+    <Compile Include="../../../../csharp/NexOS.Forms/Forms.cs" />
+    <Compile Include="../../../../csharp/NexOS.Forms/Anim.cs" />
+    <!-- Forms.cs 引用 Voice.Register；Shim 提供 Desktop 的独立构建桩 -->
+    <Compile Include="../../../../csharp/apps/standalone/Shared/Shim.cs" />
+
+    <!-- 本插件 -->
+    <Compile Include="PluginMain.cs" />
+    <Compile Include="SysInfoTools.cs" />
+    <!-- 由 tools/misc/mcp_scan.py 的 emit-dispatch 选项生成 -->
+    <Compile Include="SysInfoTools.Dispatch.g.cs" Condition="Exists('SysInfoTools.Dispatch.g.cs')" />
+  </ItemGroup>
+</Project>

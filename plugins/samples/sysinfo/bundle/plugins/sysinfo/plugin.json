@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "id": "sysinfo",
+  "name": "系统信息",
+  "version": "1.0.0",
+  "description": "CPU 占用、物理页、CLR 堆与 OS 标识的只读快照。",
+  "entry": {
+    "kind": "managed",
+    "assembly": "sysinfo.mex",
+    "init_symbol": "SysInfo.PluginMain::Init",
+    "dispatch_symbol": "SysInfo.PluginMain::Dispatch"
+  },
+  "network": {
+    "allow_hosts": []
+  },
+  "capabilities": [
+    "sys.info"
+  ],
+  "ui_layout": "ui/layout.json",
+  "tools": [
+    {
+      "name": "sys_info",
+      "description": "Read-only snapshot of CPU load, memory and OS identity.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "mem_info",
+      "description": "Physical page counters and the CLR bump-heap high-water marks.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  ]
+}

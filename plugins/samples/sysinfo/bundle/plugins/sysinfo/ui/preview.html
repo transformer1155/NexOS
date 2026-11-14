@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<!--
+  ui/preview.html - 设计稿预览，**不参与运行时**。
+  .nexbundle 的 UI 由 ui/layout.json 声明，前端（NexOS.Forms）解释执行；
+  这个文件只是让设计师/评审在不启动 VM 的情况下看布局。
+  数值是 2026-11-13 的一次真实抓取快照。
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>系统信息 · 布局预览</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; background: #0b0e14; color: #e6e9ef;
+           font: 14px/1.5 "Segoe UI", "Microsoft YaHei", sans-serif; }
+    .win { width: 520px; margin: 32px auto; border: 1px solid #2a2f3a;
+           border-radius: 10px; overflow: hidden; background: #111827; }
+    .bar { height: 34px; display: flex; align-items: center; padding: 0 12px;
+           background: #123a6b; font-weight: 600; }
+    .body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+    .row { display: flex; gap: 12px; }
+    .metric { flex: 1; background: #1b2230; border-radius: 8px; padding: 10px 12px; }
+    .metric .k { color: #9aa4b2; font-size: 12px; }
+    .metric .v { font-size: 24px; font-weight: 700; }
+    .bar-track { height: 8px; background: #1b2230; border-radius: 4px; overflow: hidden; }
+    .bar-fill { width: 37%; height: 100%; background: #5b3fd6; }
+    table { width: 100%; border-collapse: collapse; }
+    td { padding: 4px 0; color: #c9d1dc; }
+    td:last-child { text-align: right; color: #e6e9ef; }
+    .badge { background: #243043; border-radius: 999px; padding: 2px 10px;
+             font-size: 12px; color: #9fd0ff; }
+    .spacer { flex: 1; }
+    button { background: #5b3fd6; color: #fff; border: 0; border-radius: 6px;
+             padding: 6px 18px; font: inherit; }
+  </style>
+</head>
+<body>
+  <div class="win">
+    <div class="bar">系统信息</div>
+    <div class="body">
+      <div class="row">
+        <div class="metric"><div class="k">CPU 占用</div><div class="v">12%</div></div>
+        <div class="metric"><div class="k">内存占用</div><div class="v">37%</div></div>
+      </div>
+      <div class="bar-track"><div class="bar-fill"></div></div>
+      <table>
+        <tr><td>物理内存</td><td>1024 MB</td></tr>
+        <tr><td>已用</td><td>378 MB</td></tr>
+        <tr><td>空闲</td><td>646 MB</td></tr>
+        <tr><td>总页数</td><td>262144</td></tr>
+        <tr><td>已用页</td><td>96768</td></tr>
+        <tr><td>系统</td><td>NexOS 2.1</td></tr>
+        <tr><td>CPU</td><td>GenuineIntel</td></tr>
+      </table>
+      <div class="row">
+        <span class="badge">64-bit</span>
+        <span class="spacer"></span>
+        <button>刷新</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

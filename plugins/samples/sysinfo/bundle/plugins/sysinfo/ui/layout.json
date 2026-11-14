@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "window": {
+    "title": "系统信息",
+    "width": 520,
+    "height": 380,
+    "resizable": true
+  },
+  "data": {
+    "tool": "sys_info",
+    "refresh_ms": 1000
+  },
+  "root": {
+    "type": "column",
+    "padding": 16,
+    "gap": 12,
+    "children": [
+      {
+        "type": "row",
+        "gap": 12,
+        "children": [
+          {
+            "type": "metric",
+            "label": "CPU 占用",
+            "bind": "/cpu_load",
+            "unit": "%"
+          },
+          {
+            "type": "metric",
+            "label": "内存占用",
+            "bind": "/mem_used_pct",
+            "unit": "%"
+          }
+        ]
+      },
+      {
+        "type": "progress",
+        "label": "内存使用率",
+        "bind": "/mem_used_pct",
+        "max": 100
+      },
+      {
+        "type": "keyvalue",
+        "items": [
+          { "label": "物理内存", "bind": "/mem_total_kb", "unit": "KB" },
+          { "label": "已用", "bind": "/mem_used_kb", "unit": "KB" },
+          { "label": "空闲", "bind": "/mem_free_kb", "unit": "KB" },
+          { "label": "总页数", "bind": "/pages_total" },
+          { "label": "已用页", "bind": "/pages_used" },
+          { "label": "系统", "bind": "/os" },
+          { "label": "CPU", "bind": "/cpu_vendor" }
+        ]
+      },
+      {
+        "type": "row",
+        "gap": 8,
+        "children": [
+          { "type": "badge", "label": "64-bit", "bind": "/is_64bit", "true_text": "64-bit", "false_text": "32-bit" },
+          { "type": "spacer" },
+          {
+            "type": "button",
+            "label": "刷新",
+            "action": { "tool": "sys_info", "arguments": {} }
+          }
+        ]
+      }
+    ]
+  }
+}

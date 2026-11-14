@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "window": {
+    "title": "系统信息套件",
+    "width": 560,
+    "height": 430,
+    "resizable": true
+  },
+  "root": {
+    "type": "tabs",
+    "tab_position": "top",
+    "children": [
+      {
+        "type": "panel",
+        "label": "概览",
+        "plugin": "sysinfo",
+        "layout": "plugins/sysinfo/ui/layout.json"
+      },
+      {
+        "type": "panel",
+        "label": "关于",
+        "children": [
+          { "type": "heading", "text": "系统信息套件 1.0.0" },
+          {
+            "type": "text",
+            "text": "本应用是一个插件整合包：包内只有一个 sysinfo 插件，它只申请 sys.info 能力、不申请网络、不申请文件写入。"
+          },
+          {
+            "type": "text",
+            "text": "未签名安装时，内核会再次摘除 CAP_FS_WRITE，并把沙盒根强制为 /sandbox/sysinfo。"
+          },
+          {
+            "type": "keyvalue",
+            "items": [
+              { "label": "Bundle", "value": "sysinfo.suite" },
+              { "label": "Plugin", "value": "sysinfo" },
+              { "label": "Capability", "value": "sys.info" },
+              { "label": "Network", "value": "none" }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

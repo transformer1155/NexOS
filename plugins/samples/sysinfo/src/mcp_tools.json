@@ -1,0 +1,30 @@
+{
+  "mcp_server": [
+    {
+      "tool_name": "sys_info",
+      "description": "Read-only snapshot of CPU load, memory and OS identity.",
+      "parameters_schema": {
+        "type": "object",
+        "properties": {
+          "json_args": {
+            "type": "string",
+            "description": "Tool arguments as a JSON string."
+          }
+        }
+      }
+    },
+    {
+      "tool_name": "mem_info",
+      "description": "Physical page counters and the CLR bump-heap high-water marks.",
+      "parameters_schema": {
+        "type": "object",
+        "properties": {
+          "json_args": {
+            "type": "string",
+            "description": "Tool arguments as a JSON string."
+          }
+        }
+      }
+    }
+  ]
+}
